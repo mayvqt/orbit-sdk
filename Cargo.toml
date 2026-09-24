@@ -1,0 +1,3 @@
+[workspace]
+members = ["sdk/rust", "sdk/rust/native", "sdk/ffi", "examples/rust/licensed-export", "examples/rust/licensed-backend"]
+resolver = "3"

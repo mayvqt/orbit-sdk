@@ -1,0 +1,33 @@
+[package]
+name = "orbit-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+# Explicit loopback-only development transport. TLS verification is never disabled.
+local-development = []
+
+[dependencies]
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+aws-lc-rs = "=1.18.1"
+base64 = "=0.22.1"
+time = { version = "=0.3.55", features = ["parsing"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.4", features = ["time", "fs", "process"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+orbit-sdk-native = { path = "native", version = "=0.1.0" }
+
+[lints.rust]
+unsafe_code = "forbid"
+[lints.clippy]
+all = "deny"

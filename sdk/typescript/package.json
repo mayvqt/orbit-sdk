@@ -1,0 +1,19 @@
+{
+  "name": "@orbit/trusted-backend-sdk",
+  "version": "0.1.0",
+  "description": "Small online JavaScript and TypeScript client for Orbit's trusted backend API",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "import": "./index.mjs"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

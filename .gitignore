@@ -1,0 +1,8 @@
+/target/
+**/bin/
+**/obj/
+.env
+.env.*
+*.log
+*.tmp
+.DS_Store

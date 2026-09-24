@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)../NuGet.Config</RestoreConfigFile>
+    <PackageId>Orbit.Sdk</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Orbit licensing client SDK.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(OrbitLocalDevelopment)' == 'true'">
+    <DefineConstants>$(DefineConstants);ORBIT_LOCAL_DEVELOPMENT</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../LICENSE" Pack="true" PackagePath="" Link="LICENSE" />
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="[8.23.0]" />
+  </ItemGroup>
+</Project>
