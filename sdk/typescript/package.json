@@ -2,6 +2,11 @@
   "name": "@orbit/trusted-backend-sdk",
   "version": "0.1.0",
   "description": "Small online JavaScript and TypeScript client for Orbit's trusted backend API",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mayvqt/orbit-sdk.git",
+    "directory": "sdk/typescript"
+  },
   "type": "module",
   "exports": {
     ".": {

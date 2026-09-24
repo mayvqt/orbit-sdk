@@ -1,10 +1,11 @@
 # Orbit trusted backend SDK for JavaScript and TypeScript
 
 This dependency-free ESM client runs on a trusted Node.js backend (Node 20 or
-newer). It uses the built-in Fetch API and needs no build step. Copy this
-folder into your backend or install it from a local path. It makes online API
-requests; it does not validate signed grants or provide the offline/device
-behavior in Orbit's Rust, Go, C#, C++, and Python SDKs.
+newer). It uses the built-in Fetch API and needs no build step. Check out the
+`v0.1.0` source tag, then install the local package folder with
+`npm install ./orbit-sdk/sdk/typescript`. No npm registry package is published.
+It makes online API requests; it does not validate signed grants or provide the
+offline/device behavior in Orbit's Rust, Go, C#, C++, and Python SDKs.
 
 ## Configure
 
@@ -14,7 +15,7 @@ your backend needs. Keep the token in server configuration; never put it in
 browser code, a URL, an error log or a response to users.
 
 ```js
-import { OrbitBackendClient } from "./sdk/typescript/index.mjs";
+import { OrbitBackendClient } from "@orbit/trusted-backend-sdk";
 
 const orbit = new OrbitBackendClient({
   apiOrigin: process.env.ORBIT_API_ORIGIN,

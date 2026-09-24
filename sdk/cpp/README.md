@@ -1,14 +1,14 @@
 # Orbit C++ SDK
 
-Copy the whole `sdk/cpp` directory and keep `include` and `src` together. The
-wrapper needs C++17 and the Rust FFI static library built for the same target
-and toolchain. It has no third-party dependencies or network fetches. JSON
-responses are UTF-8 `std::string` values; parse them with your application's
-JSON library.
+Check out the pinned source release and keep the repository intact. The
+wrapper needs C++17 and the Rust FFI static library from the same checkout,
+built for the same target and toolchain. It has no third-party dependencies or
+network fetches. JSON responses are UTF-8 `std::string` values; parse them with
+your application's JSON library.
 
 ## Build
 
-Build the Rust library from the kit root with Rust/Cargo 1.98.1 or newer:
+Build the Rust library from the checkout root with Rust/Cargo 1.98.1 or newer:
 
 ```sh
 cargo build --manifest-path sdk/ffi/Cargo.toml --lib
@@ -36,6 +36,17 @@ CMake links the Rust static library's platform dependencies. Linux needs
 pthread, `dl`, `m` and `rt`; Windows needs `ws2_32`, `bcrypt`, `ntdll`,
 `userenv`, `advapi32`, `crypt32` and `secur32`. Build the Rust FFI for the
 same architecture, runtime and configuration as the C++ app.
+
+In your application's `CMakeLists.txt`, set the FFI path, add the SDK folder,
+and link its target (use `orbit_sdk_ffi.lib` on Windows):
+
+```cmake
+set(ORBIT_SDK_DIR "/path/to/orbit-sdk")
+set(ORBIT_FFI_STATIC_LIB "${ORBIT_SDK_DIR}/target/debug/liborbit_sdk_ffi.a"
+    CACHE FILEPATH "")
+add_subdirectory("${ORBIT_SDK_DIR}/sdk/cpp" orbit_sdk)
+target_link_libraries(my_app PRIVATE Orbit::Sdk)
+```
 
 ## Connect and activate
 

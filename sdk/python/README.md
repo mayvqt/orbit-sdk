@@ -1,12 +1,12 @@
 # Orbit Python SDK
 
 `orbit_sdk.py` is a synchronous, Python 3.12+ standard-library binding over
-Orbit's Rust C ABI. Copy this directory intact. It installs no Python packages
-and downloads no native libraries.
+Orbit's Rust C ABI. Check out the pinned source release and keep the repository
+intact. It installs no Python packages and downloads no native libraries.
 
 ## Build and load the FFI
 
-Build on the target OS from the SDK kit root with Rust/Cargo 1.98.1 or newer:
+Build on the target OS from the checkout root with Rust/Cargo 1.98.1 or newer:
 
 ```sh
 cargo build --release --manifest-path sdk/ffi/Cargo.toml

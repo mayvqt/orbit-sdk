@@ -6,16 +6,16 @@ under the [MIT licence](../LICENSE).
 
 ## Add the SDK
 
-Use .NET SDK 10.0.112, selected by the kit's `global.json`. Add a project reference,
-adjusting the paths:
+Use .NET SDK 10.0.112, selected by the kit's `global.json`. Check out the pinned source
+release, then add a project reference:
 
 ```sh
-dotnet add MyApp/MyApp.csproj reference orbit-kit/sdk/csharp/Orbit.Sdk/Orbit.Sdk.csproj
+git clone --depth 1 --branch v0.1.0 https://github.com/mayvqt/orbit-sdk.git orbit-sdk
+dotnet add MyApp/MyApp.csproj reference orbit-sdk/sdk/csharp/Orbit.Sdk/Orbit.Sdk.csproj
 ```
 
 In Visual Studio, add the existing `Orbit.Sdk.csproj` to your solution, then reference
-it from your app. Keep the `Orbit.Sdk` folder intact; Visual Studio includes its source
-files automatically. Keep the SDK's [NuGet.Config](NuGet.Config) and
+it from your app. Keep the `Orbit.Sdk` folder intact and retain its `NuGet.Config` and
 `packages.lock.json` files.
 
 For a first run, follow the [console example](../../examples/csharp/licensed-export/README.md),

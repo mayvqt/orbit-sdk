@@ -6,18 +6,15 @@ under the [MIT licence](../LICENSE).
 
 ## Add the SDK
 
-Use Go 1.27.1 or newer. For the source kit, add this to your app's `go.mod`, adjusting
-the path to the extracted kit:
+Use Go 1.27.1 or newer. Add the versioned source module with:
 
-```go
-require github.com/mayvqt/orbit-sdk/sdk/go v0.0.0
-replace github.com/mayvqt/orbit-sdk/sdk/go => ../orbit-kit/sdk/go
+```sh
+go get github.com/mayvqt/orbit-sdk/sdk/go@v0.1.0
 ```
 
-Keep the SDK directory intact and use it as one module; do not copy individual Go files.
-Keep the kit's `go.sum`. Import it with
-`import orbit "github.com/mayvqt/orbit-sdk/sdk/go"`. After a public release is tagged, `go get` works; the submodule tag uses
-the `sdk/go/v...` form.
+The module path is `github.com/mayvqt/orbit-sdk/sdk/go`; its repository release
+tag is `sdk/go/v0.1.0`. Import it with
+`import orbit "github.com/mayvqt/orbit-sdk/sdk/go"`.
 
 For a first run, follow the [console example](../../examples/go/licensed-export/README.md),
 then open **Integration** in the dashboard and copy the Go startup

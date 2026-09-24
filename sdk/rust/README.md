@@ -6,15 +6,17 @@ under the [MIT licence](../LICENSE).
 
 ## Add the SDK
 
-Use Rust/Cargo 1.98.1 or newer. Add a path dependency to the extracted kit; the path is
-relative to your app's `Cargo.toml`:
+Use Rust/Cargo 1.98.1 or newer. Pin the public source release from Git:
 
 ```toml
 [dependencies]
-orbit-sdk = { path = "../orbit-kit/sdk/rust" }
+orbit-sdk = { git = "https://github.com/mayvqt/orbit-sdk", tag = "v0.1.0" }
 ```
 
-Keep the SDK directory intact and use it as one dependency. For a first run, follow the
+For a local checkout, use `path = "../orbit-sdk/sdk/rust"` instead. Keep the SDK
+directory intact and use it as one dependency.
+
+For a first run, follow the
 [console example](../../examples/rust/licensed-export/README.md), then open
 **Integration** in the dashboard and copy the Rust startup snippet for your application
 and environment.
