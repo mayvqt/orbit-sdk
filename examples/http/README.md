@@ -23,7 +23,7 @@ code or logs. A management token belongs only on your backend.
 
 The [OpenAPI document](https://orbit.mayvie.dev/api/openapi.json) provides the
 current request/response schemas, required fields, authentication and error
-responses. Open it while signed in to the Orbit dashboard. It covers client and
+responses. It is public and needs no dashboard sign-in. It covers client and
 management operations, but is not a complete dashboard API reference.
 
 ## Try the customer flow
