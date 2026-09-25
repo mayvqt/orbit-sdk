@@ -658,6 +658,39 @@ private:
     std::filesystem::path path_;
 };
 
+void test_windows_dpapi_storage_rename_name_lengths() {
+    WindowsFixture fixture;
+    ScopedUserProfileOverride profile_override;
+    for (std::size_t length = 1; length <= 8; ++length) {
+        const auto name = std::wstring(length, L'x');
+        const auto directory = fixture.path() / name;
+        std::filesystem::create_directories(directory);
+        auto config = fixture.config();
+        config.storage.path = directory.u8string();
+
+        auto storage = orbit::detail::open_storage(config);
+        require(storage->version() == 0 && !storage->load().second,
+                "Windows storage must initialize each rename-name fixture");
+        storage->save(0, sample_credential());
+        storage.reset();
+
+        storage = orbit::detail::open_storage(config);
+        const auto reopened = storage->load();
+        require(reopened.first == 0 && reopened.second &&
+                    (*reopened.second)["activation_id"].asString() ==
+                        "synthetic_activation",
+                "Windows storage must reopen each rename-name fixture");
+        require(storage->invalidate() == 1,
+                "Windows storage must invalidate each rename-name fixture");
+        storage.reset();
+
+        storage = orbit::detail::open_storage(config);
+        require(storage->version() == 1 && !storage->load().second,
+                "Windows storage tombstones must survive each rename-name fixture");
+        storage.reset();
+    }
+}
+
 void test_windows_dpapi_storage_roundtrip_and_missing_state() {
     WindowsFixture fixture;
     ScopedUserProfileOverride profile_override;
@@ -747,6 +780,7 @@ int main() {
         test_linux_helper_timeout_and_poisoned_pending_marker();
         test_linux_private_directory_and_lease_replacement();
 #elif defined(_WIN32)
+        test_windows_dpapi_storage_rename_name_lengths();
         test_windows_dpapi_storage_roundtrip_and_missing_state();
 #endif
         return 0;

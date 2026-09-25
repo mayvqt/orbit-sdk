@@ -305,7 +305,10 @@ class WindowsStorage:
         directory = chars.value.rstrip("\\")
         name = (directory + "\\" + DATA_FILE).encode("utf-16-le")
         offset = RenameInfo.name.offset
-        allocation = ctypes.create_string_buffer(offset + len(name))
+        # Win32 rename metadata needs a terminal WCHAR beyond the counted name.
+        allocation = ctypes.create_string_buffer(
+            max(ctypes.sizeof(RenameInfo), offset + len(name) + ctypes.sizeof(ctypes.c_wchar))
+        )
         ctypes.cast(allocation, ctypes.POINTER(RenameInfo)).contents.flags = 1
         ctypes.cast(allocation, ctypes.POINTER(RenameInfo)).contents.root = None
         ctypes.cast(allocation, ctypes.POINTER(RenameInfo)).contents.length = len(name)

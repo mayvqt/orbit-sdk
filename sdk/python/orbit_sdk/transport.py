@@ -4,6 +4,7 @@ import errno
 import http.client
 import json
 import random
+import select
 import socket
 import ssl
 import threading
@@ -152,54 +153,125 @@ class _ResolverPool:
 _DNS_RESOLVER = _ResolverPool()
 
 
+_IO_POLL_INTERVAL = 0.05
+
+
+def _check_io(deadline: float, cancel: Any, operation: str) -> None:
+    if _cancelled(cancel):
+        raise _AttemptError(error(CANCELLED, "operation_cancelled"))
+    if time.monotonic() >= deadline:
+        raise socket.timeout(f"{operation} timed out")
+
+
+def _wait_ready(sock: socket.socket, deadline: float, cancel: Any, *, read: bool) -> None:
+    while True:
+        _check_io(deadline, cancel, "socket I/O")
+        remaining = deadline - time.monotonic()
+        try:
+            readable, writable, exceptional = select.select(
+                [sock] if read else [], [] if read else [sock], [sock], min(remaining, _IO_POLL_INTERVAL)
+            )
+        except InterruptedError:
+            continue
+        if readable or writable or exceptional:
+            return
+
+
+class _BoundedSSLSocket(ssl.SSLSocket):
+    """Nonblocking TLS socket whose public I/O waits honor request limits."""
+
+    def _configure(self, deadline: float, cancel: Any) -> None:
+        self._deadline = deadline
+        self._cancel = cancel
+        self.setblocking(False)
+
+    def _perform(self, operation: Callable[[], Any]) -> Any:
+        while True:
+            _check_io(self._deadline, self._cancel, "TLS I/O")
+            try:
+                result = operation()
+            except ssl.SSLWantReadError:
+                _wait_ready(self, self._deadline, self._cancel, read=True)
+                continue
+            except ssl.SSLWantWriteError:
+                _wait_ready(self, self._deadline, self._cancel, read=False)
+                continue
+            _check_io(self._deadline, self._cancel, "TLS I/O")
+            return result
+
+    def recv_into(self, buffer: Any, nbytes: int | None = None, flags: int = 0) -> int:
+        return self._perform(lambda: ssl.SSLSocket.recv_into(self, buffer, nbytes, flags))
+
+    def send(self, data: Any, flags: int = 0) -> int:
+        return self._perform(lambda: ssl.SSLSocket.send(self, data, flags))
+
+    def do_handshake(self, block: bool = False) -> None:
+        self._perform(lambda: ssl.SSLSocket.do_handshake(self, block=False))
+
+
 class _BoundedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host: str, port: int, timeout: float, context: ssl.SSLContext,
-                 addresses: list[tuple[Any, ...]], deadline: float, cancel: Any,
-                 timed_out: threading.Event) -> None:
+                 addresses: list[tuple[Any, ...]], deadline: float, cancel: Any) -> None:
         super().__init__(host, port, timeout=timeout, context=context)
         self._addresses = addresses
         self._deadline = deadline
         self._cancel = cancel
-        self._timed_out = timed_out
+
+    def _connect_nonblocking(self, sock: socket.socket, address: Any) -> None:
+        _check_io(self._deadline, self._cancel, "connection")
+        result = sock.connect_ex(address)
+        _check_io(self._deadline, self._cancel, "connection")
+        connected = {0}
+        pending: set[int] = set()
+        for source in (errno, socket):
+            for name in ("EISCONN", "WSAEISCONN"):
+                value = getattr(source, name, None)
+                if isinstance(value, int):
+                    connected.add(value)
+            for name in (
+                "EINPROGRESS", "EWOULDBLOCK", "EALREADY", "EINTR",
+                "WSAEWOULDBLOCK", "WSAEINPROGRESS", "WSAEALREADY",
+            ):
+                value = getattr(source, name, None)
+                if isinstance(value, int):
+                    pending.add(value)
+        if result in connected:
+            return
+        if result not in pending:
+            raise OSError(result, "socket connection failed")
+        while True:
+            _wait_ready(sock, self._deadline, self._cancel, read=False)
+            result = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            _check_io(self._deadline, self._cancel, "connection")
+            if result in connected:
+                return
+            if result not in pending:
+                raise OSError(result, "socket connection failed")
 
     def connect(self) -> None:
         last_failure: OSError | None = None
         for family, kind, protocol, _canonical, address in self._addresses:
             if _cancelled(self._cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled"))
-            remaining = self._deadline - time.monotonic()
-            if self._timed_out.is_set() or remaining <= 0:
+            if time.monotonic() >= self._deadline:
                 raise socket.timeout("connection attempt timed out")
             sock = socket.socket(family, kind, protocol)
             self.sock = sock
             try:
-                sock.settimeout(remaining)
-                sock.connect(address)
+                sock.setblocking(False)
+                self._connect_nonblocking(sock, address)
                 if self._tunnel_host:
                     self._tunnel()
-                if _cancelled(self._cancel):
-                    raise _AttemptError(error(CANCELLED, "operation_cancelled"))
-                remaining = self._deadline - time.monotonic()
-                if self._timed_out.is_set() or remaining <= 0:
-                    raise socket.timeout("TLS connection timed out")
+                _check_io(self._deadline, self._cancel, "TLS connection")
+                self._context.sslsocket_class = _BoundedSSLSocket
                 tls = self._context.wrap_socket(
                     sock,
                     server_hostname=self._tunnel_host or self.host,
                     do_handshake_on_connect=False,
                 )
                 self.sock = tls
-                if _cancelled(self._cancel):
-                    raise _AttemptError(error(CANCELLED, "operation_cancelled"))
-                tls.settimeout(remaining)
-                if self._timed_out.is_set() or time.monotonic() >= self._deadline:
-                    raise socket.timeout("TLS handshake timed out")
+                tls._configure(self._deadline, self._cancel)
                 tls.do_handshake()
-                if _cancelled(self._cancel):
-                    raise _AttemptError(error(CANCELLED, "operation_cancelled"))
-                remaining = self._deadline - time.monotonic()
-                if self._timed_out.is_set() or remaining <= 0:
-                    raise socket.timeout("TLS handshake timed out")
-                tls.settimeout(remaining)
                 return
             except _AttemptError:
                 self.close()
@@ -208,7 +280,7 @@ class _BoundedHTTPSConnection(http.client.HTTPSConnection):
                 self.close()
                 if _cancelled(self._cancel):
                     raise _AttemptError(error(CANCELLED, "operation_cancelled")) from exc
-                if self._timed_out.is_set() or time.monotonic() >= self._deadline:
+                if time.monotonic() >= self._deadline:
                     raise socket.timeout("connection attempt timed out") from exc
                 last_failure = exc
         if last_failure is not None:
@@ -349,8 +421,7 @@ class Transport:
                     raise error(CANCELLED, "operation_cancelled")
         raise error(TRANSIENT, "request_timeout")
 
-    def _connection(self, timeout: float, deadline: float, cancel: Any,
-                    timed_out: threading.Event) -> Any:
+    def _connection(self, timeout: float, deadline: float, cancel: Any) -> Any:
         if self._factory is not None and self._resolver is None:
             return self._factory(self._base.hostname, self._base.port or 443, timeout=timeout, context=self._ssl)
         resolver = self._resolver or _DNS_RESOLVER
@@ -372,51 +443,17 @@ class Transport:
             addresses,
             deadline,
             cancel,
-            timed_out,
         )
 
     def _attempt(self, method: str, target: str, body: bytes | None, token: str, timeout: float, cancel: Any) -> tuple[bytes | None, float | None]:
         connection = None
-        remove_cancel_callback = None
-        timed_out = threading.Event()
-        io_sock = None
         response = None
         deadline = time.monotonic() + timeout
-        timeout_timer = None
-
-        def abort() -> None:
-            if connection is None:
-                return
-            sock = io_sock or getattr(connection, "sock", None)
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-            try:
-                connection.close()
-            except OSError:
-                pass
-
-        def expire() -> None:
-            timed_out.set()
-            abort()
 
         try:
-            connection = self._connection(timeout, deadline, cancel, timed_out)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            connection = self._connection(timeout, deadline, cancel)
+            if time.monotonic() >= deadline:
                 raise _AttemptError(error(TRANSIENT, "request_timeout"))
-            timeout_timer = threading.Timer(remaining, expire)
-            timeout_timer.daemon = True
-            timeout_timer.start()
-            if cancel is not None and hasattr(cancel, "add_callback"):
-                callback_token = cancel.add_callback(abort)
-                remove_cancel_callback = lambda: cancel.remove_callback(callback_token)
             if _cancelled(cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled"))
             headers = {"Accept": "application/json"}
@@ -425,9 +462,6 @@ class Transport:
             if token:
                 headers["Authorization"] = "Bearer " + token
             connection.request(method, target, body=body, headers=headers)
-            io_sock = getattr(connection, "sock", None)
-            if io_sock is not None:
-                io_sock.settimeout(max(0.001, min(timeout, deadline - time.monotonic())))
             response = connection.getresponse()
             content_length = response.getheader("Content-Length")
             if content_length is not None and content_length.isdigit() and int(content_length) > MAX_BYTES:
@@ -437,7 +471,7 @@ class Transport:
                 if _cancelled(cancel):
                     raise _AttemptError(error(CANCELLED, "operation_cancelled"))
                 chunk = response.read(min(8192, MAX_BYTES + 1 - len(chunks)))
-                if timed_out.is_set() or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise _AttemptError(error(TRANSIENT, "request_timeout"))
                 if _cancelled(cancel):
                     raise _AttemptError(error(CANCELLED, "operation_cancelled"))
@@ -480,7 +514,7 @@ class Transport:
         except ssl.SSLError as exc:
             if _cancelled(cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled")) from exc
-            if timed_out.is_set():
+            if time.monotonic() >= deadline:
                 raise _AttemptError(error(TRANSIENT, "request_timeout")) from exc
             raise _AttemptError(error(TRANSPORT_SECURITY, "tls_failure")) from exc
         except (socket.timeout, TimeoutError) as exc:
@@ -490,7 +524,7 @@ class Transport:
         except OSError as exc:
             if _cancelled(cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled")) from exc
-            if timed_out.is_set():
+            if time.monotonic() >= deadline:
                 raise _AttemptError(error(TRANSIENT, "request_timeout")) from exc
             if _transient_os_error(exc):
                 raise _AttemptError(error(TRANSIENT, "network_unavailable")) from exc
@@ -498,15 +532,10 @@ class Transport:
         except (http.client.HTTPException, ValueError) as exc:
             if _cancelled(cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled")) from exc
-            if timed_out.is_set():
+            if time.monotonic() >= deadline:
                 raise _AttemptError(error(TRANSIENT, "request_timeout")) from exc
             raise _AttemptError(error(TRANSPORT_SECURITY, "transport_failure")) from exc
         finally:
-            if remove_cancel_callback is not None:
-                remove_cancel_callback()
-            if timeout_timer is not None:
-                timeout_timer.cancel()
-                timeout_timer.join()
             if response is not None:
                 try:
                     response.close()

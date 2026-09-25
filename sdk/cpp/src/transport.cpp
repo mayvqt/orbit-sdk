@@ -374,6 +374,11 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
 #ifdef ORBIT_SDK_TESTING
     if (!trusted_test_ca_file_.empty()) {
         set_option(handle.value, CURLOPT_CAINFO, trusted_test_ca_file_.c_str());
+#ifdef _WIN32
+        // The synthetic private test CA has no revocation distribution point.
+        set_option(handle.value, CURLOPT_SSL_OPTIONS,
+                   static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
+#endif
     }
 #endif
     set_option(handle.value, CURLOPT_NOSIGNAL, 1L);

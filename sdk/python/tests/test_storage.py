@@ -181,19 +181,30 @@ class WindowsStorageTests(unittest.TestCase):
         self.directory.cleanup()
 
     def test_dpapi_fresh_save_reopen_load_and_invalidate(self) -> None:
-        storage = WindowsStorage.open(self.directory.name, self.settings, self.device)
-        self.assertEqual(storage.load(), (0, None))
-        storage.save(0, credential())
-        storage.close()
+        for basename_length in range(8, 16):
+            directory = Path(self.directory.name, "s" * basename_length)
+            directory.mkdir()
+            storage = None
+            reopened = None
+            try:
+                storage = WindowsStorage.open(str(directory), self.settings, self.device)
+                self.assertEqual(storage.load(), (0, None))
+                storage.save(0, credential())
+                storage.close()
+                storage = None
 
-        reopened = WindowsStorage.open(self.directory.name, self.settings, self.device)
-        self.assertEqual(reopened.load(), (0, credential()))
-        self.assertEqual(reopened.invalidate(), 1)
-        self.assertEqual(reopened.load(), (1, None))
-        reopened.close()
-        ciphertext = Path(self.directory.name, "orbit-storage.bin").read_bytes()
-        self.assertNotIn(credential().credential.encode(), ciphertext)
-        self.assertFalse(list(Path(self.directory.name).glob("orbit-storage-*.tmp")))
+                reopened = WindowsStorage.open(str(directory), self.settings, self.device)
+                self.assertEqual(reopened.load(), (0, credential()))
+                self.assertEqual(reopened.invalidate(), 1)
+                self.assertEqual(reopened.load(), (1, None))
+                ciphertext = Path(directory, "orbit-storage.bin").read_bytes()
+                self.assertNotIn(credential().credential.encode(), ciphertext)
+                self.assertFalse(list(directory.glob("orbit-storage-*.tmp")))
+            finally:
+                if reopened is not None:
+                    reopened.close()
+                if storage is not None:
+                    storage.close()
 
     def test_dpapi_write_failure_poisons_and_removes_temporary_file(self) -> None:
         storage = WindowsStorage.open(self.directory.name, self.settings, self.device)

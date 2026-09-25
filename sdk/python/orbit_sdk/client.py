@@ -89,7 +89,6 @@ class Cancellation:
         self._event = threading.Event()
         self._active = 0
         self._closed = False
-        self._callbacks: dict[object, Any] = {}
 
     @classmethod
     def create(cls) -> Cancellation:
@@ -114,36 +113,12 @@ class Cancellation:
             if self._closed:
                 raise RuntimeError("Orbit cancellation handle is closed")
             self._event.set()
-            callbacks = tuple(self._callbacks.values())
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                pass
 
     def is_set(self) -> bool:
         return self._event.is_set()
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)
-
-    def add_callback(self, callback: Any) -> object | None:
-        token = object()
-        with self._condition:
-            if self._closed or self._event.is_set():
-                run_now = True
-            else:
-                self._callbacks[token] = callback
-                run_now = False
-        if run_now:
-            callback()
-            return None
-        return token
-
-    def remove_callback(self, token: object | None) -> None:
-        if token is not None:
-            with self._condition:
-                self._callbacks.pop(token, None)
 
     def close(self) -> None:
         with self._condition:

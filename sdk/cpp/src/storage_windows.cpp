@@ -386,12 +386,19 @@ void atomic_replace(HANDLE directory, const std::wstring& directory_path,
     }
     pinned.append(kDataName);
     const auto name_bytes = pinned.size() * sizeof(wchar_t);
-    if (name_bytes > MAXDWORD ||
-        name_bytes > std::numeric_limits<std::size_t>::max() -
-                         offsetof(FILE_RENAME_INFO, FileName)) {
+    const auto file_name_offset = offsetof(FILE_RENAME_INFO, FileName);
+    const auto max_dword = static_cast<std::size_t>(MAXDWORD);
+    const auto max_size = std::numeric_limits<std::size_t>::max();
+    if (name_bytes > max_dword - sizeof(wchar_t) ||
+        name_bytes > max_size - sizeof(wchar_t)) {
         storage_failure();
     }
-    const auto total = offsetof(FILE_RENAME_INFO, FileName) + name_bytes;
+    const auto tail_bytes = name_bytes + sizeof(wchar_t);
+    if (tail_bytes > max_dword - file_name_offset ||
+        tail_bytes > max_size - file_name_offset) {
+        storage_failure();
+    }
+    const auto total = file_name_offset + tail_bytes;
     std::vector<std::max_align_t> buffer(
         (total + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
     auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
@@ -399,6 +406,7 @@ void atomic_replace(HANDLE directory, const std::wstring& directory_path,
     info->RootDirectory = nullptr;
     info->FileNameLength = static_cast<DWORD>(name_bytes);
     std::memcpy(info->FileName, pinned.data(), name_bytes);
+    info->FileName[pinned.size()] = L'\0';
     if (!SetFileInformationByHandle(temporary.get(), FileRenameInfo, info,
                                     static_cast<DWORD>(total))) {
         storage_failure();

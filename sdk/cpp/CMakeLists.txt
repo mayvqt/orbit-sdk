@@ -62,7 +62,7 @@ set(ORBIT_SDK_LINK_LIBRARIES
     CURL::libcurl OpenSSL::Crypto ${ORBIT_JSONCPP_TARGET} Threads::Threads)
 if(WIN32)
     list(APPEND ORBIT_SDK_LINK_LIBRARIES
-        ws2_32 bcrypt ntdll userenv advapi32 crypt32 secur32)
+        ws2_32 bcrypt ntdll userenv advapi32 crypt32 secur32 mincore)
 endif()
 target_link_libraries(orbit_sdk PUBLIC ${ORBIT_SDK_LINK_LIBRARIES})
 set_target_properties(orbit_sdk PROPERTIES EXPORT_NAME Sdk)

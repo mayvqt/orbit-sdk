@@ -6,7 +6,6 @@
 #include <atomic>
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <condition_variable>
 #include <cstdint>
 #include <fstream>
@@ -107,10 +106,17 @@ std::string sign_test_token(const Json::Value& claims) {
     const auto signing_input = base64url_encode(
         reinterpret_cast<const unsigned char*>(header_json.data()), header_json.size()) + "." +
         base64url_encode(reinterpret_cast<const unsigned char*>(claims_json.data()), claims_json.size());
-    FILE* file = std::fopen(ORBIT_GRANT_PRIVATE_KEY_PATH, "rb");
-    require(file != nullptr, "test grant signing key is unavailable");
-    EVP_PKEY* key = PEM_read_PrivateKey(file, nullptr, nullptr, nullptr);
-    std::fclose(file);
+    std::ifstream key_file(ORBIT_GRANT_PRIVATE_KEY_PATH, std::ios::binary);
+    require(key_file.good(), "test grant signing key is unavailable");
+    std::string key_bytes((std::istreambuf_iterator<char>(key_file)),
+                          std::istreambuf_iterator<char>());
+    require(!key_bytes.empty() &&
+                key_bytes.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+            "test grant signing key has an invalid size");
+    BIO* bio = BIO_new_mem_buf(key_bytes.data(), static_cast<int>(key_bytes.size()));
+    require(bio != nullptr, "test grant signing BIO allocation failed");
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
     require(key != nullptr, "test grant signing key could not be read");
     EVP_MD_CTX* context = EVP_MD_CTX_new();
     require(context != nullptr, "test grant signing context allocation failed");

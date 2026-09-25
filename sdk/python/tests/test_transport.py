@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import http.server
 import ipaddress
+import socket
 import ssl
 import tempfile
 import threading
@@ -124,6 +125,42 @@ def _trusted_tls_server(handler: type[http.server.BaseHTTPRequestHandler]):
             server.shutdown()
             server.server_close()
             thread.join(2)
+
+
+@contextmanager
+def _stalled_tls_server():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.05)
+    accepted = threading.Event()
+    release = threading.Event()
+
+    def hold_connection() -> None:
+        connection = None
+        try:
+            while not release.is_set():
+                try:
+                    connection, _ = listener.accept()
+                    break
+                except socket.timeout:
+                    continue
+            if connection is not None:
+                with connection:
+                    accepted.set()
+                    release.wait(2)
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=hold_connection, daemon=True)
+    thread.start()
+    try:
+        yield f"https://127.0.0.1:{listener.getsockname()[1]}", accepted, release
+    finally:
+        release.set()
+        listener.close()
+        thread.join(2)
 
 
 class TransportTests(unittest.TestCase):
@@ -256,6 +293,25 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(transport.get("/api/client/v1/status"), b"{}")
             self.assertEqual(len(requests), before + 2)
 
+    def test_trusted_tls_http10_close_response_body_is_read_before_socket_close(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+                self.wfile.flush()
+
+            def log_message(self, *_: object) -> None:
+                pass
+
+        with _trusted_tls_server(Handler) as (origin, context):
+            transport = Transport(origin)
+            transport._ssl = context
+            self.assertEqual(transport.get("/api/client/v1/status"), b"{}")
+
     def test_absolute_deadline_aborts_slow_headers_and_body_with_trusted_tls(self) -> None:
         for slow_body in (False, True):
             entered = threading.Event()
@@ -303,30 +359,71 @@ class TransportTests(unittest.TestCase):
                 self.assertLess(elapsed, 0.45 if slow_body else 1.0)
                 self.assertTrue(entered.is_set())
 
-    def test_cancellation_shuts_down_an_inflight_trusted_tls_read(self) -> None:
-        entered = threading.Event()
-        release = threading.Event()
+    def test_cancellation_interrupts_trusted_tls_response_headers_and_body(self) -> None:
+        for blocked_headers in (True, False):
+            entered = threading.Event()
+            release = threading.Event()
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Length", "2")
-                    self.end_headers()
-                    self.wfile.write(b"{")
-                    self.wfile.flush()
-                    entered.set()
-                    release.wait(2)
-                    self.wfile.write(b"}")
-                except OSError:
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    if blocked_headers:
+                        entered.set()
+                        release.wait(2)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Length", "2")
+                        self.end_headers()
+                        self.wfile.write(b"{")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    if not blocked_headers:
+                        entered.set()
+                        release.wait(2)
+                    try:
+                        self.wfile.write(b"}")
+                        self.wfile.flush()
+                    except OSError:
+                        pass
+
+                def log_message(self, *_: object) -> None:
                     pass
 
-            def log_message(self, *_: object) -> None:
-                pass
+            with _trusted_tls_server(Handler) as (origin, context):
+                transport = Transport(origin)
+                transport._ssl = context
+                cancellation = Cancellation.create()
+                result: list[BaseException | bytes] = []
 
-        with _trusted_tls_server(Handler) as (origin, context):
+                def request() -> None:
+                    try:
+                        result.append(transport.get("/api/client/v1/status", cancellation))
+                    except BaseException as exc:
+                        result.append(exc)
+
+                thread = threading.Thread(target=request)
+                started = time.monotonic()
+                stopped_after_cancel = False
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    cancellation.cancel()
+                    thread.join(1)
+                    stopped_after_cancel = not thread.is_alive()
+                finally:
+                    release.set()
+                    cancellation.close()
+                    thread.join(2)
+                self.assertTrue(stopped_after_cancel)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(len(result), 1)
+                self.assertIsInstance(result[0], OrbitError)
+                self.assertEqual(result[0].kind, CANCELLED)
+                self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_tls_handshake_stall_obeys_cancellation_and_absolute_deadline(self) -> None:
+        with _stalled_tls_server() as (origin, accepted, release):
             transport = Transport(origin)
-            transport._ssl = context
             cancellation = Cancellation.create()
             result: list[BaseException | bytes] = []
 
@@ -338,19 +435,34 @@ class TransportTests(unittest.TestCase):
 
             thread = threading.Thread(target=request)
             started = time.monotonic()
+            stopped_after_cancel = False
             thread.start()
             try:
-                self.assertTrue(entered.wait(2))
+                self.assertTrue(accepted.wait(2))
                 cancellation.cancel()
                 thread.join(1)
+                stopped_after_cancel = not thread.is_alive()
             finally:
                 release.set()
                 cancellation.close()
+                thread.join(2)
+            self.assertTrue(stopped_after_cancel)
             self.assertFalse(thread.is_alive())
             self.assertEqual(len(result), 1)
             self.assertIsInstance(result[0], OrbitError)
             self.assertEqual(result[0].kind, CANCELLED)
             self.assertLess(time.monotonic() - started, 1.0)
+
+        with _stalled_tls_server() as (origin, accepted, _release):
+            transport = Transport(origin)
+            started = time.monotonic()
+            with patch("orbit_sdk.transport.OPERATION_TIMEOUT", 0.25):
+                with self.assertRaises(OrbitError) as raised:
+                    transport.get("/api/client/v1/status")
+            elapsed = time.monotonic() - started
+            self.assertTrue(accepted.is_set())
+            self.assertEqual(raised.exception.kind, TRANSIENT)
+            self.assertLess(elapsed, 0.75)
 
     def test_slow_dns_deadline_and_cancellation_do_not_start_http_requests(self) -> None:
         original_getaddrinfo = __import__("socket").getaddrinfo
