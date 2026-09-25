@@ -10,7 +10,7 @@ Use .NET SDK 10.0.112, selected by the kit's `global.json`. Check out the pinned
 release, then add a project reference:
 
 ```sh
-git clone --depth 1 --branch v0.1.0 https://github.com/mayvqt/orbit-sdk.git orbit-sdk
+git clone --depth 1 --branch v0.2.0 https://github.com/mayvqt/orbit-sdk.git orbit-sdk
 dotnet add MyApp/MyApp.csproj reference orbit-sdk/sdk/csharp/Orbit.Sdk/Orbit.Sdk.csproj
 ```
 

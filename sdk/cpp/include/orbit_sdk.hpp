@@ -1,10 +1,8 @@
 #ifndef ORBIT_SDK_HPP
 #define ORBIT_SDK_HPP
 
-#include "orbit_ffi.h"
-
 #include <cstdint>
-#include <initializer_list>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -13,19 +11,21 @@
 
 namespace orbit {
 
+class Cancellation;
+
 enum class ErrorKind : std::uint32_t {
-    none = ORBIT_FFI_ERROR_NONE,
-    configuration = ORBIT_FFI_ERROR_CONFIGURATION,
-    cancelled = ORBIT_FFI_ERROR_CANCELLED,
-    transient = ORBIT_FFI_ERROR_TRANSIENT,
-    denied = ORBIT_FFI_ERROR_DENIED,
-    invalid_response = ORBIT_FFI_ERROR_INVALID_RESPONSE,
-    transport_security = ORBIT_FFI_ERROR_TRANSPORT_SECURITY,
-    reauthentication_required = ORBIT_FFI_ERROR_REAUTHENTICATION_REQUIRED,
-    stale_response = ORBIT_FFI_ERROR_STALE_RESPONSE,
-    storage = ORBIT_FFI_ERROR_STORAGE,
-    clock_uncertain = ORBIT_FFI_ERROR_CLOCK_UNCERTAIN,
-    internal = ORBIT_FFI_ERROR_INTERNAL,
+    none = 0,
+    configuration = 1,
+    cancelled = 2,
+    transient = 3,
+    denied = 4,
+    invalid_response = 5,
+    transport_security = 6,
+    reauthentication_required = 7,
+    stale_response = 8,
+    storage = 9,
+    clock_uncertain = 10,
+    internal = 11,
 };
 
 class Error : public std::runtime_error {
@@ -46,9 +46,9 @@ private:
 };
 
 enum class StorageMode : std::uint32_t {
-    memory = ORBIT_FFI_STORAGE_MEMORY,
-    windows_dpapi = ORBIT_FFI_STORAGE_WINDOWS_DPAPI,
-    linux_secret_service = ORBIT_FFI_STORAGE_LINUX_SECRET_SERVICE,
+    memory = 0,
+    windows_dpapi = 1,
+    linux_secret_service = 2,
 };
 
 struct Storage {
@@ -71,9 +71,19 @@ struct Config {
     Storage storage;
 };
 
+class Client;
+
 namespace detail {
 struct ClientState;
 struct CancellationState;
+struct PendingRegistrationState;
+const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation*,
+                                          const std::atomic_bool& fallback);
+#ifdef ORBIT_SDK_TESTING
+class Transport;
+class CredentialStorage;
+::orbit::Client make_test_client(Config, Transport, std::shared_ptr<CredentialStorage>);
+#endif
 }
 
 class Cancellation {
@@ -84,6 +94,8 @@ public:
 private:
     std::shared_ptr<detail::CancellationState> state_;
     friend class Client;
+    friend const std::atomic_bool& detail::cancellation_flag(
+        const Cancellation*, const std::atomic_bool&);
 };
 
 class PendingRegistration {
@@ -95,15 +107,15 @@ public:
     PendingRegistration(const PendingRegistration&) = delete;
     PendingRegistration& operator=(const PendingRegistration&) = delete;
 
-    explicit operator bool() const noexcept { return handle_ != nullptr; }
+    explicit operator bool() const noexcept { return value_ != nullptr; }
 
 private:
     PendingRegistration(std::shared_ptr<detail::ClientState> owner,
-                        OrbitPendingRegistration* handle) noexcept;
+                        std::shared_ptr<detail::PendingRegistrationState> value) noexcept;
     void reset() noexcept;
 
     std::shared_ptr<detail::ClientState> owner_;
-    OrbitPendingRegistration* handle_ = nullptr;
+    std::shared_ptr<detail::PendingRegistrationState> value_;
     friend class Client;
 };
 
@@ -178,11 +190,10 @@ public:
 
 private:
     explicit Client(std::shared_ptr<detail::ClientState> state) noexcept;
-    std::string call(std::uint32_t operation,
-                     std::initializer_list<std::string_view> arguments = {},
-                     const Cancellation* cancellation = nullptr,
-                     OrbitPendingRegistration* pending = nullptr,
-                     OrbitPendingRegistration** pending_out = nullptr) const;
+#ifdef ORBIT_SDK_TESTING
+    friend Client detail::make_test_client(Config, detail::Transport,
+                                            std::shared_ptr<detail::CredentialStorage>);
+#endif
 
     std::shared_ptr<detail::ClientState> state_;
 };

@@ -10,7 +10,7 @@ Use Rust/Cargo 1.98.1 or newer. Pin the public source release from Git:
 
 ```toml
 [dependencies]
-orbit-sdk = { git = "https://github.com/mayvqt/orbit-sdk", tag = "v0.1.0" }
+orbit-sdk = { git = "https://github.com/mayvqt/orbit-sdk", tag = "v0.2.0" }
 ```
 
 For a local checkout, use `path = "../orbit-sdk/sdk/rust"` instead. Keep the SDK
