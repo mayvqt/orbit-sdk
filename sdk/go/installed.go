@@ -147,6 +147,12 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 			base = filepath.Join(base, "orbit")
 		case "windows":
 			base = filepath.Join(os.Getenv("LOCALAPPDATA"), "Orbit")
+		case "darwin":
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, ErrStorage
+			}
+			base = filepath.Join(home, "Library", "Application Support", "Orbit")
 		default:
 			return nil, ErrStorage
 		}

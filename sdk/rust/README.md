@@ -49,10 +49,16 @@ before each later protected operation. `Error::NotActivated` and
 codes.
 
 The zero-argument options use native `machine_v1` identity when available and the
-current user's default state directory. Orbit stores only the scoped fingerprint,
-never the raw machine identifier. To use an explicit persistent directory or change
-binding policy, call `Client::open_with_options` with `Options`. Identity changes rotate
-the installation ID and clear its saved activation and cached grant before recovery.
+current user's default state directory. On macOS 10.12 or newer, the state path is under
+~/Library/Application Support/Orbit; the identity is the scoped digest of
+IOPlatformUUID. The native crate links IOKit and CoreFoundation through the Apple
+SDK. Orbit stores only the scoped fingerprint, never the raw machine identifier.
+To use an explicit persistent directory or change binding policy, call
+`Client::open_with_options` with `Options`. Identity changes rotate the installation
+ID and clear its saved activation and cached grant before recovery.
+
+Native macOS compilation and runtime checks are pending; this workspace was checked
+on Linux only and has no Apple SDK or hardware.
 
 Activation retries use a securely generated, durable operation ID automatically. Use
 `activate_with_id` when your application needs to supply an ID for an uncertain retry.

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,19 @@ type installedFixture struct {
 	operations                 []string
 	previous                   string
 	offline                    bool
+}
+
+func installedTestTempDir(t testing.TB) string {
+	t.Helper()
+	path := t.TempDir()
+	if runtime.GOOS != "darwin" {
+		return path
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve temporary test directory: %v", err)
+	}
+	return canonical
 }
 
 func newInstalledFixture(t testing.TB, offline bool) *installedFixture {
@@ -162,7 +176,7 @@ func mustInstalledActivate(t *testing.T, c *Client) {
 }
 func TestInstalledActivationAndOnlineRestart(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	c := mustInstalledOpen(t, f, path)
 	id := c.device.InstallationID
 	if _, err := c.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrNotActivated) {
@@ -189,7 +203,7 @@ func TestInstalledActivationAndOnlineRestart(t *testing.T) {
 
 func TestInstalledMachineFingerprintMismatchRotatesInstallationAndClearsAuthority(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	first := Options{StatePath: path, BindingMode: BindingCustom, Fingerprint: strings.Repeat("a", 64), FingerprintProvider: "custom:test-device"}
 	client, err := f.openWith(path, first)
 	if err != nil {
@@ -222,7 +236,7 @@ func TestInstalledMachineFingerprintMismatchRotatesInstallationAndClearsAuthorit
 
 func TestEnsureAccessDoesNotPromptDuringOutage(t *testing.T) {
 	f := newInstalledFixture(t, false)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	client := mustInstalledOpen(t, f, path)
 	mustInstalledActivate(t, client)
 	if err := client.Close(); err != nil {
@@ -242,7 +256,7 @@ func TestEnsureAccessDoesNotPromptDuringOutage(t *testing.T) {
 
 func TestEnsureAccessPromptsForMissingActivationOnly(t *testing.T) {
 	f := newInstalledFixture(t, false)
-	client := mustInstalledOpen(t, f, filepath.Join(t.TempDir(), "state"))
+	client := mustInstalledOpen(t, f, filepath.Join(installedTestTempDir(t), "state"))
 	prompted := false
 	state, err := client.EnsureAccess(context.Background(), "export", func(context.Context) (string, error) {
 		prompted = true
@@ -264,7 +278,7 @@ func TestInstalledRestartOfflineKeepsOriginalGrant(t *testing.T) {
 	for _, offline := range []bool{false, true} {
 		t.Run(map[bool]string{true: "offline", false: "strict"}[offline], func(t *testing.T) {
 			f := newInstalledFixture(t, offline)
-			path := filepath.Join(t.TempDir(), "state")
+			path := filepath.Join(installedTestTempDir(t), "state")
 			c := mustInstalledOpen(t, f, path)
 			mustInstalledActivate(t, c)
 			original := time.Unix(c.state.claims.ExpiresAt, 0).UTC()
@@ -292,7 +306,7 @@ func TestInstalledUncertainActivationIdentity(t *testing.T) {
 		t.Run(map[int32]string{1: "outage", 3: "malformed", 4: "missing_expiry", 5: "finite_expiry"}[failure], func(t *testing.T) {
 			f := newInstalledFixture(t, true)
 			f.mode.Store(failure)
-			path := filepath.Join(t.TempDir(), "state")
+			path := filepath.Join(installedTestTempDir(t), "state")
 			c := mustInstalledOpen(t, f, path)
 			if _, err := c.Activate(context.Background(), "synthetic-key"); err == nil {
 				t.Fatal("invalid response accepted")
@@ -316,7 +330,7 @@ func TestInstalledUncertainActivationIdentity(t *testing.T) {
 func TestInstalledPendingDenialExpiryAndResolution(t *testing.T) {
 	f := newInstalledFixture(t, true)
 	f.mode.Store(1)
-	c := mustInstalledOpen(t, f, filepath.Join(t.TempDir(), "state"))
+	c := mustInstalledOpen(t, f, filepath.Join(installedTestTempDir(t), "state"))
 	_, _ = c.Activate(context.Background(), "synthetic-key")
 	c.installed.mu.Lock()
 	r := c.installed.record
@@ -344,7 +358,7 @@ func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.
 	t.Run("same customer resumes after restart", func(t *testing.T) {
 		f := newInstalledFixture(t, false)
 		f.loseFirstAccountActivation.Store(true)
-		path := filepath.Join(t.TempDir(), "state")
+		path := filepath.Join(installedTestTempDir(t), "state")
 		client := mustInstalledOpen(t, f, path)
 		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
 			t.Fatal(err)
@@ -416,7 +430,7 @@ func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.
 	t.Run("different customer cannot reuse pending activation", func(t *testing.T) {
 		f := newInstalledFixture(t, false)
 		f.loseFirstAccountActivation.Store(true)
-		path := filepath.Join(t.TempDir(), "state")
+		path := filepath.Join(installedTestTempDir(t), "state")
 		client := mustInstalledOpen(t, f, path)
 		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
 			t.Fatal(err)
@@ -457,7 +471,7 @@ func assertInstalledFileOmits(t *testing.T, path string, secrets ...string) {
 }
 func TestInstalledExplicitPreviousCredential(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	c := mustInstalledOpen(t, f, filepath.Join(t.TempDir(), "state"))
+	c := mustInstalledOpen(t, f, filepath.Join(installedTestTempDir(t), "state"))
 	previous := strings.Repeat("p", 43)
 	if _, err := c.ActivateWithPrevious(context.Background(), "synthetic-key", previous, "operation_123456"); err != nil || f.previous != previous {
 		t.Fatal("fresh previous-bearer rebind rejected", err)
@@ -467,7 +481,7 @@ func TestInstalledCacheClockAndSignatureFailClosed(t *testing.T) {
 	for _, change := range []string{"rollback", "inconsistent", "signature", "expired"} {
 		t.Run(change, func(t *testing.T) {
 			f := newInstalledFixture(t, true)
-			path := filepath.Join(t.TempDir(), "state")
+			path := filepath.Join(installedTestTempDir(t), "state")
 			c := mustInstalledOpen(t, f, path)
 			mustInstalledActivate(t, c)
 			c.mu.Lock()
@@ -512,7 +526,7 @@ func TestInstalledCacheClockAndSignatureFailClosed(t *testing.T) {
 }
 func TestInstalledAuthoritativeDenialClearsCache(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	c := mustInstalledOpen(t, f, path)
 	mustInstalledActivate(t, c)
 	_ = c.Close()
@@ -528,7 +542,7 @@ func TestInstalledAuthoritativeDenialClearsCache(t *testing.T) {
 }
 func TestInstalledCloseSettlesInflightAndReleasesLease(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	c := mustInstalledOpen(t, f, path)
 	mustInstalledActivate(t, c)
 	started := make(chan struct{})
@@ -553,7 +567,7 @@ func TestInstalledCloseSettlesInflightAndReleasesLease(t *testing.T) {
 }
 func TestInstalledCodecRejectsUnknownMissingDuplicateAndSecretFields(t *testing.T) {
 	f := newInstalledFixture(t, true)
-	c := mustInstalledOpen(t, f, filepath.Join(t.TempDir(), "state"))
+	c := mustInstalledOpen(t, f, filepath.Join(installedTestTempDir(t), "state"))
 	mustInstalledActivate(t, c)
 	r := c.installed.record
 	data, _ := json.Marshal(r)
@@ -584,7 +598,7 @@ func TestInstalledRequiresPrivateDedicatedState(t *testing.T) {
 		t.Skip("Linux permissions exercised separately from Windows DACL tests")
 	}
 	f := newInstalledFixture(t, true)
-	parent := t.TempDir()
+	parent := installedTestTempDir(t)
 	path := filepath.Join(parent, "state")
 	c := mustInstalledOpen(t, f, path)
 	if _, err := f.open(path); !errors.Is(err, ErrInstallationInUse) {
@@ -612,7 +626,7 @@ func TestInstalledCheckpointRejectsAndDiscardsInconsistentEvidence(t *testing.T)
 	for _, mode := range []string{"rollback", "progress"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newInstalledFixture(t, true)
-			path := filepath.Join(t.TempDir(), "state")
+			path := filepath.Join(installedTestTempDir(t), "state")
 			c := mustInstalledOpen(t, f, path)
 			mustInstalledActivate(t, c)
 			c.mu.Lock()
@@ -648,7 +662,7 @@ func TestInstalledCheckpointRejectsAndDiscardsInconsistentEvidence(t *testing.T)
 
 func TestInstalledOutageDoesNotRequestAnotherActivation(t *testing.T) {
 	f := newInstalledFixture(t, false)
-	path := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(installedTestTempDir(t), "state")
 	c := mustInstalledOpen(t, f, path)
 	mustInstalledActivate(t, c)
 	_ = c.Close()

@@ -14,7 +14,11 @@ pub fn elapsed_clock() -> Result<Duration> {
     {
         Ok(orbit_sdk_native::elapsed_clock())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        orbit_sdk_native::elapsed_clock().ok_or(Error::ClockUncertain)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(Error::ClockUncertain)
     }

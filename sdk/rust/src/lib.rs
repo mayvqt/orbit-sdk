@@ -12,7 +12,7 @@ mod parser_fuzz;
 #[cfg(all(
     test,
     feature = "local-development",
-    any(target_os = "linux", target_os = "windows")
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
 mod sleep_tests;
 mod storage;

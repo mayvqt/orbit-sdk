@@ -77,12 +77,18 @@ access separately, as shown in the [backend example](../../examples/rust/license
 
 ## Storage and clock guarantees
 
-Windows state uses current-user DPAPI and a protected ACL. Linux state uses an
-owner-only private directory and credential file, including headless installations.
+Windows state uses current-user DPAPI and a protected ACL. Linux and macOS state use
+an owner-only private directory and credential file, including headless installations.
+On macOS 10.12 or newer, the SDK derives `machine_v1` from IOKit `IOPlatformUUID`, and its elapsed clock uses
+`mach_continuous_time` so sleep counts toward expiry. State and lease files require
+`F_FULLFSYNC`; the parent directory is synchronized after atomic replacement. If the
+filesystem rejects that durability operation, the SDK fails closed. This is private
+POSIX storage, not Keychain encryption.
 Corrupt or missing established state is not silently replaced with a new installation.
 An interrupted write leaves a recovery marker, preventing a grant or credential from
 before an incomplete invalidation from being restored. Keep the default directory
-private and persistent; use one client for that directory in a process.
+private and persistent; use one client for that directory in a process. macOS native
+builds need the Apple SDK to link IOKit and CoreFoundation.
 
 Sleep counts toward expiry. A clock rollback or inconsistent saved clock evidence
 requires online validation. Local storage cannot detect every restored disk or VM
@@ -117,3 +123,7 @@ Each operation runs five measured trials of 10,000 calls after a 1,000-call warm
 | `snapshot` | 3.608 µs/op | 3.553 µs/op |
 
 The snapshot decision now samples the native anchor once. `require_access` checks a warm online grant under the initial state lock and, after an awaited refresh, builds a new decision from synchronized current state. These small differences are within expected host timing variation and do not establish a material speedup or a cross-platform performance guarantee.
+
+Linux tests run in this environment. Native macOS compilation, filesystem behavior and
+sleep-across-expiry checks remain pending because no Apple SDK or Mac hardware is
+available here.

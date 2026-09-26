@@ -2,8 +2,24 @@ package orbit
 
 import (
 	"math"
+	"math/bits"
 	"time"
 )
+
+func scaleMachTicks(ticks uint64, numerator, denominator uint32) (time.Duration, error) {
+	if numerator == 0 || denominator == 0 {
+		return 0, ErrClockUncertain
+	}
+	hi, lo := bits.Mul64(ticks, uint64(numerator))
+	if hi >= uint64(denominator) {
+		return 0, ErrClockUncertain
+	}
+	nanoseconds, _ := bits.Div64(hi, lo, uint64(denominator))
+	if nanoseconds > math.MaxInt64 {
+		return 0, ErrClockUncertain
+	}
+	return time.Duration(nanoseconds), nil
+}
 
 type requestStart struct {
 	elapsed time.Duration

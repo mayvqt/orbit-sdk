@@ -68,6 +68,8 @@ func (e *Error) Error() string {
 			return "An activation is unresolved. Retry the same input or deliberately resolve it with Logout."
 		case "pending_activation_expired":
 			return "Activation recovery expired. Deliberately resolve the pending activation before retrying."
+		case "macos_cgo_required":
+			return "macOS installed clients require cgo and the Xcode Command Line Tools."
 		}
 		return "Credential storage failed. Preserve the state directory and contact application support."
 	case ClockUncertain:
@@ -126,6 +128,7 @@ var (
 	ErrReauthenticationRequired = &Error{Kind: ReauthenticationRequired}
 	ErrStaleResponse            = &Error{Kind: StaleResponse}
 	ErrStorage                  = &Error{Kind: StorageFailure}
+	ErrNativeSupportRequired    = &Error{Kind: StorageFailure, Code: "macos_cgo_required"}
 	ErrClockUncertain           = &Error{Kind: ClockUncertain}
 )
 

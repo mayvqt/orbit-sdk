@@ -38,7 +38,7 @@ func BenchmarkInstalledWarmAccess(b *testing.B) {
 				requests.Add(1)
 				return fixture.respond(request)
 			})
-			client, err := openInstalled(context.Background(), testAppKey(), installedOptions(filepath.Join(b.TempDir(), "state")), transport)
+			client, err := openInstalled(context.Background(), testAppKey(), installedOptions(filepath.Join(installedTestTempDir(b), "state")), transport)
 			if err != nil {
 				b.Fatal(err)
 			}

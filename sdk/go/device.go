@@ -24,9 +24,21 @@ func NewInstallation() (Device, error) {
 	return Device{InstallationID: base64.RawURLEncoding.EncodeToString(entropy[:])}, nil
 }
 
+func normalizeMacOSPlatformUUID(value string, sourceLength int) (string, bool) {
+	if sourceLength < 1 || sourceLength > 256 || len(value) != sourceLength {
+		return "", false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] == 0 || value[index] > 0x7f {
+			return "", false
+		}
+	}
+	return strings.Trim(value, " \t\n\r\v\f"), true
+}
+
 // MachineFingerprint derives machine_v1 without exporting the raw OS ID.
 func MachineFingerprint(applicationID, environmentID, osFamily, machineID string) (string, error) {
-	if !opaque(applicationID) || !opaque(environmentID) || (osFamily != "linux" && osFamily != "windows") {
+	if !opaque(applicationID) || !opaque(environmentID) || (osFamily != "linux" && osFamily != "windows" && osFamily != "macos") {
 		return "", ErrConfiguration
 	}
 	normalized := strings.ToLower(strings.ReplaceAll(strings.Trim(machineID, " \t\n\r\v\f"), "-", ""))

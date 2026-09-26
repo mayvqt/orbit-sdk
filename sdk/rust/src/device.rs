@@ -9,7 +9,7 @@ pub fn machine_fingerprint(
     machine_id: &str,
 ) -> Result<String> {
     check_scope(application_id, environment_id)?;
-    if !matches!(os_family, "linux" | "windows") {
+    if !matches!(os_family, "linux" | "windows" | "macos") {
         return Err(Error::Configuration);
     }
     let normalized = machine_id
@@ -47,7 +47,12 @@ pub fn native_fingerprint(application_id: &str, environment_id: &str) -> Result<
         let identity = orbit_sdk_native::machine_uuid().ok_or_else(unavailable)?;
         machine_fingerprint(application_id, environment_id, "windows", &identity)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        let identity = orbit_sdk_native::platform_uuid().ok_or_else(unavailable)?;
+        machine_fingerprint(application_id, environment_id, "macos", &identity)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Err(unavailable())
     }
@@ -154,6 +159,13 @@ mod tests {
                 "orbit-machine-v1\napp\ntest\nwindows\n00112233445566778899aabbccddeeff",
             ),
             (
+                "app",
+                "test",
+                "macos",
+                "00112233-4455-6677-8899-AABBCCDDEEFF",
+                "orbit-machine-v1\napp\ntest\nmacos\n00112233445566778899aabbccddeeff",
+            ),
+            (
                 "other_app",
                 "live",
                 "linux",
@@ -193,6 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn macos_platform_uuid_fingerprint_fixture() {
+        assert_eq!(
+            machine_fingerprint(
+                "app",
+                "test",
+                "macos",
+                "00112233-4455-6677-8899-AABBCCDDEEFF",
+            )
+            .unwrap(),
+            "ccd81e8a12bd6695ca8e0d71b409c58696e780780e2c9e1c14ea1aa7fe8e069a"
+        );
+    }
+
+    #[test]
     fn machine_fingerprint_rejects_invalid_scope_before_native_access() {
         for (application, environment, family) in [
             ("app\nother", "test", "linux"),
@@ -201,7 +227,7 @@ mod tests {
             ("app", "", "linux"),
             ("äpp", "test", "linux"),
             ("app", "test", "Linux"),
-            ("app", "test", "macos"),
+            ("app", "test", "other"),
         ] {
             assert!(matches!(
                 machine_fingerprint(

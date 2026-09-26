@@ -16,6 +16,10 @@ fn awake_clock() -> Duration {
     {
         orbit_sdk_native::awake_clock()
     }
+    #[cfg(target_os = "macos")]
+    {
+        orbit_sdk_native::awake_clock()
+    }
     #[cfg(target_os = "linux")]
     {
         let value = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);

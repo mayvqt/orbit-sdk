@@ -17,7 +17,10 @@ mod platform;
 #[cfg(target_os = "windows")]
 #[path = "installed_windows.rs"]
 mod platform;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+#[path = "installed_macos.rs"]
+mod platform;
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::*;
     pub struct Backend;
@@ -247,6 +250,9 @@ fn valid_expiry(time: Option<i64>) -> bool {
 fn default_path(scope: &Scope) -> Result<PathBuf> {
     let base = if cfg!(target_os = "windows") {
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or(Error::Configuration)?).join("Orbit")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME").ok_or(Error::Configuration)?)
+            .join("Library/Application Support/Orbit")
     } else if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         PathBuf::from(path).join("orbit")
     } else {
@@ -875,7 +881,12 @@ mod tests {
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!(
+            #[cfg(target_os = "macos")]
+            let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize macOS temporary test root");
+            #[cfg(not(target_os = "macos"))]
+            let temporary_root = std::env::temp_dir();
+            Self(temporary_root.join(format!(
                 "orbit-installed-{}",
                 Device::new_installation().unwrap().installation_id
             )))
@@ -1890,6 +1901,86 @@ mod tests {
         assert!(matches!(client.close().await, Err(Error::Storage)));
         assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
         assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+    }
+    #[cfg(all(target_os = "macos", feature = "local-development"))]
+    #[tokio::test]
+    async fn macos_replaced_lease_denies_warm_access_and_close_without_writing_state() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let client = activated(&dir, &mut fixture, true).await;
+        fixture.assert_idle();
+
+        let data_path = dir.0.join("orbit-storage.json");
+        let lease_path = dir.0.join("orbit-storage.lock");
+        let saved_lease = dir.0.join("orbit-storage.lock.replaced");
+        let data_before = std::fs::read(&data_path).unwrap();
+        std::fs::rename(&lease_path, &saved_lease).unwrap();
+        std::fs::write(&lease_path, []).unwrap();
+        let lease_before = std::fs::read(&lease_path).unwrap();
+
+        assert!(matches!(client.snapshot(), Err(Error::Storage)));
+        {
+            let state = client.0.state.lock().unwrap();
+            assert!(state.claims.is_none());
+            assert!(state.anchor.is_none());
+            assert!(state.credential.is_none());
+        }
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Storage)
+        ));
+        fixture.assert_idle();
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+        assert!(matches!(client.close().await, Err(Error::Storage)));
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+    }
+    #[cfg(all(target_os = "macos", feature = "local-development"))]
+    #[tokio::test]
+    async fn macos_renamed_parent_denies_warm_access_and_close_without_writing_state() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let client = activated(&dir, &mut fixture, true).await;
+        fixture.assert_idle();
+
+        let data_before = std::fs::read(dir.0.join("orbit-storage.json")).unwrap();
+        let lease_before = std::fs::read(dir.0.join("orbit-storage.lock")).unwrap();
+        let saved = dir.0.with_extension("saved");
+        std::fs::rename(&dir.0, &saved).unwrap();
+        std::fs::create_dir(&dir.0).unwrap();
+
+        assert!(matches!(client.snapshot(), Err(Error::Storage)));
+        {
+            let state = client.0.state.lock().unwrap();
+            assert!(state.claims.is_none());
+            assert!(state.anchor.is_none());
+            assert!(state.credential.is_none());
+        }
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Storage)
+        ));
+        fixture.assert_idle();
+        assert_eq!(
+            std::fs::read(saved.join("orbit-storage.json")).unwrap(),
+            data_before
+        );
+        assert_eq!(
+            std::fs::read(saved.join("orbit-storage.lock")).unwrap(),
+            lease_before
+        );
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+        assert!(matches!(client.close().await, Err(Error::Storage)));
+        assert_eq!(
+            std::fs::read(saved.join("orbit-storage.json")).unwrap(),
+            data_before
+        );
+        assert_eq!(
+            std::fs::read(saved.join("orbit-storage.lock")).unwrap(),
+            lease_before
+        );
+        std::fs::remove_dir_all(saved).unwrap();
     }
     #[cfg(feature = "local-development")]
     #[tokio::test]

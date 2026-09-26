@@ -4,11 +4,17 @@ Use [the installed client](README.md) for normal applications. Parse an app key 
 
 ## Installed options and machine binding
 
-The zero value of `Options` stores private state in the current user's platform directory and computes the scoped `machine_v1` fingerprint from the native identity on supported Linux and Windows systems. If native identity is unavailable, the SDK sends no fingerprint and never substitutes a random value. The server still requires a fingerprint for HWID-locked licences.
+The zero value of `Options` stores private state in the current user's platform directory and computes the scoped `machine_v1` fingerprint from the native identity on Linux, macOS and Windows. macOS reads `IOPlatformUUID` from IOKit and scopes the normalized UUID to the `macos` family. If native identity is unavailable, the SDK sends no fingerprint and never substitutes a random value. The server still requires a fingerprint for HWID-locked licences.
 
 Set `Options.BindingMode` to `BindingDisabled` for shared VM/container images. To use an application-owned digest, select `BindingCustom` and provide both `Fingerprint` (64 lowercase hex characters) and a `FingerprintProvider` beginning with `custom:`. Do not send raw machine identifiers. If the saved identity differs from the current identity, including a transition to or from unavailable, the SDK creates a fresh installation ID and clears the saved credential, cached grant and pending operation before recovery.
 
-`Options.StatePath` selects a dedicated absolute state directory. Preserve the directory after a storage error; corrupt or missing initialized data is never silently reset. Linux uses a private owner-only file; Windows uses current-user DPAPI with a protected DACL. The explicit `OpenWindowsStorage` and `OpenSecretServiceStorage` adapters remain available for advanced credential-only persistence and take `AppKey` and `Device` values.
+`Options.StatePath` selects a dedicated absolute state directory. Preserve the directory after a storage error; corrupt or missing initialized data is never silently reset. Linux and macOS use pinned private owner-only files and an exclusive lease; macOS requires `F_FULLFSYNC` and parent-directory synchronization. Windows uses current-user DPAPI with a protected DACL. The explicit `OpenWindowsStorage` and `OpenSecretServiceStorage` adapters remain available for advanced credential-only persistence and take `AppKey` and `Device` values.
+
+## macOS build and validation
+
+Build installed clients on macOS 10.12 or newer with cgo enabled and the Xcode Command Line Tools installed. The macOS files link the system IOKit and CoreFoundation frameworks for platform identity and use `mach_continuous_time` for sleep-inclusive elapsed time. A filesystem that rejects `F_FULLFSYNC` fails closed; the SDK does not fall back to ordinary fsync for file contents. When cgo is disabled, Open returns `ErrNativeSupportRequired`.
+
+Portable Go tests cover the macOS UUID framing fixture, timebase scaling and overflow, while Linux runs the POSIX lease, restart and storage-failure tests. Native macOS compilation and runtime checks remain pending because this environment has no Apple SDK or hardware. Before claiming full Mac support, run the package tests and explicitly exercise sleep across expiry, lease contention, copied/replaced state and durable-write failure on a Mac.
 
 ## Access and mutation IDs
 

@@ -73,7 +73,9 @@ func run() error {
 
 The app key is public configuration, not a secret. Keep licence keys and passwords out of source, command-line arguments and logs. Orbit never saves them. The SDK automatically uses native machine identity when available; see [advanced options](ADVANCED.md#installed-options-and-machine-binding) to disable binding for shared images or supply an application-owned provider.
 
-The state directory is private to the current user: owner-only files on Linux and current-user DPAPI on Windows. `Options{StatePath: ...}` selects a dedicated absolute directory for a service account or persistent container volume. Share one `*Client` in the process; another process opening the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
+The state directory is private to the current user: owner-only files on Linux and macOS, and current-user DPAPI on Windows. On macOS 10.12 or newer, builds need cgo and the Xcode Command Line Tools; the installed client links IOKit and CoreFoundation. With CGO_ENABLED=0, installed-client setup returns ErrNativeSupportRequired rather than using a weaker clock or storage path. The macOS implementation has not yet been validated on native Apple hardware.
+
+`Options{StatePath: ...}` selects a dedicated absolute directory for a service account or persistent container volume. Share one `*Client` in the process; another process opening the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
 
 ## Optional customer accounts
 
