@@ -17,11 +17,14 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-Earlier Wi-Fi and STM32 integration cross-builds are documented in the board
-guide. This v0.4.0 local candidate has host C/Rust validation and portable ARM
-object measurements only; no new firmware cross-build or physical-board run is
-claimed. See the [board requirements and build commands](docs/boards.md) before
-integrating a port.
+The v0.4.0 local candidate has now been cross-compiled and linked for the
+ESP32, ESP8266/NodeMCU, Pico W, Pico 2 W, STM32G0B1RE, and Linux/Pi AArch64
+examples. The default and 8 KiB arena profiles were linked for ESP32, both Pico
+boards, STM32, and Pi. All seven portable CTest suites pass under AArch64 QEMU
+for both arena profiles, and the Rust wrapper checks for Cortex-M0+ and
+Cortex-M33. No firmware was flashed or run on physical hardware. Image sizes,
+budget headroom, exact toolchains, and commands are in the
+[board guide](docs/boards.md).
 
 ## Configure and activate
 
@@ -104,10 +107,13 @@ arena rejects any request or response that does not fit. Measured portable
 Cortex-M0+ client stack is conservatively **3,716 bytes** (app-key parsing adds
 at most **240 bytes**);
 crypto, TLS, board libraries, runtime helpers and interrupts are additional.
-The STM32G0B1RE's 144 KiB RAM can accommodate these portable buffers with room for
-its bridge and crypto. An earlier integration harness linked successfully; this
-candidate has not been rebuilt for STM32. Measure actual stack and heap after
-adding your board initialization and application.
+The current STM32G0B1RE link-only harness uses 44,384 bytes of RAM in the default
+profile and 19,808 bytes with the compact arena, including its minimum heap and
+stack reservation. It occupies 29,268 bytes of the 508 KiB firmware region in
+both sizes. This validates cross-compilation and static linker fit; it does not
+measure runtime stack or heap after board initialization. The
+[board guide](docs/boards.md) records the current per-target measurements and
+hardware limits.
 
 The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
 use. The [security and storage reference](docs/security.md) covers lifecycle and

@@ -25,10 +25,14 @@ Provision a key once with `orbit_example_activate`; call `orbit_example_tick`
 from your loop and `orbit_example_check` before each protected action.
 
 This port targets the STM32G0B1RE's 512 KiB flash and 144 KiB RAM. The host bridge
-supplies networking; the MCU does not have built-in Wi-Fi. The core, this HAL
-port, UART bridge, shared example and Mbed TLS 3.6.6 crypto provider were cross-compiled and linked for Cortex-M0+ with Arm GNU 14.3.Rel1
-and STM32CubeG0 1.6.3. A validation harness using ST's startup/linker files
-and a 508 KiB firmware region used 44,876 bytes of flash and 44,064 bytes of
-reserved RAM. The harness does not configure the UART or replace your Cube
-application; board initialization, heap/stack sizing and hardware operation
-still require validation.
+supplies networking; the MCU does not have built-in Wi-Fi. The current candidate
+links with STM32CubeG0 1.6.3, Mbed TLS 3.6.6 and Arm GNU 14.3.1 through the
+[maintained link-only harness](validation/). Its 29,268-byte flash load image
+ends at `0x08007254`, below the reserved journal region at `0x0807f000`. The
+default profile uses 44,384 bytes of RAM including the harness's 512-byte heap
+and 1 KiB stack reservation. The 8 KiB arena profile uses the same flash and
+19,808 bytes of RAM. The 136-byte `.data` includes 56 bytes of RAM-function code
+copied from flash at startup. This harness uses a synthetic
+public app key and does not initialize UART or replace your Cube application;
+board initialization, runtime stack/heap sizing and hardware operation still
+require validation.

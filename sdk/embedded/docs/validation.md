@@ -27,6 +27,39 @@ real C layout, parse an app key, exercise default and compact buffers and
 callback drop/restart, and compile-fail attempts to reuse buffers or drop an
 AppKey while its client is active.
 
+For this local candidate, the same seven CTest executables were cross-built and
+all passed under QEMU AArch64 11.1.1 with a Debian trixie arm64 sysroot, both
+with the default and 8 KiB C arena. The Linux example and bridge host also
+linked for AArch64. The Rust wrapper and its C build script passed `cargo check`
+for `thumbv6m-none-eabi` (Cortex-M0+) and `thumbv8m.main-none-eabi`
+(Cortex-M33), with both arena sizes. These checks establish compile/link and
+portable emulation only; no board was flashed or run.
+
+With both Rust targets installed and Arm GNU Embedded tools on `PATH`, reproduce
+the wrapper checks from the SDK root with:
+
+```sh
+export ORBIT_CC=arm-none-eabi-gcc ORBIT_AR=arm-none-eabi-ar
+ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
+  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  --target thumbv6m-none-eabi
+ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
+  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  --target thumbv6m-none-eabi
+ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
+  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  --target thumbv8m.main-none-eabi
+ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
+  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  --target thumbv8m.main-none-eabi
+```
+
+The maintained STM32 link-only harness is under
+[`examples/embedded/stm32g0b1re/validation`](../../../examples/embedded/stm32g0b1re/validation).
+It links the current common example, parser, HAL adapter, startup, and Mbed TLS
+crypto provider for both arena sizes. Its entry point does not initialize or
+exercise the UART.
+
 ASan/UBSan validation uses:
 
 ```sh

@@ -46,6 +46,8 @@ your firmware build. The build script never downloads tools or dependencies.
 
 `cargo test --offline` checks the actual C ABI layout, default and compact buffer
 use, AppKey parsing, callback lifecycle, a compile-fail buffer-reuse example and
-a compile-fail check that the AppKey outlives its client. MCU Rust
-targets/toolchains still need a board build; host tests do not establish target
-firmware compatibility.
+a compile-fail check that the AppKey outlives its client. The current checkout
+also passes `cargo check` for `thumbv6m-none-eabi` and
+`thumbv8m.main-none-eabi`, including the matching C cross-build script. These
+checks do not link a board application or establish target firmware operation;
+see the [embedded validation record](../docs/validation.md).

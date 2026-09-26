@@ -86,3 +86,48 @@ its parsed application and environment IDs borrow the original key text. Rust
 stores the decoded origin inline in `AppKey` and borrows the IDs from the input.
 This setup memory is separate from the client buffer totals above.
 The verifier-only API keeps its independent published limits.
+
+## Linked example footprints
+
+These are cross-linked local candidate examples, not hardware measurements.
+RAM headroom subtracts the linked static sections and the explicit minimum
+heap/stack reservations noted in the table from the board or linker region. It
+does not measure TLS heap use, runtime stack high-water or free heap after
+initialization. The Pico values include vectors and uninitialized data in the
+static RAM total. STM32 RAM headroom includes the linker's 512-byte minimum
+heap and 1 KiB minimum stack reservation.
+
+| Target/profile | `.text` | `.rodata` | `.data` | `.bss` | Flash remaining | Static RAM remaining |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ESP32 default | 296,402 | 77,464 | 9,500 | 49,392 | 608,000 / 1 MiB app slot | 121,844 / 180,736 DRAM; 74,269 / 131,072 IRAM |
+| ESP32 8 KiB | 296,402 | 77,464 | 9,500 | 24,816 | 608,000 / 1 MiB app slot | 146,420 / 180,736 DRAM; 74,269 / 131,072 IRAM |
+| ESP8266 NodeMCU 8 KiB | 426,723 code sections | 3,304 | 1,496 | 43,448 | 612,941 / 1,044,464-byte app slot | 33,672 / 81,920 |
+| Pico W default | 191,880 | 20,228 | 3,008 | 56,856 | 1,873,548 / 2 MiB after 8 KiB journal reserve | 206,152 / 270,336 after 4 KiB heap/stack reserve |
+| Pico W 8 KiB | 191,880 | 20,228 | 3,008 | 32,280 | 1,873,548 / 2 MiB after 8 KiB journal reserve | 230,728 / 270,336 after 4 KiB heap/stack reserve |
+| Pico 2 W default | 171,988 | 18,468 | 4,104 | 56,416 | 3,991,480 / 4 MiB after 8 KiB journal reserve | 467,576 / 532,480 after 4 KiB heap/stack reserve |
+| Pico 2 W 8 KiB | 171,988 | 18,468 | 4,104 | 31,840 | 3,991,480 / 4 MiB after 8 KiB journal reserve | 492,152 / 532,480 after 4 KiB heap/stack reserve |
+| STM32G0B1RE default | 26,872 | 2,052 | 136 | 42,712 | 490,924 / 508 KiB linker region | 103,072 / 144 KiB after minimum heap/stack |
+| STM32G0B1RE 8 KiB | 26,872 | 2,052 | 136 | 18,136 | 490,924 / 508 KiB linker region | 127,648 / 144 KiB after minimum heap/stack |
+
+Pico flash totals use the generated BIN size, including boot metadata, the load
+image for `.data` and 32 bytes of Pico 2 W output padding;
+Pico static RAM totals also include the runtime vector table and
+uninitialized data. Their linkers reserve 2 KiB each for heap and stack, which
+is subtracted from the displayed SRAM headroom. STM32 flash use is 29,268 bytes
+in each profile, including the 188-byte interrupt vector, alignment padding,
+exception index, init/fini arrays and the 136-byte `.data` load image. That
+image contains 56 bytes of RAM-function code copied to RAM at startup; its end
+is `0x08007254`, below the reserved journal region at `0x0807f000`. The ESP32
+IDF report gives 440,457 bytes
+of image sections (440,576-byte padded binary) for both profiles. The
+NodeMCU's code total is `.text` + `.text1` + `.irom0.text`.
+
+The AArch64 Linux `orbit_pi` ELF is dynamically linked and has no fixed flash
+slot or per-process static RAM ceiling. `size` reports text/data/BSS of
+69,893/1,104/42,272 bytes with the default arena, and 69,893/1,104/17,696 bytes
+with 8 KiB. Linux shared libraries, process stack, TLS allocations, OS use and
+free RAM were not measured.
+
+Toolchains, linker budgets, and reproduction commands are listed in the
+[board guide](boards.md). None of these figures establishes a physical-board
+run.
