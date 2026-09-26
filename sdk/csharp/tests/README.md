@@ -41,6 +41,18 @@ and expiry. Additional checks cover exact fractional expiry, copied and bounded
 trusted keys, duplicate JWKS fields, endpoint syntax and redacted results. No
 storage provider or external server is contacted.
 
+## Floating-session verification
+
+```sh
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --session-vectors contracts/sdk/session-grants.json
+```
+
+All 184 shared cases check exact process/session sequence, scope and machine
+binding, short expiry, refresh timing, retry intervals, key purpose and encodings.
+Additional checks cover owned bounded keys, immutable/redacted metadata, concurrent
+verification and rejection by ordinary, offline and download verifiers. This
+internal component does not implement seat acquisition, renewal or release yet.
+
 ## Security and lifecycle
 
 ```sh

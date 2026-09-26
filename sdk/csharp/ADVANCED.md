@@ -100,6 +100,16 @@ implemented; ordinary cached access grants are not long-term licence files.
 See the [offline contract](../../contracts/sdk/offline.md) and
 [verifier checks](tests/README.md#long-term-offline-file-verification).
 
+## Floating-session verification foundation
+
+The internal session verifier uses .NET's built-in cryptography and consumes all
+184 shared signed cases. It binds a short grant to the current process session
+and exact renewal sequence, with immutable/redacted results. It never saves a
+session grant. Seat acquisition, renewal, release and server accounting still need
+their lifecycle integration; this component does not enable floating licensing
+in `OrbitClient` yet. See the [session contract](../../contracts/sdk/floating.md)
+and [test command](tests/README.md#floating-session-verification).
+
 ## Seller-hosted downloads
 
 Use `DownloadTicketVerifier` on a seller's protected download endpoint. Configure

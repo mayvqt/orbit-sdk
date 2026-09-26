@@ -42,9 +42,11 @@ if (args is ["--offline-vectors", var offlinePath]) return OfflineFileTests.Run(
 
 if (args is ["--download-vectors", var downloadPath]) return DownloadTicketTests.Run(downloadPath);
 
+if (args is ["--session-vectors", var sessionPath]) return await SessionGrantTests.RunAsync(sessionPath);
+
 if (args.Length != 1)
 {
-    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --offline-vectors PATH | --download-vectors PATH | --security | --installed | --benchmark-access | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
+    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --offline-vectors PATH | --download-vectors PATH | --session-vectors PATH | --security | --installed | --benchmark-access | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
     return 2;
 }
 

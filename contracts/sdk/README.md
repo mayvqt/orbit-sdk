@@ -68,7 +68,7 @@ separate session-grant purpose. It is an implementation baseline; ordinary
 activation grants do not provide concurrent-session enforcement.
 
 [session-grants.json](session-grants.json) supplies 184 signed cases (23 valid,
-161 invalid) for the internal Python verifier and future SDK ports. Its expected
+161 invalid), consumed by the internal Python and C# verifiers. Its expected
 context extends the connected corpus with `session_id`, exact `sequence` and
 the configured Test/Live `key_environment`. Cases cover process/sequence binding,
 120-second intervals, active retries without deadline extension, exact expiry,

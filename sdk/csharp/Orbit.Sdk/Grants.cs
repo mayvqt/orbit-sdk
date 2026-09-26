@@ -58,7 +58,8 @@ internal sealed class GrantKeys
 
     internal bool Contains(string token) => keys.ContainsKey(ParseToken(token).Kid);
 
-    private static (string Kid, string Signed, byte[] Signature, JsonElement Claims) ParseToken(string token)
+    private static (string Kid, string Signed, byte[] Signature, JsonElement Claims) ParseToken(
+        string token, string purpose = "orbit-access+jwt")
     {
         if (token == null || token.Length > 16384) throw JsonWire.Invalid();
         var parts = token.Split('.');
@@ -69,16 +70,15 @@ internal sealed class GrantKeys
         JsonWire.ExactFields(header, "alg", "typ", "kid");
         var claims = JsonWire.Parse(JsonWire.DecodeBase64(parts[1]));
         var kid = JsonWire.String(header, "kid");
-        if (JsonWire.String(header, "alg") != "ES256" || JsonWire.String(header, "typ") != "orbit-access+jwt" ||
+        if (JsonWire.String(header, "alg") != "ES256" || JsonWire.String(header, "typ") != purpose ||
             kid.Length is < 1 or > 128 || !kid.All(char.IsAscii)) throw JsonWire.Invalid();
         return (kid, parts[0] + "." + parts[1], signature, claims);
     }
 
-    internal ValueTask<GrantClaims> VerifyAsync(string token, GrantExpected expected)
+    private JsonElement VerifySignature(string token, string purpose)
     {
-        var parsed = ParseToken(token);
+        var parsed = ParseToken(token, purpose);
         if (!keys.TryGetValue(parsed.Kid, out var key)) throw JsonWire.Invalid();
-        var audience = $"orbit:{expected.Config.ApplicationId}:{expected.Config.EnvironmentId}";
         try
         {
             using var publicKey = ECDsa.Create(key);
@@ -87,9 +87,17 @@ internal sealed class GrantKeys
         }
         catch (Exception error) when (error is CryptographicException or ArgumentException)
         { throw JsonWire.Invalid(); }
+        return parsed.Claims;
+    }
+
+    internal JsonElement VerifySessionSignature(string token) => VerifySignature(token, "orbit-session+jwt");
+
+    internal ValueTask<GrantClaims> VerifyAsync(string token, GrantExpected expected)
+    {
+        var claims = VerifySignature(token, "orbit-access+jwt");
+        var audience = $"orbit:{expected.Config.ApplicationId}:{expected.Config.EnvironmentId}";
         // Scope, purpose, duplicates and exact numeric lifetimes belong to the
         // Orbit contract. Built-in cryptography only verifies the ES256 bytes.
-        var claims = parsed.Claims;
         var licence = JsonWire.String(claims, "sub");
         var jti = JsonWire.String(claims, "jti");
         var issued = JsonWire.Integer(claims, "iat");
