@@ -56,6 +56,11 @@ Unix seconds. End returns the service's ordinary empty success response. Scope
 and session ownership are immutable. A session ID already belonging to another
 activation must not disclose its owner or authorize any operation.
 
+Once a session has advanced beyond sequence 1, another start request using its
+ID is stale and returns `session_sequence_conflict`. It must not turn a delayed
+start retry into a different renewal decision. An SDK retries start only until
+its first successful acknowledgement, then uses renewal with the next sequence.
+
 The start retry key is the session ID itself. A repeated start returns the same
 active session and signed decision interval; it neither extends the deadline
 nor consumes another seat. A repeated renewal with the last accepted sequence
@@ -133,6 +138,38 @@ Already issued local grants remain usable until their deadline unless the SDK
 receives and acts on the denial sooner. Ending a seat remotely cannot recall a
 signed grant held by an offline or modified client. Describe this bounded delay
 plainly; do not promise instantaneous remote revocation or copy protection.
+
+## Operator HTTP profile
+
+Policy, licence and owned-licence results include `concurrent_session_limit` as
+an integer from zero through 65535. The activation response's explicit
+`session_required` profile remains the trigger for automatic SDK acquisition.
+
+Management routes use `/api/management/v1/licences/{licence_id}/sessions` with
+the existing explicit application/environment query scope:
+
+- `GET` requires `devices:read` and returns `items` and nullable `next_cursor`.
+  Default page size is 50, maximum 100. An optional `state` filter accepts
+  `active`, `ended` or `expired`; omission lists all retained records. Order by
+  descending original creation time and session ID with the existing scoped
+  cursor rules. Derive active/expired status from current database time.
+- `POST /{session_id}/end` requires `devices:write`. Its body contains the
+  existing bounded `reason` and `idempotency_key`; use the ordinary 24-hour
+  operation replay contract. Return empty success, including for an already
+  ended or expired owned session. Scope and current authorization are checked
+  on retries; an unrelated session ID returns the normal nondisclosing failure.
+
+Each item contains `session_id`, `activation_id`, `installation_id`, `sequence`,
+`state`, `created_at`, `renewed_at`, `expires_at` and nullable `ended_at`.
+Timestamps use RFC3339 UTC. No credential, grant, fingerprint, customer-session
+token or download ticket appears in this view. `renewed_at` is the latest signed
+interval's issuance time, initially equal to `created_at`.
+
+Dashboard routes append the same licence-relative paths to the ordinary scoped
+dashboard base, with existing RBAC and CSRF enforcement. Show concurrent sessions
+in the licence detail, separately from registered devices. Ending one preserves
+the device registration and shows the remaining signed-grant delay described
+above. Keep Test and Live queries and cached results separate.
 
 ## SDK lifecycle
 
