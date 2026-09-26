@@ -6,9 +6,10 @@ Use .NET SDK 10.0.112, selected by the repository's `global.json`.
 
 ## Install and configure
 
-Reference the SDK project from your application's source checkout:
+Clone the release next to your application, then reference the SDK project:
 
 ```sh
+git clone --depth 1 --branch v0.3.0 https://github.com/mayvqt/orbit-sdk.git
 dotnet add MyApp/MyApp.csproj reference orbit-sdk/sdk/csharp/Orbit.Sdk/Orbit.Sdk.csproj
 ```
 

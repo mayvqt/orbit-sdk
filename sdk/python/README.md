@@ -22,7 +22,7 @@ from getpass import getpass
 from orbit_sdk import AppConfig, Client, OrbitError
 
 config = AppConfig(
-    api_origin="https://orbit.example",
+    api_origin="https://orbit.mayvie.dev",
     application_id="app_id_from_integration",
     environment_id="environment_id_from_integration",
     issuer="https://issuer.example",
@@ -66,15 +66,18 @@ For Account or Both mode, register and confirm the email link before signing in.
 After opening a client, sign in and let the customer choose an owned licence:
 
 ```python
+import uuid
+
 orbit.login(username, password)
 licences = orbit.owned_licences()["items"]
 licence_id = choose_licence(licences)  # Your application's selection UI.
+operation_id = str(uuid.uuid4())  # 16–128 characters; reuse it for retries.
 orbit.activate_account(licence_id, operation_id)
 orbit.require_access("export")
 ```
 
-Sign-in alone does not grant access. Keep `operation_id` unchanged for retries
-of that account activation in the same session. On later starts, check saved
+Sign-in alone does not grant access. Create one `operation_id` per selection and
+keep it unchanged if you retry that account activation. On later starts, check saved
 access before showing a sign-in form.
 
 ## Advanced integration

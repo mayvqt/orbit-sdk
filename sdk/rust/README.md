@@ -76,18 +76,9 @@ Close cancels work, joins scheduling and checkpoints clock evidence before relea
 the local lease. It does not release the purchased device slot. `deactivate` deliberately
 releases that slot after Orbit confirms the request.
 
-Windows uses current-user DPAPI and a private protected DACL. Linux uses an owner-only
-credential file (0700 directories, 0600 files), including headless installations. The
-selected provider never falls back to a different store. Corrupt or missing established
-state requires deliberate recovery; it never silently allocates a new installation.
-An interrupted state write leaves a durable recovery marker, so restart cannot restore
-a credential or grant from before an incomplete invalidation. Windows services must
-open and use storage under their process account, without thread impersonation.
-
-Sleep counts toward expiry. A clock rollback or inconsistent saved evidence requires
-online validation. Local files cannot reliably detect restored VM/disk snapshots or
-clock rollback above the last saved high-water value. Enforcement is not tamper-proof
-against someone controlling the local account or machine.
+State is private to the current user: DPAPI on Windows, owner-only files on Linux.
+[Storage and clock guarantees](advanced.md#storage-and-clock-guarantees) explain
+recovery, sleep and clock rollback.
 
 ## Optional: username/password sign-in
 
@@ -99,7 +90,10 @@ After a buyer registers and confirms their email, use the same client:
 ```rust,ignore
 orbit.login(&username, &password, &cancel).await?;
 let page = orbit.owned_licences(None, &cancel).await?;
-// Select a licence ID from page.items. Retain this operation ID for retries.
+// Let the user select a licence ID from page.items.
+// Any unique 16–128 character string, e.g. a UUID. Create it once per selection
+// and reuse it if you retry this activation.
+let operation_id = new_operation_id();
 orbit.activate_account(&selected_id, &operation_id, &cancel).await?;
 orbit.require_access("export", &cancel).await?;
 ```
