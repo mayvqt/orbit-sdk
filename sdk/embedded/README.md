@@ -14,10 +14,10 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-The native Wi-Fi ports and STM32 HAL integration are provided as source ports;
-their board builds and hardware runs remain to be verified. The Linux adapter
-and portable client have host test coverage. See the [board requirements and
-build commands](docs/boards.md) before integrating a port.
+The Wi-Fi examples and STM32 integration harness have passed cross-builds;
+physical-board testing is still required. The Linux adapter and portable client
+have host test coverage. See the [board requirements and build commands](docs/boards.md)
+before integrating a port.
 
 ## Configure and activate
 
@@ -84,7 +84,8 @@ The full client reserves **41,776 bytes** for state, transaction arena and parse
 scratch. Measured portable Cortex-M0+ stack is conservatively **3,700 bytes**;
 crypto, TLS, board libraries, runtime helpers and interrupts are additional.
 The STM32G0B1RE's 144 KiB RAM can accommodate these portable buffers with room for
-its bridge and crypto, but a board link and runtime measurement are still needed.
+its bridge and crypto. The integration harness links successfully; measure actual
+stack and heap after adding your board initialization and application.
 
 The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
 use. The [security and storage reference](docs/security.md) covers lifecycle and

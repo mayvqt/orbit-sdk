@@ -23,8 +23,11 @@ The example reads a key from its private terminal when needed; it never writes
 the key to disk. Provisioning UIs should hide input. The same build creates
 `orbit/orbit_bridge_host`, which can serve a trusted raw USB/UART stream for an
 MCU. Pass the one allowed HTTPS origin as its argument. Do not mix log output or
-terminal echo into that binary stream. Linux x86-64 builds/tests pass; no Pi
-hardware or ARM Linux runtime check has been performed yet.
+terminal echo into that binary stream. Linux x86-64 builds/tests pass. The example
+and bridge host also cross-link for
+64-bit Pi Linux with Clang 22.1.8, Cortex-A53 and a Debian trixie arm64 sysroot
+(glibc 2.41, libcurl 8.14.1, OpenSSL 3.5.7). Pi hardware and ARM Linux runtime
+checks remain outstanding.
 
 ## ESP32
 
@@ -44,8 +47,8 @@ and update/debug controls for deployment. The port uses esp-tls and Mbed TLS,
 requires Wi-Fi entropy to be active, and performs no automatic storage erasure.
 Deep sleep resumes through client initialization and online validation.
 
-The IDF SDK/toolchain is not installed in the current validation environment;
-this board build and hardware run remain outstanding.
+The ESP32 example builds with ESP-IDF 5.5.2 and its GCC 14.2 toolchain.
+Physical-board testing remains outstanding.
 
 ## ESP8266 / NodeMCU
 
@@ -64,8 +67,10 @@ locally is not negotiation. The port uses trusted wall time for conservative
 elapsed tracking and denies access after rollback. Measure free heap during TLS
 handshake as well as Orbit's static buffers; ESP8266 is the tightest RAM target.
 
-PlatformIO, the ESP8266 core/toolchain and hardware are unavailable in the current
-validation environment. This target has not been built or run yet.
+The NodeMCU example builds with PlatformIO 6.1.19, ESP8266 Arduino 3.1.2 and
+GCC 10.3. Its 8 KiB Orbit arena leaves 34,124 bytes of static RAM headroom while
+retaining the full TLS receive buffer. Peak TLS heap and hardware operation
+remain unverified.
 
 ## Pico W and Pico 2 W: native Wi-Fi
 
@@ -96,8 +101,8 @@ execution for other-core/interrupt coordination. Reinitialize after uncertain
 sleep elapsed time. A trusted host bridge is an optional alternative transport;
 the native example does not require one.
 
-The Pico SDK, Arm GCC tools and hardware are unavailable in the current validation
-environment. Native Wi-Fi builds and hardware tests remain outstanding.
+Both native Wi-Fi examples build with Pico SDK 2.3.1 and Arm GCC 14.3.1,
+producing ELF, BIN and UF2 files. Physical-board testing remains outstanding.
 
 ## STM32G0B1RE
 
@@ -123,6 +128,8 @@ standalone networking needs an external network module and a separately
 integrated authenticated TLS transport.
 
 The [STM32G0B1RE](https://www.st.com/en/microcontrollers-microprocessors/stm32g0b1re.html)
-has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. Portable M0+ compilation
-passes; CubeG0 integration, a final firmware link and hardware tests remain
-outstanding because that SDK/toolchain and board are unavailable here.
+has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. The integration harness
+links with CubeG0 1.6.3, Arm GCC 14.3.1 and Mbed TLS
+3.6.6, using 44,876 bytes of flash and 44,064 bytes of reserved RAM. It includes
+HAL/CMSIS startup but is not a complete runnable board application: supply UART
+initialization and verify runtime stack, heap and power-loss behaviour on hardware.

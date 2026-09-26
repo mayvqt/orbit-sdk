@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(orbit_embedded_core VERSION 0.1.0 LANGUAGES C)
+project(orbit_embedded_core VERSION 0.3.1 LANGUAGES C)
 
 include(CTest)
 
