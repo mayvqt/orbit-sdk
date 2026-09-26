@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Orbit.Sdk;
@@ -50,6 +51,7 @@ internal static class DeviceIdentityTests
             ("app", "test", "linux", "00112233445566778899aabbccddeeff", "orbit-machine-v1\napp\ntest\nlinux\n00112233445566778899aabbccddeeff"),
             ("app", "test", "linux", " \t\r\n00112233-4455-6677-8899-AABBCCDDEEFF\v\f ", "orbit-machine-v1\napp\ntest\nlinux\n00112233445566778899aabbccddeeff"),
             ("app", "test", "windows", "00112233-4455-6677-8899-AABBCCDDEEFF", "orbit-machine-v1\napp\ntest\nwindows\n00112233445566778899aabbccddeeff"),
+            ("app", "test", "macos", "00112233-4455-6677-8899-AABBCCDDEEFF", "orbit-machine-v1\napp\ntest\nmacos\n00112233445566778899aabbccddeeff"),
             ("other_app", "live", "linux", "0123456789ABCDEF0123456789ABCDEF", "orbit-machine-v1\nother_app\nlive\nlinux\n0123456789abcdef0123456789abcdef")
         ];
         foreach (var vector in vectors)
@@ -58,7 +60,22 @@ internal static class DeviceIdentityTests
             var actual = DeviceIdentity.MachineFingerprint(vector.Application, vector.Environment, vector.Family, vector.MachineId);
             if (actual != expected) throw new InvalidOperationException("Machine fingerprint framing mismatch");
         }
+        if (DeviceIdentity.MachineFingerprint("app", "test", "macos",
+                "00112233-4455-6677-8899-AABBCCDDEEFF") !=
+            "ccd81e8a12bd6695ca8e0d71b409c58696e780780e2c9e1c14ea1aa7fe8e069a")
+            throw new InvalidOperationException("macOS fingerprint disagrees with the shared scoped vector");
         if (DeviceIdentity.Provider != "machine_v1") throw new InvalidOperationException("Machine fingerprint provider mismatch");
+        if (MacOSStorageLease.StatEntryPoint(Architecture.X64, at: false) != "fstat$INODE64" ||
+            MacOSStorageLease.StatEntryPoint(Architecture.X64, at: true) != "fstatat$INODE64" ||
+            MacOSStorageLease.StatEntryPoint(Architecture.Arm64, at: false) != "fstat" ||
+            MacOSStorageLease.StatEntryPoint(Architecture.Arm64, at: true) != "fstatat")
+            throw new InvalidOperationException("Darwin inode64 stat symbol selection mismatch");
+        try
+        {
+            _ = MacOSStorageLease.StatEntryPoint(Architecture.Arm, at: false);
+            throw new InvalidOperationException("Unsupported Darwin stat architecture was accepted");
+        }
+        catch (OrbitException error) when (error.Error == OrbitError.Storage) { }
 
         foreach (var machineId in new[]
         {
@@ -71,9 +88,10 @@ internal static class DeviceIdentityTests
 
         (string Application, string Environment, string Family)[] invalidScopes =
         [
-            ("app\nother", "test", "linux"), ("app", "test/live", "linux"), ("app", "test", "macos"),
+            ("app\nother", "test", "linux"), ("app", "test/live", "linux"),
             ("", "test", "linux"), ("app", "", "linux"), (new string('a', 129), "test", "linux"),
-            ("app", new string('a', 129), "linux"), ("äpp", "test", "linux"), ("app", "test", "Linux")
+            ("app", new string('a', 129), "linux"), ("äpp", "test", "linux"), ("app", "test", "Linux"),
+            ("app", "test", "macOS")
         ];
         foreach (var scope in invalidScopes)
             Expect(OrbitError.Configuration, null,
@@ -82,6 +100,26 @@ internal static class DeviceIdentityTests
         // Invalid scope must fail before reading any native identity, on every platform.
         Expect(OrbitError.Configuration, null, () => DeviceIdentity.NativeFingerprint("app\nother", "test"));
         Expect(OrbitError.Configuration, null, () => DeviceIdentity.NativeFingerprint("app", "test/live"));
+        if (MacOSDeviceIdentity.NormalizePlatformUuid(" \t00112233-4455-6677-8899-AABBCCDDEEFF\r\n") !=
+            "00112233445566778899aabbccddeeff")
+            throw new InvalidOperationException("IOPlatformUUID normalization mismatch");
+        foreach (var badUuid in new string?[] { null, "", new string('0', 32), new string('f', 32),
+                     "00112233-4455-6677-8899-aabbccddeeefg", "00112233445566778899aabbccddeef" })
+            Expect(OrbitError.Denied, "device_identity_unavailable", () => MacOSDeviceIdentity.NormalizePlatformUuid(badUuid));
+        var releasedAfterRead = false;
+        if (MacOSDeviceIdentity.ReadOwnedProperty(new DisposalProbe(() => releasedAfterRead = true),
+                () => "00112233-4455-6677-8899-AABBCCDDEEFF") != "00112233445566778899aabbccddeeff" ||
+            !releasedAfterRead)
+            throw new InvalidOperationException("IOKit property ownership was not released after a successful read");
+        var releasedAfterFailure = false;
+        try
+        {
+            _ = MacOSDeviceIdentity.ReadOwnedProperty(new DisposalProbe(() => releasedAfterFailure = true),
+                () => throw new InvalidOperationException("synthetic property conversion failure"));
+        }
+        catch (InvalidOperationException) { }
+        if (!releasedAfterFailure)
+            throw new InvalidOperationException("IOKit property ownership was not released after a failed read");
         SmbiosIdentity();
         return Task.CompletedTask;
     }
@@ -159,6 +197,11 @@ internal static class DeviceIdentityTests
             offset += record.Length;
         }
         return table;
+    }
+
+    private sealed class DisposalProbe(Action released) : IDisposable
+    {
+        public void Dispose() => released();
     }
 
     private static void Expect(OrbitError expected, string? code, Func<string> operation)

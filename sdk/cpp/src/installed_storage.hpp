@@ -30,6 +30,8 @@ std::shared_ptr<InstalledStorage> open_linux_installed_storage(std::string direc
 #elif defined(_WIN32)
 std::shared_ptr<InstalledStorage> open_windows_installed_storage(
     std::string directory, const Config& config);
+#elif defined(__APPLE__)
+std::shared_ptr<InstalledStorage> open_macos_installed_storage(std::string directory);
 #endif
 
 } // namespace orbit::detail

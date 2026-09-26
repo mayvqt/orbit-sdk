@@ -19,7 +19,13 @@ int main(int argc, char** argv) {
     std::filesystem::path smoke_path;
     if (smoke) {
         app_key = "orbit_app_test_aHR0cHM6Ly9leGFtcGxlLmludmFsaWQ.cpp_smoke_app.cpp_smoke_env";
-        smoke_path = std::filesystem::temp_directory_path() /
+        auto temporary_root = std::filesystem::temp_directory_path();
+#if defined(__APPLE__)
+        // macOS commonly exposes /tmp through a symlink; resolve the fixture
+        // root so the SDK can keep rejecting symlinked state-directory paths.
+        temporary_root = std::filesystem::canonical(temporary_root);
+#endif
+        smoke_path = temporary_root /
             ("orbit-cpp-smoke-" + orbit::new_installation_id());
         options.state_directory = smoke_path.string();
     } else {

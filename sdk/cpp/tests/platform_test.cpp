@@ -31,6 +31,8 @@
 #include <unistd.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach_time.h>
 #endif
 
 namespace {
@@ -142,6 +144,10 @@ void test_installation_id_and_fingerprint_vectors() {
     require(orbit::machine_fingerprint("app", "test", "windows",
                                        "00112233445566778899aabbccddeeff") != fingerprint,
             "OS family must be included in the machine fingerprint");
+    require(orbit::machine_fingerprint("app", "test", "macos",
+                                       " 00112233-4455-6677-8899-AABBCCDDEEFF ") ==
+                "ccd81e8a12bd6695ca8e0d71b409c58696e780780e2c9e1c14ea1aa7fe8e069a",
+            "macOS machine fingerprint must match its scoped SHA-256 vector");
     for (const auto identity : {"", "00000000000000000000000000000000",
                                 "ffffffffffffffffffffffffffffffff",
                                 "00112233445566778899aabbccddeefg",
@@ -155,6 +161,45 @@ void test_installation_id_and_fingerprint_vectors() {
         }
         require(rejected, "invalid machine identities must fail closed");
     }
+}
+
+void test_macos_identity_and_clock_boundaries() {
+    const auto uuid = orbit::detail::testing::normalize_macos_platform_uuid(
+        " \t00112233-4455-6677-8899-AABBCCDDEEFF\r\n");
+    require(uuid && *uuid == "00112233445566778899aabbccddeeff",
+            "IOPlatformUUID normalization must trim ASCII whitespace and canonicalize hex");
+    for (const auto invalid : {std::string_view{}, std::string_view("00000000000000000000000000000000"),
+                               std::string_view("ffffffffffffffffffffffffffffffff"),
+                               std::string_view("00112233-4455-6677-8899-aabbccddeeefg")}) {
+        require(!orbit::detail::testing::normalize_macos_platform_uuid(invalid),
+                "missing or malformed IOPlatformUUID must fail closed");
+    }
+    const auto nanos = orbit::detail::testing::mach_ticks_to_nanoseconds(24'000'000, 125, 3);
+    require(nanos && *nanos == 1'000'000'000,
+            "mach timebase conversion must preserve its rational scale");
+    require(!orbit::detail::testing::mach_ticks_to_nanoseconds(1, 0, 1) &&
+            !orbit::detail::testing::mach_ticks_to_nanoseconds(1, 1, 0) &&
+            !orbit::detail::testing::mach_ticks_to_nanoseconds(UINT64_MAX, UINT32_MAX, 1),
+            "invalid timebase ratios and conversion overflow must fail closed");
+}
+
+void test_native_resource_release_on_success_and_failure() {
+    std::vector<int> released;
+    released.reserve(2);
+    {
+        orbit::detail::testing::ScopedResource resource(7, [&](int value) { released.push_back(value); });
+        require(resource.get() == 7, "scoped native handle must expose its retained value");
+    }
+    try {
+        orbit::detail::testing::ScopedResource resource(9, [&](int value) { released.push_back(value); });
+        throw std::runtime_error("synthetic native conversion failure");
+    } catch (const std::runtime_error&) { }
+    {
+        orbit::detail::testing::ScopedResource empty(0, [&](int value) { released.push_back(value); });
+        (void)empty;
+    }
+    require(released == std::vector<int>{7, 9},
+            "native service and CoreFoundation handles must release exactly once on all exits");
 }
 
 std::vector<unsigned char> smbios_system_record() {
@@ -226,6 +271,30 @@ void test_native_clock() {
     require(wall > 1'700'000'000 && orbit::detail::wall_seconds() >= wall,
             "native wall clock must return Unix seconds");
 }
+
+#if defined(__APPLE__)
+int run_macos_clock_suspend() {
+    mach_timebase_info_data_t ratio{};
+    if (mach_timebase_info(&ratio) != KERN_SUCCESS || ratio.numer == 0 || ratio.denom == 0) return 1;
+    const auto awake_now = [&]() -> std::optional<std::int64_t> {
+        return orbit::detail::testing::mach_ticks_to_nanoseconds(
+            mach_absolute_time(), ratio.numer, ratio.denom);
+    };
+    const auto awake_start = awake_now();
+    const auto elapsed_start = orbit::detail::elapsed_nanoseconds();
+    if (!awake_start || elapsed_start < 0) return 1;
+    std::cout << "READY: suspend macOS for at least two seconds, then press Enter.\n" << std::flush;
+    std::string acknowledgement;
+    if (!std::getline(std::cin, acknowledgement)) return 1;
+    const auto elapsed = orbit::detail::elapsed_nanoseconds() - elapsed_start;
+    const auto awake_end = awake_now();
+    if (!awake_end || *awake_end < *awake_start || elapsed < *awake_end - *awake_start ||
+        elapsed - (*awake_end - *awake_start) < 2'000'000'000LL) return 1;
+    std::cout << "PASS: mach_continuous_time included sleep; elapsed_ns=" << elapsed
+              << " awake_ns=" << (*awake_end - *awake_start) << '\n';
+    return 0;
+}
+#endif
 
 void test_storage_codec_legacy_record_and_versions() {
     auto config = sample_config();
@@ -769,9 +838,18 @@ void test_windows_dpapi_storage_roundtrip_and_missing_state() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#if defined(__APPLE__)
+    if (argc == 2 && std::string_view(argv[1]) == "--clock-suspend")
+        return run_macos_clock_suspend();
+#else
+    (void)argv;
+    if (argc > 1) return 2;
+#endif
     try {
         test_installation_id_and_fingerprint_vectors();
+        test_macos_identity_and_clock_boundaries();
+        test_native_resource_release_on_success_and_failure();
         test_smbios_fixture_parser();
         test_native_clock();
         test_storage_codec_legacy_record_and_versions();

@@ -33,6 +33,15 @@ symbolic-link privileges report a skip if those privileges are unavailable.
 The ordinary Linux suite does not access your keyring. Run tests in a development
 account with no production credentials.
 
-Some additional modes exercise real sleep or OS storage. They need a dedicated
-test environment and are separate from the commands above. Never use the bundled
-synthetic signing keys for a real service.
+The security suite includes the scoped macOS fingerprint vector and injected
+mach-timebase ratio/overflow cases on every host. A Linux run exercises the
+portable private-file lease, restart and failure checks; it does not exercise
+IOKit, `mach_continuous_time` or Darwin filesystem calls. The macOS storage
+implementation uses private POSIX files rather than Keychain protection. Run
+the same three commands above on macOS x64 and arm64 before claiming native
+validation.
+
+The `--clock-suspend` and `--grant-suspend` modes exercise real sleep and need a
+dedicated interactive test machine; their commands are in `ADVANCED.md`.
+Additional modes exercise native OS storage. They are separate from the commands
+above. Never use the bundled synthetic signing keys for a real service.

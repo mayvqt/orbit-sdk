@@ -24,6 +24,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach_time.h>
+#include <time.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #endif
 
 namespace orbit {
@@ -268,6 +273,41 @@ std::string read_windows_machine_uuid() {
 }
 #endif
 
+#if defined(__APPLE__)
+std::string read_macos_platform_uuid() {
+    mach_port_t master_port = MACH_PORT_NULL;
+    auto matching = IOServiceMatching("IOPlatformExpertDevice");
+    if (matching == nullptr) identity_error();
+    // IOServiceGetMatchingService consumes the matching dictionary.
+    const auto service = IOServiceGetMatchingService(master_port, matching);
+    if (service == IO_OBJECT_NULL) identity_error();
+    detail::testing::ScopedResource service_guard(
+        service, [](io_object_t value) { (void)IOObjectRelease(value); });
+    auto key = CFStringCreateWithCString(kCFAllocatorDefault, "IOPlatformUUID", kCFStringEncodingUTF8);
+    if (key == nullptr) identity_error();
+    detail::testing::ScopedResource key_guard(key, [](CFStringRef value) { CFRelease(value); });
+    auto property = IORegistryEntryCreateCFProperty(service_guard.get(), key_guard.get(), kCFAllocatorDefault, 0);
+    if (property == nullptr) identity_error();
+    detail::testing::ScopedResource property_guard(property, [](CFTypeRef value) { CFRelease(value); });
+    if (CFGetTypeID(property) != CFStringGetTypeID()) identity_error();
+    const auto text = static_cast<CFStringRef>(property);
+    const auto length = CFStringGetLength(text);
+    if (length <= 0 || length > 256) identity_error();
+    std::string raw;
+    raw.reserve(static_cast<std::size_t>(length));
+    for (CFIndex index = 0; index < length; ++index) {
+        const auto character = CFStringGetCharacterAtIndex(text, index);
+        if (character == 0 || character > 0x7f) identity_error();
+        raw.push_back(static_cast<char>(character));
+    }
+    const auto parsed = detail::testing::normalize_macos_platform_uuid(
+        raw);
+    if (!parsed) identity_error();
+    return *parsed;
+}
+
+#endif
+
 } // namespace
 
 std::string new_installation_id() {
@@ -283,7 +323,7 @@ std::string machine_fingerprint(std::string_view application_id,
                                 std::string_view family,
                                 std::string_view identity) {
     if (!opaque(application_id) || !opaque(environment_id) ||
-        (family != "linux" && family != "windows")) {
+        (family != "linux" && family != "windows" && family != "macos")) {
         configuration_error();
     }
     const auto normalized = normalized_machine_id(identity);
@@ -313,6 +353,9 @@ std::string native_fingerprint(std::string_view application_id,
 #elif defined(_WIN32)
     const auto identity = read_windows_machine_uuid();
     return machine_fingerprint(application_id, environment_id, "windows", identity);
+#elif defined(__APPLE__)
+    const auto identity = read_macos_platform_uuid();
+    return machine_fingerprint(application_id, environment_id, "macos", identity);
 #else
     identity_error();
 #endif
@@ -357,13 +400,23 @@ std::int64_t elapsed_nanoseconds() {
     }
     return static_cast<std::int64_t>(whole_seconds * 1'000'000'000ULL +
                                      remainder * 100ULL);
+#elif defined(__APPLE__)
+    static const mach_timebase_info_data_t ratio = [] {
+        mach_timebase_info_data_t value{};
+        if (mach_timebase_info(&value) != KERN_SUCCESS || value.numer == 0 || value.denom == 0)
+            throw Error(1, ErrorKind::clock_uncertain, "clock_uncertain", {});
+        return value;
+    }();
+    const auto value = testing::mach_ticks_to_nanoseconds(mach_continuous_time(), ratio.numer, ratio.denom);
+    if (!value) throw Error(1, ErrorKind::clock_uncertain, "clock_uncertain", {});
+    return *value;
 #else
     throw Error(1, ErrorKind::clock_uncertain, "clock_uncertain", {});
 #endif
 }
 
 std::int64_t wall_seconds() {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     timespec value{};
     if (::clock_gettime(CLOCK_REALTIME, &value) != 0 || value.tv_sec < 0 ||
         value.tv_nsec < 0 || value.tv_nsec >= 1'000'000'000 ||
@@ -396,6 +449,26 @@ namespace testing {
 
 std::optional<std::string> parse_smbios_uuid(std::string_view raw) {
     return parse_smbios_uuid_impl(raw);
+}
+
+std::optional<std::string> normalize_macos_platform_uuid(std::string_view raw) {
+    const auto normalized = normalized_machine_id(raw);
+    if (!valid_machine_id(normalized)) return std::nullopt;
+    return normalized;
+}
+
+std::optional<std::int64_t> mach_ticks_to_nanoseconds(
+    std::uint64_t ticks, std::uint32_t numerator, std::uint32_t denominator) {
+    if (numerator == 0 || denominator == 0) return std::nullopt;
+    const auto whole_ticks = ticks / denominator;
+    const auto remainder = ticks % denominator;
+    if (whole_ticks > std::numeric_limits<std::uint64_t>::max() / numerator)
+        return std::nullopt;
+    const auto whole = whole_ticks * numerator;
+    const auto fraction = (remainder * static_cast<std::uint64_t>(numerator)) / denominator;
+    if (whole > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - fraction)
+        return std::nullopt;
+    return static_cast<std::int64_t>(whole + fraction);
 }
 
 } // namespace testing

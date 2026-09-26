@@ -7,12 +7,38 @@ internal static class Clock
 {
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec { public long Seconds; public long Nanoseconds; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MachTimebase { public uint Numerator; public uint Denominator; }
 
     [DllImport("libc", EntryPoint = "clock_gettime", SetLastError = true)]
     private static extern int ClockGetTime(int clockId, out Timespec value);
 
     [DllImport("api-ms-win-core-realtime-l1-1-1.dll", EntryPoint = "QueryInterruptTimePrecise")]
     private static extern void QueryInterruptTimePrecise(out ulong ticks);
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_timebase_info")]
+    private static extern int MachTimebaseInfo(out MachTimebase info);
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_continuous_time")]
+    private static extern ulong MachContinuousTime();
+
+    private static readonly Lazy<MachTimebase> MacTimebase = new(() =>
+    {
+        if (MachTimebaseInfo(out var info) != 0 || info.Numerator == 0 || info.Denominator == 0)
+            throw new OrbitException(OrbitError.ClockUncertain);
+        return info;
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    internal static bool TryConvertMachToTimeSpanTicks(ulong ticks, uint numerator, uint denominator, out long result)
+    {
+        result = 0;
+        if (numerator == 0 || denominator == 0) return false;
+        var nanoseconds = (UInt128)ticks * numerator / denominator;
+        var timeSpanTicks = nanoseconds / 100;
+        if (timeSpanTicks > (UInt128)long.MaxValue) return false;
+        result = (long)timeSpanTicks;
+        return true;
+    }
 
     internal static long ElapsedTicks()
     {
@@ -24,6 +50,15 @@ internal static class Clock
                 // The biased clock includes time spent in sleep and hibernation.
                 QueryInterruptTimePrecise(out var ticks);
                 return checked((long)ticks);
+            }
+            if (OperatingSystem.IsMacOS())
+            {
+                if (!Environment.Is64BitProcess)
+                    throw new OrbitException(OrbitError.ClockUncertain);
+                var ratio = MacTimebase.Value;
+                if (!TryConvertMachToTimeSpanTicks(MachContinuousTime(), ratio.Numerator, ratio.Denominator, out var converted))
+                    throw new OrbitException(OrbitError.ClockUncertain);
+                return converted;
             }
             if (!OperatingSystem.IsLinux() || !Environment.Is64BitProcess)
                 throw new OrbitException(OrbitError.ClockUncertain);

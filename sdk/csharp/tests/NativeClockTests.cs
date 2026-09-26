@@ -11,9 +11,15 @@ internal static class NativeClockTests
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec { public long Seconds; public long Nanoseconds; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MachTimebase { public uint Numerator; public uint Denominator; }
 
     [DllImport("libc", EntryPoint = "clock_gettime", SetLastError = true)]
     private static extern int ClockGetTime(int clockId, out Timespec value);
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_absolute_time")]
+    private static extern ulong MachAbsoluteTime();
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_timebase_info")]
+    private static extern int MachTimebaseInfo(out MachTimebase info);
 
     private static long AwakeTicks()
     {
@@ -21,6 +27,13 @@ internal static class NativeClockTests
         {
             QueryUnbiasedInterruptTimePrecise(out var ticks);
             return checked((long)ticks);
+        }
+        if (OperatingSystem.IsMacOS())
+        {
+            if (MachTimebaseInfo(out var ratio) != 0 ||
+                !Clock.TryConvertMachToTimeSpanTicks(MachAbsoluteTime(), ratio.Numerator, ratio.Denominator, out var ticks))
+                throw new InvalidOperationException("Native awake-time conversion failed");
+            return ticks;
         }
         if (!OperatingSystem.IsLinux() || !Environment.Is64BitProcess ||
             ClockGetTime(1, out var value) != 0 || value.Seconds < 0 || value.Nanoseconds is < 0 or >= 1_000_000_000)
@@ -158,15 +171,14 @@ internal static class NativeClockTests
 
     internal static int RunSuspend()
     {
-        if (!OperatingSystem.IsWindows())
-            throw new InvalidOperationException("This native check requires Windows");
-        QueryUnbiasedInterruptTimePrecise(out var activeStart);
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS())
+            throw new InvalidOperationException("This native check requires Windows or macOS");
+        var activeStart = AwakeTicks();
         var start = Clock.ElapsedTicks();
         Console.WriteLine("READY: suspend/hibernate for at least two seconds, then press Enter.");
         if (Console.ReadLine() is null) throw new InvalidOperationException("No acknowledgement");
         var elapsed = checked(Clock.ElapsedTicks() - start);
-        QueryUnbiasedInterruptTimePrecise(out var activeEnd);
-        var active = checked((long)(activeEnd - activeStart));
+        var active = checked(AwakeTicks() - activeStart);
         if (elapsed - active < TimeSpan.TicksPerSecond)
             throw new InvalidOperationException("No actual sleep interval observed");
         Console.WriteLine($"SDK elapsed={TimeSpan.FromTicks(elapsed)}, active elapsed={TimeSpan.FromTicks(active)}");

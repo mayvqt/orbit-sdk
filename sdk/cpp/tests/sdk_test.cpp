@@ -610,8 +610,11 @@ Client client_for(ApiFixture& fixture) {
 }
 
 std::string persistent_test_path() {
-    return (std::filesystem::temp_directory_path() /
-            ("orbit-cpp-installed-test-" + new_installation_id())).string();
+    auto temporary_root = std::filesystem::temp_directory_path();
+#if defined(__APPLE__)
+    temporary_root = std::filesystem::canonical(temporary_root);
+#endif
+    return (temporary_root / ("orbit-cpp-installed-test-" + new_installation_id())).string();
 }
 
 Client persistent_client_for(ApiFixture& fixture, const std::string& path,

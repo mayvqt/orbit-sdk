@@ -77,3 +77,7 @@ See the [runnable example](../../examples/cpp/README.md) and
 [advanced usage](advanced.md) for storage options, cancellation and account APIs.
 The library target for consumers building alongside this checkout is
 `Orbit::Sdk`.
+
+The native implementation supports Linux, Windows and macOS. macOS uses the
+system IOKit and CoreFoundation frameworks and private POSIX installed files;
+its native runtime still needs validation on Apple hardware.

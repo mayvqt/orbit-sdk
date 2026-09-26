@@ -34,6 +34,7 @@ internal static class InstalledTests
             ("close cancels an active validation and releases ownership",CloseDuringRequest),
             ("format-2 rejects missing unknown and duplicate fields",Codec),
             ("lease contention missing data and unsafe leaf fail closed",Files),
+            ("macOS renamed state directory is rejected before lease commit",MacOSDirectoryReplacement),
             ("interrupted writes and data links remain fenced",InterruptedFiles),
             ("abandoned clients release their installation lease",Abandoned),
             ("explicit previous bearer works without local credential",PreviousBearer),
@@ -165,7 +166,17 @@ internal static class InstalledTests
     }
     private sealed class Fixture : IAsyncDisposable
     {
-        internal readonly string Root = Directory.CreateTempSubdirectory("orbit-installed-").FullName;
+        internal readonly string Root = CreateRoot();
+        private static string CreateRoot()
+        {
+            if (!OperatingSystem.IsMacOS()) return Directory.CreateTempSubdirectory("orbit-installed-").FullName;
+            var cache = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Library", "Caches", "OrbitSdkTests");
+            Directory.CreateDirectory(cache);
+            var root = System.IO.Path.Combine(cache, "orbit-installed-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            return root;
+        }
         internal string Path => System.IO.Path.Combine(Root, "state");
         internal readonly LoopbackServer Server;
         internal int Mode, Activations, Validations;
@@ -663,6 +674,38 @@ internal static class InstalledTests
             await Expect(OrbitError.Storage, async () => { await using var c = await f.Open(unsafePath); });
             Require(File.GetUnixFileMode(unsafePath).HasFlag(UnixFileMode.GroupRead));
         }
+    }
+    private static Task MacOSDirectoryReplacement()
+    {
+        if (!OperatingSystem.IsMacOS()) return Task.CompletedTask;
+        var root = Directory.CreateTempSubdirectory("orbit-macos-lease-");
+        var path = System.IO.Path.Combine(root.FullName, "state");
+        var moved = path + "-moved";
+        try
+        {
+            using var lease = MacOSStorageLease.Open(path, installed: true);
+            lease.BeforeLeaseCommitForTest = () =>
+            {
+                Directory.Move(path, moved);
+                Directory.CreateDirectory(path);
+                SetMacPrivateDirectoryMode(path);
+            };
+            try
+            {
+                lease.WriteInstalled([1, 2, 3], allowMissing: true);
+                throw new InvalidOperationException("A renamed pinned directory accepted a lease commit");
+            }
+            catch (OrbitException error) when (error.Error == OrbitError.Storage) { }
+            Require(new FileInfo(System.IO.Path.Combine(moved, MacOSStorageLease.LeaseName)).Length == 1);
+            Require(!File.Exists(System.IO.Path.Combine(moved, "orbit-storage.bin")));
+        }
+        finally { Directory.Delete(root.FullName, recursive: true); }
+        return Task.CompletedTask;
+    }
+    private static void SetMacPrivateDirectoryMode(string path)
+    {
+        if (!OperatingSystem.IsMacOS()) throw new PlatformNotSupportedException();
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
     private static async Task PreviousBearer()
     {

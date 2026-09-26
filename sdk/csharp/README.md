@@ -52,9 +52,16 @@ If identity is unavailable, it sends no fingerprint. A stored identity mismatch
 fails closed and cannot restore cached offline access.
 
 Windows state is protected with current-user DPAPI. Linux state uses private
-files under `$XDG_STATE_HOME/orbit` (normally `~/.local/state/orbit`). Set
-`OrbitOptions.StatePath` to a dedicated absolute directory when needed. Share
-one client per installation; a competing process is rejected.
+files under `$XDG_STATE_HOME/orbit` (normally `~/.local/state/orbit`). macOS
+uses private POSIX files under `~/Library/Application Support/Orbit`; this is
+not Keychain encryption. Set `OrbitOptions.StatePath` to a dedicated absolute
+directory when needed. Share one client per installation; a competing process
+is rejected.
+
+On macOS, the SDK derives its default `machine_v1` identity from IOKit's
+`IOPlatformUUID` and uses `mach_continuous_time` so sleep counts toward access
+expiry. It stores only the scoped hash. Native macOS runtime validation is still
+required; see [advanced integration](ADVANCED.md).
 
 ## Customer accounts
 

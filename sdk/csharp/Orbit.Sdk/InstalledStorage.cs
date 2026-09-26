@@ -102,7 +102,8 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
     {
         if (disposed || poisoned)
             throw Storage();
-        files.Check();
+        try { files.Check(); }
+        catch (Exception) { poisoned = true; throw Storage(); }
     }
     private void Write(InstalledRecord value)
     {

@@ -114,6 +114,8 @@ public sealed partial class OrbitClient : IAsyncDisposable
                     root = string.IsNullOrEmpty(selected) ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "state") : selected;
                     root = Path.Combine(root, "orbit");
                 }
+                else if (OperatingSystem.IsMacOS())
+                    root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support", "Orbit");
                 else
                     throw new OrbitException(OrbitError.Storage);
                 path = Path.Combine(root, Convert.ToHexStringLower(entropy));
@@ -124,6 +126,8 @@ public sealed partial class OrbitClient : IAsyncDisposable
                 files = new InstalledWindowsFiles(path, entropy);
             else if (OperatingSystem.IsLinux())
                 files = new InstalledLinuxFiles(path);
+            else if (OperatingSystem.IsMacOS())
+                files = new InstalledMacOSFiles(path);
             else
                 throw new OrbitException(OrbitError.Storage);
             storage = new InstalledStorage(files, scope, app.Fingerprint, app.FingerprintProvider);

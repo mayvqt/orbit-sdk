@@ -16,6 +16,7 @@ internal static class SecurityTests
             ("ensure access prompts only for missing activation", EnsureAccessPromptsOnlyWhenNeededAsync),
             ("custom fingerprint providers match service grammar", FingerprintProvidersAsync),
             ("machine fingerprints preserve scoped framing and reject invalid identities", DeviceIdentityTests.RunAsync),
+            ("macOS mach timebase conversion checks ratios and overflow", MacTimebaseConversionAsync),
             ("protected storage codec binds scope and rejects malformed records", WindowsStorageTests.CodecAsync),
             ("Windows storage persists and exclusively leases protected credentials", WindowsStorageTests.NativeAsync),
             ("Secret Service framing and helper responses reject unsafe state", SecretServiceTests.CodecAsync),
@@ -127,6 +128,18 @@ internal static class SecurityTests
             catch (OrbitException error) when (error.Error == OrbitError.ClockUncertain) { continue; }
             throw new InvalidOperationException("Invalid clock anchor accepted");
         }
+        return Task.CompletedTask;
+    }
+
+    private static Task MacTimebaseConversionAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Require(Clock.TryConvertMachToTimeSpanTicks(24_000_000, 125, 3, out var ticks) &&
+            ticks == TimeSpan.TicksPerSecond);
+        Require(Clock.TryConvertMachToTimeSpanTicks(0, 1, 1, out var zero) && zero == 0);
+        Require(!Clock.TryConvertMachToTimeSpanTicks(1, 0, 1, out _));
+        Require(!Clock.TryConvertMachToTimeSpanTicks(1, 1, 0, out _));
+        Require(!Clock.TryConvertMachToTimeSpanTicks(ulong.MaxValue, uint.MaxValue, 1, out _));
         return Task.CompletedTask;
     }
 
