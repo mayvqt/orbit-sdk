@@ -272,21 +272,32 @@ impl Client {
     pub fn snapshot(&self) -> Result<Snapshot> {
         let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
         self.sync_storage(&mut state)?;
-        if state
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.now().is_err())
-        {
-            state.claims = None;
-            state.anchor = None;
-            state.generation = state.generation.wrapping_add(1);
-            if let Some(storage) = &self.0.installed {
-                state.storage_version = storage.clear_cached(false, false)?;
+        self.checked_snapshot_locked(&mut state)
+    }
+    fn checked_snapshot_locked(&self, state: &mut State) -> Result<Snapshot> {
+        let now = if let Some(anchor) = &state.anchor {
+            match anchor.now() {
+                Ok(now) => Some(now),
+                Err(_) => {
+                    state.claims = None;
+                    state.anchor = None;
+                    state.generation = state.generation.wrapping_add(1);
+                    if let Some(storage) = &self.0.installed {
+                        state.storage_version = storage.clear_cached(false, false)?;
+                    }
+                    None
+                }
             }
-        }
-        Self::snapshot_state(&state)
+        } else {
+            None
+        };
+        Self::snapshot_state_at(state, now)
     }
     fn snapshot_state(state: &State) -> Result<Snapshot> {
+        let now = state.anchor.as_ref().and_then(|anchor| anchor.now().ok());
+        Self::snapshot_state_at(state, now)
+    }
+    fn snapshot_state_at(state: &State, now: Option<i64>) -> Result<Snapshot> {
         let credential_expiry = state
             .credential
             .as_ref()
@@ -309,10 +320,9 @@ impl Client {
             offline_allowed: false,
             remaining_offline: Duration::ZERO,
         };
-        if let (Some(claims), Some(anchor)) = (&state.claims, &state.anchor) {
-            let now = match anchor.now() {
-                Ok(now) => now,
-                Err(_) => return Ok(snapshot),
+        if let Some(claims) = &state.claims {
+            let Some(now) = now else {
+                return Ok(snapshot);
             };
             snapshot.expires_at =
                 Some(crate::accounts::from_unix_seconds(claims.exp).ok_or(Error::InvalidResponse)?);
@@ -351,7 +361,13 @@ impl Client {
         if self.0.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Closed);
         }
-        let version = self.0.storage.version()?;
+        let version = match self.0.storage.version() {
+            Ok(version) => version,
+            Err(error) => {
+                clear(state);
+                return Err(error);
+            }
+        };
         if version != state.storage_version {
             clear(state);
             state.storage_version = version;
@@ -660,27 +676,50 @@ impl Client {
         feature: &str,
         cancel: &Cancellation,
     ) -> Result<Snapshot> {
-        let snapshot = self.snapshot()?;
-        let snapshot = if matches!(
-            snapshot.access,
-            Access::RefreshRequired | Access::Expired | Access::Offline
-        ) {
-            match self.refresh_if_needed(cancel).await {
-                Ok(value) => value,
-                Err(error @ Error::Transient { .. }) => {
-                    let snapshot = self.snapshot()?;
-                    if snapshot.access != Access::Offline {
-                        return Err(error);
-                    }
-                    snapshot
-                }
-                Err(error) => return Err(error),
+        let refresh_needed = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
             }
-        } else {
-            snapshot
+            let snapshot = self.checked_snapshot_locked(&mut state)?;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if snapshot.access == Access::Online {
+                if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
+                    return Err(Error::FeatureUnavailable);
+                }
+                return Ok(snapshot);
+            }
+            matches!(
+                snapshot.access,
+                Access::RefreshRequired | Access::Expired | Access::Offline
+            )
         };
-        if !matches!(snapshot.access, Access::Online | Access::Offline) {
+        if !refresh_needed {
             return Err(Error::NotActivated);
+        }
+        let mut refresh_error = None;
+        match self.refresh_if_needed(cancel).await {
+            Ok(_) => {}
+            Err(error @ Error::Transient { .. }) => refresh_error = Some(error),
+            Err(error) => return Err(error),
+        }
+        // The awaited refresh can race logout or external storage invalidation.
+        // Synchronize the current generation, then sample native time once and
+        // build the decision from that live state.
+        let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+        self.sync_storage(&mut state)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let snapshot = self.checked_snapshot_locked(&mut state)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if !matches!(snapshot.access, Access::Online | Access::Offline) {
+            return Err(refresh_error.unwrap_or(Error::NotActivated));
         }
         if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
             return Err(Error::FeatureUnavailable);

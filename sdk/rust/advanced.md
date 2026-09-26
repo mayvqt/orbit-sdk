@@ -98,3 +98,22 @@ disabled. Default builds accept HTTPS origins only.
 `client.support_summary(&error)` creates safe JSON with scope, error code, request
 reference, and local timestamp; it contains no app key, credential, customer session,
 fingerprint, or server-private message.
+
+## Warm access benchmark
+
+From the repository root, run the opt-in signed installed-client benchmark with a private local state directory, loopback fixture transport, and the native clock:
+
+```sh
+RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true cargo test -p orbit-sdk \
+  --features local-development --locked --offline --release benchmark_installed_warm_access \
+  -- --ignored --nocapture
+```
+
+Each operation runs five measured trials of 10,000 calls after a 1,000-call warmup. The test checks that every call verifies installed storage and that the measured loops send no HTTP requests or write state. The before measurement uses baseline commit `4af8920` with this same harness and storage-verification fix, while retaining the baseline access hot path. On Linux/x86_64 with rustc and Cargo 1.98.1 (Intel Core i7-10700K, Linux 7.2.6; optimized Cargo release profile), the median was:
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| `require_access` | 3.653 µs/op | 3.617 µs/op |
+| `snapshot` | 3.608 µs/op | 3.553 µs/op |
+
+The snapshot decision now samples the native anchor once. `require_access` checks a warm online grant under the initial state lock and, after an awaited refresh, builds a new decision from synchronized current state. These small differences are within expected host timing variation and do not establish a material speedup or a cross-platform performance guarantee.

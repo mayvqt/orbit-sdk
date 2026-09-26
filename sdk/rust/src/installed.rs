@@ -28,12 +28,21 @@ mod platform {
         pub fn write(&self, _: &[u8]) -> Result<()> {
             Err(Error::Storage)
         }
+        pub fn verify(&self) -> Result<()> {
+            Err(Error::Storage)
+        }
     }
 }
 
 const MAX_BYTES: usize = 64 * 1024;
 const MAX_TIME: i64 = 253_402_300_799;
 const MAX_GENERATION: u64 = i64::MAX as u64;
+
+#[cfg(test)]
+static TEST_STORAGE_VERSION_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_DISK_WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 const WRITE_PENDING: &[u8] = &[1];
 fn check_write_marker(file: &std::fs::File, expected: &[u8]) -> Result<()> {
@@ -337,11 +346,20 @@ impl Record {
     }
 }
 impl DiskState {
-    fn check(&self) -> Result<()> {
+    fn check(&mut self) -> Result<()> {
         if self.poisoned {
             Err(Error::Storage)
         } else if self.backend.is_none() {
             Err(Error::Closed)
+        } else if self
+            .backend
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .verify()
+            .is_err()
+        {
+            self.poisoned = true;
+            Err(Error::Storage)
         } else {
             Ok(())
         }
@@ -360,6 +378,8 @@ impl DiskState {
             self.poisoned = true;
             return Err(Error::Storage);
         }
+        #[cfg(test)]
+        TEST_DISK_WRITES.fetch_add(1, Ordering::Relaxed);
         self.record = record;
         self.checkpoint = Instant::now();
         Ok(())
@@ -446,12 +466,12 @@ impl InstalledStorage {
         Ok(Self(Mutex::new(state)))
     }
     fn identity(&self) -> Result<(Config, Device)> {
-        let s = self.0.lock().map_err(|_| Error::Storage)?;
+        let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
         Ok((s.record.config(), s.record.device()))
     }
     pub(crate) fn activation_pending(&self) -> Result<bool> {
-        let state = self.0.lock().map_err(|_| Error::Storage)?;
+        let mut state = self.0.lock().map_err(|_| Error::Storage)?;
         state.check()?;
         Ok(state.record.pending_activation.is_some())
     }
@@ -566,7 +586,7 @@ impl InstalledStorage {
         current_fingerprint: Option<&str>,
         current_fingerprint_provider: Option<&str>,
     ) -> Result<Option<(grants::Claims, Anchor, Keys)>> {
-        let s = self.0.lock().map_err(|_| Error::Storage)?;
+        let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
         if s.record.installation.fingerprint.as_deref() != current_fingerprint
             || s.record.installation.fingerprint_provider.as_deref() != current_fingerprint_provider
@@ -669,12 +689,14 @@ fn restored_time(cache: &Cache, wall: i64) -> Result<i64> {
 }
 impl Storage for InstalledStorage {
     fn version(&self) -> Result<u64> {
-        let s = self.0.lock().map_err(|_| Error::Storage)?;
+        let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
+        #[cfg(test)]
+        TEST_STORAGE_VERSION_READS.fetch_add(1, Ordering::Relaxed);
         Ok(s.record.generation)
     }
     fn load(&self) -> Result<(u64, Option<StoredCredential>)> {
-        let s = self.0.lock().map_err(|_| Error::Storage)?;
+        let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
         Ok((s.record.generation, s.record.saved()))
     }
@@ -1835,6 +1857,40 @@ mod tests {
             test_storage(&app(), fixture.transport.canonical_origin(), Some(&dir.0)).unwrap();
         assert!(reopened.0.lock().unwrap().record.credential.is_some());
     }
+    #[cfg(all(target_os = "linux", feature = "local-development"))]
+    #[tokio::test]
+    async fn replaced_lease_denies_warm_access_and_close_without_writing_state() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let client = activated(&dir, &mut fixture, true).await;
+        fixture.assert_idle();
+
+        let data_path = dir.0.join("orbit-storage.json");
+        let lease_path = dir.0.join("orbit-storage.lock");
+        let saved_lease = dir.0.join("orbit-storage.lock.replaced");
+        let data_before = std::fs::read(&data_path).unwrap();
+        std::fs::rename(&lease_path, &saved_lease).unwrap();
+        std::fs::write(&lease_path, []).unwrap();
+        let lease_before = std::fs::read(&lease_path).unwrap();
+
+        assert!(matches!(client.snapshot(), Err(Error::Storage)));
+        {
+            let state = client.0.state.lock().unwrap();
+            assert!(state.claims.is_none());
+            assert!(state.anchor.is_none());
+            assert!(state.credential.is_none());
+        }
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Storage)
+        ));
+        fixture.assert_idle();
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+        assert!(matches!(client.close().await, Err(Error::Storage)));
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+    }
     #[cfg(feature = "local-development")]
     #[tokio::test]
     async fn invalid_cached_signature_never_grants_offline_but_keeps_online_recovery_credential() {
@@ -2136,5 +2192,61 @@ mod tests {
             );
         }
         reopened.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    #[ignore = "opt-in benchmark: run with --ignored benchmark_installed_warm_access --nocapture"]
+    async fn benchmark_installed_warm_access() {
+        const CALLS: usize = 10_000;
+        const WARMUP: usize = 1_000;
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let client = activated(&directory, &mut fixture, false).await;
+        fixture.assert_idle();
+
+        let reads = TEST_STORAGE_VERSION_READS.load(Ordering::Relaxed);
+        let writes = TEST_DISK_WRITES.load(Ordering::Relaxed);
+        for (name, guard) in [("RequireAccess", true), ("Snapshot", false)] {
+            let mut micros_per_call = Vec::with_capacity(5);
+            for _ in 0..5 {
+                for _ in 0..WARMUP {
+                    if guard {
+                        std::hint::black_box(client.require_access("export").await.unwrap());
+                    } else {
+                        std::hint::black_box(client.snapshot().unwrap());
+                    }
+                }
+                fixture.assert_idle();
+                let before_reads = TEST_STORAGE_VERSION_READS.load(Ordering::Relaxed);
+                let before_writes = TEST_DISK_WRITES.load(Ordering::Relaxed);
+                let started = Instant::now();
+                for _ in 0..CALLS {
+                    if guard {
+                        std::hint::black_box(client.require_access("export").await.unwrap());
+                    } else {
+                        std::hint::black_box(client.snapshot().unwrap());
+                    }
+                }
+                let elapsed = started.elapsed();
+                let checks = TEST_STORAGE_VERSION_READS.load(Ordering::Relaxed) - before_reads;
+                let after_writes = TEST_DISK_WRITES.load(Ordering::Relaxed);
+                assert!(
+                    checks >= CALLS,
+                    "{name} skipped storage-version reads: {checks}"
+                );
+                assert_eq!(after_writes, before_writes, "{name} wrote installed state");
+                fixture.assert_idle();
+                micros_per_call.push(elapsed.as_secs_f64() * 1_000_000.0 / CALLS as f64);
+            }
+            micros_per_call.sort_by(f64::total_cmp);
+            println!(
+                "{name}: median {:.3} us/op (5 trials x {CALLS}, {WARMUP} warmup calls each)",
+                micros_per_call[2]
+            );
+        }
+        assert!(TEST_STORAGE_VERSION_READS.load(Ordering::Relaxed) > reads);
+        assert_eq!(TEST_DISK_WRITES.load(Ordering::Relaxed), writes);
+        client.close().await.unwrap();
     }
 }

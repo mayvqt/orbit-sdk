@@ -175,7 +175,7 @@ impl Backend {
         backend.verify()?;
         Ok((backend, bytes))
     }
-    fn verify(&self) -> Result<()> {
+    pub(super) fn verify(&self) -> Result<()> {
         self.verify_marker(&[])
     }
     fn verify_marker(&self, marker: &[u8]) -> Result<()> {
