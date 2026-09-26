@@ -115,6 +115,100 @@ details, choose delivery mode, publish metadata. Explain the public-URL sharing
 limitation at that choice. Metadata publication and the product's code releases
 remain separate operations.
 
+## Metadata and HTTP profile
+
+Management routes use `/api/management/v1/releases`, the ordinary explicit
+application/environment query scope, and `releases:read` or `releases:write`
+permissions. Dashboard routes use the same services after workspace RBAC and
+CSRF checks. All mutations use the service's existing idempotency key and replay
+contract. A metadata publication in a local fixture does not authorize deploying
+or releasing Orbit itself.
+
+- `POST /releases` creates a draft from `channel`, `version`, `notes` and
+  `idempotency_key`. `GET /releases` lists bounded, cursor-paginated releases
+  within the scope, optionally filtered by channel; `GET /releases/{id}` reads
+  one. Default page size is 50, maximum 100.
+- `PATCH /releases/{id}` changes draft metadata. Artifact create/update/delete
+  uses `/releases/{id}/artifacts` and `/releases/{id}/artifacts/{artifact_id}`.
+  Only drafts that have never been published are editable.
+- `POST /releases/{id}/publish` publishes a complete draft with at least one
+  artifact. Allocate its increasing `release_number` atomically on first
+  publication, scoped to application/environment/channel. A draft has no number.
+  `POST /releases/{id}/unpublish` stops discovery and new authorization. Repeating
+  either action is a no-op; republishing preserves its original number and bytes.
+
+Channel, platform and architecture are 1–32 ASCII lowercase letters, digits,
+`_` or `-`, beginning with a letter. Display versions are nonempty plain text
+of at most 64 UTF-8 bytes. Notes are plain text of at most 8192 UTF-8 bytes and
+must be rendered as text, not executable markup. Bound each release to 32
+artifacts and require unique platform/architecture pairs. Standard desktop
+platform names are `windows`, `macos` and `linux`; standard architectures include
+`x64`, `arm64`, `x86` and `armv7`. Embedded boards may use their own explicit
+target names under the same grammar.
+
+Artifact input contains `platform`, `architecture`, `filename`, `byte_length`,
+`sha256`, `delivery_mode`, `url` and `required_feature`. The latter is null or a
+valid entitlement name. Delivery modes are `public` and `protected`. Require the
+byte-length and digest bounds from the ticket profile. The URL is at most 2048
+ASCII characters and obeys the delivery-mode rules above. The filename is a
+nonempty basename of at most 255 UTF-8 bytes, without slash, backslash or control
+characters, and is neither `.` nor `..`. It is display metadata; it must not
+choose a local destination path implicitly. The service creates artifact IDs.
+
+An artifact result adds `id` and `release_id`. A release result contains `id`,
+`channel`, `version`, `notes`, nullable `release_number`, `state` (`draft`,
+`published` or `unpublished`), `created_at`, nullable `published_at`, and its
+artifact list. Identifiers use the service's opaque-ID grammar. Number values are
+positive integers no greater than `2^53-1`; timestamps use RFC3339 UTC. Once first
+published, metadata and artifact definitions are immutable, including URLs.
+Change them by publishing a new release. Unpublishing does not downgrade software
+already installed, and discovery never silently returns a lower release number.
+
+Installed routes use the prefix
+`/api/client/v1/activations/{activation_id}` and `POST` bodies with the ordinary
+activation proof (`application_id`, `environment_id`, `credential`,
+`installation_id`, `fingerprint`, `fingerprint_provider`):
+
+- `/updates` additionally takes `channel`, `platform`, `architecture` and
+  `installed_release_number` (zero through `2^53-1`). It returns
+  `{"release": null, "artifact": null}` when no eligible update exists, or
+  the matching published release and exact target artifact. At most one artifact
+  is selected. Filter by licence/feature eligibility before choosing the newest
+  release; another target is never a fallback.
+- `/downloads/authorize` additionally takes `release_id` and `artifact_id`.
+  It returns `artifact`, `ticket` and `expires_at`. Public delivery has null
+  ticket and expiry. Protected delivery contains the short ticket and its
+  RFC3339 expiry. The artifact's configured URL is the initial destination.
+
+Both operations authenticate the current activation proof and licence each time.
+They do not acquire a floating seat, extend an offline file or consume a usage
+unit implicitly. Scope admission/rate limiting occurs before database work,
+using ordinary client capacity, not the separate validation capacity. Responses
+are `Cache-Control: no-store`; delivery URLs and tickets are omitted from logs.
+
+Trusted backends use `GET /api/management/v1/licences/{id}/updates` with those
+target/filter parameters, and `POST .../licences/{id}/downloads/authorize` with
+the release/artifact IDs. Both require scoped `licences:read` and `releases:read`.
+They apply the same current eligibility rules; management authorization does not
+make a revoked licence eligible. There is no unauthenticated release directory
+or app-key-only URL disclosure endpoint.
+
+SDK update checks take the installed release number, default channel `stable`,
+and optional explicit target. Desktop SDKs may default to their actual runtime
+OS/architecture using the standard names; an unknown target requires explicit
+configuration. Embedded callers supply the board target. Return typed optional
+update metadata. Download authorization is separate from downloading bytes.
+Streaming requires a caller-chosen destination and maximum size, allows at most
+five HTTPS redirects, and forwards no Orbit bearer on any redirect, including
+one to the same origin. Do not use ambient cookies or caller-global credentials.
+
+Store only metadata in Orbit. Use scoped indexes for release discovery and
+artifact lookup, and serialize publication numbering within its own channel.
+Include metadata/numbering in scoped recovery, export, app purge and reset
+inventory. Restoring a release must preserve its immutable number and target
+definitions or fail. Application deletion removes release metadata while leaving
+the seller's external storage untouched. No cleanup job contacts that storage.
+
 ## Acceptance
 
 Cover cross-application/environment/target isolation, licence and feature denial,
