@@ -90,7 +90,7 @@ struct ParsedToken {
     std::vector<unsigned char> signature;
 };
 
-ParsedToken parse_token(std::string_view token) {
+ParsedToken parse_token(std::string_view token, std::string_view purpose = "orbit-access+jwt") {
     if (token.empty() || token.size() > 16384) invalid();
     const auto first = token.find('.');
     if (first == std::string_view::npos) invalid();
@@ -107,7 +107,7 @@ ParsedToken parse_token(std::string_view token) {
     const auto alg = string_value(required(header, "alg"));
     const auto typ = string_value(required(header, "typ"));
     const auto kid = string_value(required(header, "kid"));
-    if (alg != "ES256" || typ != "orbit-access+jwt" || kid.empty() || kid.size() > 128 ||
+    if (alg != "ES256" || typ != purpose || kid.empty() || kid.size() > 128 ||
         std::any_of(kid.begin(), kid.end(), [](unsigned char c) { return c > 0x7f; })) invalid();
     return {token.substr(0, second), kid, parse_json(claims_text, 32768), std::move(signature)};
 }
@@ -254,6 +254,13 @@ Json::Value GrantKeys::jwks_for(std::string_view token) const {
     result["keys"] = Json::Value(Json::arrayValue);
     result["keys"].append(found->second);
     return result;
+}
+
+GrantKeys::SignedOfflinePayload GrantKeys::verify_offline_signature(std::string_view token) const {
+    auto parsed = parse_token(token, "orbit-offline+jwt");
+    const auto key = keys_.find(parsed.kid);
+    if (key == keys_.end() || !verify_signature(key->second.get(), parsed.signing_input, parsed.signature)) invalid();
+    return {std::move(parsed.kid), std::move(parsed.claims)};
 }
 
 GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expected) const {

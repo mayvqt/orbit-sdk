@@ -92,6 +92,18 @@ before claiming native macOS validation. The suspend check waits for Enter after
 resuming from at least two seconds of sleep and compares `mach_continuous_time`
 with the awake-only `mach_absolute_time` counter.
 
+## Long-term offline-file verification
+
+The internal offline verifier consumes all 104 shared signed-file cases and
+checks the same canonical renewal digest as Python and C#. It uses the existing
+P-256 signature implementation with a separate token purpose, trusted key prefix,
+strict claims, binding, expiry and sequence rules. `orbit_offline_tests` runs
+with the ordinary CTest suite, including exact JWKS size and duplicate-key checks.
+
+Installed import, renewal and durable restart integration are still pending.
+Passing the verifier corpus does not establish restored offline access; see the
+[offline contract](../../contracts/sdk/offline.md).
+
 ## Warm access benchmark
 
 Configure and build the opt-in Release benchmark with installed dependencies,

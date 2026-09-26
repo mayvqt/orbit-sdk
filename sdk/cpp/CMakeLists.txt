@@ -41,6 +41,7 @@ set(ORBIT_SDK_SOURCES
     src/grants.cpp
     src/installed_storage.cpp
     src/json.cpp
+    src/offline.cpp
     src/persistent_codec.cpp
     src/platform.cpp
     src/persistent_client.cpp
@@ -123,6 +124,19 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         target_compile_options(orbit_sdk_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME orbit_sdk_tests COMMAND orbit_sdk_tests)
+
+    add_executable(orbit_offline_tests tests/offline_test.cpp)
+    target_include_directories(orbit_offline_tests PRIVATE include src)
+    target_compile_features(orbit_offline_tests PRIVATE cxx_std_17)
+    target_link_libraries(orbit_offline_tests PRIVATE Orbit::Sdk)
+    target_compile_definitions(orbit_offline_tests PRIVATE
+        ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json")
+    if(MSVC)
+        target_compile_options(orbit_offline_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_offline_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME orbit_offline_tests COMMAND orbit_offline_tests)
 
     add_executable(orbit_platform_tests tests/platform_test.cpp)
     target_include_directories(orbit_platform_tests PRIVATE include src)

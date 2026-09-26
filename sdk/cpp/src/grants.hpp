@@ -59,6 +59,11 @@ public:
     Json::Value jwks_for(std::string_view token) const;
     GrantClaims verify(std::string_view token, const GrantExpected& expected) const;
 
+    struct SignedOfflinePayload { std::string key_id; Json::Value claims; };
+    // Signature/purpose validation only. OfflineKeys owns the full offline
+    // claim, binding, lifetime and renewal-sequence checks.
+    SignedOfflinePayload verify_offline_signature(std::string_view token) const;
+
 private:
     std::map<std::string, std::shared_ptr<EVP_PKEY>> keys_;
     std::map<std::string, Json::Value> public_keys_;

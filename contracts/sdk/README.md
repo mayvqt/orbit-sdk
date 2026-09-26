@@ -37,8 +37,8 @@ trusted rotation. These files
 are distinct from short-lived connected access grants. `expected` contains the
 app key, installation, optional binding, verification time and minimum accepted
 renewal sequence; per-case overrides and replacement trusted `jwks` work like the
-connected corpus. Python and C# verifiers consume the corpus. Python's installed
-import, renewal and restart behavior is covered separately; C# lifecycle
+connected corpus. Python, C# and C++ verifiers consume the corpus. Python's installed
+import, renewal and restart behavior is covered separately; C#/C++ lifecycle
 integration, other SDK consumers and the server issuance workflow are still
 being implemented.
 
