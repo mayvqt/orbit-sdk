@@ -46,6 +46,12 @@ durable renewal or reboot behavior is complete. Those require the behavioral
 checks in the contract. The configured keys are trusted inputs; no case authorizes
 discovering a key from the file being verified.
 
+## Licensed downloads
+
+The pending seller-hosted delivery feature is defined in
+[downloads.md](downloads.md). Its contract does not imply that release discovery,
+download authorization or SDK helpers are implemented.
+
 ## App keys
 
 [app-keys.json](app-keys.json) fixes how every SDK parses the public app key
