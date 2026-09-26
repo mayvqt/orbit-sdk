@@ -14,6 +14,18 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- con
 The shared corpus checks valid grants and rejects incorrect signatures, claims,
 bindings and expiry values. Keep the SDK and corpus from the same download.
 
+## Long-term offline-file verification
+
+```sh
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --offline-vectors contracts/sdk/offline-files.json
+```
+
+All 104 shared cases exercise the separate offline purpose, keys, scope, binding,
+expiry and sequence floor. Additional checks compare the canonical claim digest
+with Python, reorder signed JSON fields, and enforce immutable entitlements and
+bounded strict keys. This is verifier coverage; installed import, renewal and
+restart integration are still pending and need their own lifecycle checks.
+
 ## Security and lifecycle
 
 ```sh

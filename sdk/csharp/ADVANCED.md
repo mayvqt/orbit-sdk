@@ -92,6 +92,14 @@ The lower-level SDK constructor and storage adapters remain internal for SDK
 fixtures. Application code should use the app-key entry point and the built-in
 installed storage.
 
+## Long-term offline files
+
+The separate offline-file verifier now consumes the 104 shared security cases.
+The C# installed import, renewal and durable restart workflow is still being
+implemented; ordinary cached access grants are not long-term licence files.
+See the [offline contract](../../contracts/sdk/offline.md) and
+[verifier checks](tests/README.md#long-term-offline-file-verification).
+
 ## Customer accounts and backend identity
 
 `RegisterAsync`, `ResendRegistrationAsync`, password recovery and email-change
