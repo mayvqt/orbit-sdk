@@ -35,7 +35,8 @@ from .errors import (
 from .grants import Expected, Keys, valid_entitlements, verify
 from .jsonutil import fields, strict_int, text, unique_json
 from .storage import MemoryStorage, StoredCredential, WindowsStorage, SecretServiceStorage, valid_credential
-from .persistent_storage import AccessState, InstallationStorage, PendingActivation, canonical_scope
+from .persistent_storage import AccessState, InstallationStorage, OfflineState, PendingActivation, canonical_scope
+from .offline import Expected as OfflineExpected, OfflineFile, OfflineKeys, OfflineRequest, request as offline_request, verify as verify_offline_file
 from .transport import CLIENT_PREFIX, JWKS_PATH, Transport, _safe_origin
 
 
@@ -368,7 +369,7 @@ class _AccountSession:
 class Client:
     """Synchronous Orbit client. Use ``with Client.open(app_key) as orbit: ...``."""
 
-    def __init__(self, config: _Config, transport: Any, storage: Any, *, persistent: bool = False) -> None:
+    def __init__(self, config: _Config, transport: Any, storage: Any, *, persistent: bool = False, app_key: AppKey | None = None, offline_keys: OfflineKeys | None = None) -> None:
         self.config = config
         self.transport = transport
         self._storage = storage
@@ -395,13 +396,21 @@ class Client:
         self._keys: Keys | None = None
         self._keys_lock = threading.Lock()
         self._persisted_access: AccessState | None = None
+        self._app_key = app_key
+        self._offline_keys = offline_keys
+        self._offline_file: OfflineFile | None = None
+        self._offline_state: OfflineState | None = None
         self._lifecycle_condition = threading.Condition()
         self._lifecycle_stop = threading.Event()
         self._lifecycle_thread: threading.Thread | None = None
         self._close_deferred = False
         self._last_checkpoint_elapsed = elapsed_ns() if self._persistent else 0
         if self._persistent_storage is not None:
-            self._restore_cached_access()
+            self._offline_state = self._persistent_storage.offline
+            if self._offline_state is not None and self._offline_state.jws is not None:
+                self._restore_offline_file()
+            else:
+                self._restore_cached_access()
 
     @staticmethod
     def _device(config: _Config) -> _Device:
@@ -419,6 +428,7 @@ class Client:
         state_path: str | os.PathLike[str] | None = None,
         device_binding: DeviceBinding | None = None,
         machine_binding: bool = True,
+        offline_keys: Mapping[str, Any] | str | bytes | None = None,
     ) -> Client:
         """Open a stable installation with private credential and grant storage.
 
@@ -430,6 +440,7 @@ class Client:
         ``DeviceBinding`` when the host supplies a stable custom identity.
         """
         parsed = _parse_app_key(app_key)
+        trusted_offline_keys = None if offline_keys is None else OfflineKeys.parse(offline_keys, parsed.environment)
         binding = _resolve_binding(parsed, device_binding, machine_binding)
         scope = _AppScope(
             api_origin=parsed.api_origin,
@@ -439,7 +450,7 @@ class Client:
             fingerprint=None if binding is None else binding.fingerprint,
             fingerprint_provider=None if binding is None else binding.provider,
         )
-        return cls._open_app(scope, state_path, transport=None, start_worker=True)
+        return cls._open_app(scope, state_path, transport=None, start_worker=True, app_key=parsed, offline_keys=trusted_offline_keys)
 
     @classmethod
     def open_with_storage(
@@ -501,6 +512,8 @@ class Client:
         *,
         transport: Any | None,
         start_worker: bool,
+        app_key: AppKey | None = None,
+        offline_keys: OfflineKeys | None = None,
     ) -> Client:
         if not isinstance(app_scope, _AppScope):
             raise TypeError("app scope must be an internal _AppScope")
@@ -520,8 +533,8 @@ class Client:
                 fingerprint_provider=app_scope.fingerprint_provider or "",
             )
             _validate_config(config)
-            client = cls(config, live_transport, storage, persistent=True)
-            if storage.pending_activation is None:
+            client = cls(config, live_transport, storage, persistent=True, app_key=app_key, offline_keys=offline_keys)
+            if storage.pending_activation is None and not client._offline_mode():
                 try:
                     client._refresh(None, respect_retry=False)
                 except OrbitError as exc:
@@ -543,6 +556,82 @@ class Client:
         """Private deterministic dependency injection for the SDK test suite."""
         _validate_config(config)
         return cls(config, transport, storage if storage is not None else MemoryStorage())
+
+    def _offline_mode(self) -> bool:
+        return self._offline_state is not None and self._offline_state.jws is not None
+
+    def _offline_expected(self, now: int, sequence: int) -> OfflineExpected:
+        if self._app_key is None:
+            raise error(CONFIGURATION, "offline_requires_installed_client")
+        return OfflineExpected(
+            self._app_key, self.config.installation_id, now,
+            self.config.fingerprint or None, self.config.fingerprint_provider or None, sequence,
+        )
+
+    def _restore_offline_file(self) -> None:
+        state = self._offline_state
+        assert state is not None and state.jws is not None
+        if self._offline_keys is None:
+            raise error(CONFIGURATION, "offline_keys_required")
+        verified = verify_offline_file(state.jws, self._offline_keys, self._offline_expected(state.verified_at, state.sequence))
+        if (verified.sequence, verified.issuance_id, verified.content_digest) != (state.sequence, state.issuance_id, state.content_digest):
+            raise error(STORAGE, "storage_failed")
+        self._offline_file = verified
+        start = Start.capture()
+        if start.wall + 30 < state.wall_high_water:
+            # Preserve the renewal floor and allow a deliberate new import after
+            # the clock is corrected. No authority is restored with uncertain time.
+            return
+        self._anchor = Anchor(max(start.wall, state.time_high_water), start)
+
+    def offline_request(self) -> OfflineRequest:
+        """Export public setup for this installation; this grants no access."""
+        with self._operation():
+            self._sync_storage()
+            if self._persistent_storage is None or self._app_key is None:
+                raise error(CONFIGURATION, "offline_requires_installed_client")
+            return offline_request(self._app_key, self.config.installation_id, self.config.fingerprint or None, self.config.fingerprint_provider or None)
+
+    def import_offline_file(self, file: str | bytes, *, cancellation: Cancellation | None = None) -> Snapshot:
+        """Verify and durably import a file with the application's trusted keys."""
+        with self._operation(cancellation) as cancel:
+            if self._persistent_storage is None or self._app_key is None:
+                raise error(CONFIGURATION, "offline_requires_installed_client")
+            if self._offline_keys is None:
+                raise error(CONFIGURATION, "offline_keys_required")
+            generation = self._generation_now()
+            self._acquire_serial(generation, cancel)
+            try:
+                with self._state_lock:
+                    self._check_generation(generation)
+                    previous = self._persistent_storage.offline
+                    start = Start.capture()
+                    if previous is not None and start.wall + 30 < previous.wall_high_water:
+                        raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+                    now = max(start.wall, previous.time_high_water if previous else 0)
+                    if self._anchor is not None:
+                        now = max(now, self._anchor.now())
+                    verified = verify_offline_file(file, self._offline_keys, self._offline_expected(now, previous.sequence if previous else 1))
+                    trusted_now = max(now, verified.issued_at)
+                    saved = OfflineState(
+                        verified.token, verified.sequence, verified.issuance_id, verified.content_digest,
+                        now, trusted_now, max(start.wall, previous.wall_high_water if previous else 0),
+                    )
+                    _check_cancel(cancel)
+                    try:
+                        version = self._persistent_storage.save_offline(self._storage_version, saved)
+                    except OrbitError as exc:
+                        if exc.kind == STORAGE:
+                            self._clear_all_locked()
+                        raise
+                    self._clear_all_locked()
+                    self._storage_version = version
+                    self._offline_state, self._offline_file = saved, verified
+                    self._anchor = Anchor(trusted_now, start)
+                    self._last_checkpoint_elapsed = start.elapsed
+                    return _to_snapshot(self._snapshot_locked(trusted_now))
+            finally:
+                self._serial.release()
 
     def _restore_cached_access(self) -> None:
         assert self._persistent_storage is not None
@@ -606,6 +695,26 @@ class Client:
         if not force and elapsed - self._last_checkpoint_elapsed < 60_000_000_000:
             return
         with self._state_lock:
+            if self._offline_mode():
+                state, anchor = self._offline_state, self._anchor
+                if state is None or anchor is None:
+                    self._last_checkpoint_elapsed = elapsed
+                    return
+                try:
+                    checkpoint = replace(state, time_high_water=max(state.time_high_water, anchor.now()), wall_high_water=max(state.wall_high_water, wall_seconds()))
+                    self._persistent_storage.checkpoint_offline(checkpoint)
+                    self._offline_state = checkpoint
+                except OrbitError as exc:
+                    if exc.kind == STORAGE:
+                        self._clear_all_locked()
+                        raise
+                    if exc.kind != CLOCK_UNCERTAIN:
+                        self._clear_all_locked()
+                        raise
+                    # Keep the continuous-clock evidence. A later import must
+                    # not restart time from an older wall clock/checkpoint.
+                self._last_checkpoint_elapsed = elapsed
+                return
             access, anchor = self._persisted_access, self._anchor
             if access is None or anchor is None or self._claims is None:
                 self._last_checkpoint_elapsed = elapsed
@@ -654,7 +763,7 @@ class Client:
                         self._checkpoint_persistent_cache()
                         snapshot = self._snapshot()
                         pending_activation = self._persistent_storage is not None and self._persistent_storage.pending_activation is not None
-                        needs_refresh = not pending_activation and snapshot["access"] in ("refresh_required", "expired", "offline")
+                        needs_refresh = not pending_activation and not snapshot.get("offline_file_mode", False) and snapshot["access"] in ("refresh_required", "expired", "offline")
                         with self._state_lock:
                             if needs_refresh and self._anchor is not None and self._claims is not None:
                                 try:
@@ -743,6 +852,8 @@ class Client:
         self._claims = None
         self._anchor = None
         self._persisted_access = None
+        self._offline_file = None
+        self._offline_state = None
         self._transient = False
         self._retry_deadline = None
 
@@ -752,6 +863,8 @@ class Client:
 
     def _invalidate(self, *, clear_account: bool = True, preserve_pending: bool = False) -> int:
         with self._state_lock:
+            if self._offline_mode():
+                self._checkpoint_persistent_cache(force=True)
             if clear_account:
                 self._clear_all_locked()
             else:
@@ -800,6 +913,8 @@ class Client:
                 try:
                     now = self._anchor.now()
                 except OrbitError:
+                    if self._offline_mode():
+                        return self._snapshot_locked()
                     self._claims = None
                     self._anchor = None
                     self._generation += 1
@@ -823,6 +938,25 @@ class Client:
             "offline_allowed": False,
             "remaining_offline_seconds": 0,
         }
+        if self._offline_mode():
+            result["offline_file_mode"] = True
+            result["reauthentication_required"] = False
+            result["offline_allowed"] = True
+            if self._offline_file is not None:
+                result["expires_at"] = self._offline_file.expires_at
+            if self._offline_file is None or self._anchor is None:
+                return result
+            if now is None:
+                try:
+                    now = self._anchor.now()
+                except OrbitError:
+                    return result
+            remaining = self._offline_file.expires_at - now
+            result["access"] = "offline" if remaining > 0 else "expired"
+            if remaining > 0:
+                result["entitlements"] = dict(self._offline_file.entitlements)
+                result["remaining_offline_seconds"] = remaining
+            return result
         if self._claims is None or self._anchor is None:
             return result
         if now is None:
@@ -927,20 +1061,22 @@ class Client:
                 with self._state_lock:
                     if self._generation != original:
                         raise error(STALE_RESPONSE, "stale_response")
-                    version = self._persistent_storage.begin_activation(
-                        self._storage_version,
-                        pending,
-                        preserve_credential=bool(previous),
-                    )
-                    self._generation += 1
+                    if self._offline_mode():
+                        self._checkpoint_persistent_cache(force=True)
+                    try:
+                        version = self._persistent_storage.begin_activation(
+                            self._storage_version,
+                            pending,
+                            preserve_credential=bool(previous),
+                        )
+                    except OrbitError as exc:
+                        if exc.kind == STORAGE:
+                            self._clear_all_locked()
+                        raise
+                    self._clear_access_locked()
                     generation = self._generation
                     self._storage_version = version
                     self._credential = saved_before if previous else None
-                    self._claims = None
-                    self._anchor = None
-                    self._persisted_access = None
-                    self._transient = False
-                    self._retry_deadline = None
                     if principal == "key":
                         self._account = None
             else:
@@ -1219,6 +1355,15 @@ class Client:
     def require_access(self, feature: str, *, cancellation: Cancellation | None = None) -> Snapshot:
         with self._operation(cancellation) as cancel:
             snapshot = self._snapshot()
+            if snapshot.get("offline_file_mode", False):
+                _check_cancel(cancel)
+                if snapshot["access"] == "expired":
+                    raise error(DENIED, "offline_file_expired")
+                if snapshot["access"] != "offline":
+                    raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+                if not snapshot["entitlements"].get(feature, False):
+                    raise FeatureUnavailableError()
+                return _to_snapshot(snapshot)
             if snapshot["access"] in ("refresh_required", "expired", "offline"):
                 try:
                     self._refresh(cancel, respect_retry=True)

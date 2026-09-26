@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import hashlib
 import json
 from types import MappingProxyType
@@ -27,6 +28,30 @@ _REQUIRED = frozenset((
     "environment_id", "activation_id", "installation_id", "sequence", "binding_mode",
     "policy_version", "entitlements",
 ))
+
+
+@dataclass(frozen=True, repr=False)
+class OfflineRequest:
+    app_key: str
+    installation_id: str
+    fingerprint: str | None
+    fingerprint_provider: str | None
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "format": "orbit-offline-request", "version": 1, "app_key": self.app_key,
+            "installation_id": self.installation_id, "fingerprint": self.fingerprint,
+            "fingerprint_provider": self.fingerprint_provider,
+        }, separators=(",", ":"))
+
+    def __repr__(self) -> str:
+        return "OfflineRequest(<redacted>)"
+
+
+def request(key: AppKey, installation_id: str, fingerprint: str | None, provider: str | None) -> OfflineRequest:
+    origin = base64.urlsafe_b64encode(key.api_origin.encode("utf-8")).rstrip(b"=").decode("ascii")
+    app_key = f"orbit_app_{key.environment}_{origin}.{key.application_id}.{key.environment_id}"
+    return OfflineRequest(app_key, installation_id, fingerprint, provider)
 
 
 def _invalid() -> None:

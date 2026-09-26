@@ -69,6 +69,10 @@ asks Orbit to revoke the remote customer session.
 
 ## Advanced integration
 
+[Offline licence files](advanced.md#offline-licence-files) support installations
+that cannot contact Orbit. This candidate includes local file verification and
+durable import; the server issuance workflow is still being implemented.
+
 [Advanced APIs and storage](advanced.md) cover registration, cancellation,
 custom machine identities, manual storage and recovery.
 [Run the console example](../../examples/python/README.md) for a complete app.

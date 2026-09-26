@@ -17,6 +17,7 @@ from .client import (
 )
 from .device import installation_id_new, machine_fingerprint, native_fingerprint
 from .errors import FeatureUnavailableError, NotActivatedError, OrbitError
+from .offline import OfflineRequest
 
 __all__ = [
     "AccessStatus",
@@ -28,6 +29,7 @@ __all__ = [
     "FeatureUnavailableError",
     "NotActivatedError",
     "OrbitError",
+    "OfflineRequest",
     "OwnedLicence",
     "OwnedLicencePage",
     "PendingRegistration",

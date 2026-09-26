@@ -9,7 +9,8 @@ Start with [the quickstart](README.md) for normal installed applications.
 `logout`, `register`, `resend_registration`, `login`, `account`,
 `owned_licences`, `claim_licence`, `activate_account`,
 `activate_account_previous`, `logout_account`, `request_email_change`,
-`request_password_recovery`, and `customer_session_authorization`. Network methods accept an optional
+`request_password_recovery`, `customer_session_authorization`, `offline_request`,
+and `import_offline_file`. Network methods accept an optional
 `cancellation=Cancellation.create()` keyword argument. Calls may run
 concurrently; activation, refresh, login, and session-authenticated account
 operations serialize when they change or depend on client state. Closing a
@@ -102,6 +103,70 @@ to Orbit. If the current identity differs from the one saved with the
 installation, the SDK discards its saved credential and signed grant and
 creates a fresh installation ID. The new machine must activate within the
 licence's device limit before it can restore access.
+
+## Offline licence files
+
+The candidate implements local request export, verification and durable import.
+Server issuance and the dashboard workflow are still pending; this is not yet a
+complete customer workflow. The wire format and issuance rules are defined in
+the [offline-file contract](../../contracts/sdk/offline.md).
+
+Supply an offline-purpose JWKS from your application's trusted bundle through
+`offline_keys`. Never take verification keys from the licence file or an
+untrusted upload. On the disconnected machine, export its public request:
+
+```python
+import os
+from pathlib import Path
+
+from orbit_sdk import Client
+
+trusted_keys = Path("orbit-offline-keys.json").read_bytes()
+with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbit:
+    Path("installation-request.json").write_text(
+        orbit.offline_request().to_json(), encoding="utf-8"
+    )
+```
+
+The request contains public configuration and the installation identity; it is
+not proof of ownership or authority. Transfer it to the seller's authenticated
+issuance workflow. When you receive the signed file, import it on that same
+installation:
+
+```python
+import os
+from pathlib import Path
+
+from orbit_sdk import Client
+
+trusted_keys = Path("orbit-offline-keys.json").read_bytes()
+with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbit:
+    orbit.import_offline_file(Path("licence.orbit").read_bytes())
+    orbit.require_access("export")
+    # Perform the protected export here.
+```
+
+Subsequent starts only need `open(..., offline_keys=...)` and `require_access()`;
+the signed file is saved in private installation storage. Valid offline access
+makes no HTTP requests, including background validation. The normal snapshot
+reports `AccessStatus.OFFLINE` and its absolute expiry. Missing features and
+expired files fail without prompting for an online key. Renew by importing a
+newer file; re-importing a still-valid file does not extend its term.
+
+Explicit online activation changes back to connected access. Logout removes local
+access. Both preserve renewal and clock high-water values, so an older file cannot
+undo a newer renewal. A failed online activation does not restore the previous
+offline authority. Storage failures deny access; uncertain clocks must be corrected
+before access can resume. Each restart verifies against your configured trusted
+keys, so distribute new keys through a trusted application/configuration update
+before using files signed by them.
+
+An offline machine cannot learn about a later server-side revocation until it
+reconnects or imports updated authority. Someone controlling the whole machine
+can restore old files and clocks or patch the program. Private storage, renewal
+sequences and fixed signed expiry do not promise protection against a complete
+machine snapshot rollback. Native Windows/macOS offline runtime checks remain
+pending; Linux behavior and shared signed vectors are covered by the suite.
 
 ## macOS platform checks
 
