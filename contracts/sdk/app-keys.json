@@ -1,0 +1,160 @@
+{
+  "format_version": 1,
+  "cases": [
+    {
+      "name": "hosted test key",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": true,
+      "api_origin": "https://orbit.mayvie.dev",
+      "issuer": "https://orbit.mayvie.dev",
+      "application_id": "Q2lK7xY3bR9mT0pW4vN8sA",
+      "environment_id": "Zx8_c-1dKpL5qR2tU6wY0g",
+      "environment": "test"
+    },
+    {
+      "name": "live key with port",
+      "key": "orbit_app_live_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Q6ODQ0Mw.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": true,
+      "api_origin": "https://orbit.example.test:8443",
+      "issuer": "https://orbit.example.test:8443",
+      "application_id": "Q2lK7xY3bR9mT0pW4vN8sA",
+      "environment_id": "Zx8_c-1dKpL5qR2tU6wY0g",
+      "environment": "live"
+    },
+    {
+      "name": "surrounding whitespace is trimmed",
+      "key": "  orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g\n",
+      "valid": true,
+      "api_origin": "https://orbit.mayvie.dev",
+      "issuer": "https://orbit.mayvie.dev",
+      "application_id": "Q2lK7xY3bR9mT0pW4vN8sA",
+      "environment_id": "Zx8_c-1dKpL5qR2tU6wY0g",
+      "environment": "test"
+    },
+    {
+      "name": "maximum length ids",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "valid": true,
+      "api_origin": "https://orbit.mayvie.dev",
+      "issuer": "https://orbit.mayvie.dev",
+      "application_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "environment_id": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "environment": "test"
+    },
+    {
+      "name": "empty",
+      "key": "",
+      "valid": false
+    },
+    {
+      "name": "unknown environment",
+      "key": "orbit_app_prod_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "uppercase prefix",
+      "key": "ORBIT_APP_TEST_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "missing prefix",
+      "key": "aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "licence key prefix",
+      "key": "orb_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "old unversioned prefix",
+      "key": "orbit_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "two parts",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA",
+      "valid": false
+    },
+    {
+      "name": "four parts",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g.extra",
+      "valid": false
+    },
+    {
+      "name": "empty application id",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2..Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "empty environment id",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.",
+      "valid": false
+    },
+    {
+      "name": "padded base64",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2MQ==.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "standard base64 alphabet",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3QvPz4.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "origin not utf-8",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC7_LmRldg.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "http origin",
+      "key": "orbit_app_test_aHR0cDovL29yYml0LmV4YW1wbGUudGVzdA.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "origin with path",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3QvYXBp.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "origin with trailing slash",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Qv.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "origin with credentials",
+      "key": "orbit_app_test_aHR0cHM6Ly91c2VyOnBhc3NAb3JiaXQuZXhhbXBsZS50ZXN0.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "origin with query",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Q_eD0x.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "application id with space",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.bad id.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "application id too long",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "environment id with plus",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.a+b",
+      "valid": false
+    },
+    {
+      "name": "internal whitespace",
+      "key": "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2 .Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    },
+    {
+      "name": "oversized key",
+      "key": "orbit_app_test_aHR0cHM6Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhLmV4YW1wbGUudGVzdA.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+      "valid": false
+    }
+  ]
+}

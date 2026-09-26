@@ -25,3 +25,20 @@ when testing an unpacked SDK outside the source tree.
 This covers grant acceptance. Transport, account/device concurrency, offline
 state transitions and native suspend behavior need separate integration and
 platform checks.
+
+## App keys
+
+[app-keys.json](app-keys.json) fixes how every SDK parses the public app key
+shown on Orbit's **Integration** page. An app key is not a secret; it only
+names the API origin, application and environment:
+
+```text
+orbit_app_{test|live}_{base64url(api_origin)}.{application_id}.{environment_id}
+```
+
+Parsing trims surrounding whitespace, then requires at most 512 characters,
+the exact lowercase `orbit_app_test_` or `orbit_app_live_` prefix (secret
+licence keys start with `orb_`) and exactly three `.`-separated parts. The origin uses the unpadded URL-safe base64 alphabet and
+must decode to UTF-8 that passes the SDK's ordinary HTTPS origin rules. Both IDs
+are 1–128 ASCII letters, digits, `_` or `-`. The grant issuer is the API origin.
+Any other input is a configuration error. Valid cases list the parsed values.
