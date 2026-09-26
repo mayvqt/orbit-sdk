@@ -5,7 +5,7 @@ These Orbit-authored shared SDK fixtures are available under the
 
 [grants.json](grants.json) contains fixed ES256 tokens signed with the existing
 synthetic key in `sdk/rust/tests/fixtures`. This is public test material, never a
-production signing key. Twelve valid and 89 invalid cases cover scope, claim types,
+production signing key. Twelve valid and 92 invalid cases cover scope, claim types,
 time/lifetime limits, negotiated refresh timing, binding, duplicate fields, boolean entitlements, JOSE headers,
 signature/encoding rejection and bounded trusted JWKS handling.
 
@@ -15,6 +15,8 @@ the trusted verification context; a case's optional `expected` object overrides
 only those fields. A case's optional `jwks` replaces the whole trusted key set.
 `valid` is the expected result of key parsing followed by grant verification.
 Malformed input must return rejection without crashing or accepting access.
+For `binding_mode=none`, fingerprint claims must be absent; explicit JSON null
+values are rejected as well as populated fingerprint claims.
 
 The corpus uses format version 1. Its tokens were generated with the workstation's
 existing Python cryptography ECDSA implementation and the checked-in synthetic

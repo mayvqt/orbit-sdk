@@ -154,8 +154,13 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
     public = keys._entries.get(header["kid"])
     if public is None:
         _invalid()
+    raw_claims = unique_json(payload)
+    if isinstance(raw_claims, dict) and raw_claims.get("binding_mode") == "none" and (
+        "fingerprint" in raw_claims or "fingerprint_provider" in raw_claims
+    ):
+        _invalid()
     claims = fields(
-        unique_json(payload),
+        raw_claims,
         _CLAIM_TYPES,
         optional=("fingerprint", "fingerprint_provider", "licence_expires_at"),
     )
