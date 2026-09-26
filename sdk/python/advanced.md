@@ -168,6 +168,45 @@ sequences and fixed signed expiry do not promise protection against a complete
 machine snapshot rollback. Native Windows/macOS offline runtime checks remain
 pending; Linux behavior and shared signed vectors are covered by the suite.
 
+## Seller download-ticket verification
+
+`DownloadTicketVerifier` is the first part of the seller-hosted download feature.
+Release discovery, server ticket issuance and the installed streaming helper are
+still pending. The verifier performs no network requests and needs only public
+Orbit keys. Configure the endpoint and app key on your backend; do not derive
+them from an incoming token or an untrusted `Host` header.
+
+```python
+from orbit_sdk import DownloadTicketVerifier
+
+
+def authorize_artifact(app_key, endpoint, public_jwks, bearer_token, artifacts):
+    verifier = DownloadTicketVerifier(app_key, endpoint, public_jwks)
+    ticket = verifier.verify(bearer_token)
+    artifact = artifacts.get(ticket.artifact_id)
+    if artifact is None or (
+        artifact["release_id"] != ticket.release_id
+        or artifact["sha256"] != ticket.sha256
+        or artifact["byte_length"] != ticket.byte_length
+    ):
+        raise PermissionError("Unknown or changed artifact")
+    return artifact
+```
+
+Here `artifacts` is your own trusted registry. Match the verified metadata before
+selecting a file or creating an expiring URL from your storage provider. Never
+turn a ticket's artifact ID directly into a filesystem path. In a running server,
+construct and reuse a verifier with your configured keys; replace it when your
+trusted key set rotates. It validates the exact endpoint audience, Test/Live scope,
+purpose, signature and deadline. Invalid tickets raise `OrbitError` with code
+`invalid_download_ticket`. Returned times are aware UTC `datetime` values.
+
+Read the token from the request's `Authorization: Bearer` header and never log
+it. Your backend should serve the file or return a short-lived storage URL; the
+client must not forward the Orbit bearer to that storage redirect. A ticket is
+replayable until its deadline, at most 120 seconds. A permanent public URL remains
+shareable and cannot provide subsequent licence enforcement.
+
 ## macOS platform checks
 
 The candidate's macOS bindings read `IOPlatformUUID` through IOKit and use

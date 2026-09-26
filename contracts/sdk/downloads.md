@@ -62,6 +62,29 @@ uses only the trusted scoped JWKS endpoint or bundled keys. It never discovers
 a key from the ticket. Allow at most 30 seconds of issuance skew and no expiry
 grace.
 
+The exact header fields are `alg`, `typ` and `kid`. Connected-ring key IDs start
+with `test-` or `live-` according to the configured app key, with a nonempty opaque
+suffix; reject offline-purpose or mixed-environment keys. The trusted JWKS has
+only `keys`, contains 1–8 strict public P-256 signing keys, and is at most 16 KiB.
+
+The exact required claims are `ver=1`, `iss`, `aud`, `sub`, `jti`, `iat`, `nbf`,
+`exp`, `application_id`, `environment_id`, `release_id`, `artifact_id`, `sha256`
+and `byte_length`. `sub` is the licence ID. Identifiers are 1–128 ASCII letters,
+digits, `_` or `-`; the SHA-256 value is 64 lowercase hexadecimal characters.
+Byte length is an integer from 1 through `2^53-1`. All timestamps are integers
+from zero through 253402300799, with `nbf=iat` and `iat < exp <= iat+120`.
+Reject boolean/fractional numeric values, explicit nulls, duplicates and unknown
+claims. The compact ticket is ASCII, at most 16 KiB, with canonical unpadded
+base64url segments and a 64-byte ES256 signature; surrounding whitespace is not
+part of a valid HTTP bearer token.
+
+The protected endpoint is a configured, exact HTTPS URL of at most 2048 ASCII
+characters, without credentials, query, fragment, whitespace or backslashes.
+Use percent encoding for non-ASCII path characters. A seller verifier returns
+verified artifact metadata, which the seller matches against its own artifact
+registry before selecting a file or storage object. It must not use an artifact
+ID directly as an unchecked filesystem path or fetch a URL supplied by a ticket.
+
 The installed client sends the ticket only to the configured protected endpoint,
 in an `Authorization: Bearer` header. Do not forward it to a storage redirect or
 another origin. Tickets and authorization responses are not cached or logged.
