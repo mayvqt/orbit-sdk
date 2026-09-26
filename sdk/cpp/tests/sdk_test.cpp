@@ -60,13 +60,74 @@ Corpus load_corpus() {
     std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     auto value = parse_json(bytes, 2 * 1024 * 1024);
     require(value["format_version"].asInt() == 1, "unexpected grant corpus version");
-    require(value["cases"].isArray() && value["cases"].size() == 101, "shared corpus must contain all 101 vectors");
+    require(value["cases"].isArray() && value["cases"].size() == 104, "shared corpus must contain all 104 vectors");
     return {value, value["jwks"], value["expected"]};
+}
+
+Json::Value load_app_key_corpus() {
+    std::ifstream input(ORBIT_APP_KEY_VECTORS_PATH, std::ios::binary);
+    require(input.good(), "could not open shared app-key corpus");
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    auto value = parse_json(bytes, 256 * 1024);
+    require(value["format_version"].asInt() == 1 && value["cases"].isArray(),
+            "unexpected app-key corpus format");
+    return value;
 }
 
 std::string text(const Json::Value& value, const char* name) {
     require(value[name].isString(), std::string("missing string field ") + name);
     return value[name].asString();
+}
+
+std::size_t test_shared_app_key_vectors() {
+    const auto corpus = load_app_key_corpus();
+    std::size_t valid = 0;
+    std::size_t invalid = 0;
+    for (const auto& item : corpus["cases"]) {
+        bool accepted = false;
+        try {
+            const auto parsed = AppKey::parse(text(item, "key"));
+            accepted = true;
+            require(parsed.api_origin() == text(item, "api_origin") &&
+                        parsed.issuer() == text(item, "issuer") &&
+                        parsed.application_id() == text(item, "application_id") &&
+                        parsed.environment_id() == text(item, "environment_id") &&
+                        parsed.environment() == text(item, "environment"),
+                    "app-key vector output mismatch: " + text(item, "name"));
+        } catch (const Error& error) {
+            require(error.kind() == ErrorKind::configuration,
+                    "app-key vector failed with a non-configuration error");
+        }
+        const bool expected = item["valid"].asBool();
+        require(accepted == expected, "app-key vector mismatch: " + text(item, "name"));
+        expected ? ++valid : ++invalid;
+    }
+    require(valid > 0 && invalid > 0, "app-key corpus must exercise valid and invalid cases");
+    return corpus["cases"].size();
+}
+
+void test_fingerprint_options() {
+    const auto key = AppKey::parse(
+        "orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g");
+    const auto automatic = resolve_fingerprint(key, Options{});
+    if (automatic) {
+        require(automatic->provider == "machine_v1" && automatic->value.size() == 64 &&
+                    std::all_of(automatic->value.begin(), automatic->value.end(), [](char c) {
+                        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                    }),
+                "automatic fingerprint must use the scoped machine_v1 digest");
+    }
+    Options disabled;
+    disabled.disable_machine_binding = true;
+    require(!resolve_fingerprint(key, disabled), "disabled machine binding must omit fingerprint");
+    Options custom;
+    custom.fingerprint = Fingerprint{std::string(64, 'a'), "custom:fixture"};
+    const auto supplied = resolve_fingerprint(key, custom);
+    require(supplied && supplied->value == custom.fingerprint->value &&
+                supplied->provider == custom.fingerprint->provider,
+            "custom fingerprint option must be preserved");
+    custom.disable_machine_binding = true;
+    expect_error([&] { (void)resolve_fingerprint(key, custom); }, ErrorKind::configuration);
 }
 
 std::string base64url_encode(const unsigned char* bytes, std::size_t size) {
@@ -200,7 +261,7 @@ GrantExpected vector_expected(const Json::Value& value) {
         lic, activation, installation, fp, prov,
         value["credential_expires_at"].isNull() ? std::nullopt : std::optional<std::int64_t>(value["credential_expires_at"].asInt64()),
         value["licence_expires_at"].isNull() ? std::nullopt : std::optional<std::int64_t>(value["licence_expires_at"].asInt64()),
-        value["now"].asInt64(),
+        value["now"].asInt64(), false, std::nullopt,
     };
 }
 
@@ -225,7 +286,7 @@ void test_shared_grant_vectors(const Corpus& corpus) {
         require(accepted == expected_valid, "grant vector mismatch: " + text(item, "name"));
         expected_valid ? ++valid : ++invalid;
     }
-    require(valid == 12 && invalid == 89, "grant corpus valid/invalid case counts changed");
+    require(valid == 12 && invalid == 92, "grant corpus valid/invalid case counts changed");
 
     std::string strict_token;
     for (const auto& item : corpus.value["cases"]) {
@@ -236,6 +297,27 @@ void test_shared_grant_vectors(const Corpus& corpus) {
     const auto keys = GrantKeys::parse(corpus.jwks);
     const auto expected = vector_expected(corpus.expected);
     expect_error([&] { (void)keys.verify(wide_policy, expected); }, ErrorKind::invalid_response);
+
+    const std::string runtime_fingerprint(64, 'a');
+    const std::string runtime_provider = "machine_v1";
+    auto optional_binding = expected;
+    optional_binding.fingerprint = runtime_fingerprint;
+    optional_binding.fingerprint_provider = runtime_provider;
+    optional_binding.allow_unbound_fingerprint = true;
+    optional_binding.expected_binding_mode = "none";
+    require(keys.verify(strict_token, optional_binding).binding_mode == "none",
+            "runtime verification must accept a signed unbound grant with an optional device identity");
+    auto strict_binding = optional_binding;
+    strict_binding.allow_unbound_fingerprint = false;
+    expect_error([&] { (void)keys.verify(strict_token, strict_binding); }, ErrorKind::invalid_response);
+    auto provider_only_context = expected;
+    provider_only_context.fingerprint.reset();
+    provider_only_context.fingerprint_provider = runtime_provider;
+    expect_error([&] { (void)keys.verify(strict_token, provider_only_context); },
+                 ErrorKind::invalid_response);
+    auto wrong_mode = optional_binding;
+    wrong_mode.expected_binding_mode = "hwid";
+    expect_error([&] { (void)keys.verify(strict_token, wrong_mode); }, ErrorKind::invalid_response);
 }
 
 void test_strict_bounded_json() {
@@ -358,6 +440,9 @@ struct ApiFixture {
     std::atomic_bool finite_persistent_response{false};
     std::atomic_bool missing_expiry{false};
     std::atomic_bool pre_epoch_server_time{false};
+    std::atomic_bool far_future_metadata{false};
+    std::atomic_bool activation_response_lost{false};
+    std::atomic_bool login_denied{false};
     std::string last_activation_idempotency;
     std::string last_previous_credential;
     std::shared_ptr<Gate> activation_gate;
@@ -414,6 +499,7 @@ struct ApiFixture {
                         ? input["previous_credential"].asString() : std::string{};
                 }
                 if (input["credential_mode"] == "persistent") persistent_mode = true;
+                if (activation_response_lost.load()) return HttpResponse{503, "{}", {}};
                 if (malformed_activation.load()) return HttpResponse{200, R"({"bad":true})", {}};
                 auto reply = activation_reply(corpus, offline_activation.load(), installation,
                     persistent_mode.load() && !finite_persistent_response.load());
@@ -432,15 +518,21 @@ struct ApiFixture {
             if (route == "/api/client/v1/sessions") {
                 if (sessions_gate) sessions_gate->block();
                 require(method == "POST", "login method mismatch");
+                if (login_denied.load()) {
+                    return HttpResponse{403,
+                        R"({"error":{"code":"invalid_credentials","message":"Invalid credentials","request_id":"login_1"}})", {}};
+                }
                 Json::Value value(Json::objectValue);
                 value["customer"] = Json::Value(Json::objectValue);
                 value["customer"]["id"] = "customer_1";
                 value["customer"]["username"] = "alice";
                 value["customer"]["email"] = "alice@example.test";
                 value["customer"]["suspended"] = false;
-                value["customer"]["created_at"] = "2026-01-01T00:00:00Z";
+                value["customer"]["created_at"] = far_future_metadata.load()
+                    ? "9999-01-01T00:00:00Z" : "2026-01-01T00:00:00Z";
                 value["session"] = std::string(43, 's');
-                value["expires_at"] = "2027-01-01T00:00:00Z";
+                value["expires_at"] = far_future_metadata.load()
+                    ? "9999-01-01T00:00:00Z" : "2027-01-01T00:00:00Z";
                 return HttpResponse{200, encode_json(value), {}};
             }
             if (route == "/api/client/v1/registrations") {
@@ -448,7 +540,8 @@ struct ApiFixture {
                 Json::Value value(Json::objectValue);
                 value["accepted"] = true;
                 value["resend_credential"] = std::string(43, 'r');
-                value["expires_at"] = "2027-01-01T00:00:00Z";
+                value["expires_at"] = far_future_metadata.load()
+                    ? "9999-01-01T00:00:00Z" : "2027-01-01T00:00:00Z";
                 return HttpResponse{200, encode_json(value), {}};
             }
             if (route == "/api/client/v1/registrations/resend") {
@@ -466,13 +559,13 @@ struct ApiFixture {
                 require(method == "GET" && bearer_value == std::string(43, 's'), "licence list authorization missing");
                 Json::Value page(Json::objectValue);
                 page["items"] = Json::Value(Json::arrayValue);
-                page["items"].append(ApiFixture::sample_licence());
+                page["items"].append(ApiFixture::sample_licence(far_future_metadata.load()));
                 page["next_cursor"] = "cursor_2";
                 return HttpResponse{200, encode_json(page), {}};
             }
             if (route == "/api/client/v1/licence-claims") {
                 require(method == "POST" && bearer_value.empty(), "licence claim leaked bearer header");
-                return HttpResponse{200, encode_json(ApiFixture::sample_licence()), {}};
+                return HttpResponse{200, encode_json(ApiFixture::sample_licence(far_future_metadata.load())), {}};
             }
             if (route.find("/api/client/v1/sessions/current?") == 0 && method == "DELETE") {
                 if (logout_gate) logout_gate->block();
@@ -487,14 +580,16 @@ struct ApiFixture {
         };
     }
 
-    static Json::Value sample_licence() {
+    static Json::Value sample_licence(bool far_future = false) {
         Json::Value licence(Json::objectValue);
         licence["id"] = "licence_1";
         licence["policy_name"] = "Standard";
         licence["state"] = "active";
         licence["expiry_mode"] = "never";
-        licence["first_used_at"] = Json::nullValue;
-        licence["expires_at"] = Json::nullValue;
+        licence["first_used_at"] = far_future
+            ? "9999-12-31T23:59:59Z" : "2026-01-01T00:00:00Z";
+        licence["expires_at"] = far_future
+            ? "9999-12-31T23:59:59Z" : "2027-01-01T00:00:00Z";
         licence["duration_seconds"] = Json::Int64{3000000000LL};
         licence["device_limit"] = 1;
         licence["hwid_locked"] = false;
@@ -515,60 +610,209 @@ std::string persistent_test_path() {
             ("orbit-cpp-installed-test-" + new_installation_id())).string();
 }
 
-Client persistent_client_for(ApiFixture& fixture, const std::string& path) {
+Client persistent_client_for(ApiFixture& fixture, const std::string& path,
+                             std::optional<Fingerprint> fingerprint = std::nullopt) {
     auto setup = config();
     setup.installation_id.reset();
+    setup.fingerprint = std::move(fingerprint);
     auto storage = open_installed_storage(setup, path);
     return make_test_installed_client(setup,
         Transport("https://example.test", fixture.handler()), std::move(storage));
+}
+
+void test_installed_identity_mismatch_rotates_installation(const Corpus& corpus) {
+    const auto path = persistent_test_path();
+    std::string old_id;
+    {
+        ApiFixture original(corpus.value);
+        original.offline_activation = true;
+        auto client = persistent_client_for(original, path);
+        (void)client.activate("identity-bound-key");
+        old_id = client.installation_id();
+        client.close();
+    }
+    const Fingerprint custom{std::string(64, 'a'), "custom:fixture"};
+    std::string custom_id;
+    {
+        ApiFixture changed(corpus.value);
+        auto client = persistent_client_for(changed, path, custom);
+        custom_id = client.installation_id();
+        client.close();
+        require(custom_id != old_id && changed.validate_calls == 0,
+                "changed fingerprint must rotate installation without validating old authority");
+    }
+    {
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.fingerprint = custom;
+        auto installed = open_installed_storage(setup, path);
+        const auto bytes = installed->load();
+        require(bytes.has_value(), "identity rotation must persist an installed record");
+        const auto record = persistent_codec::decode(setup, installed->provider(), *bytes);
+        require(record["installation"]["id"] == custom_id &&
+                    record["installation"]["fingerprint"] == custom.value &&
+                    record["installation"]["fingerprint_provider"] == custom.provider &&
+                    record["credential"].isNull() && record["pending_activation"].isNull() &&
+                    record["access"].isNull(),
+                "changed fingerprint must persist no credential, pending mutation, or signed grant");
+    }
+    {
+        ApiFixture unavailable(corpus.value);
+        auto client = persistent_client_for(unavailable, path);
+        const auto new_id = client.installation_id();
+        client.close();
+        require(new_id != custom_id && unavailable.validate_calls == 0,
+                "unavailable fingerprint transition must rotate without validating old authority");
+    }
+    {
+        auto setup = config();
+        setup.installation_id.reset();
+        auto installed = open_installed_storage(setup, path);
+        const auto bytes = installed->load();
+        require(bytes.has_value(), "unavailable identity transition must persist a new record");
+        const auto record = persistent_codec::decode(setup, installed->provider(), *bytes);
+        require(record["installation"]["fingerprint"].isNull() &&
+                    record["installation"]["fingerprint_provider"].isNull() &&
+                    record["credential"].isNull() && record["pending_activation"].isNull() &&
+                    record["access"].isNull(),
+                "unavailable fingerprint transition must clear saved identity and authority");
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
 }
 
 void test_activation_accounts_and_proofs(const Corpus& corpus) {
     ApiFixture fixture(corpus.value);
     auto client = client_for(fixture);
     auto sibling = client;
-    const auto activated = parse_json(client.activate("key-from-stdin", "idempotency-123456"));
-    require(activated["access"].asString() == "online", "activation should produce online access");
-    require(activated["entitlements"]["export"].asBool(), "verified export entitlement missing");
+    const auto activated = client.activate("key-from-stdin", "idempotency-123456");
+    require(activated.access == Access::online, "activation should produce online access");
+    require(activated.has_feature("export"), "verified export entitlement missing");
     const auto safe_snapshot = client.snapshot();
-    require(safe_snapshot.find("bearer") == std::string::npos && safe_snapshot.find(std::string(43, 'c')) == std::string::npos,
-            "snapshot exposed the private credential");
+    require(safe_snapshot.access == Access::online && safe_snapshot.has_feature("export"),
+            "typed snapshot must expose only access metadata");
     require(fixture.storage->load().second.has_value(), "verified credential was not stored");
-    require(client.require_access("export").find("online") != std::string::npos,
+    require(client.require_access("export").access == Access::online,
             "require_access should accept a current entitlement");
     Cancellation pre_cancelled;
     pre_cancelled.cancel();
     expect_error([&] { (void)client.require_access("export", &pre_cancelled); }, ErrorKind::cancelled);
-    require(sibling.snapshot().find("online") != std::string::npos,
+    require(sibling.snapshot().access == Access::online,
             "client copies should share current access state");
 
     static_assert(!std::is_copy_constructible<PendingRegistration>::value, "pending registrations must remain move-only");
     auto registration = client.register_customer("license-key", "alice", "alice@example.test", "correct horse battery");
-    require(registration.metadata_json.find("accepted") != std::string::npos && registration.pending,
+    require(registration.accepted && registration.expires_at.time_since_epoch().count() > 0 && registration.pending,
             "registration metadata/proof missing");
     client.resend_registration(registration.pending);
     auto other_client = client_for(fixture);
     expect_error([&] { other_client.resend_registration(registration.pending); }, ErrorKind::configuration);
 
-    const auto logged_in = parse_json(client.login("alice", "password"));
-    require(logged_in["customer"]["username"].asString() == "alice", "login metadata mismatch");
+    const auto logged_in = client.login("alice", "password");
+    require(logged_in.customer.username == "alice", "login metadata mismatch");
+    require(logged_in.customer.created_at.time_since_epoch().count() == 1767225600 &&
+                logged_in.expires_at.time_since_epoch().count() == 1798761600,
+            "ordinary account timestamps must preserve exact Unix seconds");
     require(client.customer_session_authorization() == "Bearer " + std::string(43, 's'),
             "customer proof mismatch");
-    require(client.account().find(std::string(43, 's')) == std::string::npos,
-            "account metadata exposed customer proof");
-    const auto page = parse_json(client.owned_licences("cursor_1"));
-    require(page["items"].size() == 1 && page["next_cursor"].asString() == "cursor_2",
+    const auto safe_account = client.account();
+    require(safe_account && safe_account->customer.username == "alice",
+            "account metadata mismatch");
+    const auto page = client.owned_licences("cursor_1");
+    require(page.items.size() == 1 && page.next_cursor == std::optional<std::string>("cursor_2"),
             "owned licence metadata mismatch");
-    require(page["items"][0]["duration_seconds"].asInt64() == 3000000000LL,
+    require(page.items[0].duration == std::optional<std::chrono::seconds>(std::chrono::seconds(3000000000LL)),
             "owned licence duration must preserve values above i32 range");
-    const auto claimed = parse_json(client.claim_licence("claim-key", "claim-idempotency-123"));
-    require(claimed["id"].asString() == "licence_1", "claim licence result mismatch");
+    require(page.items[0].first_used_at && page.items[0].expires_at &&
+                page.items[0].first_used_at->time_since_epoch().count() == 1767225600 &&
+                page.items[0].expires_at->time_since_epoch().count() == 1798761600,
+            "ordinary owned-licence timestamps must preserve exact Unix seconds");
+    const auto claimed = client.claim_licence("claim-key", "claim-idempotency-123");
+    require(claimed.id == "licence_1", "claim licence result mismatch");
     client.request_email_change("password", "new@example.test");
     client.request_password_recovery("alice@example.test");
-    client.account_logout();
-    require(client.account() == "null", "account logout did not clear local session");
-    require(sibling.snapshot().find("denied") != std::string::npos,
+    client.logout_account();
+    require(!client.account(), "account logout did not clear local session");
+    require(sibling.snapshot().access == Access::denied,
             "client copies should observe logout state");
+}
+
+void test_public_timestamp_seconds_range() {
+    ApiFixture fixture{Json::Value(Json::objectValue)};
+    fixture.far_future_metadata = true;
+    auto client = client_for(fixture);
+    const auto account = client.login("alice", "password");
+    require(account.customer.created_at.time_since_epoch().count() == 253370764800LL &&
+                account.expires_at.time_since_epoch().count() == 253370764800LL,
+            "year-9999 account timestamps must preserve seconds without clock-duration overflow");
+    const auto page = client.owned_licences();
+    require(page.items.size() == 1 && page.items[0].first_used_at && page.items[0].expires_at &&
+                page.items[0].first_used_at->time_since_epoch().count() == 253402300799LL &&
+                page.items[0].expires_at->time_since_epoch().count() == 253402300799LL,
+            "year-9999 owned-licence timestamps must preserve exact Unix seconds");
+}
+
+void test_empty_explicit_activation_operation_ids(const Corpus& corpus) {
+    ApiFixture fixture(corpus.value);
+    auto client = client_for(fixture);
+    (void)client.activate("initial-key");
+    const std::optional<std::string_view> empty_id = std::string_view{};
+    const auto request_count = [&] {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        return fixture.requests.size();
+    };
+    auto requests_before = request_count();
+    auto activation_calls_before = fixture.activation_calls.load();
+    const auto key_access_before = client.snapshot().access;
+    expect_error([&] { (void)client.activate("bad-id-key", empty_id); }, ErrorKind::configuration);
+    expect_error([&] { (void)client.activate_previous("bad-id-key", "previous-credential", empty_id); },
+                 ErrorKind::configuration);
+    require(request_count() == requests_before && fixture.activation_calls == activation_calls_before &&
+                client.snapshot().access == key_access_before,
+            "empty explicit key operation IDs must fail before request or activation mutation");
+
+    (void)client.login("alice", "password");
+    requests_before = request_count();
+    activation_calls_before = fixture.activation_calls.load();
+    const auto account_access_before = client.snapshot().access;
+    expect_error([&] { (void)client.activate_account("licence_1", empty_id); }, ErrorKind::configuration);
+    expect_error([&] {
+        (void)client.activate_account_previous("licence_1", "previous-credential", empty_id);
+    }, ErrorKind::configuration);
+    require(request_count() == requests_before && fixture.activation_calls == activation_calls_before &&
+                client.snapshot().access == account_access_before,
+            "empty explicit account operation IDs must fail before request or activation mutation");
+}
+
+void test_ensure_access_prompt_semantics(const Corpus& corpus) {
+    ApiFixture fixture(corpus.value);
+    auto client = client_for(fixture);
+    int prompts = 0;
+    expect_error([&] {
+        (void)client.ensure_access("export", [&]() -> std::optional<std::string> {
+            ++prompts;
+            return std::nullopt;
+        });
+    }, ErrorKind::not_activated);
+    require(prompts == 1, "ensure_access must ask once when access is not activated");
+    const auto activated = client.ensure_access("export", [&]() -> std::optional<std::string> {
+        ++prompts;
+        return "key-from-prompt";
+    });
+    require(activated.access == Access::online && prompts == 2,
+            "ensure_access must activate a supplied key and return typed access");
+    require(client.ensure_access("export", [&]() -> std::optional<std::string> {
+        ++prompts;
+        return "unused";
+    }).access == Access::online && prompts == 2,
+        "ensure_access must not prompt when access already exists");
+    expect_error([&] {
+        (void)client.ensure_access("missing", [&]() -> std::optional<std::string> {
+            ++prompts;
+            return "unused";
+        });
+    }, ErrorKind::feature_unavailable);
+    require(prompts == 2, "feature-unavailable must propagate without prompting");
 }
 
 void test_transport_retry_errors_and_cancellation() {
@@ -662,7 +906,7 @@ void test_logout_generation_fences_late_responses(const Corpus& corpus) {
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.activation_gate->wait_until_entered();
-        client.local_logout();
+        client.logout();
         fixture.activation_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response) && !fixture.storage->load().second,
@@ -678,10 +922,10 @@ void test_logout_generation_fences_late_responses(const Corpus& corpus) {
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.sessions_gate->wait_until_entered();
-        client.local_logout();
+        client.logout();
         fixture.sessions_gate->release();
         worker.join();
-        require(result == static_cast<int>(ErrorKind::stale_response) && client.account() == "null",
+        require(result == static_cast<int>(ErrorKind::stale_response) && !client.account(),
                 "local logout must fence late login results");
     }
     for (const bool fail_logout : {false, true}) {
@@ -692,19 +936,19 @@ void test_logout_generation_fences_late_responses(const Corpus& corpus) {
         fixture.logout_error = fail_logout;
         std::atomic_int result{-1};
         std::thread worker([&] {
-            try { client.account_logout(); }
+            try { client.logout_account(); }
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.logout_gate->wait_until_entered();
-        require(client.account() == "null", "account logout must clear local metadata before network completion");
+        require(!client.account(), "account logout must clear local metadata before network completion");
         expect_error([&] { (void)client.customer_session_authorization(); }, ErrorKind::reauthentication_required);
         (void)client.login("alice", "password");
-        require(client.account().find("alice") != std::string::npos,
+        require(client.account() && client.account()->customer.username == "alice",
                 "new account login must be visible while old logout is pending");
         fixture.logout_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response) &&
-                client.account().find("alice") != std::string::npos,
+                client.account() && client.account()->customer.username == "alice",
                 "late logout success or error must not affect a newer account session");
     }
     for (const bool fail_deactivation : {false, true}) {
@@ -719,13 +963,13 @@ void test_logout_generation_fences_late_responses(const Corpus& corpus) {
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.deactivation_gate->wait_until_entered();
-        const auto newer = parse_json(client.activate("key-from-stdin", "new-activation-idempotency"));
-        require(newer["access"] == "online", "new activation must complete while deactivation is pending");
+        const auto newer = client.activate("key-from-stdin", "new-activation-idempotency");
+        require(newer.access == Access::online, "new activation must complete while deactivation is pending");
         fixture.deactivation_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response) &&
                 fixture.storage->load().second.has_value() &&
-                parse_json(client.snapshot())["access"] == "online",
+                client.snapshot().access == Access::online,
                 "late deactivation success or error must not clear a newer activation");
     }
 }
@@ -745,13 +989,13 @@ void test_unauthenticated_generation_fences(const Corpus& corpus) {
             }
         });
         fixture.registration_gate->wait_until_entered();
-        const auto newer = parse_json(client.activate("key-from-stdin", "new-activation-idempotency"));
-        require(newer["access"] == "online", "activation must complete while registration is pending");
+        const auto newer = client.activate("key-from-stdin", "new-activation-idempotency");
+        require(newer.access == Access::online, "activation must complete while registration is pending");
         fixture.registration_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response) &&
                 fixture.storage->load().second.has_value() &&
-                parse_json(client.snapshot())["access"] == "online",
+                client.snapshot().access == Access::online,
                 "late registration proof must not outlive a newer activation");
     }
     {
@@ -766,7 +1010,7 @@ void test_unauthenticated_generation_fences(const Corpus& corpus) {
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.resend_gate->wait_until_entered();
-        client.local_logout();
+        client.logout();
         fixture.resend_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response),
@@ -782,7 +1026,7 @@ void test_unauthenticated_generation_fences(const Corpus& corpus) {
             catch (const Error& error) { result.store(static_cast<int>(error.kind())); }
         });
         fixture.recovery_gate->wait_until_entered();
-        client.local_logout();
+        client.logout();
         fixture.recovery_gate->release();
         worker.join();
         require(result == static_cast<int>(ErrorKind::stale_response),
@@ -973,9 +1217,9 @@ void test_persistent_invalid_cache_clock_recovers_credential(const Corpus& corpu
             recovery.offline_activation = true;
             recovery.offline_refresh = outage;
             auto reopened = persistent_client_for(recovery, path);
-            const auto snapshot = parse_json(reopened.snapshot());
-            require(snapshot["access"] == (outage ? "refresh_required" : "online") &&
-                        !snapshot["reauthentication_required"].asBool() &&
+            const auto snapshot = reopened.snapshot();
+            require(snapshot.access == (outage ? Access::refresh_required : Access::online) &&
+                        !snapshot.reauthentication_required &&
                         recovery.activation_calls == 0 && recovery.validate_calls == (outage ? 3 : 1),
                     "invalid cache clock must preserve the credential for online validation only");
             reopened.close();
@@ -988,7 +1232,7 @@ void test_persistent_invalid_cache_clock_recovers_credential(const Corpus& corpu
                 }
                 recovery.offline_refresh = false;
                 auto online = persistent_client_for(recovery, path);
-                require(parse_json(online.snapshot())["access"] == "online" && recovery.activation_calls == 0,
+                require(online.snapshot().access == Access::online && recovery.activation_calls == 0,
                         "saved credential must recover after invalid clock cache and boot outage");
                 online.close();
             }
@@ -1047,13 +1291,13 @@ void test_persistent_online_restart_and_offline_recovery(const Corpus& corpus) {
         require(first.activation_calls == 0 && first.validate_calls == 0,
                 "fresh installed open must not make a network request");
         installation = client.installation_id();
-        const auto activated = parse_json(client.activate("persistent-license-key"));
-        require(activated["access"] == "online" &&
-                    activated["credential_expires_at"].isNull(),
+        const auto activated = client.activate("persistent-license-key");
+        require(activated.access == Access::online && !activated.credential_expires_at,
                 "persistent activation must explicitly negotiate a null credential expiry");
         require(first.persistent_mode.load() && first.activation_calls == 1,
                 "key-first activation must request persistent credential mode");
-        original_expiry = json_int64(activated["expires_at"]);
+        original_expiry = std::chrono::duration_cast<std::chrono::seconds>(
+            activated.expires_at->time_since_epoch()).count();
         client.close();
     }
 #if defined(__linux__)
@@ -1081,9 +1325,9 @@ void test_persistent_online_restart_and_offline_recovery(const Corpus& corpus) {
         require(client.installation_id() == installation && online.validate_calls == 1 &&
                     online.activation_calls == 0,
                 "restart must reuse the installation and validate without asking for a key");
-        const auto state = parse_json(client.snapshot());
-        require(state["access"] == "online" &&
-                    json_int64(state["expires_at"]) == original_expiry,
+        const auto state = client.snapshot();
+        require(state.access == Access::online && state.expires_at &&
+                    std::chrono::duration_cast<std::chrono::seconds>(state.expires_at->time_since_epoch()).count() == original_expiry,
                 "online restart must retain the original signed grant deadline");
         client.close();
     }
@@ -1093,11 +1337,11 @@ void test_persistent_online_restart_and_offline_recovery(const Corpus& corpus) {
         offline.offline_activation = true;
         offline.offline_refresh = true;
         auto client = persistent_client_for(offline, path);
-        const auto state = parse_json(client.snapshot());
-        require(offline.validate_calls == 3 && state["access"] == "offline" &&
-                    json_int64(state["expires_at"]) == original_expiry,
+        const auto state = client.snapshot();
+        require(offline.validate_calls == 3 && state.access == Access::offline && state.expires_at &&
+                    std::chrono::duration_cast<std::chrono::seconds>(state.expires_at->time_since_epoch()).count() == original_expiry,
                 "transient validation may restore only the original offline-enabled grant");
-        require(parse_json(client.require_access("export"))["access"] == "offline",
+        require(client.require_access("export").access == Access::offline,
                 "offline restart must still enforce access through require_access");
         client.close();
     }
@@ -1151,6 +1395,92 @@ void test_persistent_uncertain_activation_reuses_identity(const Corpus& corpus) 
         require(record["pending_activation"].isNull(),
                 "verified durable acceptance must clear the pending mutation");
     }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_account_activation_survives_failed_login(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    const std::string password = "never-persist-account-password";
+    const std::string account_session(43, 's');
+    auto read_record = [&] {
+        auto setup = config();
+        setup.installation_id.reset();
+        auto installed = open_installed_storage(setup, path);
+        const auto bytes = installed->load();
+        require(bytes.has_value(), "account activation recovery record is missing");
+        return persistent_codec::decode(setup, installed->provider(), *bytes);
+    };
+    std::string operation_id;
+    {
+        ApiFixture lost(corpus.value);
+        auto client = persistent_client_for(lost, path);
+        const auto account = client.login("alice", password);
+        require(account.customer.id == "customer_1",
+                "initial account login must identify the expected customer");
+        lost.activation_response_lost = true;
+        expect_error([&] { (void)client.activate_account("licence"); }, ErrorKind::transient);
+        {
+            std::lock_guard<std::mutex> lock(lost.mutex);
+            operation_id = lost.last_activation_idempotency;
+        }
+        require(operation_id.size() >= 16 && lost.activation_calls > 0,
+                "uncertain account activation must save its operation identity before sending");
+        client.close();
+    }
+    const auto pending_record = read_record();
+    require(pending_record["pending_activation"]["principal_kind"] == "account" &&
+                pending_record["pending_activation"]["operation_id"] == operation_id &&
+                pending_record["credential"].isNull() && pending_record["access"].isNull(),
+            "uncertain account activation must persist only its retry identity");
+    auto persisted = encode_json(pending_record);
+    require(persisted.find(password) == std::string::npos &&
+                persisted.find(account_session) == std::string::npos &&
+                !pending_record.isMember("password") && !pending_record.isMember("customer_session"),
+            "account password and session must not be persisted");
+
+    {
+        ApiFixture rejected(corpus.value);
+        rejected.login_denied = true;
+        auto client = persistent_client_for(rejected, path);
+        expect_error([&] { (void)client.login("alice", "wrong-account-password"); }, ErrorKind::denied);
+        client.close();
+    }
+    const auto after_failure = read_record();
+    require(after_failure["pending_activation"]["operation_id"] == operation_id &&
+                after_failure["credential"].isNull() && after_failure["access"].isNull(),
+            "failed login must clear account/access authority while retaining pending activation identity");
+    persisted = encode_json(after_failure);
+    require(persisted.find(password) == std::string::npos &&
+                persisted.find("wrong-account-password") == std::string::npos &&
+                persisted.find(account_session) == std::string::npos,
+            "failed login must not persist account credentials");
+
+    {
+        ApiFixture recovered(corpus.value);
+        auto client = persistent_client_for(recovered, path);
+        const auto account = client.login("alice", password);
+        require(account.customer.id == "customer_1",
+                "recovery login must verify the same customer identity");
+        const auto accepted = client.activate_account("licence");
+        require(accepted.access == Access::online,
+                "account activation should recover after successful login");
+        {
+            std::lock_guard<std::mutex> lock(recovered.mutex);
+            require(recovered.last_activation_idempotency == operation_id,
+                    "account activation retry must reuse its original operation ID");
+        }
+        client.close();
+    }
+    const auto recovered_record = read_record();
+    require(recovered_record["pending_activation"].isNull() &&
+                !recovered_record["credential"].isNull(),
+            "verified retry must clear pending identity and persist the activation credential");
+    persisted = encode_json(recovered_record);
+    require(persisted.find(password) == std::string::npos &&
+                persisted.find(account_session) == std::string::npos,
+            "successful account login session and password must remain memory-only");
     std::error_code ignored;
     std::filesystem::remove_all(path, ignored);
 }
@@ -1311,26 +1641,40 @@ void test_jwks_recovery_and_offline_clock(const Corpus& corpus) {
     expect_error([&] { (void)client.activate("licence-key", "idempotency-123456"); }, ErrorKind::transient);
     require(fixture.jwks_calls == 3 && !fixture.storage->load().second,
             "transient key fetch must retry and must not persist an unverified first credential");
-    auto recovered = parse_json(client.activate("licence-key", "idempotency-123456"));
-    require(recovered["access"].asString() == "online" && fixture.storage->load().second,
+    auto recovered = client.activate("licence-key", "idempotency-123456");
+    require(recovered.access == Access::online && fixture.storage->load().second,
             "activation should recover after a transient JWKS outage");
 
     ApiFixture offline_fixture(corpus.value);
     offline_fixture.offline_activation = true;
     auto offline_client = client_for(offline_fixture);
-    require(parse_json(offline_client.activate("licence-key", "idempotency-123456"))["access"] == "online",
+    require(offline_client.activate("licence-key", "idempotency-123456").access == Access::online,
             "offline-capable activation should start online");
     clock.advance(61);
     offline_fixture.offline_refresh = true;
-    const auto offline = parse_json(offline_client.require_access("export"));
-    require(offline["access"].asString() == "offline" && offline["entitlements"]["export"].asBool(),
+    const auto offline = offline_client.require_access("export");
+    require(offline.access == Access::offline && offline.has_feature("export"),
             "verified offline grant must authorize cached entitlements during a transient outage");
     clock.advance(840);
-    require(parse_json(offline_client.snapshot())["access"].asString() == "expired",
+    require(offline_client.snapshot().access == Access::expired,
             "offline authority must expire at the signed grant deadline");
     clock.wall.fetch_sub(100);
-    require(parse_json(offline_client.snapshot())["access"].asString() == "refresh_required",
+    require(offline_client.snapshot().access == Access::refresh_required,
             "wall clock rollback must discard cached verified authority");
+
+    ApiFixture strict_fixture(corpus.value);
+    auto strict_client = client_for(strict_fixture);
+    (void)strict_client.activate("strict-outage-key", "strict-outage-operation");
+    clock.advance(61);
+    strict_fixture.offline_refresh = true;
+    int outage_prompts = 0;
+    expect_error([&] {
+        (void)strict_client.ensure_access("export", [&]() -> std::optional<std::string> {
+            ++outage_prompts;
+            return "must-not-be-requested";
+        });
+    }, ErrorKind::transient);
+    require(outage_prompts == 0, "ensure_access must never prompt for a transient outage");
 }
 
 } // namespace
@@ -1338,10 +1682,15 @@ void test_jwks_recovery_and_offline_clock(const Corpus& corpus) {
 int main() {
     try {
         const auto corpus = load_corpus();
+        const auto app_key_vectors = test_shared_app_key_vectors();
+        test_fingerprint_options();
         test_strict_bounded_json();
         test_shared_grant_vectors(corpus);
+        test_empty_explicit_activation_operation_ids(corpus);
         test_transport_retry_errors_and_cancellation();
         test_activation_accounts_and_proofs(corpus);
+        test_public_timestamp_seconds_range();
+        test_ensure_access_prompt_semantics(corpus);
         test_unauthenticated_generation_fences(corpus);
         test_clock_anchor_bounds();
         test_persistent_storage_format_and_contention();
@@ -1349,6 +1698,7 @@ int main() {
         test_owner_cancellation_during_backoff();
         test_persistent_worker_stops_on_storage_failure(corpus);
         test_persistent_invalid_cache_clock_recovers_credential(corpus);
+        test_installed_identity_mismatch_rotates_installation(corpus);
 #if defined(_WIN32)
         test_windows_interrupted_installed_write(corpus);
 #endif
@@ -1356,12 +1706,18 @@ int main() {
         test_persistent_strict_outage_is_not_activation_required(corpus);
         test_persistent_online_restart_and_offline_recovery(corpus);
         test_persistent_uncertain_activation_reuses_identity(corpus);
+        test_persistent_account_activation_survives_failed_login(corpus);
         test_persistent_previous_rebind_and_expiry_contract(corpus);
         test_pre_epoch_server_time(corpus);
         test_jwks_recovery_and_offline_clock(corpus);
         test_logout_generation_fences_late_responses(corpus);
-        std::cout << "C++ SDK tests passed (101 grant vectors, strict JSON, transport, access, account and race cases).\n";
+        std::cout << "C++ SDK tests passed (" << app_key_vectors
+                  << " app-key vectors, 104 grant vectors, fingerprint options, strict JSON, transport, access, account and race cases).\n";
         return 0;
+    } catch (const Error& error) {
+        std::cerr << "C++ SDK error kind=" << static_cast<unsigned>(error.kind())
+                  << " code=" << error.code() << '\n';
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "C++ SDK test failure: " << error.what() << '\n';
         return 1;

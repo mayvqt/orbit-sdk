@@ -1,5 +1,6 @@
 #include "installed_storage.hpp"
 
+#include "core.hpp"
 #include "error.hpp"
 #include "json.hpp"
 #if defined(_WIN32)

@@ -168,7 +168,7 @@ bool verify_signature(EVP_PKEY* key, std::string_view signing_input,
 }
 
 std::optional<std::string> optional_string(const Json::Value& value, const char* key) {
-    if (!value.isMember(key) || value[key].isNull()) return std::nullopt;
+    if (!value.isMember(key)) return std::nullopt;
     return string_value(value[key]);
 }
 
@@ -263,12 +263,19 @@ GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expec
     auto claims = parse_claims(parsed.claims);
     const auto audience = "orbit:" + std::string(expected.application) + ":" + std::string(expected.environment);
     const bool bound = [&] {
-        if (!expected.fingerprint && !expected.fingerprint_provider) {
-            return claims.binding_mode == "none" && !claims.fingerprint && !claims.fingerprint_provider;
-        }
-        return expected.fingerprint && expected.fingerprint_provider && claims.binding_mode == "hwid" &&
-               claims.fingerprint && *claims.fingerprint == *expected.fingerprint &&
-               claims.fingerprint_provider && *claims.fingerprint_provider == *expected.fingerprint_provider;
+        if (expected.expected_binding_mode && claims.binding_mode != *expected.expected_binding_mode)
+            return false;
+        const bool expected_unbound = !expected.fingerprint && !expected.fingerprint_provider;
+        const bool expected_optional_binding = expected.allow_unbound_fingerprint &&
+            expected.fingerprint && expected.fingerprint_provider;
+        const bool unbound = claims.binding_mode == "none" && !claims.fingerprint &&
+            !claims.fingerprint_provider &&
+            (expected_unbound || expected_optional_binding);
+        const bool hardware_bound = claims.binding_mode == "hwid" && expected.fingerprint &&
+            expected.fingerprint_provider && claims.fingerprint &&
+            *claims.fingerprint == *expected.fingerprint && claims.fingerprint_provider &&
+            *claims.fingerprint_provider == *expected.fingerprint_provider;
+        return unbound || hardware_bound;
     }();
     const auto allowance = claims.offline_allowed ? std::int64_t{86400} : std::int64_t{300};
     const auto add_saturated = [](std::int64_t value, std::int64_t delta) {

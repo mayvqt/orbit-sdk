@@ -43,7 +43,20 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
         {
             try
             {
-                Record = InstalledCodec.Decode(bytes, scope, files.Provider, fingerprint, provider);
+                Record = InstalledCodec.Decode(bytes, scope, files.Provider, fingerprint, provider, allowIdentityMismatch: true);
+                if (Record.Installation.Fingerprint != fingerprint || Record.Installation.FingerprintProvider != provider)
+                {
+                    // A changed or unavailable device identity starts a new installation scope. Never
+                    // carry a pending mutation or signed grant onto the new identity.
+                    Write(Record with
+                    {
+                        Installation = new(Device.NewInstallation().InstallationId, fingerprint, provider),
+                        Generation = 0,
+                        Credential = null,
+                        PendingActivation = null,
+                        Access = null
+                    });
+                }
             }
             finally { CryptographicOperations.ZeroMemory(bytes); }
         }
@@ -134,7 +147,8 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 });
         }
     }
-    internal (string OperationId, long Version) Begin(string principal, bool account, string? previous, string? operation)
+    internal (string OperationId, long Version) Begin(string principal, bool account, string? previous,
+        string? operation, string? principalIdentity = null)
     {
         lock (gate)
         {
@@ -144,6 +158,7 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 ["scope"] = new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["api_origin"] = Record.Scope.ApiOrigin, ["issuer"] = Record.Scope.Issuer, ["application_id"] = Record.Scope.ApplicationId, ["environment_id"] = Record.Scope.EnvironmentId },
                 ["installation"] = new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["id"] = Record.Installation.Id, ["fingerprint"] = Record.Installation.Fingerprint, ["fingerprint_provider"] = Record.Installation.FingerprintProvider },
                 ["principal_kind"] = account ? "account" : "key",
+                ["principal_identity"] = principalIdentity,
                 ["licence_input"] = principal,
                 ["previous_credential"] = previous,
                 ["credential_mode"] = "persistent"

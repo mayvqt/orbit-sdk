@@ -49,6 +49,7 @@ if (root["format_version"] is not JsonValue version || !version.TryGetValue<int>
     Console.Error.WriteLine("Shared grants require format_version 1 and nonempty cases");
     return 2;
 }
+AppKeyTests.Run();
 var passed = 0;
 var failed = 0;
 foreach (var entry in cases)

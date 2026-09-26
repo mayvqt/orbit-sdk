@@ -21,6 +21,8 @@ internal static class InstalledTests
             ("original offline deadline survives qualified outage",OfflineRestart),
             ("strict restart outage does not request another key",StrictRestart),
             ("uncertain activation keeps identity after restart",PendingIdentity),
+            ("failed account login preserves pending activation identity",PendingAccountIdentity),
+            ("changed device identity rotates installation and clears old access",IdentityMismatch),
             ("pending mutation fences a retained credential",PendingFence),
             ("expired pending mutation requires deliberate resolution",PendingExpiry),
             ("malformed and incorrect expiry replies retain pending identity",MalformedIdentity),
@@ -43,7 +45,12 @@ internal static class InstalledTests
             {
                 await test.Run().WaitAsync(TimeSpan.FromSeconds(20));
             }
-            catch (Exception error) { failed++; Console.Error.WriteLine($"FAIL: {test.Name} ({error.GetType().Name})"); }
+            catch (OrbitException error)
+            {
+                failed++;
+                Console.Error.WriteLine($"FAIL: {test.Name} ({error.Error}, {error.Code})");
+            }
+            catch (Exception error) { failed++; Console.Error.WriteLine($"FAIL: {test.Name} ({error.GetType().Name}: {error.Message})"); }
         }
         Console.WriteLine($"Installed client cases: {cases.Length - failed} passed, {failed} failed");
         return failed == 0 ? 0 : 1;
@@ -54,7 +61,6 @@ internal static class InstalledTests
 #endif
     }
 #if ORBIT_LOCAL_DEVELOPMENT
-    private const string Issuer = "https://orbit.example.test";
     private static void Require(bool condition)
     {
         if (!condition)
@@ -75,6 +81,7 @@ internal static class InstalledTests
         internal string Path => System.IO.Path.Combine(Root, "state");
         internal readonly LoopbackServer Server;
         internal int Mode, Activations, Validations;
+        internal bool LoginDenied;
         internal bool Offline = true;
         internal long? FiniteExpiry;
         internal readonly List<string> Operations = [];
@@ -85,9 +92,23 @@ internal static class InstalledTests
         {
             Server = new LoopbackServer(Respond);
         }
-        internal AppConfig Config => new(Server.Origin, "app", "test", Issuer, Path);
+        internal string Issuer => Server.Origin;
         internal InstalledScope Scope => new(Server.Origin, Issuer, "app", "test");
-        internal Task<OrbitClient> Open() => OrbitClient.OpenLocalAsync(Config);
+        internal string? CurrentFingerprint, CurrentProvider;
+        internal Task<OrbitClient> Open(string? statePath = null, string? fingerprint = null,
+            string? provider = null, bool disableMachineBinding = true)
+        {
+            var origin = JsonWire.EncodeBase64(Encoding.UTF8.GetBytes(Server.Origin));
+            var appKey = $"orbit_app_test_{origin}.app.test";
+            CurrentFingerprint = fingerprint;
+            CurrentProvider = fingerprint == null ? null : provider;
+            return OrbitClient.OpenLocalAsync(appKey, new OrbitOptions
+            {
+                StatePath = statePath ?? Path,
+                DisableMachineBinding = disableMachineBinding,
+                Fingerprint = fingerprint == null ? null : new Fingerprint(fingerprint, provider!)
+            });
+        }
         internal async Task Activate(OrbitClient client) => Require((await client.ActivateAsync("synthetic-key")).Access == Access.Online);
         private async Task<FixtureReply> Respond(FixtureRequest request, CancellationToken cancellationToken)
         {
@@ -97,6 +118,21 @@ internal static class InstalledTests
                 return new(200, JsonSerializer.Serialize(new
                 {
                     keys = new[] { new { kty = "EC", crv = "P-256", alg = "ES256", use = "sig", kid = "installed", x = JsonWire.EncodeBase64(key.Q.X!), y = JsonWire.EncodeBase64(key.Q.Y!) } }
+                }));
+            }
+            if (request.Path == "/api/client/v1/sessions")
+            {
+                if (LoginDenied)
+                    return new(403, "{\"error\":{\"code\":\"invalid_credentials\",\"message\":\"Invalid credentials\",\"request_id\":\"fixture\"}}");
+                var accountTime = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                return new(200, JsonSerializer.Serialize(new
+                {
+                    customer = new
+                    {
+                        id = "customer_1", username = "alice", email = "alice@example.test",
+                        suspended = false, created_at = accountTime.ToString("O")
+                    },
+                    session = new string('s', 43), expires_at = accountTime.AddDays(7).ToString("O")
                 }));
             }
             var body = JsonNode.Parse(request.Body)!.AsObject();
@@ -142,8 +178,6 @@ internal static class InstalledTests
                 environment_id = "test",
                 activation_id = "activation",
                 installation_id = id,
-                fingerprint = (string?)null,
-                fingerprint_provider = (string?)null,
                 binding_mode = "none",
                 policy_version = 1,
                 offline_allowed = Offline,
@@ -165,7 +199,7 @@ internal static class InstalledTests
                 server_time = DateTimeOffset.FromUnixTimeSeconds(now).ToString("O"),
                 grant = unsigned + "." + JsonWire.EncodeBase64(signature),
                 binding_mode = "none",
-                fingerprint_provider = (string?)null,
+                fingerprint_provider = CurrentProvider,
                 licence_expires_at = (string?)null,
                 secret_replay_expired = false
             })!.AsObject();
@@ -177,12 +211,12 @@ internal static class InstalledTests
                 response["credential"] = new string('r', 43);
             return new(200, response.ToJsonString());
         }
-        internal InstalledRecord Record()
+        internal InstalledRecord Record(string? fingerprint = null, string? provider = null)
         {
             var bytes = File.ReadAllBytes(System.IO.Path.Combine(Path, "orbit-storage.bin"));
             if (OperatingSystem.IsWindows())
                 bytes = WindowsDataProtection.UnprotectInstalled(bytes, SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(Scope, InstalledCodec.Options)));
-            return InstalledCodec.Decode(bytes, Scope, OperatingSystem.IsWindows() ? "windows_dpapi" : "private_file", null, null);
+            return InstalledCodec.Decode(bytes, Scope, OperatingSystem.IsWindows() ? "windows_dpapi" : "private_file", fingerprint, provider);
         }
         internal void WriteRecord(InstalledRecord record)
         {
@@ -212,13 +246,13 @@ internal static class InstalledTests
         {
             Require((await c.RequireAccessAsync("export")).Access == Access.Online);
             Require(f.Record().Installation.Id == id && f.Activations == 1 && f.Validations == 1);
-            await Expect(OrbitError.Denied, () => c.RequireAccessAsync("missing"), "feature_unavailable");
+            await Expect(OrbitError.FeatureUnavailable, () => c.RequireAccessAsync("missing"), "feature_unavailable");
         }
     }
     private static async Task OfflineRestart()
     {
         await using var f = new Fixture();
-        long? expiry;
+        DateTimeOffset? expiry;
         await using (var c = await f.Open())
         {
             await f.Activate(c);
@@ -254,6 +288,82 @@ internal static class InstalledTests
             await f.Activate(c);
         }
         Require(f.Operations.Count == 2 && f.Operations.All(id => id == pending.OperationId) && f.Record().PendingActivation == null);
+    }
+    private static async Task PendingAccountIdentity()
+    {
+        await using var f = new Fixture { Mode = 1 };
+        const string password = "never-persist-account-password";
+        var accountSession = new string('s', 43);
+        await using (var client = await f.Open())
+        {
+            var account = await client.LoginAsync("alice", password);
+            Require(account.Customer.Id == "customer_1");
+            await Expect(OrbitError.Transient, () => client.ActivateAccountAsync("licence"));
+        }
+
+        var uncertain = f.Record();
+        var pending = uncertain.PendingActivation!;
+        Require(pending.PrincipalKind == "account" && f.Operations.Count == 1 &&
+            f.Operations[0] == pending.OperationId && uncertain.Credential == null && uncertain.Access == null);
+        var saved = File.ReadAllText(System.IO.Path.Combine(f.Path, "orbit-storage.bin"));
+        Require(!saved.Contains(password, StringComparison.Ordinal) &&
+            !saved.Contains(accountSession, StringComparison.Ordinal) &&
+            !saved.Contains("customer_session", StringComparison.Ordinal));
+
+        f.Mode = 0;
+        f.LoginDenied = true;
+        await using (var client = await f.Open())
+            await Expect(OrbitError.Denied, () => client.LoginAsync("alice", "wrong-account-password"));
+        var afterFailedLogin = f.Record();
+        Require(afterFailedLogin.PendingActivation?.OperationId == pending.OperationId &&
+            afterFailedLogin.Credential == null && afterFailedLogin.Access == null);
+        saved = File.ReadAllText(System.IO.Path.Combine(f.Path, "orbit-storage.bin"));
+        Require(!saved.Contains(password, StringComparison.Ordinal) &&
+            !saved.Contains("wrong-account-password", StringComparison.Ordinal) &&
+            !saved.Contains(accountSession, StringComparison.Ordinal));
+
+        f.LoginDenied = false;
+        await using (var client = await f.Open())
+        {
+            var account = await client.LoginAsync("alice", password);
+            Require(account.Customer.Id == "customer_1");
+            await client.ActivateAccountAsync("licence");
+        }
+        var recovered = f.Record();
+        Require(f.Operations.Count == 2 && f.Operations.All(id => id == pending.OperationId) &&
+            recovered.PendingActivation == null && recovered.Credential != null);
+        saved = File.ReadAllText(System.IO.Path.Combine(f.Path, "orbit-storage.bin"));
+        Require(!saved.Contains(password, StringComparison.Ordinal) &&
+            !saved.Contains(accountSession, StringComparison.Ordinal));
+    }
+    private static async Task IdentityMismatch()
+    {
+        await using var f = new Fixture();
+        const string firstFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const string secondFingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        string originalId;
+        await using (var client = await f.Open(fingerprint: firstFingerprint, provider: "custom:fixture", disableMachineBinding: false))
+        {
+            await f.Activate(client);
+            originalId = f.Record(firstFingerprint, "custom:fixture").Installation.Id;
+        }
+        await using (var client = await f.Open(fingerprint: secondFingerprint, provider: "custom:fixture", disableMachineBinding: false))
+        {
+            var changed = f.Record(secondFingerprint, "custom:fixture");
+            Require(changed.Installation.Id != originalId && changed.Credential == null &&
+                changed.PendingActivation == null && changed.Access == null &&
+                changed.Installation.Fingerprint == secondFingerprint && f.Validations == 0);
+            await f.Activate(client);
+            Require(f.Operations.Count == 2 && changed.Installation.Id != originalId);
+        }
+        var currentId = f.Record(secondFingerprint, "custom:fixture").Installation.Id;
+        await using (var client = await f.Open(disableMachineBinding: true))
+        {
+            var unavailable = f.Record();
+            Require(unavailable.Installation.Id != currentId && unavailable.Credential == null &&
+                unavailable.PendingActivation == null && unavailable.Access == null &&
+                unavailable.Installation.Fingerprint == null && f.Validations == 0);
+        }
     }
     private static async Task MalformedIdentity()
     {
@@ -314,7 +424,7 @@ internal static class InstalledTests
         finite.WriteRecord(record with { Credential = record.Credential! with { ExpiresAt = finite.FiniteExpiry }, Access = null });
         await using (var client = await finite.Open())
         {
-            Require((await client.RequireAccessAsync("export")).CredentialExpiresAt == finite.FiniteExpiry);
+            Require((await client.RequireAccessAsync("export")).CredentialExpiresAt == DateTimeOffset.FromUnixTimeSeconds(finite.FiniteExpiry!.Value));
             Require(finite.Record().Credential!.ExpiresAt == finite.FiniteExpiry);
             finite.FiniteExpiry = null;
             await Expect(OrbitError.InvalidResponse, () => client.RefreshAsync());
@@ -452,17 +562,17 @@ internal static class InstalledTests
         {
             var unsafePath = System.IO.Path.Combine(f.Root, "unsafe");
             Directory.CreateDirectory(unsafePath);
-            await Expect(OrbitError.Storage, async () => { await using var c = await OrbitClient.OpenLocalAsync(f.Config with { StatePath = unsafePath }); });
+            await Expect(OrbitError.Storage, async () => { await using var c = await f.Open(unsafePath); });
             Require(Directory.GetFileSystemEntries(unsafePath).Length == 0);
             using var identity = WindowsIdentity.GetCurrent();
-            await WindowsIdentity.RunImpersonatedAsync(identity.AccessToken, () => Expect(OrbitError.Storage, async () => { await using var c = await OrbitClient.OpenLocalAsync(f.Config with { StatePath = System.IO.Path.Combine(f.Root, "impersonated") }); }));
+            await WindowsIdentity.RunImpersonatedAsync(identity.AccessToken, () => Expect(OrbitError.Storage, async () => { await using var c = await f.Open(System.IO.Path.Combine(f.Root, "impersonated")); }));
         }
         if (OperatingSystem.IsLinux())
         {
             var unsafePath = System.IO.Path.Combine(f.Root, "unsafe");
             Directory.CreateDirectory(unsafePath);
             File.SetUnixFileMode(unsafePath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead);
-            await Expect(OrbitError.Storage, async () => { await using var c = await OrbitClient.OpenLocalAsync(f.Config with { StatePath = unsafePath }); });
+            await Expect(OrbitError.Storage, async () => { await using var c = await f.Open(unsafePath); });
             Require(File.GetUnixFileMode(unsafePath).HasFlag(UnixFileMode.GroupRead));
         }
     }

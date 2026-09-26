@@ -2,9 +2,10 @@ using Orbit.Sdk;
 using System.Text.Json;
 
 const string commands = "Commands: activate, login, licences, more, select, claim, register, resend, recover, email, account-logout, status, export, deactivate, logout, quit";
-if (args.Length is < 4 or > 5)
+var appKey = Environment.GetEnvironmentVariable("ORBIT_APP_KEY");
+if (string.IsNullOrWhiteSpace(appKey))
 {
-    Console.Error.WriteLine("Usage: Orbit.LicensedExport URL APP_ID ENVIRONMENT_ID ISSUER [ABSOLUTE_STATE_DIRECTORY]");
+    Console.Error.WriteLine("Set ORBIT_APP_KEY to the public app key copied from Orbit Integration.");
     return 2;
 }
 
@@ -13,23 +14,17 @@ try
 {
     using var lifetime = new CancellationTokenSource();
     Console.CancelKeyPress += (_, cancel) => { cancel.Cancel = true; lifetime.Cancel(); };
-    var app = new AppConfig(args[0], args[1], args[2], args[3], args.Length == 5 ? args[4] : null);
-    await using var client = await OpenClientAsync(app, lifetime.Token);
+    await using var client = await OrbitClient.OpenAsync(appKey, cancellationToken: lifetime.Token);
     supportClient = client;
     try
     {
-        await client.RequireAccessAsync("export", lifetime.Token);
-    }
-    catch (OrbitException error) when (error.Error == OrbitError.Denied && error.Code == "access_unavailable")
-    {
-        Console.WriteLine("Enter a licence key, or leave it empty to use the account commands.");
-        var key = Prompt("Licence key: ");
-        if (key.Length != 0)
-            await client.ActivateAsync(key, cancellationToken: lifetime.Token);
+        await client.EnsureAccessAsync("export",
+            _ => ValueTask.FromResult<string?>(Prompt("Licence key (leave empty to use account commands): ")),
+            lifetime.Token);
     }
     catch (OrbitException error) { Console.WriteLine(error.Message); PrintSupport(client, error, Console.Out); }
     Console.WriteLine(commands);
-    PendingRegistration? pending = null;
+    RegistrationResult? pending = null;
     string? nextCursor = null;
     try
     {
@@ -72,7 +67,7 @@ try
                             if (page.Items.Count == 0)
                                 Console.WriteLine("No owned licences. Use claim with an eligible key.");
                             foreach (var licence in page.Items)
-                                Console.WriteLine($"{licence.Id} | {licence.PolicyName} | {licence.State} | expires {licence.ExpiresAt ?? "not started or perpetual"}");
+                                Console.WriteLine($"{licence.Id} | {licence.PolicyName} | {licence.State} | expires {licence.ExpiresAt?.ToString("O") ?? "not started or perpetual"}");
                             nextCursor = page.NextCursor;
                             if (nextCursor != null)
                                 Console.WriteLine("Use more for the next page.");
@@ -88,7 +83,7 @@ try
                     case "claim":
                         {
                             var key = Prompt("Licence key to claim (paste locally): ");
-                            var licence = await client.ClaimLicenceAsync(key, OperationId(), lifetime.Token);
+                            var licence = await client.ClaimLicenceAsync(key, cancellationToken: lifetime.Token);
                             Console.WriteLine($"Claimed licence {licence.Id}. Use select to activate it.");
                             break;
                         }
@@ -136,7 +131,7 @@ try
                     case "status":
                         {
                             var state = client.Snapshot();
-                            Console.WriteLine($"Access: {state.Access}; grant expiry: {state.ExpiresAt}; next check: {state.NextCheckAt}; credential expiry: {state.CredentialExpiresAt}; reauthentication required: {state.ReauthenticationRequired}; offline allowed: {state.OfflineAllowed}; offline seconds: {state.RemainingOfflineSeconds}; storage: {client.StorageCapability}");
+                            Console.WriteLine($"Access: {state.Access}; grant expiry: {state.ExpiresAt}; next check: {state.NextCheckAt}; credential expiry: {state.CredentialExpiresAt}; reauthentication required: {state.ReauthenticationRequired}; offline allowed: {state.OfflineAllowed}; offline time: {state.RemainingOffline}; storage: {client.StorageCapability}");
                             break;
                         }
                     case "export":
@@ -150,7 +145,7 @@ try
                     case "deactivate":
                         try
                         {
-                            await client.DeactivateAsync(OperationId(), lifetime.Token);
+                            await client.DeactivateAsync(cancellationToken: lifetime.Token);
                             Console.WriteLine("Device slot released.");
                         }
                         catch (OrbitException error) { Console.WriteLine($"Local access cleared; server release was not confirmed: {error.Message}"); PrintSupport(client, error, Console.Out); }
@@ -195,16 +190,6 @@ static string PasswordPrompt()
 {
     Console.Write("Password (this console does not hide terminal input): ");
     return Console.ReadLine() ?? "";
-}
-
-static string OperationId() => Device.NewInstallation().InstallationId;
-
-static Task<OrbitClient> OpenClientAsync(AppConfig config, CancellationToken cancellationToken)
-{
-#if ORBIT_LOCAL_DEVELOPMENT
-    if (config.ApiOrigin.StartsWith("http:", StringComparison.Ordinal)) return OrbitClient.OpenLocalAsync(config, cancellationToken);
-#endif
-    return OrbitClient.OpenAsync(config, cancellationToken);
 }
 
 static void PrintSupport(OrbitClient client, OrbitException error, TextWriter output) =>

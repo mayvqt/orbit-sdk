@@ -1,38 +1,29 @@
 # C# licensing example
 
-A console app checks the `export` feature before producing a sample report.
+This console app uses Orbit's installed client to authorize a sample export.
 Use .NET SDK 10.0.112 and the [C# SDK](../../../sdk/csharp/README.md).
 
-## Run
-
-In Orbit, select your application and **Test** environment. Create a policy with
-`export` enabled and hardware locking off, then issue a licence. Copy the four
-public values from **Integration**:
+Copy the public app key from Orbit's **Integration** page, starting with the
+**Test** environment:
 
 ```sh
-dotnet run --project examples/csharp/licensed-export -- API_ORIGIN APP_ID ENVIRONMENT_ID ISSUER
+export ORBIT_APP_KEY='orbit_app_test_...'
+dotnet run --project examples/csharp/licensed-export
 ```
 
-Enter a licence key when first prompted, then enter `export`. Input is visible
-in this demo; never put a key or password in the command line. `status` displays
-access and expiry, and `quit` closes the application without deactivating it.
+The example asks for a licence key only when there is no activation. Enter
+`export` to run the protected sample. Licence and password input is visible in
+this demo; never put either in command-line arguments.
 
-The SDK saves this installation and refreshes access automatically. Run the same
-command after restart: a valid saved activation needs no key prompt. An optional
-fifth argument names a dedicated absolute state directory for a service account
-or persistent container volume.
+The SDK saves this installation and validates it online after restart. Verified
+offline access is available only when the signed grant permits it. An optional
+`OrbitOptions.StatePath` can select a dedicated absolute state directory in
+application code.
 
-For an explicit local HTTP test service, add `-p:OrbitLocalDevelopment=true`
-before `--`. HTTP is restricted to literal loopback IPs; normal builds use HTTPS.
+For Account or Both authentication, use `register`, confirm the email link, then
+`login`, `licences` and `select` before exporting. Other commands show claiming a
+licence, registration recovery, account logout and device deactivation. Local
+logout clears local access; only acknowledged deactivation releases a device
+slot.
 
-## Optional customer accounts
-
-For Account or Both mode, leave the initial key prompt empty and enter `register`.
-Confirm the email link, then use `login`, `licences` and `select` before `export`.
-Customer accounts belong to your software, separately from the Orbit dashboard.
-
-Other commands are `more`, `claim`, `resend`, `recover`, `email`, `logout`,
-`account-logout` and `deactivate`. Logout clears local access; account logout also
-requests session revocation. Only acknowledged deactivation releases a device slot.
-
-Source and examples are [MIT licensed](../../../sdk/LICENSE).
+The SDK and example source are [MIT licensed](../../../sdk/LICENSE).

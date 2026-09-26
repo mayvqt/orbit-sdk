@@ -207,7 +207,8 @@ std::string sha256_hex(std::string_view input) {
 std::string activation_input_digest(const Config& config, std::string_view key,
                                     std::optional<std::string_view> previous,
                                     std::string_view principal,
-                                    std::optional<std::string_view> account_licence) {
+                                    std::optional<std::string_view> account_licence,
+                                    std::optional<std::string_view> principal_identity = std::nullopt) {
     Json::Value input(Json::objectValue);
     Json::Value scope(Json::objectValue);
     scope["api_origin"] = config.api_origin;
@@ -222,6 +223,8 @@ std::string activation_input_digest(const Config& config, std::string_view key,
         ? Json::Value(config.fingerprint->provider) : null_value();
     input["principal_kind"] = std::string(principal);
     input["credential_mode"] = "persistent";
+    input["principal_identity"] = principal_identity
+        ? Json::Value(std::string(*principal_identity)) : null_value();
     if (account_licence) input["licence_id"] = std::string(*account_licence);
     else input["licence_key"] = std::string(key);
     input["previous_credential_digest"] = previous
@@ -328,6 +331,30 @@ ClockStart capture_clock() {
     return {value.first, value.second};
 }
 
+std::optional<Fingerprint> resolve_fingerprint(const ::orbit::AppKey& app_key,
+                                                const ::orbit::Options& options) {
+    if (options.disable_machine_binding && options.fingerprint) {
+        raise(ErrorKind::configuration, "configuration");
+    }
+    if (options.fingerprint) {
+        if (!valid_lower_hex(options.fingerprint->value, 64) ||
+            !valid_provider(options.fingerprint->provider)) {
+            raise(ErrorKind::configuration, "configuration");
+        }
+        return options.fingerprint;
+    }
+    if (options.disable_machine_binding) return std::nullopt;
+    try {
+        return Fingerprint{::orbit::native_fingerprint(app_key.application_id(), app_key.environment_id()),
+                           "machine_v1"};
+    } catch (const Error& error) {
+        if (error.kind() == ErrorKind::denied && error.code() == "device_identity_unavailable") {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
 std::int64_t ClockAnchor::now() const {
     const auto [elapsed, wall] = current_clock();
     if (server_seconds < 0 || elapsed_nanoseconds < 0 || wall_seconds < 0 ||
@@ -391,11 +418,11 @@ void ClientState::clear_all_locked() {
     customer.reset();
 }
 
-void ClientState::invalidate_locked() {
+void ClientState::invalidate_locked(bool clear_pending) {
     if (persistent) {
         persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
         persistent_record["credential"] = null_value();
-        persistent_record["pending_activation"] = null_value();
+        if (clear_pending) persistent_record["pending_activation"] = null_value();
         persistent_record["access"] = null_value();
         persist_record_locked();
         return;
@@ -501,6 +528,7 @@ Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
         (credential->expires_at && *credential->expires_at <= capture_clock().wall_seconds + 86400);
     result["offline_allowed"] = false;
     result["remaining_offline_seconds"] = Json::UInt64(0);
+    result["policy_version"] = Json::Int64(0);
     if (!claims || !anchor) return result;
     std::int64_t now = 0;
     try {
@@ -522,6 +550,7 @@ Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
     result["reauthentication_required"] = !credential ||
         (credential->expires_at && *credential->expires_at <= now + 86400);
     result["offline_allowed"] = claims->offline_allowed;
+    result["policy_version"] = static_cast<Json::Int64>(claims->policy_version);
     std::string access;
     if (claims->expires_at <= now) access = "expired";
     else if (transient) access = claims->offline_allowed ? "offline" : "refresh_required";
@@ -572,7 +601,7 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         ? std::optional<std::string_view>(config.fingerprint->provider) : std::nullopt;
     if (!opaque(activation_id) || installation_id != *config.installation_id ||
         fingerprint_provider != (configured_provider ? std::optional<std::string>(*configured_provider) : std::nullopt) ||
-        binding != (configured_fingerprint ? "hwid" : "none")) invalid_response();
+        (configured_fingerprint ? (binding != "none" && binding != "hwid") : binding != "none")) invalid_response();
 
     const auto server_time = timestamp(server_text);
     out_anchor = ClockAnchor{server_time, start.elapsed_nanoseconds, start.wall_seconds};
@@ -618,6 +647,8 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         expiry,
         licence_expiry,
         now,
+        true,
+        binding,
     };
     GrantClaims verified;
     {
@@ -748,7 +779,7 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
     const bool automatic = idempotency_key.empty();
     if ((account_licence ? !opaque(*account_licence) : (key.empty() || key.size() > 256)) ||
         (!automatic && (idempotency_key.size() < 16 || idempotency_key.size() > 128)) ||
-        (automatic && (!persistent || account_licence)) || !valid_utf8(key) ||
+        (automatic && !persistent) || !valid_utf8(key) ||
         !valid_utf8(idempotency_key) || (previous && !valid_utf8(*previous))) {
         raise(ErrorKind::configuration, "configuration");
     }
@@ -762,24 +793,24 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
         throw_if_cancelled(cancelled);
-        if (persistent && account_licence) {
-            if (!persistent_record["pending_activation"].isNull()) {
-                raise(ErrorKind::configuration, "activation_pending_resolution_required");
+        if (persistent) {
+            std::optional<std::string> customer_identity;
+            if (account_licence) {
+                if (!customer) raise(ErrorKind::reauthentication_required, "reauthentication_required");
+                account_token = customer->bearer;
+                customer_identity = text(required(required(customer->account, "customer"), "id"));
             }
-            if (!customer) raise(ErrorKind::reauthentication_required, "reauthentication_required");
-            account_token = customer->bearer;
-            clear_access_locked();
-            invalidate_locked();
-        } else if (persistent) {
             const auto digest = activation_input_digest(
-                config, key, previous, "key", std::nullopt);
+                config, key, previous, account_licence ? "account" : "key",
+                account_licence, customer_identity
+                    ? std::optional<std::string_view>(*customer_identity) : std::nullopt);
             const auto now = capture_clock().wall_seconds;
             if (now <= 0) raise(ErrorKind::clock_uncertain, "clock_uncertain");
             auto candidate = persistent_record;
             const auto& pending = candidate["pending_activation"];
             if (!pending.isNull()) {
                 if (!pending.isObject() || !pending["operation_id"].isString() ||
-                    pending["principal_kind"] != "key" ||
+                    pending["principal_kind"] != (account_licence ? "account" : "key") ||
                     pending["input_digest"].asString() != digest) {
                     raise(ErrorKind::configuration, "activation_pending_input_mismatch");
                 }
@@ -796,7 +827,7 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
                 if (automatic) operation_id = new_installation_id();
                 candidate["pending_activation"] = Json::Value(Json::objectValue);
                 candidate["pending_activation"]["operation_id"] = operation_id;
-                candidate["pending_activation"]["principal_kind"] = "key";
+                candidate["pending_activation"]["principal_kind"] = account_licence ? "account" : "key";
                 candidate["pending_activation"]["input_digest"] = digest;
                 candidate["pending_activation"]["created_at"] = static_cast<Json::Int64>(now);
                 advance_generation_locked();
@@ -907,11 +938,11 @@ Json::Value ClientState::require_access(std::string_view feature, const std::ato
     const auto current_access = current["access"].asString();
     if (current_access != "online" && current_access != "offline") {
         std::lock_guard<std::mutex> lock(mutex);
-        if (persistent && credential && transient) raise(ErrorKind::transient, "network_unavailable");
-        raise(ErrorKind::denied, "access_unavailable");
+        if (credential && transient) raise(ErrorKind::transient, "network_unavailable");
+        raise(ErrorKind::not_activated, "access_unavailable");
     }
     if (!current["entitlements"].isMember(std::string(feature)) || !current["entitlements"][std::string(feature)].asBool()) {
-        raise(ErrorKind::denied, "feature_unavailable");
+        raise(ErrorKind::feature_unavailable, "feature_unavailable");
     }
     throw_if_cancelled(cancelled);
     return current;
@@ -963,7 +994,8 @@ void ClientState::finish_account_error(std::uint64_t request_generation,
     if (error_kind && *error_kind != ErrorKind::transient && *error_kind != ErrorKind::cancelled &&
         !(*error_kind == ErrorKind::denied && error_code == "session_expired")) {
         clear_all_locked();
-        invalidate_locked();
+        // An unrelated account failure cannot resolve an uncertain activation.
+        invalidate_locked(false);
     }
 }
 
@@ -1073,8 +1105,9 @@ Json::Value ClientState::login(std::string_view username, std::string_view passw
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
+        const bool preserve_pending = persistent && !persistent_record["pending_activation"].isNull();
         clear_all_locked();
-        invalidate_locked();
+        invalidate_locked(!preserve_pending);
         request_generation = current_generation;
     }
     Json::Value input(Json::objectValue);
@@ -1254,33 +1287,6 @@ std::string ClientState::customer_session_authorization() {
     return "Bearer " + customer->bearer;
 }
 
-std::shared_ptr<ClientState> connect_state(Config config) {
-    if (!config.installation_id || config.installation_id->empty()) config.installation_id = new_installation_id();
-    if (!opaque(config.application_id) || !opaque(config.environment_id) || config.issuer.empty() ||
-        config.issuer.size() > 2048 || !valid_utf8(config.issuer) ||
-        config.installation_id->size() < 16 || !opaque(*config.installation_id)) {
-        raise(ErrorKind::configuration, "configuration");
-    }
-    if (config.fingerprint && (!valid_lower_hex(config.fingerprint->value, 64) ||
-                               !valid_provider(config.fingerprint->provider))) {
-        raise(ErrorKind::configuration, "configuration");
-    }
-    const auto now = current_clock();
-    if (now.first < 0 || now.second < 0) raise(ErrorKind::clock_uncertain, "clock_uncertain");
-    Transport transport(config.api_origin);
-    auto protected_storage = open_storage(config);
-    const auto loaded = protected_storage->load();
-    std::optional<Credential> credential;
-    if (loaded.second) {
-        ClientState temporary(config, Transport(config.api_origin), protected_storage,
-                              loaded.first, std::nullopt);
-        credential = temporary.stored_credential(*loaded.second);
-    }
-    return std::make_shared<ClientState>(std::move(config), std::move(transport),
-                                         std::move(protected_storage), loaded.first,
-                                         std::move(credential));
-}
-
 std::shared_ptr<ClientState> open_installed_state(
     Config config, Transport transport, std::shared_ptr<InstalledStorage> installed) {
     auto raw_record = installed->load();
@@ -1292,9 +1298,20 @@ std::shared_ptr<ClientState> open_installed_state(
         installed->initialize(bytes);
     } else {
         if (!raw_record) raise(ErrorKind::corrupt_state, "installation_state_corrupt");
-        record = persistent_codec::decode(config, installed->provider(), *raw_record);
-        config.installation_id = record["installation"]["id"].asString();
-        record = persistent_codec::decode(config, installed->provider(), *raw_record);
+        record = persistent_codec::decode(config, installed->provider(), *raw_record, true);
+        const auto& saved_fingerprint = record["installation"]["fingerprint"];
+        const auto& saved_provider = record["installation"]["fingerprint_provider"];
+        const bool identity_matches = config.fingerprint
+            ? saved_fingerprint.isString() && saved_fingerprint.asString() == config.fingerprint->value &&
+              saved_provider.isString() && saved_provider.asString() == config.fingerprint->provider
+            : saved_fingerprint.isNull() && saved_provider.isNull();
+        if (!identity_matches) {
+            config.installation_id = new_installation_id();
+            record = persistent_codec::empty_record(config, installed->provider());
+            installed->save(persistent_codec::encode(config, installed->provider(), record));
+        } else {
+            config.installation_id = record["installation"]["id"].asString();
+        }
     }
     const auto generation_value = json_int64(record["generation"]);
     std::optional<Credential> credential;
@@ -1376,9 +1393,203 @@ const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation* cancellat
     return fallback;
 }
 
+namespace {
+
+::orbit::Timestamp public_time(std::int64_t seconds) {
+    return ::orbit::Timestamp(std::chrono::seconds(seconds));
+}
+
+std::optional<::orbit::Timestamp> optional_time(const Json::Value& value, const char* name) {
+    const auto seconds = optional_integer(value, name);
+    if (!seconds) return std::nullopt;
+    return public_time(*seconds);
+}
+
+::orbit::Access public_access(const Json::Value& value) {
+    const auto name = text(required(value, "access"));
+    if (name == "denied") return ::orbit::Access::denied;
+    if (name == "online") return ::orbit::Access::online;
+    if (name == "offline") return ::orbit::Access::offline;
+    if (name == "refresh_required") return ::orbit::Access::refresh_required;
+    if (name == "expired") return ::orbit::Access::expired;
+    invalid_response();
+}
+
+::orbit::Snapshot public_snapshot(const Json::Value& value) {
+    if (!value.isObject()) invalid_response();
+    ::orbit::Snapshot output;
+    output.access = public_access(value);
+    output.expires_at = optional_time(value, "expires_at");
+    output.next_check_at = optional_time(value, "next_check_at");
+    output.credential_expires_at = optional_time(value, "credential_expires_at");
+    output.reauthentication_required = boolean(required(value, "reauthentication_required"));
+    output.offline_allowed = boolean(required(value, "offline_allowed"));
+    output.remaining_offline = std::chrono::seconds(integer(required(value, "remaining_offline_seconds")));
+    const auto policy = integer(required(value, "policy_version"));
+    if (policy < 0 || policy > INT32_MAX) invalid_response();
+    output.policy_version = static_cast<std::int32_t>(policy);
+    const auto& entitlements = required(value, "entitlements");
+    if (!entitlements.isObject() || entitlements.size() > 64) invalid_response();
+    for (const auto& name : entitlements.getMemberNames()) {
+        if (!entitlements[name].isBool()) invalid_response();
+        output.entitlements.emplace(name, entitlements[name].asBool());
+    }
+    return output;
+}
+
+::orbit::Customer public_customer(const Json::Value& value) {
+    ::orbit::Customer output;
+    output.id = text(required(value, "id"));
+    output.username = text(required(value, "username"));
+    output.email = text(required(value, "email"));
+    output.suspended = boolean(required(value, "suspended"));
+    output.created_at = public_time(timestamp(text(required(value, "created_at"))));
+    return output;
+}
+
+::orbit::Account public_account(const Json::Value& value) {
+    ::orbit::Account output;
+    output.customer = public_customer(required(value, "customer"));
+    output.expires_at = public_time(timestamp(text(required(value, "expires_at"))));
+    return output;
+}
+
+::orbit::OwnedLicence public_licence(const Json::Value& value) {
+    ::orbit::OwnedLicence output;
+    output.id = text(required(value, "id"));
+    output.policy_name = text(required(value, "policy_name"));
+    output.state = text(required(value, "state"));
+    output.expiry_mode = text(required(value, "expiry_mode"));
+    const auto first_used = optional_string(value, "first_used_at");
+    const auto expires = optional_string(value, "expires_at");
+    const auto duration = optional_integer(value, "duration_seconds");
+    if (first_used) output.first_used_at = public_time(timestamp(*first_used));
+    if (expires) output.expires_at = public_time(timestamp(*expires));
+    if (duration) output.duration = std::chrono::seconds(*duration);
+    const auto device_limit = integer(required(value, "device_limit"));
+    const auto offline_seconds = integer(required(value, "offline_seconds"));
+    if (device_limit < 0 || device_limit > INT32_MAX || offline_seconds < 0) invalid_response();
+    output.device_limit = static_cast<std::int32_t>(device_limit);
+    output.hwid_locked = boolean(required(value, "hwid_locked"));
+    output.offline_allowed = boolean(required(value, "offline_allowed"));
+    output.offline_duration = std::chrono::seconds(offline_seconds);
+    const auto& entitlements = required(value, "entitlements");
+    if (!entitlements.isObject() || entitlements.size() > 64) invalid_response();
+    for (const auto& name : entitlements.getMemberNames()) {
+        if (!entitlements[name].isBool()) invalid_response();
+        output.entitlements.emplace(name, entitlements[name].asBool());
+    }
+    return output;
+}
+
+} // namespace
+
 } // namespace orbit::detail
 
 namespace orbit {
+
+namespace {
+
+[[noreturn]] void invalid_app_key() {
+    detail::raise(ErrorKind::configuration, "invalid_app_key");
+}
+
+int app_key_base64_value(char value) {
+    if (value >= 'A' && value <= 'Z') return value - 'A';
+    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+    if (value >= '0' && value <= '9') return value - '0' + 52;
+    if (value == '-') return 62;
+    if (value == '_') return 63;
+    return -1;
+}
+
+std::string decode_app_key_origin(std::string_view encoded) {
+    if (encoded.empty() || encoded.size() % 4 == 1) invalid_app_key();
+    std::string decoded;
+    decoded.reserve(encoded.size() * 3 / 4);
+    std::uint32_t accumulator = 0;
+    unsigned bits = 0;
+    for (const auto character : encoded) {
+        const auto value = app_key_base64_value(character);
+        if (value < 0) invalid_app_key();
+        accumulator = (accumulator << 6) | static_cast<std::uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            decoded.push_back(static_cast<char>((accumulator >> bits) & 0xff));
+        }
+    }
+    if ((bits && (accumulator & ((1u << bits) - 1u)) != 0) || !detail::valid_utf8(decoded)) {
+        invalid_app_key();
+    }
+    return decoded;
+}
+
+bool app_key_id(std::string_view value) {
+    return !value.empty() && value.size() <= 128 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return (character >= 'A' && character <= 'Z') ||
+                   (character >= 'a' && character <= 'z') ||
+                   (character >= '0' && character <= '9') || character == '_' || character == '-';
+        });
+}
+
+std::string required_operation_id(std::optional<std::string_view> value) {
+    return value ? std::string(*value) : new_installation_id();
+}
+
+void validate_optional_activation_operation_id(std::optional<std::string_view> value) {
+    if (value && (value->size() < 16 || value->size() > 128 || !detail::valid_utf8(*value))) {
+        detail::raise(ErrorKind::configuration, "configuration");
+    }
+}
+
+} // namespace
+
+AppKey::AppKey(std::string api_origin, std::string application_id,
+               std::string environment_id, std::string environment)
+    : api_origin_(std::move(api_origin)), issuer_(api_origin_),
+      application_id_(std::move(application_id)), environment_id_(std::move(environment_id)),
+      environment_(std::move(environment)) {}
+
+AppKey AppKey::parse(std::string_view input) {
+    while (!input.empty() && std::isspace(static_cast<unsigned char>(input.front()))) input.remove_prefix(1);
+    while (!input.empty() && std::isspace(static_cast<unsigned char>(input.back()))) input.remove_suffix(1);
+    if (input.empty() || input.size() > 512) invalid_app_key();
+    std::string_view environment;
+    std::string_view rest;
+    constexpr std::string_view test_prefix = "orbit_app_test_";
+    constexpr std::string_view live_prefix = "orbit_app_live_";
+    if (input.substr(0, test_prefix.size()) == test_prefix) {
+        environment = "test";
+        rest = input.substr(test_prefix.size());
+    } else if (input.substr(0, live_prefix.size()) == live_prefix) {
+        environment = "live";
+        rest = input.substr(live_prefix.size());
+    } else {
+        invalid_app_key();
+    }
+    const auto first_dot = rest.find('.');
+    const auto second_dot = first_dot == std::string_view::npos
+        ? std::string_view::npos : rest.find('.', first_dot + 1);
+    if (first_dot == std::string_view::npos || first_dot == 0 ||
+        second_dot == std::string_view::npos || second_dot == first_dot + 1 ||
+        rest.find('.', second_dot + 1) != std::string_view::npos) invalid_app_key();
+    const auto encoded_origin = rest.substr(0, first_dot);
+    const auto application = rest.substr(first_dot + 1, second_dot - first_dot - 1);
+    const auto environment_id = rest.substr(second_dot + 1);
+    if (!app_key_id(application) || !app_key_id(environment_id)) invalid_app_key();
+    auto origin = decode_app_key_origin(encoded_origin);
+    if (origin.empty() || origin.back() == '/') invalid_app_key();
+    try {
+        detail::Transport transport(origin);
+        origin = transport.origin();
+    } catch (const Error&) {
+        invalid_app_key();
+    }
+    return AppKey(std::move(origin), std::string(application), std::string(environment_id),
+                  std::string(environment));
+}
 
 Error::Error(std::uint32_t status, ErrorKind kind, std::string code,
              std::string request_id)
@@ -1389,6 +1600,11 @@ Cancellation::Cancellation() : state_(std::make_shared<detail::CancellationState
 
 void Cancellation::cancel() const noexcept {
     if (state_) state_->cancelled.store(true, std::memory_order_relaxed);
+}
+
+bool Snapshot::has_feature(std::string_view feature) const {
+    const auto found = entitlements.find(std::string(feature));
+    return found != entitlements.end() && found->second;
 }
 
 PendingRegistration::PendingRegistration(
@@ -1422,37 +1638,23 @@ Client& Client::operator=(Client&& other) noexcept {
     return *this;
 }
 
-Client Client::connect(Config config) { return Client(detail::connect_state(std::move(config))); }
+Client Client::open(std::string_view app_key, Options options) {
+    return open(AppKey::parse(app_key), std::move(options));
+}
 
-Client Client::open(AppConfig app,
-                    std::optional<std::string> state_directory) {
-    Config config;
-    config.api_origin = std::move(app.api_origin);
-    config.application_id = std::move(app.application_id);
-    config.environment_id = std::move(app.environment_id);
-    config.issuer = std::move(app.issuer);
-    config.fingerprint = std::move(app.fingerprint);
-    if (!detail::opaque(config.application_id) || !detail::opaque(config.environment_id) ||
-        config.issuer.empty() || config.issuer.size() > 2048 || !detail::valid_utf8(config.issuer) ||
-        std::any_of(config.issuer.begin(), config.issuer.end(), [](unsigned char c) {
-            return c < 0x20 || c == 0x7f;
-        }) || (config.fingerprint &&
-            (!detail::valid_lower_hex(config.fingerprint->value, 64) ||
-             !detail::valid_provider(config.fingerprint->provider)))) {
-        detail::raise(ErrorKind::configuration, "configuration");
-    }
+Client Client::open(const AppKey& app_key, Options options) {
+    detail::Config config;
+    config.api_origin = app_key.api_origin();
+    config.application_id = app_key.application_id();
+    config.environment_id = app_key.environment_id();
+    config.issuer = app_key.issuer();
+    config.fingerprint = detail::resolve_fingerprint(app_key, options);
     (void)detail::capture_clock();
     detail::Transport transport(config.api_origin);
     config.api_origin = transport.origin();
-    auto installed = detail::open_installed_storage(config, std::move(state_directory));
-    auto state = detail::open_installed_state(
-        std::move(config), std::move(transport), std::move(installed));
+    auto installed = detail::open_installed_storage(config, std::move(options.state_directory));
+    auto state = detail::open_installed_state(std::move(config), std::move(transport), std::move(installed));
     return Client(std::move(state));
-}
-
-const Config& Client::config() const noexcept {
-    static const Config empty;
-    return state_ ? state_->config : empty;
 }
 
 const std::string& Client::installation_id() const noexcept {
@@ -1468,53 +1670,76 @@ detail::ClientState& require_state(const std::shared_ptr<detail::ClientState>& s
 }
 } // namespace
 
-std::string Client::snapshot(const Cancellation* cancellation) const {
+Snapshot Client::snapshot(const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
     if (detail::cancellation_flag(cancellation, inactive).load(std::memory_order_relaxed)) {
         detail::raise(ErrorKind::cancelled, "cancelled");
     }
-    return detail::encode_json(require_state(state_).snapshot());
+    return detail::public_snapshot(require_state(state_).snapshot());
 }
 
-std::string Client::activate(std::string_view licence_key, std::string_view idempotency_key,
-                             const Cancellation* cancellation) const {
+Snapshot Client::activate(std::string_view licence_key,
+                          std::optional<std::string_view> idempotency_key,
+                          const Cancellation* cancellation) const {
+    validate_optional_activation_operation_id(idempotency_key);
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).activate(licence_key, idempotency_key,
+    auto& state = require_state(state_);
+    const auto operation = idempotency_key ? std::string(*idempotency_key)
+        : (state.persistent ? std::string{} : new_installation_id());
+    return detail::public_snapshot(state.activate(licence_key, operation,
         std::nullopt, detail::cancellation_flag(cancellation, inactive)));
 }
 
-std::string Client::activate(std::string_view licence_key,
-                             const Cancellation* cancellation) const {
-    std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).activate(licence_key, {},
-        std::nullopt, detail::cancellation_flag(cancellation, inactive)));
+Snapshot Client::activate(std::string_view licence_key, const Cancellation* cancellation) const {
+    return activate(licence_key, std::nullopt, cancellation);
 }
 
-std::string Client::activate_previous(std::string_view licence_key,
-                                      std::optional<std::string_view> previous_credential,
-                                      std::string_view idempotency_key,
-                                      const Cancellation* cancellation) const {
+Snapshot Client::activate_previous(std::string_view licence_key,
+                                   std::optional<std::string_view> previous_credential,
+                                   std::optional<std::string_view> idempotency_key,
+                                   const Cancellation* cancellation) const {
+    validate_optional_activation_operation_id(idempotency_key);
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).activate(licence_key, idempotency_key,
+    auto& state = require_state(state_);
+    const auto operation = idempotency_key ? std::string(*idempotency_key)
+        : (state.persistent ? std::string{} : new_installation_id());
+    return detail::public_snapshot(state.activate(licence_key, operation,
         previous_credential, detail::cancellation_flag(cancellation, inactive)));
 }
 
-std::string Client::refresh(const Cancellation* cancellation) const {
+Snapshot Client::refresh(const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).refresh(detail::cancellation_flag(cancellation, inactive)));
+    return detail::public_snapshot(require_state(state_).refresh(detail::cancellation_flag(cancellation, inactive)));
 }
 
-std::string Client::require_access(std::string_view feature, const Cancellation* cancellation) const {
+Snapshot Client::require_access(std::string_view feature, const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).require_access(feature, detail::cancellation_flag(cancellation, inactive)));
+    return detail::public_snapshot(require_state(state_).require_access(feature, detail::cancellation_flag(cancellation, inactive)));
 }
 
-void Client::deactivate(std::string_view idempotency_key, const Cancellation* cancellation) const {
-    std::atomic_bool inactive{false};
-    require_state(state_).deactivate(idempotency_key, detail::cancellation_flag(cancellation, inactive));
+Snapshot Client::ensure_access(std::string_view feature,
+                               const std::function<std::optional<std::string>()>& ask_for_key,
+                               const Cancellation* cancellation) const {
+    try {
+        return require_access(feature, cancellation);
+    } catch (const Error& error) {
+        if (error.kind() != ErrorKind::not_activated) throw;
+    }
+    if (!ask_for_key) detail::raise(ErrorKind::not_activated, "access_unavailable");
+    const auto key = ask_for_key();
+    if (!key || key->empty()) detail::raise(ErrorKind::not_activated, "access_unavailable");
+    (void)activate(*key, std::nullopt, cancellation);
+    return require_access(feature, cancellation);
 }
 
-void Client::local_logout() const { require_state(state_).local_logout(); }
+void Client::deactivate(std::optional<std::string_view> idempotency_key,
+                        const Cancellation* cancellation) const {
+    std::atomic_bool inactive{false};
+    const auto operation = required_operation_id(idempotency_key);
+    require_state(state_).deactivate(operation, detail::cancellation_flag(cancellation, inactive));
+}
+
+void Client::logout() const { require_state(state_).local_logout(); }
 
 void Client::close() const { require_state(state_).close(); }
 
@@ -1524,8 +1749,12 @@ RegistrationResult Client::register_customer(
     std::atomic_bool inactive{false};
     auto result = require_state(state_).register_customer(licence_key, username, email, password,
                                                           detail::cancellation_flag(cancellation, inactive));
-    return RegistrationResult{detail::encode_json(result.first),
-                              PendingRegistration(state_, std::move(result.second))};
+    RegistrationResult output;
+    output.accepted = detail::boolean(detail::required(result.first, "accepted"));
+    output.expires_at = detail::public_time(detail::timestamp(
+        detail::text(detail::required(result.first, "expires_at"))));
+    output.pending = PendingRegistration(state_, std::move(result.second));
+    return output;
 }
 
 void Client::resend_registration(const PendingRegistration& pending,
@@ -1537,43 +1766,64 @@ void Client::resend_registration(const PendingRegistration& pending,
     state_->resend_registration(*pending.value_, detail::cancellation_flag(cancellation, inactive));
 }
 
-std::string Client::login(std::string_view username, std::string_view password,
-                          const Cancellation* cancellation) const {
+Account Client::login(std::string_view username, std::string_view password,
+                      const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).login(username, password, detail::cancellation_flag(cancellation, inactive)));
+    return detail::public_account(require_state(state_).login(username, password, detail::cancellation_flag(cancellation, inactive)));
 }
 
-std::string Client::account() const { return detail::encode_json(require_state(state_).account()); }
+std::optional<Account> Client::account() const {
+    const auto value = require_state(state_).account();
+    if (value.isNull()) return std::nullopt;
+    return detail::public_account(value);
+}
 
-std::string Client::owned_licences(std::optional<std::string_view> cursor,
+OwnedLicencePage Client::owned_licences(std::optional<std::string_view> cursor,
+                                        const Cancellation* cancellation) const {
+    std::atomic_bool inactive{false};
+    const auto page = require_state(state_).owned_licences(cursor, detail::cancellation_flag(cancellation, inactive));
+    OwnedLicencePage output;
+    const auto& items = detail::required(page, "items");
+    output.items.reserve(items.size());
+    for (const auto& item : items) output.items.push_back(detail::public_licence(item));
+    output.next_cursor = detail::optional_string(page, "next_cursor");
+    return output;
+}
+
+OwnedLicence Client::claim_licence(std::string_view licence_key,
+                                   std::optional<std::string_view> idempotency_key,
                                    const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).owned_licences(cursor, detail::cancellation_flag(cancellation, inactive)));
-}
-
-std::string Client::claim_licence(std::string_view licence_key, std::string_view idempotency_key,
-                                  const Cancellation* cancellation) const {
-    std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).claim_licence(licence_key, idempotency_key,
+    const auto operation = required_operation_id(idempotency_key);
+    return detail::public_licence(require_state(state_).claim_licence(licence_key, operation,
         detail::cancellation_flag(cancellation, inactive)));
 }
 
-std::string Client::activate_account(std::string_view licence_id, std::string_view idempotency_key,
-                                     const Cancellation* cancellation) const {
+Snapshot Client::activate_account(std::string_view licence_id,
+                                  std::optional<std::string_view> idempotency_key,
+                                  const Cancellation* cancellation) const {
+    validate_optional_activation_operation_id(idempotency_key);
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).activate({}, idempotency_key, std::nullopt,
+    auto& state = require_state(state_);
+    const auto operation = idempotency_key ? std::string(*idempotency_key)
+        : (state.persistent ? std::string{} : new_installation_id());
+    return detail::public_snapshot(state.activate({}, operation, std::nullopt,
         detail::cancellation_flag(cancellation, inactive), licence_id));
 }
 
-std::string Client::activate_account_previous(
+Snapshot Client::activate_account_previous(
     std::string_view licence_id, std::optional<std::string_view> previous_credential,
-    std::string_view idempotency_key, const Cancellation* cancellation) const {
+    std::optional<std::string_view> idempotency_key, const Cancellation* cancellation) const {
+    validate_optional_activation_operation_id(idempotency_key);
     std::atomic_bool inactive{false};
-    return detail::encode_json(require_state(state_).activate({}, idempotency_key, previous_credential,
+    auto& state = require_state(state_);
+    const auto operation = idempotency_key ? std::string(*idempotency_key)
+        : (state.persistent ? std::string{} : new_installation_id());
+    return detail::public_snapshot(state.activate({}, operation, previous_credential,
         detail::cancellation_flag(cancellation, inactive), licence_id));
 }
 
-void Client::account_logout(const Cancellation* cancellation) const {
+void Client::logout_account(const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
     require_state(state_).account_logout(detail::cancellation_flag(cancellation, inactive));
 }

@@ -2,8 +2,8 @@ namespace Orbit.Sdk;
 
 public enum OrbitError
 {
-    Configuration, Cancelled, Transient, Denied, InvalidResponse, TransportSecurity,
-    ReauthenticationRequired, StaleResponse, Storage, ClockUncertain
+    Configuration, Cancelled, Transient, Denied, NotActivated, FeatureUnavailable,
+    InvalidResponse, TransportSecurity, ReauthenticationRequired, StaleResponse, Storage, ClockUncertain
 }
 
 /// <summary>Contains only safe error classification, never server messages or bearer material.</summary>
@@ -51,6 +51,8 @@ public sealed class OrbitException : Exception
         return error switch
         {
             OrbitError.Configuration => "Invalid Orbit configuration",
+            OrbitError.NotActivated => "Activate a licence before using this feature",
+            OrbitError.FeatureUnavailable => "This licence does not include the requested feature",
             OrbitError.Cancelled => "Operation cancelled",
             OrbitError.Transient => "Orbit is temporarily unreachable. Try again later.",
             OrbitError.Denied => "Orbit denied access. Contact application support.",

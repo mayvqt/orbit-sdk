@@ -2,12 +2,12 @@ using System.Text.Json;
 
 namespace Orbit.Sdk;
 
-public sealed record Customer(string Id, string Username, string Email, bool Suspended, string CreatedAt);
-public sealed record Account(Customer Customer, string ExpiresAt);
+public sealed record Customer(string Id, string Username, string Email, bool Suspended, DateTimeOffset CreatedAt);
+public sealed record Account(Customer Customer, DateTimeOffset ExpiresAt);
 public sealed record OwnedLicence(string Id, string PolicyName, string State, string ExpiryMode,
-    string? FirstUsedAt, string? ExpiresAt, long? DurationSeconds, int DeviceLimit, bool HwidLocked,
-    bool OfflineAllowed, int OfflineSeconds, IReadOnlyDictionary<string, bool> Entitlements);
-public sealed record OwnedLicences(IReadOnlyList<OwnedLicence> Items, string? NextCursor);
+    DateTimeOffset? FirstUsedAt, DateTimeOffset? ExpiresAt, TimeSpan? Duration, int DeviceLimit, bool HwidLocked,
+    bool OfflineAllowed, TimeSpan OfflineDuration, IReadOnlyDictionary<string, bool> Entitlements);
+public sealed record OwnedLicencePage(IReadOnlyList<OwnedLicence> Items, string? NextCursor);
 
 /// <summary>
 /// Sensitive login proof held only in memory. Possession establishes neither
@@ -41,21 +41,21 @@ public sealed class Registration(string licenceKey, string username, string emai
 }
 
 /// <summary>A scoped resend proof held only in memory. Not an account session or an access grant.</summary>
-public sealed class PendingRegistration
+public sealed class RegistrationResult
 {
     public bool Accepted => true;
-    public string ExpiresAt { get; }
+    public DateTimeOffset ExpiresAt { get; }
     internal string ResendCredential { get; }
     internal string ApplicationId { get; }
     internal string EnvironmentId { get; }
-    internal PendingRegistration(string expiresAt, string resendCredential, OrbitConfig config)
+    internal RegistrationResult(DateTimeOffset expiresAt, string resendCredential, OrbitConfig config)
     {
         ExpiresAt = expiresAt;
         ResendCredential = resendCredential;
         ApplicationId = config.ApplicationId;
         EnvironmentId = config.EnvironmentId;
     }
-    public override string ToString() => "Orbit pending registration (redacted)";
+    public override string ToString() => "Orbit registration result (redacted)";
 }
 
 internal sealed class CustomerSession(string token, Account account)
@@ -97,8 +97,9 @@ public sealed partial class OrbitClient
             {
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
+                var preservePending = installed?.Record.PendingActivation != null;
                 Clear();
-                InvalidateStorage();
+                InvalidateStorage(clearPending: !preservePending);
                 expected = generation;
             }
             try
@@ -113,7 +114,7 @@ public sealed partial class OrbitClient
                 var expires = JsonWire.String(reply, "expires_at");
                 _ = JsonWire.Timestamp(expires);
                 if (!JsonWire.Bearer(token)) throw JsonWire.Invalid();
-                var account = new Account(customer, expires);
+                var account = new Account(customer, DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(expires)));
                 lock (gate)
                 {
                     CheckGeneration(expected);
@@ -164,7 +165,7 @@ public sealed partial class OrbitClient
         }
     }
 
-    public async Task<OwnedLicences> OwnedLicencesAsync(string? after = null, CancellationToken cancellationToken = default)
+    public async Task<OwnedLicencePage> OwnedLicencesAsync(string? after = null, CancellationToken cancellationToken = default)
     {
         if (after != null && !JsonWire.Opaque(after)) throw new OrbitException(OrbitError.Configuration);
         var expected = Generation();
@@ -181,19 +182,20 @@ public sealed partial class OrbitClient
                 var items = entries.EnumerateArray().Select(ReadLicence).ToArray();
                 var cursor = JsonWire.OptionalString(reply, "next_cursor");
                 if (cursor != null && !JsonWire.Opaque(cursor)) throw JsonWire.Invalid();
-                return FinishAccount(new OwnedLicences(Array.AsReadOnly(items), cursor), expected, cancellationToken);
+                return FinishAccount(new OwnedLicencePage(Array.AsReadOnly(items), cursor), expected, cancellationToken);
             }
             catch (OrbitException error) { throw FinishAccountError(error, expected, cancellationToken); }
         }
         finally { serial.Release(); }
     }
 
-    public Task<OwnedLicence> ClaimLicenceAsync(string licenceKey, string idempotencyKey, CancellationToken cancellationToken = default)
+    public Task<OwnedLicence> ClaimLicenceAsync(string licenceKey, string? idempotencyKey = null, CancellationToken cancellationToken = default)
     {
-        if (licenceKey.Length is < 1 or > 256 || !JsonWire.OperationId(idempotencyKey)) throw new OrbitException(OrbitError.Configuration);
+        if (licenceKey.Length is < 1 or > 256 || idempotencyKey != null && !JsonWire.OperationId(idempotencyKey))
+            throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
         body["licence_key"] = licenceKey;
-        body["idempotency_key"] = idempotencyKey;
+        body["idempotency_key"] = idempotencyKey ?? Device.NewInstallation().InstallationId;
         return AccountPostAsync("/api/client/v1/licence-claims", body, true, ReadLicence, cancellationToken);
     }
 
@@ -206,7 +208,7 @@ public sealed partial class OrbitClient
         _ = await AccountPostAsync("/api/client/v1/email-changes", body, false, Accepted, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<PendingRegistration> RegisterAsync(Registration registration, CancellationToken cancellationToken = default)
+    public async Task<RegistrationResult> RegisterAsync(Registration registration, CancellationToken cancellationToken = default)
     {
         if (registration.LicenceKey.Length is < 1 or > 256 || registration.Username.Length > 128 ||
             registration.Email.Length > 254 || registration.Password.Length > 256 ||
@@ -223,10 +225,10 @@ public sealed partial class OrbitClient
         var expiry = JsonWire.String(reply, "expires_at");
         _ = JsonWire.Timestamp(expiry);
         if (!JsonWire.Bearer(proof)) throw JsonWire.Invalid();
-        return new PendingRegistration(expiry, proof, config);
+        return new RegistrationResult(DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(expiry)), proof, config);
     }
 
-    public async Task ResendRegistrationAsync(PendingRegistration pending, CancellationToken cancellationToken = default)
+    public async Task ResendRegistrationAsync(RegistrationResult pending, CancellationToken cancellationToken = default)
     {
         if (pending.ApplicationId != config.ApplicationId || pending.EnvironmentId != config.EnvironmentId)
             throw new OrbitException(OrbitError.Configuration);
@@ -294,7 +296,8 @@ public sealed partial class OrbitClient
                 !(error.Error == OrbitError.Denied && error.Code == "session_expired"))
             {
                 Clear();
-                InvalidateStorage();
+                // Account failures cannot resolve an unrelated uncertain activation.
+                InvalidateStorage(clearPending: false);
             }
             return error;
         }
@@ -304,12 +307,13 @@ public sealed partial class OrbitClient
 
     private static Customer ReadCustomer(JsonElement value)
     {
+        var createdAt = JsonWire.String(value, "created_at");
         var customer = new Customer(JsonWire.String(value, "id"), JsonWire.String(value, "username"),
-            JsonWire.String(value, "email"), JsonWire.Boolean(value, "suspended"), JsonWire.String(value, "created_at"));
+            JsonWire.String(value, "email"), JsonWire.Boolean(value, "suspended"),
+            DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(createdAt)));
         if (!JsonWire.Opaque(customer.Id) || customer.Suspended || customer.Username.Length is < 3 or > 32 ||
             !customer.Username.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_') || customer.Email.Length is < 1 or > 254)
             throw JsonWire.Invalid();
-        _ = JsonWire.Timestamp(customer.CreatedAt);
         return customer;
     }
 
@@ -323,11 +327,14 @@ public sealed partial class OrbitClient
             throw JsonWire.Invalid();
         var firstUsed = JsonWire.OptionalString(value, "first_used_at");
         var expires = JsonWire.OptionalString(value, "expires_at");
-        if (firstUsed != null) _ = JsonWire.Timestamp(firstUsed);
-        if (expires != null) _ = JsonWire.Timestamp(expires);
+        var duration = JsonWire.OptionalInteger(value, "duration_seconds");
+        if (duration is { } seconds &&
+            (seconds < 0 || seconds > TimeSpan.MaxValue.Ticks / TimeSpan.TicksPerSecond)) throw JsonWire.Invalid();
         return new OwnedLicence(id, policy, JsonWire.String(value, "state"), JsonWire.String(value, "expiry_mode"),
-            firstUsed, expires, JsonWire.OptionalInteger(value, "duration_seconds"), (int)deviceLimit,
-            JsonWire.Boolean(value, "hwid_locked"), JsonWire.Boolean(value, "offline_allowed"), (int)offlineSeconds,
+            firstUsed == null ? null : DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(firstUsed)),
+            expires == null ? null : DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(expires)),
+            duration == null ? null : TimeSpan.FromTicks(duration.Value * TimeSpan.TicksPerSecond), (int)deviceLimit,
+            JsonWire.Boolean(value, "hwid_locked"), JsonWire.Boolean(value, "offline_allowed"), TimeSpan.FromSeconds(offlineSeconds),
             JsonWire.Entitlements(JsonWire.Field(value, "entitlements")));
     }
 }

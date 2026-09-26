@@ -1,5 +1,6 @@
 #include "storage_windows.hpp"
 
+#include "core.hpp"
 #include "storage_codec.hpp"
 #include "installed_storage.hpp"
 

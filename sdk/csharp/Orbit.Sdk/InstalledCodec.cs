@@ -42,7 +42,8 @@ internal static class InstalledCodec
         }
         return bytes;
     }
-    internal static InstalledRecord Decode(byte[] bytes, InstalledScope scope, string provider, string? fingerprint, string? fingerprintProvider)
+    internal static InstalledRecord Decode(byte[] bytes, InstalledScope scope, string provider, string? fingerprint, string? fingerprintProvider,
+        bool allowIdentityMismatch = false)
     {
         try
         {
@@ -59,10 +60,12 @@ internal static class InstalledCodec
             if (JsonWire.Field(json, "access").ValueKind != JsonValueKind.Null)
                 JsonWire.ExactFields(JsonWire.Field(json, "access"), "jws", "jwks", "licence_expires_at", "received_server_time", "received_wall_time", "server_high_water", "wall_high_water");
             var r = JsonSerializer.Deserialize<InstalledRecord>(bytes, Options) ?? throw JsonWire.Invalid();
+            var identityMatches = r.Installation.Fingerprint == fingerprint && r.Installation.FingerprintProvider == fingerprintProvider;
             if (r.Sdk != Sdk || r.Format != 2 || r.Provider != provider || r.Scope != scope || r.Generation < 0 ||
-                r.Installation.Fingerprint != fingerprint || r.Installation.FingerprintProvider != fingerprintProvider)
+                (!allowIdentityMismatch && !identityMatches))
                 throw JsonWire.Invalid();
-            new OrbitConfig(scope.ApplicationId, scope.EnvironmentId, scope.Issuer).Validate(new Device(r.Installation.Id, fingerprint, fingerprintProvider));
+            new OrbitConfig(scope.ApplicationId, scope.EnvironmentId, scope.Issuer).Validate(new Device(r.Installation.Id,
+                r.Installation.Fingerprint, r.Installation.FingerprintProvider));
             if (r.Credential is { } c && (!JsonWire.Opaque(c.ActivationId) || !JsonWire.Opaque(c.LicenceId) || !JsonWire.Bearer(c.Bearer) || !Expiry(c.ExpiresAt)))
                 throw JsonWire.Invalid();
             if (r.PendingActivation is { } p && (!JsonWire.OperationId(p.OperationId) || p.PrincipalKind is not ("key" or "account") ||

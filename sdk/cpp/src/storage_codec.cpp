@@ -1,5 +1,6 @@
 #include "storage_codec.hpp"
 
+#include "core.hpp"
 #include "json.hpp"
 
 #include <openssl/evp.h>

@@ -8,7 +8,8 @@ internal sealed record GrantClaims(string LicenceId, long IssuedAt, long Expires
     bool OfflineAllowed, int PolicyVersion, IReadOnlyDictionary<string, bool> Entitlements);
 
 internal sealed record GrantExpected(OrbitConfig Config, Device Device, string? LicenceId, string ActivationId,
-    long? CredentialExpiresAt, long? LicenceExpiresAt, long Now);
+    long? CredentialExpiresAt, long? LicenceExpiresAt, long Now,
+    bool AllowUnboundFingerprint = false, string? ExpectedBindingMode = null);
 
 internal sealed class GrantKeys
 {
@@ -107,10 +108,18 @@ internal sealed class GrantKeys
         var policy = JsonWire.Integer(claims, "policy_version");
         var licenceExpiry = JsonWire.OptionalInteger(claims, "licence_expires_at");
         var binding = JsonWire.String(claims, "binding_mode");
-        var bound = expected.Device.Fingerprint == null
-            ? binding == "none" && JsonWire.OptionalString(claims, "fingerprint") == null && JsonWire.OptionalString(claims, "fingerprint_provider") == null
-            : binding == "hwid" && JsonWire.OptionalString(claims, "fingerprint") == expected.Device.Fingerprint &&
-              JsonWire.OptionalString(claims, "fingerprint_provider") == expected.Device.FingerprintProvider;
+        var hasFingerprintClaim = claims.TryGetProperty("fingerprint", out _);
+        var hasProviderClaim = claims.TryGetProperty("fingerprint_provider", out _);
+        var claimFingerprint = JsonWire.OptionalString(claims, "fingerprint");
+        var claimProvider = JsonWire.OptionalString(claims, "fingerprint_provider");
+        var expectedUnbound = expected.Device.Fingerprint == null && expected.Device.FingerprintProvider == null;
+        var expectedOptionalBinding = expected.AllowUnboundFingerprint &&
+            expected.Device.Fingerprint != null && expected.Device.FingerprintProvider != null;
+        var bound = (expected.ExpectedBindingMode == null || binding == expected.ExpectedBindingMode) &&
+            (binding == "none" && !hasFingerprintClaim && !hasProviderClaim &&
+                (expectedUnbound || expectedOptionalBinding) ||
+             binding == "hwid" && expected.Device.Fingerprint != null && expected.Device.FingerprintProvider != null &&
+                claimFingerprint == expected.Device.Fingerprint && claimProvider == expected.Device.FingerprintProvider);
         // Bound values before addition so attacker-controlled integer dates cannot overflow.
         if (issued is < 0 or > 253402300799 || expected.Now is < 0 or > 253402300799 ||
             JsonWire.String(claims, "iss") != expected.Config.Issuer || JsonWire.String(claims, "aud") != audience ||

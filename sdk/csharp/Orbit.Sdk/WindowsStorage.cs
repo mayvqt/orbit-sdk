@@ -31,7 +31,7 @@ public sealed class WindowsStorage : ICredentialStorage, IDisposable
         entropy = ProtectedStorageCodec.Entropy(config, device);
     }
 
-    public static WindowsStorage Open(string directory, OrbitConfig config, Device device)
+    internal static WindowsStorage Open(string directory, OrbitConfig config, Device device)
     {
         WindowsStorage? storage = null;
         try

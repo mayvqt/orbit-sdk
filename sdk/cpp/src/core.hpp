@@ -21,6 +21,27 @@
 
 namespace orbit::detail {
 
+enum class StorageMode : std::uint32_t {
+    memory = 0,
+    windows_dpapi = 1,
+    linux_secret_service = 2,
+};
+
+struct Storage {
+    StorageMode mode = StorageMode::memory;
+    std::string path;
+};
+
+struct Config {
+    std::string api_origin;
+    std::string application_id;
+    std::string environment_id;
+    std::string issuer;
+    std::optional<std::string> installation_id;
+    std::optional<Fingerprint> fingerprint;
+    Storage storage;
+};
+
 struct CancellationState {
     std::atomic_bool cancelled{false};
 };
@@ -44,6 +65,8 @@ struct ClockStart {
 };
 
 ClockStart capture_clock();
+std::optional<Fingerprint> resolve_fingerprint(const ::orbit::AppKey& app_key,
+                                               const ::orbit::Options& options);
 
 struct ClockAnchor {
     std::int64_t server_seconds = 0;
@@ -144,7 +167,6 @@ public:
     std::size_t active_calls = 0;
 
 private:
-    friend std::shared_ptr<ClientState> connect_state(Config);
 #ifdef ORBIT_SDK_TESTING
     friend ::orbit::Client make_test_client(Config, Transport,
                                              std::shared_ptr<CredentialStorage>);
@@ -168,7 +190,7 @@ private:
     void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();
-    void invalidate_locked();
+    void invalidate_locked(bool clear_pending = true);
     std::uint64_t request_generation_locked();
     Credential stored_credential(const Json::Value& value) const;
     Json::Value credential_json(const Credential& value) const;
@@ -191,7 +213,6 @@ private:
     ClientState* state_;
 };
 
-std::shared_ptr<ClientState> connect_state(Config config);
 std::shared_ptr<ClientState> open_installed_state(
     Config config, Transport transport, std::shared_ptr<InstalledStorage> installed);
 

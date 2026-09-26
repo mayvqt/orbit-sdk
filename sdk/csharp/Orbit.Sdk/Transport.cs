@@ -52,17 +52,27 @@ public sealed class Transport : IDisposable
     /// <summary>Available only in an explicit local development build; accepts literal loopback addresses.</summary>
     public static Transport LocalLoopback(string origin)
     {
+        _ = ValidateOrigin(origin, allowLoopbackHttp: true);
         var uri = ParseOrigin(origin, "http");
-        var authority = origin[(origin.IndexOf("://", StringComparison.Ordinal) + 3)..].TrimEnd('/');
-        var host = authority.StartsWith('[') ? authority[1..authority.IndexOf(']')] : authority.Split(':')[0];
-        if (!IPAddress.TryParse(host, out var address) || !IPAddress.IsLoopback(address) ||
-            (address.AddressFamily == AddressFamily.InterNetwork &&
-             (host.Split('.').Length != 4 || host.Split('.').Any(part => part.Length == 0 ||
-                 !part.All(char.IsAsciiDigit) || (part.Length > 1 && part[0] == '0')))))
-            throw new OrbitException(OrbitError.Configuration);
         return new Transport(uri, true);
     }
 #endif
+
+    internal static string ValidateOrigin(string value, bool allowLoopbackHttp = false)
+    {
+        var uri = ParseOrigin(value, allowLoopbackHttp ? "http" : "https");
+        if (allowLoopbackHttp)
+        {
+            var authority = value[(value.IndexOf("://", StringComparison.Ordinal) + 3)..].TrimEnd('/');
+            var host = authority.StartsWith('[') ? authority[1..authority.IndexOf(']')] : authority.Split(':')[0];
+            if (!IPAddress.TryParse(host, out var address) || !IPAddress.IsLoopback(address) ||
+                (address.AddressFamily == AddressFamily.InterNetwork &&
+                 (host.Split('.').Length != 4 || host.Split('.').Any(part => part.Length == 0 ||
+                     !part.All(char.IsAsciiDigit) || (part.Length > 1 && part[0] == '0')))))
+                throw new OrbitException(OrbitError.Configuration);
+        }
+        return uri.GetLeftPart(UriPartial.Authority);
+    }
 
     private static Uri ParseOrigin(string value, string scheme)
     {

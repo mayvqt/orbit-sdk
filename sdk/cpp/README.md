@@ -1,56 +1,79 @@
 # Orbit C++ SDK
 
-License a desktop app or customer-hosted service with C++17. Requires libcurl 8+
-with asynchronous DNS, OpenSSL 3+, and JsonCpp 1.9.5+.
+License a desktop app or customer-hosted service with C++17. The v0.4.0 API in
+this checkout is an unreleased candidate. It requires libcurl 8+ with asynchronous
+DNS, OpenSSL 3+, and JsonCpp 1.9.5+ already installed.
 
-## Setup
+## Quickstart
 
-Copy the API origin, application ID, environment ID and issuer from Orbit's
-**Integration** page. Start in **Test**.
+Keep the SDK checkout beside your application directory. Add this
+`CMakeLists.txt` to your application, then save the program below as `main.cpp`:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(licensed_app LANGUAGES CXX)
+add_subdirectory(../Orbit-SDK/sdk/cpp orbit-sdk)
+add_executable(licensed_app main.cpp)
+target_link_libraries(licensed_app PRIVATE Orbit::Sdk)
+```
+
+Build from your application directory:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build
+```
+
+Copy the public app key from Orbit's **Integration** page (start in **Test**) to
+`ORBIT_APP_KEY`. The SDK selects a scoped `machine_v1` fingerprint by default;
+ordinary setup does not need hardware-ID code.
 
 ```cpp
 #include <orbit_sdk.hpp>
 
-// Configure once with public values from Integration.
-auto orbit = orbit::Client::open({
-    "https://orbit.mayvie.dev", "application_id", "environment_id", "issuer"
-});
+#include <cstdlib>
+#include <iostream>
+#include <optional>
+#include <string>
 
-// Reuse access after a restart; ask for a key only when none is available.
-try {
-    orbit.require_access("export");
-} catch (const orbit::Error& failure) {
-    if (failure.code() != "access_unavailable") throw;
-    orbit.activate(read_licence_key()); // Your UI or terminal prompt.
-    orbit.require_access("export");
+int main() {
+    const char* app_key = std::getenv("ORBIT_APP_KEY");
+    if (app_key == nullptr || *app_key == '\0') return 2;
+
+    try {
+        auto client = orbit::Client::open(app_key);
+        client.ensure_access("export", []() -> std::optional<std::string> {
+            std::cout << "Licence key: ";
+            std::string key;
+            std::getline(std::cin, key);
+            if (key.empty()) return std::nullopt;
+            return key;
+        });
+        // Perform the protected export here.
+        client.close();
+    } catch (const orbit::Error& error) {
+        std::cerr << "Orbit error: " << error.code() << '\n';
+        return 1;
+    }
+    return 0;
 }
 ```
 
-`open()` remembers the installation and credential, refreshes access automatically
-and handles uncertain activation retries. It never stores the licence key.
-Call `require_access()` before protected work; `snapshot()` is informational.
-Temporary connection failures do not require another activation.
+`ensure_access` asks for a key only when the installation has no usable access.
+Feature denials and service outages propagate without prompting. Access results
+are typed `Snapshot` values; use `snapshot()` for display and
+`require_access("export")` immediately before protected work.
 
-Copies of `Client` share one installation. `close()` stops refreshes and saves
-state without deactivating it; destruction also closes the last copy.
+The SDK stores an installation credential, never the licence key. Copies of a
+`Client` share state. `close()` stops refresh work while keeping the installation
+for the next run. `logout()` clears local access; `deactivate()` releases the
+server-side device slot.
 
-## Build
-
-Clone the release; CMake discovers installed dependencies without downloading them:
-
-```sh
-git clone --depth 1 --branch v0.3.0 https://github.com/mayvqt/orbit-sdk.git && cd orbit-sdk
-cmake -S sdk/cpp -B build/orbit-cpp -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build build/orbit-cpp
-cmake --install build/orbit-cpp --prefix /path/to/prefix
-```
-
-Link the in-tree `Orbit::Sdk` target, or use the installed package:
-
-```cmake
-find_package(OrbitSdk CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE Orbit::Sdk)
-```
+Customer accounts are separate from Orbit dashboard accounts. When account
+authentication is enabled, call `login`, inspect `owned_licences`, then use
+`activate_account` and `require_access`. Login alone grants no licensed access.
 
 See the [runnable example](../../examples/cpp/README.md) and
-[advanced usage](advanced.md) for account sign-in, custom storage and cancellation.
+[advanced usage](advanced.md) for storage options, cancellation and account APIs.
+The library target for consumers building alongside this checkout is
+`Orbit::Sdk`.

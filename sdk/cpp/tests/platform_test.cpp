@@ -1,4 +1,4 @@
-#include "orbit_sdk.hpp"
+#include "core.hpp"
 
 #include "json.hpp"
 #include "platform.hpp"
@@ -41,8 +41,8 @@ void require(bool condition, std::string_view message) {
     }
 }
 
-orbit::Config sample_config() {
-    orbit::Config config;
+orbit::detail::Config sample_config() {
+    orbit::detail::Config config;
     config.api_origin = "https://example.test";
     config.issuer = "https://example.test";
     config.application_id = "app";
@@ -86,7 +86,7 @@ void append_u32_be(std::string& bytes, std::uint32_t value) {
     bytes.push_back(static_cast<char>(value & 0xff));
 }
 
-std::string expected_secret_service_scope(const orbit::Config& config,
+std::string expected_secret_service_scope(const orbit::detail::Config& config,
                                           std::string_view directory) {
     std::string entropy_preimage("orbit.sdk.storage.v1\0", 21);
     for (const auto* value : {&config.issuer, &config.application_id,
@@ -333,7 +333,7 @@ void test_storage_codec_legacy_record_and_versions() {
     }
     require(duplicate_rejected, "codec parser must reject duplicate JSON fields");
 
-    orbit::Config memory_config;
+    orbit::detail::Config memory_config;
     const auto memory = orbit::detail::open_storage(memory_config);
     require(memory->version() == 0 && !memory->load().second,
             "memory storage must start at generation zero");
@@ -414,9 +414,9 @@ public:
     const std::string& child_pid() const { return child_pid_; }
     void mode(const char* value) { ::setenv("ORBIT_CPP_TEST_HELPER_MODE", value, 1); }
 
-    orbit::Config config() const {
+    orbit::detail::Config config() const {
         auto value = sample_config();
-        value.storage.mode = orbit::StorageMode::linux_secret_service;
+        value.storage.mode = orbit::detail::StorageMode::linux_secret_service;
         value.storage.path = storage_;
         return value;
     }
@@ -648,9 +648,9 @@ public:
     }
     std::string path_utf8() const { return path_.u8string(); }
     std::filesystem::path path() const { return path_; }
-    orbit::Config config() const {
+    orbit::detail::Config config() const {
         auto value = sample_config();
-        value.storage.mode = orbit::StorageMode::windows_dpapi;
+        value.storage.mode = orbit::detail::StorageMode::windows_dpapi;
         value.storage.path = path_utf8();
         return value;
     }

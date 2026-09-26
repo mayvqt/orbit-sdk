@@ -3,8 +3,8 @@ using System.Text.Json;
 
 namespace Orbit.Sdk;
 
-/// <summary>Public application configuration. StatePath names an optional dedicated absolute directory.</summary>
-public sealed record AppConfig(string ApiOrigin, string ApplicationId, string EnvironmentId, string Issuer,
+/// <summary>Test-only/internal representation derived from an app key.</summary>
+internal sealed record AppConfig(string ApiOrigin, string ApplicationId, string EnvironmentId, string Issuer,
     string? StatePath = null, string? Fingerprint = null, string? FingerprintProvider = null);
 
 internal sealed class InstalledLifetime
@@ -30,20 +30,60 @@ public sealed partial class OrbitClient : IAsyncDisposable
     private InstalledLifetime? lifetime;
     private Task? closeTask;
 
-    /// <summary>Opens a remembered installation and starts automatic validation.</summary>
-    public static Task<OrbitClient> OpenAsync(AppConfig app, CancellationToken cancellationToken = default)
+    /// <summary>Opens an installed client using one app key and optional local settings.</summary>
+    public static Task<OrbitClient> OpenAsync(string appKey, OrbitOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var parsed = AppKey.Parse(appKey);
+        var app = CreateAppConfig(parsed, options);
+        ValidateApp(app);
+        return OpenInstalledAsync(app, new Transport(app.ApiOrigin), cancellationToken);
+    }
+#if ORBIT_LOCAL_DEVELOPMENT
+    /// <summary>Local-development entry point for an app key targeting literal loopback HTTP.</summary>
+    public static Task<OrbitClient> OpenLocalAsync(string appKey, OrbitOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var parsed = AppKey.ParseLocal(appKey);
+        var app = CreateAppConfig(parsed, options);
+        ValidateApp(app);
+        return OpenInstalledAsync(app, Transport.LocalLoopback(app.ApiOrigin), cancellationToken);
+    }
+#endif
+
+    // Internal overloads keep deterministic installed fixtures independent of the host machine identity.
+    internal static Task<OrbitClient> OpenAsync(AppConfig app, CancellationToken cancellationToken = default)
     {
         ValidateApp(app);
         return OpenInstalledAsync(app, new Transport(app.ApiOrigin), cancellationToken);
     }
 #if ORBIT_LOCAL_DEVELOPMENT
-    /// <summary>Explicit local-development equivalent, restricted to literal loopback HTTP.</summary>
-    public static Task<OrbitClient> OpenLocalAsync(AppConfig app, CancellationToken cancellationToken = default)
+    internal static Task<OrbitClient> OpenLocalAsync(AppConfig app, CancellationToken cancellationToken = default)
     {
         ValidateApp(app);
         return OpenInstalledAsync(app, Transport.LocalLoopback(app.ApiOrigin), cancellationToken);
     }
 #endif
+
+    private static AppConfig CreateAppConfig(AppKey key, OrbitOptions? options)
+    {
+        options ??= new OrbitOptions();
+        var fingerprint = ResolveFingerprint(key, options);
+        return new AppConfig(key.ApiOrigin, key.ApplicationId, key.EnvironmentId, key.Issuer,
+            options.StatePath, fingerprint?.Value, fingerprint?.Provider);
+    }
+    internal static Fingerprint? ResolveFingerprint(AppKey key, OrbitOptions? options)
+    {
+        options ??= new OrbitOptions();
+        if (options.DisableMachineBinding && options.Fingerprint != null)
+            throw new OrbitException(OrbitError.Configuration);
+        if (options.Fingerprint != null)
+            return options.Fingerprint;
+        if (options.DisableMachineBinding)
+            return null;
+        try { return new Fingerprint(DeviceIdentity.NativeFingerprint(key.ApplicationId, key.EnvironmentId), DeviceIdentity.Provider); }
+        catch (OrbitException error) when (error.Error == OrbitError.Denied && error.Code == "device_identity_unavailable") { return null; }
+    }
     private static void ValidateApp(AppConfig app)
     {
         ArgumentNullException.ThrowIfNull(app);
@@ -133,7 +173,8 @@ public sealed partial class OrbitClient : IAsyncDisposable
         {
             var restoredKeys = GrantKeys.Parse(access.Jwks);
             var grant = await restoredKeys.VerifyAsync(access.Jws, new GrantExpected(config, device, saved.LicenceId, saved.ActivationId,
-                saved.CredentialExpiresAt == 0 ? null : saved.CredentialExpiresAt, access.LicenceExpiresAt, access.ReceivedServerTime)).ConfigureAwait(false);
+                saved.CredentialExpiresAt == 0 ? null : saved.CredentialExpiresAt, access.LicenceExpiresAt,
+                access.ReceivedServerTime, AllowUnboundFingerprint: true)).ConfigureAwait(false);
             var start = Clock.Capture();
             if (start.WallSeconds < access.WallHighWater || access.WallHighWater < access.ReceivedWallTime || access.ServerHighWater < access.ReceivedServerTime ||
                 Math.Abs(checked((access.ServerHighWater - access.ReceivedServerTime) - (access.WallHighWater - access.ReceivedWallTime))) > 30)

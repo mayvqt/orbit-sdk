@@ -1,5 +1,6 @@
 #include "persistent_codec.hpp"
 
+#include "core.hpp"
 #include "error.hpp"
 #include "grants.hpp"
 #include "json.hpp"
@@ -156,7 +157,7 @@ Json::Value empty_record(const Config& config, std::string_view provider) {
 }
 
 Json::Value decode(const Config& config, std::string_view provider,
-                   std::string_view bytes) {
+                   std::string_view bytes, bool allow_identity_mismatch) {
     if (bytes.empty() || bytes.size() > max_plaintext) corrupt();
     Json::Value record;
     try {
@@ -190,12 +191,12 @@ Json::Value decode(const Config& config, std::string_view provider,
     const bool valid_binding = fingerprint.isString() && fingerprint_provider_value.isString() &&
         lower_hex(fingerprint.asString()) &&
         fingerprint_provider(fingerprint_provider_value.asString());
-    if ((!no_binding && !valid_binding) ||
-        (config.fingerprint
-            ? (!fingerprint.isString() || fingerprint.asString() != config.fingerprint->value ||
-               !fingerprint_provider_value.isString() ||
-               fingerprint_provider_value.asString() != config.fingerprint->provider)
-            : !no_binding)) corrupt();
+    const bool identity_matches = config.fingerprint
+        ? fingerprint.isString() && fingerprint.asString() == config.fingerprint->value &&
+          fingerprint_provider_value.isString() &&
+          fingerprint_provider_value.asString() == config.fingerprint->provider
+        : no_binding;
+    if ((!no_binding && !valid_binding) || (!allow_identity_mismatch && !identity_matches)) corrupt();
 
     validate_credential(record["credential"]);
     validate_pending(record["pending_activation"]);

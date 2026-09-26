@@ -47,6 +47,8 @@ struct GrantExpected {
     std::optional<std::int64_t> credential_expires_at;
     std::optional<std::int64_t> licence_expires_at;
     std::int64_t now = 0;
+    bool allow_unbound_fingerprint = false;
+    std::optional<std::string_view> expected_binding_mode;
 };
 
 class GrantKeys {

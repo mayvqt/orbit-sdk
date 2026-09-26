@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(orbit_sdk_cpp VERSION 0.3.0 LANGUAGES CXX)
+project(orbit_sdk_cpp VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -104,6 +104,7 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_compile_definitions(orbit_sdk_tests PRIVATE ORBIT_SDK_TESTING=1)
     target_link_libraries(orbit_sdk_tests PRIVATE ${ORBIT_SDK_LINK_LIBRARIES})
     target_compile_definitions(orbit_sdk_tests PRIVATE
+        ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
         ORBIT_GRANT_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/grants.json"
         ORBIT_GRANT_PRIVATE_KEY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/es256-test-private.pem"
     )

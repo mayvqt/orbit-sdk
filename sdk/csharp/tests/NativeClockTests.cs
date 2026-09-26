@@ -100,7 +100,7 @@ internal static class NativeClockTests
                 using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 var denied = false;
                 try { await item.Client.RequireAccessAsync("export", deadline.Token); }
-                catch (OrbitException error) when (error.Error == OrbitError.Denied && error.Code == "access_unavailable")
+                catch (OrbitException error) when (error.Error == OrbitError.NotActivated && error.Code == "access_unavailable")
                 { denied = true; }
                 if (!denied || item.Server.RequestCount <= 2)
                     throw new InvalidOperationException("Expired protected access did not deny after blocked refresh");
@@ -132,7 +132,7 @@ internal static class NativeClockTests
             application_id = "app", environment_id = "test", activation_id = "activation", installation_id = "installation_1234",
             iat = now, nbf = now, exp = now + 30, refresh_after = now + 30, offline_allowed = offline,
             policy_version = 1, entitlements = new { export = true }, binding_mode = "none",
-            fingerprint = (string?)null, fingerprint_provider = (string?)null, licence_expires_at = (long?)null
+            licence_expires_at = (long?)null
         }));
         var input = header + "." + payload;
         var signature = signer.SignData(Encoding.ASCII.GetBytes(input), HashAlgorithmName.SHA256,
@@ -151,7 +151,7 @@ internal static class NativeClockTests
 
     private static void AssertExpired(Snapshot snapshot)
     {
-        if (snapshot.Access != Access.Expired || snapshot.Entitlements.Count != 0 || snapshot.RemainingOfflineSeconds != 0)
+        if (snapshot.Access != Access.Expired || snapshot.Entitlements.Count != 0 || snapshot.RemainingOffline != TimeSpan.Zero)
             throw new InvalidOperationException("Expired grant retained access or entitlements");
     }
 #endif

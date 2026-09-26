@@ -137,7 +137,7 @@ bool ClientState::restore_persistent_cache(bool allow_offline) {
         GrantExpected expected{
             config.issuer, config.application_id, config.environment_id, licence,
             saved.activation_id, *config.installation_id, fingerprint, provider,
-            saved.expires_at, licence_expiry, received_server,
+            saved.expires_at, licence_expiry, received_server, true, std::nullopt,
         };
         auto restored_claims = restored_keys.verify(cached["jws"].asString(), expected);
         if (!restored_claims.offline_allowed || estimated_server >= restored_claims.expires_at) {

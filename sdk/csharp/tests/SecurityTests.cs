@@ -12,6 +12,8 @@ internal static class SecurityTests
         (string Name, Func<CancellationToken, Task> Run)[] cases =
         [
             ("public setup connects with HTTPS and rejects invalid origin or scope", PublicSetupAsync),
+            ("app-key activation uses optional fingerprints without weakening grant checks", OptionalFingerprintBindingAsync),
+            ("ensure access prompts only for missing activation", EnsureAccessPromptsOnlyWhenNeededAsync),
             ("custom fingerprint providers match service grammar", FingerprintProvidersAsync),
             ("machine fingerprints preserve scoped framing and reject invalid identities", DeviceIdentityTests.RunAsync),
             ("protected storage codec binds scope and rejects malformed records", WindowsStorageTests.CodecAsync),
@@ -156,8 +158,8 @@ internal static class SecurityTests
         expires_at = "2030-01-01T00:00:00Z"
     }));
 
-    private static OrbitClient Client(Transport transport, ICredentialStorage? storage = null) =>
-        new(new OrbitConfig("app", "test", "https://orbit.example.test"), new Device(Installation), transport, storage);
+    private static OrbitClient Client(Transport transport, ICredentialStorage? storage = null, Device? device = null) =>
+        new(new OrbitConfig("app", "test", "https://orbit.example.test"), device ?? new Device(Installation), transport, storage);
 
     private static TaskCompletionSource<T> Signal<T>() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -185,7 +187,8 @@ internal static class SecurityTests
             } } }));
         }
 
-        internal FixtureReply Reply(bool validation = false, bool offlineAllowed = true)
+        internal FixtureReply Reply(bool validation = false, bool offlineAllowed = true,
+            string? fingerprintProvider = null, string bindingMode = "none")
         {
             var header = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(new { alg = "ES256", typ = "orbit-access+jwt", kid = keyId }));
             var payload = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(new
@@ -194,7 +197,7 @@ internal static class SecurityTests
                 application_id = "app", environment_id = "test", activation_id = "activation", installation_id = Installation,
                 iat = now, nbf = now, exp = now + 300, refresh_after = now + 60,
                 offline_allowed = offlineAllowed, policy_version = 1, entitlements = new { export = true },
-                binding_mode = "none", fingerprint = (string?)null, fingerprint_provider = (string?)null,
+                binding_mode = "none",
                 licence_expires_at = (long?)null
             }));
             var signed = header + "." + payload;
@@ -204,8 +207,8 @@ internal static class SecurityTests
             {
                 activation_id = "activation", installation_id = Installation, credential = validation ? null : SessionToken,
                 credential_expires_at = Timestamp(now + 86400), server_time = Timestamp(now),
-                grant = signed + "." + JsonWire.EncodeBase64(signature), binding_mode = "none",
-                fingerprint_provider = (string?)null, licence_expires_at = (string?)null, secret_replay_expired = false
+                grant = signed + "." + JsonWire.EncodeBase64(signature), binding_mode = bindingMode,
+                fingerprint_provider = fingerprintProvider, licence_expires_at = (string?)null, secret_replay_expired = false
             }));
         }
 
@@ -241,6 +244,94 @@ internal static class SecurityTests
             throw new InvalidOperationException("Invalid provider accepted");
         }
         return Task.CompletedTask;
+    }
+
+    private static async Task OptionalFingerprintBindingAsync(CancellationToken cancellationToken)
+    {
+        using var fixture = new GrantFixture();
+        const string provider = "custom:fixture.v1";
+        var device = new Device(Installation, new string('a', 64), provider);
+        await using (var server = new LoopbackServer((request, _) => Task.FromResult(
+            request.Path.StartsWith("/.well-known/", StringComparison.Ordinal)
+                ? fixture.Keys : fixture.Reply(fingerprintProvider: provider))))
+        using (var transport = Transport.LocalLoopback(server.Origin))
+        {
+            var client = Client(transport, device: device);
+            Require((await client.ActivateAsync("synthetic-key", cancellationToken: cancellationToken)).Access == Access.Online);
+        }
+
+        foreach (var (providerReply, bindingMode) in new[] { ((string?)null, "none"), (provider, "hwid") })
+        {
+            await using var server = new LoopbackServer((request, _) => Task.FromResult(
+                request.Path.StartsWith("/.well-known/", StringComparison.Ordinal)
+                    ? fixture.Keys : fixture.Reply(fingerprintProvider: providerReply, bindingMode: bindingMode)));
+            using var transport = Transport.LocalLoopback(server.Origin);
+            var client = Client(transport, device: device);
+            await ExpectAsync(OrbitError.InvalidResponse, () => client.ActivateAsync(
+                "synthetic-key", cancellationToken: cancellationToken));
+        }
+    }
+
+    private static async Task EnsureAccessPromptsOnlyWhenNeededAsync(CancellationToken cancellationToken)
+    {
+        using var fixture = new GrantFixture();
+        await using (var server = new LoopbackServer((request, _) => Task.FromResult(
+            request.Path.StartsWith("/.well-known/", StringComparison.Ordinal) ? fixture.Keys : fixture.Reply())))
+        using (var transport = Transport.LocalLoopback(server.Origin))
+        {
+            var client = Client(transport);
+            var prompts = 0;
+            var access = await client.EnsureAccessAsync("export", _ =>
+            {
+                prompts++;
+                return ValueTask.FromResult<string?>("synthetic-key");
+            }, cancellationToken);
+            Require(access.HasFeature("export") && prompts == 1);
+            await client.EnsureAccessAsync("export", _ =>
+            {
+                prompts++;
+                return ValueTask.FromResult<string?>("unexpected");
+            }, cancellationToken);
+            Require(prompts == 1);
+            await ExpectAsync(OrbitError.FeatureUnavailable, () => client.EnsureAccessAsync("missing", _ =>
+            {
+                prompts++;
+                return ValueTask.FromResult<string?>("unexpected");
+            }, cancellationToken));
+            Require(prompts == 1);
+
+            var empty = Client(transport);
+            await ExpectAsync(OrbitError.NotActivated, () => empty.EnsureAccessAsync("export", _ =>
+            {
+                prompts++;
+                return ValueTask.FromResult<string?>(null);
+            }, cancellationToken));
+            Require(prompts == 2);
+        }
+
+        var validationCalls = 0;
+        await using var outage = new LoopbackServer((request, _) => Task.FromResult(
+            request.Path.StartsWith("/.well-known/", StringComparison.Ordinal) ? fixture.Keys :
+            request.Path.EndsWith("/validate", StringComparison.Ordinal)
+                ? CountedOutage() : fixture.Reply()));
+        using var outageTransport = Transport.LocalLoopback(outage.Origin);
+        var storage = new MemoryStorage();
+        var first = Client(outageTransport, storage);
+        await first.ActivateAsync("synthetic-key", "operation_123456", cancellationToken);
+        var cold = Client(outageTransport, storage);
+        var outagePrompts = 0;
+        await ExpectAsync(OrbitError.Transient, () => cold.EnsureAccessAsync("export", _ =>
+        {
+            outagePrompts++;
+            return ValueTask.FromResult<string?>("unexpected");
+        }, cancellationToken));
+        Require(validationCalls > 0 && outagePrompts == 0);
+
+        FixtureReply CountedOutage()
+        {
+            validationCalls++;
+            return ErrorReply(503, "service_unavailable");
+        }
     }
 
     private static async Task DelayedLoginAsync(CancellationToken cancellationToken)
@@ -357,7 +448,7 @@ internal static class SecurityTests
         var saved = storage.Load().Credential ?? throw new InvalidOperationException("Activation credential was not stored");
 
         var cold = Client(transport, storage);
-        await ExpectAsync(OrbitError.Denied, () => cold.RequireAccessAsync("export", cancellationToken));
+        await ExpectAsync(OrbitError.Transient, () => cold.RequireAccessAsync("export", cancellationToken));
         Require(cold.Snapshot().Access == Access.RefreshRequired);
         RequireSameCredential(saved, storage.Load().Credential);
 
@@ -391,12 +482,12 @@ internal static class SecurityTests
         var saved = storage.Load().Credential ?? throw new InvalidOperationException("Activation credential was not stored");
 
         var cold = Client(transport, storage);
-        await ExpectAsync(OrbitError.Denied, () => cold.RequireAccessAsync("export", cancellationToken));
+        await ExpectAsync(OrbitError.Transient, () => cold.RequireAccessAsync("export", cancellationToken));
         Require(validationRequests == 1);
         Require(cold.Snapshot().Access == Access.RefreshRequired);
         RequireSameCredential(saved, storage.Load().Credential);
 
-        await ExpectAsync(OrbitError.Denied, () => cold.RequireAccessAsync("export", cancellationToken));
+        await ExpectAsync(OrbitError.Transient, () => cold.RequireAccessAsync("export", cancellationToken));
         Require(validationRequests == 1);
         RequireSameCredential(saved, storage.Load().Credential);
 
@@ -436,7 +527,7 @@ internal static class SecurityTests
 
         var cold = Client(transport, storage);
         var queuedCalls = Enumerable.Range(0, 8)
-            .Select(_ => ExpectAsync(OrbitError.Denied, () => cold.RequireAccessAsync("export", cancellationToken)))
+            .Select(_ => ExpectAsync(OrbitError.Transient, () => cold.RequireAccessAsync("export", cancellationToken)))
             .ToArray();
         await received.Task.WaitAsync(cancellationToken);
         release.SetResult(true);
@@ -484,7 +575,7 @@ internal static class SecurityTests
         Require(client.Snapshot().Access == Access.RefreshRequired);
         Require(client.Snapshot().Entitlements.Count == 0);
         RequireSameCredential(saved, storage.Load().Credential);
-        await ExpectAsync(OrbitError.Denied, () => client.RequireAccessAsync("export", cancellationToken));
+        await ExpectAsync(OrbitError.Transient, () => client.RequireAccessAsync("export", cancellationToken));
         RequireSameCredential(saved, storage.Load().Credential);
     }
 
@@ -1178,7 +1269,7 @@ internal static class SecurityTests
                 credential_expires_at = now.AddDays(30).ToString("yyyy-MM-ddTHH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
                 grant = "e30.e30.AA",
                 server_time = now.ToString("yyyy-MM-ddTHH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
-                binding_mode = "none", fingerprint_provider = (string?)null, licence_expires_at = (string?)null,
+                binding_mode = "none", licence_expires_at = (string?)null,
                 secret_replay_expired = false
             })));
         });
