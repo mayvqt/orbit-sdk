@@ -61,6 +61,7 @@ function licenceShape(overrides = {}) {
     hwid_locked: false,
     offline_allowed: true,
     offline_seconds: 900,
+    offline_file_seconds: 0,
     entitlements: { export: true },
     reference: "",
     note: "",
@@ -411,6 +412,23 @@ test("licence responses validate the server shape before returning typed fields"
   });
   await assert.rejects(client.getLicence("licence_example"), (error) =>
     error instanceof OrbitTransportError && error.code === "invalid_response");
+});
+
+test("licence responses preserve and bound the separate offline file term", async () => {
+  let seconds = 0;
+  const client = new OrbitBackendClient(config, {
+    fetchImpl: async () => jsonResponse(licenceShape({ offline_file_seconds: seconds })),
+  });
+  for (seconds of [0, 86_400, 31_622_400]) {
+    const licence = await client.getLicence("licence_example");
+    assert.equal(licence.offline_file_seconds, seconds);
+    assert.equal(licence.offline_seconds, 900);
+    assert.ok(Object.isFrozen(licence));
+  }
+  for (seconds of [undefined, null, false, true, -1, 1, 86_399, 31_622_401, 86_400.5, "86400", []]) {
+    await assert.rejects(client.getLicence("licence_example"), (error) =>
+      error instanceof OrbitTransportError && error.code === "invalid_response");
+  }
 });
 
 test("licence policy names follow the server's trimmed 80-character name schema", async () => {

@@ -12,7 +12,7 @@ from orbit_sdk.client import _Config as Config
 from orbit_sdk.errors import CANCELLED, DENIED, REAUTHENTICATION_REQUIRED, STALE_RESPONSE, TRANSIENT, error
 from orbit_sdk.storage import MemoryStorage, StoredCredential
 
-from support import FakeTransport, activation_reply
+from support import FakeTransport, activation_reply, licence_value
 
 
 def make_config() -> Config:
@@ -96,6 +96,32 @@ class ClientFlowTests(unittest.TestCase):
         self.assertRegex(request[2]["idempotency_key"], r"^[A-Za-z0-9_-]{32}$")
         with self.assertRaises((AttributeError, TypeError)):
             licence.entitlements["export"] = False
+
+    def test_owned_licence_offline_file_term_is_native_and_bounded(self) -> None:
+        self.client.login("alice", "synthetic-password")
+        for seconds in (0, 86_400, 31_622_400):
+            with self.subTest(seconds=seconds), patch("support.licence_value", return_value={
+                **licence_value(), "offline_file_seconds": seconds,
+            }):
+                licence = self.client.owned_licences().items[0]
+                self.assertEqual(licence.offline_file_duration, dt.timedelta(seconds=seconds))
+                self.assertEqual(licence.offline_duration, dt.timedelta(seconds=900))
+                with self.assertRaises(AttributeError):
+                    licence.offline_file_duration = dt.timedelta(0)
+        for invalid in (None, False, True, -1, 1, 86_399, 31_622_401, 86_400.0, "86400", []):
+            self.client.login("alice", "synthetic-password")
+            with self.subTest(invalid=invalid), patch("support.licence_value", return_value={
+                **licence_value(), "offline_file_seconds": invalid,
+            }):
+                with self.assertRaises(OrbitError) as failure:
+                    self.client.owned_licences()
+                self.assertEqual(failure.exception.kind, "invalid_response")
+        missing = licence_value()
+        del missing["offline_file_seconds"]
+        self.client.login("alice", "synthetic-password")
+        with patch("support.licence_value", return_value=missing), self.assertRaises(OrbitError) as failure:
+            self.client.owned_licences()
+        self.assertEqual(failure.exception.kind, "invalid_response")
 
     def test_custom_fingerprint_accepts_signed_unbound_grant_and_checks_provider(self) -> None:
         config = Config(

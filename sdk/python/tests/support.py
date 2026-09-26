@@ -184,5 +184,6 @@ def licence_value() -> dict[str, Any]:
         "hwid_locked": False,
         "offline_allowed": True,
         "offline_seconds": 900,
+        "offline_file_seconds": 0,
         "entitlements": {"export": True},
     }

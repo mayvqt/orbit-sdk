@@ -22,8 +22,10 @@ resend proof in memory; use it only with `resend_registration()` and close it
 when finished. `login()` and `account()` return a frozen `Account`.
 `owned_licences()` returns an `OwnedLicencePage` whose items are frozen
 `OwnedLicence` values. Timestamps use UTC-aware `datetime`, durations use
-`timedelta`, and entitlement maps cannot be mutated. Listing or claiming a
-licence does not grant access: activate the chosen licence and call
+`timedelta`, and entitlement maps cannot be mutated. `offline_file_duration`
+is separate from the connected `offline_duration`; a zero file duration means
+issuance is disabled. Listing or claiming a licence does not grant access:
+activate the chosen licence and call
 `require_access()`. `logout_account()` requests remote revocation and clears
 local account state; `logout()` clears activation and customer session state
 without a network request. `claim_licence(key)` generates a secure operation

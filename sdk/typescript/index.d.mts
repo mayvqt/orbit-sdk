@@ -97,6 +97,7 @@ export interface OrbitLicence {
   readonly hwid_locked: boolean;
   readonly offline_allowed: boolean;
   readonly offline_seconds: number;
+  readonly offline_file_seconds: number;
   readonly entitlements: Readonly<Record<string, boolean>>;
   readonly reference: string;
   readonly note: string;

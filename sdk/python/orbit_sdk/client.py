@@ -150,6 +150,7 @@ class OwnedLicence:
     hwid_locked: bool
     offline_allowed: bool
     offline_duration: dt.timedelta
+    offline_file_duration: dt.timedelta
     entitlements: Mapping[str, bool]
 
 
@@ -1790,6 +1791,7 @@ def _to_owned_licence(value: dict[str, Any]) -> OwnedLicence:
         hwid_locked=value["hwid_locked"],
         offline_allowed=value["offline_allowed"],
         offline_duration=dt.timedelta(seconds=value["offline_seconds"]),
+        offline_file_duration=dt.timedelta(seconds=value["offline_file_seconds"]),
         entitlements=MappingProxyType(dict(value["entitlements"])),
     )
 
@@ -1924,6 +1926,7 @@ def _check_licence(value: Any) -> dict[str, Any]:
         "hwid_locked": bool,
         "offline_allowed": bool,
         "offline_seconds": int,
+        "offline_file_seconds": int,
         "entitlements": dict,
     }, optional=("first_used_at", "expires_at", "duration_seconds"))
     features = licence["entitlements"]
@@ -1939,12 +1942,15 @@ def _check_licence(value: Any) -> dict[str, Any]:
         raise error(INVALID_RESPONSE, "invalid_licence")
     if not strict_int(licence["offline_seconds"], minimum=-(1 << 31), maximum=(1 << 31) - 1):
         raise error(INVALID_RESPONSE, "invalid_licence")
+    file_seconds = licence["offline_file_seconds"]
+    if not strict_int(file_seconds, minimum=0, maximum=31_622_400) or 0 < file_seconds < 86_400:
+        raise error(INVALID_RESPONSE, "invalid_licence")
     for date in (licence["first_used_at"], licence["expires_at"]):
         if date is not None:
             timestamp(date)
     return {name: licence[name] for name in (
         "id", "policy_name", "state", "expiry_mode", "first_used_at", "expires_at",
-        "duration_seconds", "device_limit", "hwid_locked", "offline_allowed", "offline_seconds", "entitlements",
+        "duration_seconds", "device_limit", "hwid_locked", "offline_allowed", "offline_seconds", "offline_file_seconds", "entitlements",
     )}
 
 

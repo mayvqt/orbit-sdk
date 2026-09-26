@@ -108,7 +108,9 @@ each call; it is not cached across protected operations.
   `idempotencyKey` on the result, so you can retry deliberately with the exact
   same key. Returned licence keys are ephemeral secrets; handle them securely
   and never log them.
-* `getLicence(id)` returns safe licence metadata.
+* `getLicence(id)` returns safe licence metadata. `offline_file_seconds` is the
+  policy's separate long-term file limit (zero means disabled); `offline_seconds`
+  remains the connected grant's offline allowance.
 * `replaceLicenceKey(id, { reason, idempotencyKey })` invalidates old
   activation credentials and returns any ephemeral key disclosure.
   `idempotencyKey` is optional, generated and returned the same way as above.

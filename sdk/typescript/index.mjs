@@ -514,6 +514,7 @@ function isLicence(value) {
     nullableTimestamp(value.first_used_at) && nullableTimestamp(value.expires_at) &&
     isSafeInteger(value.device_limit, 1, 100) && typeof value.hwid_locked === "boolean" &&
     typeof value.offline_allowed === "boolean" && isSafeInteger(value.offline_seconds, 0, 86_400) &&
+    (value.offline_file_seconds === 0 || isSafeInteger(value.offline_file_seconds, 86_400, 31_622_400)) &&
     isEntitlements(entitlements) &&
     typeof value.reference === "string" && utf8Length(value.reference) <= 200 &&
     typeof value.note === "string" && utf8Length(value.note) <= 2000 &&
@@ -553,6 +554,7 @@ function freezeLicence(value) {
     hwid_locked: value.hwid_locked,
     offline_allowed: value.offline_allowed,
     offline_seconds: value.offline_seconds,
+    offline_file_seconds: value.offline_file_seconds,
     entitlements: Object.freeze({ ...value.entitlements }),
     reference: value.reference,
     note: value.note,
