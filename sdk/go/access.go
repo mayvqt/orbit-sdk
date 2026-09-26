@@ -201,11 +201,19 @@ func (c *Client) checkGeneration(generation uint64) error {
 func (c *Client) Snapshot() (Snapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.checkedSnapshotLocked()
+}
+
+// checkedSnapshotLocked synchronizes external storage and samples the native
+// clock once for this decision. A bad sample discards cached authority before
+// returning a snapshot that requires online refresh.
+func (c *Client) checkedSnapshotLocked() (Snapshot, error) {
 	if err := c.syncStorageLocked(); err != nil {
 		return Snapshot{}, err
 	}
 	if c.state.anchor != nil {
-		if _, err := c.state.anchor.now(); err != nil {
+		now, err := c.state.anchor.now()
+		if err != nil {
 			c.state.claims = nil
 			c.state.anchor = nil
 			c.state.generation++
@@ -214,11 +222,20 @@ func (c *Client) Snapshot() (Snapshot, error) {
 					return Snapshot{}, err
 				}
 			}
+			return c.snapshotLockedAt(0, false), nil
 		}
+		return c.snapshotLockedAt(now, true), nil
 	}
-	return c.snapshotLocked(), nil
+	return c.snapshotLockedAt(0, false), nil
 }
 func (c *Client) snapshotLocked() Snapshot {
+	if c.state.anchor == nil {
+		return c.snapshotLockedAt(0, false)
+	}
+	now, err := c.state.anchor.now()
+	return c.snapshotLockedAt(now, err == nil)
+}
+func (c *Client) snapshotLockedAt(now int64, clockValid bool) Snapshot {
 	snapshot := Snapshot{Access: AccessDenied, Entitlements: make(map[string]bool), ReauthenticationRequired: true, StorageCapability: c.storageCapability}
 	state := &c.state
 	var credentialExpiry *int64
@@ -232,11 +249,7 @@ func (c *Client) snapshotLocked() Snapshot {
 		}
 		snapshot.ReauthenticationRequired = false
 	}
-	if state.claims == nil || state.anchor == nil {
-		return snapshot
-	}
-	now, err := state.anchor.now()
-	if err != nil {
+	if state.claims == nil || state.anchor == nil || !clockValid {
 		return snapshot
 	}
 	claims := state.claims
@@ -516,18 +529,44 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 	if ctx.Err() != nil {
 		return Snapshot{}, ErrCancelled
 	}
-	snapshot, err := c.Snapshot()
+	c.mu.Lock()
+	snapshot, err := c.checkedSnapshotLocked()
 	if err != nil {
+		c.mu.Unlock()
 		return Snapshot{}, err
 	}
-	if snapshot.Access == AccessRefreshRequired || snapshot.Access == AccessExpired || snapshot.Access == AccessOffline {
-		if _, err := c.refresh(ctx, true); err != nil && !errors.Is(err, ErrTransient) {
-			return Snapshot{}, err
-		}
+	if ctx.Err() != nil {
+		c.mu.Unlock()
+		return Snapshot{}, ErrCancelled
 	}
-	// Refresh may race a local logout or another context's invalidation. Obtain
-	// the final decision from current state, never the returned request snapshot.
-	snapshot, err = c.Snapshot()
+	if snapshot.Access == AccessOnline {
+		if !snapshot.HasFeature(feature) {
+			c.mu.Unlock()
+			return Snapshot{}, ErrFeatureUnavailable
+		}
+		c.mu.Unlock()
+		return snapshot, nil
+	}
+	if snapshot.Access != AccessRefreshRequired && snapshot.Access != AccessExpired && snapshot.Access != AccessOffline {
+		transient := c.state.transient
+		c.mu.Unlock()
+		if transient {
+			return Snapshot{}, ErrTransient
+		}
+		return Snapshot{}, ErrNotActivated
+	}
+	c.mu.Unlock()
+	if _, err := c.refresh(ctx, true); err != nil && !errors.Is(err, ErrTransient) {
+		return Snapshot{}, err
+	}
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	// Network completion may race logout or external invalidation. Re-sample
+	// current storage and time after refresh before returning authorization.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snapshot, err = c.checkedSnapshotLocked()
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -535,9 +574,7 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		return Snapshot{}, ErrCancelled
 	}
 	if snapshot.Access != AccessOnline && snapshot.Access != AccessOffline {
-		c.mu.Lock()
 		unavailableDuringOutage := c.state.transient
-		c.mu.Unlock()
 		if unavailableDuringOutage {
 			return Snapshot{}, ErrTransient
 		}

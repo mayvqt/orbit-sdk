@@ -36,7 +36,7 @@ func testResponse(request *http.Request, status int, body string) *http.Response
 	}
 }
 
-func testTransport(t *testing.T, handler roundTripFunc) *Transport {
+func testTransport(t testing.TB, handler roundTripFunc) *Transport {
 	t.Helper()
 	transport, err := NewTransport("https://orbit.example.test")
 	if err != nil {

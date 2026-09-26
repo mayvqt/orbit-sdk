@@ -22,7 +22,7 @@ import (
 )
 
 type installedFixture struct {
-	t                          *testing.T
+	t                          testing.TB
 	key                        *ecdsa.PrivateKey
 	mode                       atomic.Int32 // 0 online, 1 outage, 2 denied, 3 malformed, 4 missing expiry, 5 finite expiry
 	validation                 atomic.Int32
@@ -37,7 +37,7 @@ type installedFixture struct {
 	offline                    bool
 }
 
-func newInstalledFixture(t *testing.T, offline bool) *installedFixture {
+func newInstalledFixture(t testing.TB, offline bool) *installedFixture {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
