@@ -104,7 +104,8 @@ skew, with no access at or after `exp`. Timestamps use the existing maximum
 
 Offline-file signing uses keys separate from connected access grants, with
 separate Test and Live rings. Public key IDs use the purpose prefix
-`offline-test-` or `offline-live-`. An ordinary access grant or JWKS must not become
+`offline-test-` or `offline-live-`, with a nonempty suffix and at most 128 ASCII
+letters, digits, underscores or hyphens in the whole ID. An ordinary access grant or JWKS must not become
 offline-file authority. Retain public verification material through the longest
 outstanding file plus clock skew. Applications deployed without connectivity must
 receive new trusted keys through their trusted software/configuration update

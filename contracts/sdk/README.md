@@ -28,6 +28,23 @@ This covers grant acceptance. Transport, account/device concurrency, offline
 state transitions and native suspend behavior need separate integration and
 platform checks.
 
+## Long-term offline files
+
+[offline.md](offline.md) defines the separate signed-file and renewal contract.
+[offline-files.json](offline-files.json) supplies 13 valid and 91 invalid synthetic
+ES256 cases, using the fixture key named above and a second synthetic key for
+trusted rotation. These files
+are distinct from short-lived connected access grants. `expected` contains the
+app key, installation, optional binding, verification time and minimum accepted
+renewal sequence; per-case overrides and replacement trusted `jwks` work like the
+connected corpus. The Python verifier consumes the corpus. Other SDK consumers
+and installed import/persistence are still being implemented.
+
+Do not treat a passing file-verification corpus as evidence that issuance,
+durable renewal or reboot behavior is complete. Those require the behavioral
+checks in the contract. The configured keys are trusted inputs; no case authorizes
+discovering a key from the file being verified.
+
 ## App keys
 
 [app-keys.json](app-keys.json) fixes how every SDK parses the public app key
