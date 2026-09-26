@@ -58,6 +58,12 @@ download authorization or SDK helpers are implemented.
 separate session-grant purpose. It is an implementation baseline; ordinary
 activation grants do not provide concurrent-session enforcement.
 
+## Usage and resource limits
+
+[limits.md](limits.md) defines online usage consumption and persistent resource
+allocations, including retries and the trust boundary for customer-controlled
+applications. Implementation and behavioral tests remain pending.
+
 ## App keys
 
 [app-keys.json](app-keys.json) fixes how every SDK parses the public app key
