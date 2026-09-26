@@ -63,3 +63,35 @@ ctest --test-dir build/cpp-tests --output-on-failure
 
 The native suite loads shared app-key and grant vectors. TLS tests use Python 3
 and the repository's synthetic certificates.
+
+## Warm access benchmark
+
+Configure and build the opt-in Release benchmark with installed dependencies,
+then run it from the repository root:
+
+```sh
+cmake -S sdk/cpp -B build/cpp-bench-release -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp-bench-release --target orbit_sdk_tests -j2
+build/cpp-bench-release/orbit_sdk_tests --benchmark-access
+```
+
+The benchmark activates a signed synthetic grant using private local installed
+storage and the native clock, warms both paths, then measures five batches of
+10,000 `require_access` calls and, separately, 10,000 `snapshot` calls. It
+reports median time per call and verifies that the measured loops add no HTTP
+requests or storage writes while retaining storage-invalidation checks.
+
+On CachyOS Linux x86-64 with GCC 16.2.1 and libstdc++ 20260810, Release results
+were:
+
+| Path | Adjusted baseline (`4e735f8`) | Current |
+| --- | ---: | ---: |
+| `require_access` | 5.78126 µs/op | 3.02612 µs/op |
+| `snapshot` | 5.4326 µs/op | 2.99526 µs/op |
+
+The baseline uses the `4e735f8` source with only the same installed-storage
+verification check and benchmark harness applied; it retains the internal JSON
+snapshot path. After timing, a separate 500-guard/500-snapshot verification
+pass observed 1,000 successful lease checks. The timed loops had zero writes
+and no increase from the two setup HTTP requests. These are local measurements,
+not cross-platform performance guarantees; Windows and macOS were not measured.

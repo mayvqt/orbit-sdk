@@ -834,6 +834,14 @@ public:
 
     bool initialization_needed() const noexcept override { return initialize_; }
 
+    void verify() override {
+        try {
+            check();
+        } catch (...) {
+            throw Error(1, ErrorKind::storage, "installation_storage_unavailable", {});
+        }
+    }
+
     std::optional<std::string> load() override {
         try {
             const auto bytes = read_record();

@@ -262,7 +262,7 @@ public sealed partial class OrbitClient : IAsyncDisposable
             catch (OrbitException) { return Timeout.InfiniteTimeSpan; }
             if (client.installed?.Record.PendingActivation != null)
                 return Timeout.InfiniteTimeSpan;
-            var snapshot = client.SnapshotState();
+            var snapshot = client.SnapshotLocked();
             due = client.credential != null && (snapshot.Access is Access.RefreshRequired or Access.Expired or Access.Offline) && client.RetryDueLocked();
         }
         if (due)

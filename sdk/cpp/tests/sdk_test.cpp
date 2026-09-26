@@ -20,7 +20,9 @@
 #include <type_traits>
 #include <vector>
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include <openssl/bn.h>
@@ -363,10 +365,12 @@ struct Gate {
 struct TestStorage final : CredentialStorage {
     std::mutex mutex;
     std::uint64_t generation = 0;
+    std::size_t version_reads = 0;
     std::optional<Json::Value> credential;
 
     std::uint64_t version() override {
         std::lock_guard<std::mutex> lock(mutex);
+        ++version_reads;
         return generation;
     }
     std::pair<std::uint64_t, std::optional<Json::Value>> load() override {
@@ -692,8 +696,11 @@ void test_activation_accounts_and_proofs(const Corpus& corpus) {
     require(safe_snapshot.access == Access::online && safe_snapshot.has_feature("export"),
             "typed snapshot must expose only access metadata");
     require(fixture.storage->load().second.has_value(), "verified credential was not stored");
+    const auto reads_before_guard = fixture.storage->version_reads;
     require(client.require_access("export").access == Access::online,
             "require_access should accept a current entitlement");
+    require(fixture.storage->version_reads > reads_before_guard,
+            "warm access guard must retain its storage-generation invalidation read");
     Cancellation pre_cancelled;
     pre_cancelled.cancel();
     expect_error([&] { (void)client.require_access("export", &pre_cancelled); }, ErrorKind::cancelled);
@@ -1146,9 +1153,11 @@ public:
     explicit FailingInstalledStorage(std::shared_ptr<InstalledStorage> wrapped)
         : wrapped_(std::move(wrapped)) {}
     bool initialization_needed() const noexcept override { return wrapped_->initialization_needed(); }
+    void verify() override { wrapped_->verify(); }
     std::optional<std::string> load() override { return wrapped_->load(); }
     void initialize(std::string_view bytes) override { wrapped_->initialize(bytes); }
     void save(std::string_view bytes) override {
+        ++save_attempts;
         if (fail.load()) {
             ++failed_writes;
             throw Error(1, ErrorKind::storage, "installation_state_write_failed", {});
@@ -1158,6 +1167,7 @@ public:
     std::string_view provider() const noexcept override { return wrapped_->provider(); }
     std::atomic_bool fail{false};
     std::atomic_int failed_writes{0};
+    std::atomic_int save_attempts{0};
 private:
     std::shared_ptr<InstalledStorage> wrapped_;
 };
@@ -1190,6 +1200,58 @@ void test_persistent_worker_stops_on_storage_failure(const Corpus& corpus) {
     std::error_code ignored;
     std::filesystem::remove_all(path, ignored);
 }
+
+#if defined(__linux__)
+void test_installed_lease_replacement_fails_closed(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    auto setup = config();
+    setup.installation_id.reset();
+    ApiFixture fixture(corpus.value);
+    auto installed = std::make_shared<FailingInstalledStorage>(open_installed_storage(setup, path));
+    auto state = open_installed_state(setup,
+        Transport("https://example.test", fixture.handler()), installed);
+    std::atomic_bool cancelled{false};
+    require(state->activate("lease-replacement-key", {}, std::nullopt, cancelled).access == Access::online,
+            "installed lease test activation failed");
+    installed->save_attempts = 0;
+    const auto request_count = [&] {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        return fixture.requests.size();
+    };
+    const auto requests_before = request_count();
+    const auto record_path = std::filesystem::path(path) / "orbit-installed.state";
+    const auto lease_path = std::filesystem::path(path) / "orbit-storage.lock";
+    const auto moved_lease_path = std::filesystem::path(path) / "orbit-storage.lock.saved";
+    const auto read_record = [&] {
+        std::ifstream input(record_path, std::ios::binary);
+        require(input.good(), "installed lease test record cannot be opened");
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const auto record_before = read_record();
+    std::error_code rename_error;
+    std::filesystem::rename(lease_path, moved_lease_path, rename_error);
+    require(!rename_error, "installed lease test could not rename the active lease");
+    const int replacement = ::open(lease_path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    require(replacement >= 0, "installed lease test could not create a replacement lease");
+    (void)::close(replacement);
+
+    reset_access_benchmark_metrics();
+    expect_error([&] { (void)state->snapshot(); }, ErrorKind::storage);
+    expect_error([&] { (void)state->require_access("export", cancelled); }, ErrorKind::storage);
+    require(state->persistence_failed.load() && !state->credential && !state->claims && !state->anchor,
+            "lease verification failure must poison storage and clear volatile authority");
+    require(request_count() == requests_before && read_record() == record_before &&
+                access_benchmark_storage_writes() == 0 && installed->save_attempts == 0,
+            "invalid installed lease must block access without HTTP or a state-file rewrite");
+    state->close();
+    require(installed->save_attempts == 0,
+            "closing a poisoned installed client must not rewrite its untrusted state path");
+    state.reset();
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+#endif
 
 void test_persistent_invalid_cache_clock_recovers_credential(const Corpus& corpus) {
     FakeClock clock;
@@ -1677,11 +1739,142 @@ void test_jwks_recovery_and_offline_clock(const Corpus& corpus) {
     require(outage_prompts == 0, "ensure_access must never prompt for a transient outage");
 }
 
+struct AccessMeasurement {
+    double median_microseconds_per_operation = 0.0;
+};
+
+template <class Operation>
+AccessMeasurement measure_access(Operation&& operation) {
+    constexpr std::size_t batch_count = 5;
+    constexpr std::size_t calls_per_batch = 10000;
+    std::array<double, batch_count> batches{};
+    for (auto& elapsed : batches) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < calls_per_batch; ++index) {
+            const auto result = operation();
+            require(result.access == Access::online && result.has_feature("export"),
+                    "access benchmark observed a non-online result");
+        }
+        elapsed = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - start).count() / calls_per_batch;
+    }
+    std::sort(batches.begin(), batches.end());
+    return {batches[batch_count / 2]};
+}
+
+const char* benchmark_platform() {
+#if defined(_WIN32)
+    return "Windows";
+#elif defined(__APPLE__)
+    return "macOS";
+#elif defined(__linux__)
+    return "Linux";
+#else
+    return "unknown";
+#endif
+}
+
+const char* benchmark_architecture() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "x86";
+#else
+    return "unknown";
+#endif
+}
+
+int run_access_benchmark(const Corpus& corpus) {
+    const auto path = persistent_test_path();
+    try {
+        ApiFixture fixture(corpus.value);
+        auto client = persistent_client_for(fixture, path);
+        require(client.activate("benchmark-access-key").access == Access::online,
+                "access benchmark setup activation failed");
+        for (int index = 0; index < 2000; ++index) {
+            const auto guard = client.require_access("export");
+            const auto snapshot = client.snapshot();
+            require(guard.access == Access::online && snapshot.access == Access::online,
+                    "access benchmark warmup failed");
+        }
+
+        const auto request_count = [&] {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            return fixture.requests.size();
+        };
+        const auto requests_before = request_count();
+        reset_access_benchmark_metrics();
+        const auto guard = measure_access([&] { return client.require_access("export"); });
+        const auto snapshot = measure_access([&] { return client.snapshot(); });
+        require(request_count() == requests_before,
+                "warm access loops must not increase HTTP request count");
+        require(access_benchmark_storage_writes() == 0,
+                "warm access loops must not write installed state");
+
+        set_access_benchmark_invalidation_counting(true);
+        constexpr std::size_t verification_calls = 500;
+        for (std::size_t index = 0; index < verification_calls; ++index) {
+            (void)client.require_access("export");
+            (void)client.snapshot();
+        }
+        set_access_benchmark_invalidation_counting(false);
+        const auto checks = access_benchmark_invalidation_checks();
+        require(checks >= verification_calls * 2 && access_benchmark_storage_writes() == 0 &&
+                    request_count() == requests_before,
+                "every warm operation must retain its storage invalidation check without writing or HTTP");
+
+        std::cout << "Access benchmark: platform=" << benchmark_platform()
+                  << " arch=" << benchmark_architecture();
+#ifdef NDEBUG
+        std::cout << " build=Release";
+#else
+        std::cout << " build=Debug";
+#endif
+#if defined(__VERSION__)
+        std::cout << " compiler=" << __VERSION__;
+#elif defined(_MSC_VER)
+        std::cout << " compiler=MSVC-" << _MSC_VER;
+#else
+        std::cout << " compiler=unknown";
+#endif
+#if defined(__GLIBCXX__)
+            std::cout << " runtime=libstdc++-" << __GLIBCXX__;
+#elif defined(_LIBCPP_VERSION)
+            std::cout << " runtime=libc++-" << _LIBCPP_VERSION;
+#endif
+        std::cout << '\n'
+                  << "RequireAccess: median " << guard.median_microseconds_per_operation
+                  << " us/op (5 x 10000)\n"
+                  << "Snapshot: median " << snapshot.median_microseconds_per_operation
+                  << " us/op (5 x 10000)\n"
+                  << "Warm-loop checks: installed-storage checks=" << checks
+                  << "; storage writes=0; HTTP requests unchanged at " << requests_before << '\n';
+        client.close();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        return 0;
+    } catch (const std::exception& error) {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        std::cerr << "Access benchmark failed: " << error.what() << '\n';
+        return 1;
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto corpus = load_corpus();
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-access") {
+            return run_access_benchmark(corpus);
+        }
+        if (argc != 1) {
+            std::cerr << "Usage: orbit_sdk_tests [--benchmark-access]\n";
+            return 2;
+        }
         const auto app_key_vectors = test_shared_app_key_vectors();
         test_fingerprint_options();
         test_strict_bounded_json();
@@ -1697,6 +1890,9 @@ int main() {
         test_persistent_close_cancels_foreground(corpus);
         test_owner_cancellation_during_backoff();
         test_persistent_worker_stops_on_storage_failure(corpus);
+#if defined(__linux__)
+        test_installed_lease_replacement_fails_closed(corpus);
+#endif
         test_persistent_invalid_cache_clock_recovers_credential(corpus);
         test_installed_identity_mismatch_rotates_installation(corpus);
 #if defined(_WIN32)

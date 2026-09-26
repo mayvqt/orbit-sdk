@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -20,6 +21,15 @@
 #include <thread>
 
 namespace orbit::detail {
+
+#ifdef ORBIT_SDK_TESTING
+void reset_access_benchmark_metrics() noexcept;
+void set_access_benchmark_invalidation_counting(bool enabled) noexcept;
+std::size_t access_benchmark_invalidation_checks() noexcept;
+std::size_t access_benchmark_storage_writes() noexcept;
+void note_access_benchmark_invalidation_check() noexcept;
+void note_access_benchmark_storage_write() noexcept;
+#endif
 
 enum class StorageMode : std::uint32_t {
     memory = 0,
@@ -88,17 +98,17 @@ public:
                 std::optional<Credential> credential, bool persistent = false);
 
     ~ClientState() noexcept;
-    Json::Value snapshot();
+    ::orbit::Snapshot snapshot();
     void close();
     void start_worker();
     void begin_call();
     void end_call() noexcept;
-    Json::Value activate(std::string_view key, std::string_view idempotency_key,
-                         std::optional<std::string_view> previous,
-                         const std::atomic_bool& cancelled,
-                         std::optional<std::string_view> account_licence = std::nullopt);
-    Json::Value refresh(const std::atomic_bool& cancelled, bool if_needed = false);
-    Json::Value require_access(std::string_view feature, const std::atomic_bool& cancelled);
+    ::orbit::Snapshot activate(std::string_view key, std::string_view idempotency_key,
+                               std::optional<std::string_view> previous,
+                               const std::atomic_bool& cancelled,
+                               std::optional<std::string_view> account_licence = std::nullopt);
+    ::orbit::Snapshot refresh(const std::atomic_bool& cancelled, bool if_needed = false);
+    ::orbit::Snapshot require_access(std::string_view feature, const std::atomic_bool& cancelled);
     void deactivate(std::string_view idempotency_key, const std::atomic_bool& cancelled);
     void local_logout();
     std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> register_customer(
@@ -175,18 +185,18 @@ private:
     void check_generation(std::uint64_t request_generation,
                           const std::atomic_bool& cancelled);
     std::unique_lock<std::timed_mutex> lock_serial(const std::atomic_bool& cancelled);
-    Json::Value snapshot_locked(bool tolerate_clock_error);
+    ::orbit::Snapshot snapshot_locked(bool tolerate_clock_error);
     std::pair<Credential, GrantClaims> verify_reply(
         const Json::Value& reply, const std::optional<Credential>& previous,
         std::optional<std::string_view> expected_licence, ClockStart start,
         const std::atomic_bool& cancelled, ClockAnchor& out_anchor);
-    Json::Value accept_reply(const std::optional<Json::Value>& reply,
-                             const Error* response_error,
-                             std::uint64_t request_generation,
-                             const std::optional<Credential>& previous,
-                             std::optional<std::string_view> expected_licence,
-                             ClockStart start,
-                             const std::atomic_bool& cancelled, bool mutation = false);
+    ::orbit::Snapshot accept_reply(const std::optional<Json::Value>& reply,
+                                   const Error* response_error,
+                                   std::uint64_t request_generation,
+                                   const std::optional<Credential>& previous,
+                                   std::optional<std::string_view> expected_licence,
+                                   ClockStart start,
+                                   const std::atomic_bool& cancelled, bool mutation = false);
     void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();

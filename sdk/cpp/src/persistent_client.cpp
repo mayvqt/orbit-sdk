@@ -8,6 +8,12 @@
 namespace orbit::detail {
 namespace {
 
+#ifdef ORBIT_SDK_TESTING
+std::atomic_bool count_benchmark_invalidation_checks{false};
+std::atomic_size_t benchmark_invalidation_checks{0};
+std::atomic_size_t benchmark_storage_writes{0};
+#endif
+
 std::int64_t stored_integer(const Json::Value& value) {
     return json_int64(value);
 }
@@ -21,6 +27,36 @@ std::int64_t absolute_difference(std::int64_t left, std::int64_t right) {
 }
 
 } // namespace
+
+#ifdef ORBIT_SDK_TESTING
+void reset_access_benchmark_metrics() noexcept {
+    benchmark_invalidation_checks.store(0, std::memory_order_relaxed);
+    benchmark_storage_writes.store(0, std::memory_order_relaxed);
+    count_benchmark_invalidation_checks.store(false, std::memory_order_relaxed);
+}
+
+void set_access_benchmark_invalidation_counting(bool enabled) noexcept {
+    count_benchmark_invalidation_checks.store(enabled, std::memory_order_relaxed);
+}
+
+std::size_t access_benchmark_invalidation_checks() noexcept {
+    return benchmark_invalidation_checks.load(std::memory_order_relaxed);
+}
+
+std::size_t access_benchmark_storage_writes() noexcept {
+    return benchmark_storage_writes.load(std::memory_order_relaxed);
+}
+
+void note_access_benchmark_invalidation_check() noexcept {
+    if (count_benchmark_invalidation_checks.load(std::memory_order_relaxed)) {
+        benchmark_invalidation_checks.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void note_access_benchmark_storage_write() noexcept {
+    benchmark_storage_writes.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 void ClientState::persist_record_locked() {
     if (!persistent || !installed_storage || persistent_record.isNull()) {
@@ -39,6 +75,9 @@ void ClientState::commit_persistent_locked(Json::Value record) {
     try {
         const auto bytes = persistent_codec::encode(config, installed_storage->provider(), record);
         installed_storage->save(bytes);
+#ifdef ORBIT_SDK_TESTING
+        note_access_benchmark_storage_write();
+#endif
         persistent_record = std::move(record);
     } catch (...) {
         persistence_failed.store(true, std::memory_order_relaxed);
@@ -219,8 +258,9 @@ void ClientState::worker_loop() noexcept {
             } else {
                 try {
                     const auto state = snapshot_locked(true);
-                    if (state["access"] == "refresh_required" ||
-                        state["access"] == "expired" || state["access"] == "offline") {
+                    if (state.access == ::orbit::Access::refresh_required ||
+                        state.access == ::orbit::Access::expired ||
+                        state.access == ::orbit::Access::offline) {
                         refresh_now = true;
                     } else {
                         const auto until = std::max<std::int64_t>(

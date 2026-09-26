@@ -63,3 +63,31 @@ The SDK returns native result types. Timestamps use `DateTimeOffset`, elapsed
 and offline durations use `TimeSpan`, and `Snapshot.HasFeature` is suitable for
 display logic. Always call `RequireAccessAsync` immediately before protected
 work; `Snapshot()` is informational.
+
+## Warm access benchmark
+
+With the locked dependencies already restored, run the opt-in Release benchmark
+from the repository root:
+
+```sh
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --configuration Release --no-restore -p:OrbitLocalDevelopment=true -- --benchmark-access
+```
+
+It activates a signed synthetic grant using private local installed storage and
+the native clock, warms both paths, then measures five batches of 10,000 calls
+for `RequireAccessAsync` and `Snapshot` separately. It reports median time and
+current-thread allocated bytes per call, and verifies that measured loops add
+no HTTP requests or storage writes while retaining per-call storage-version
+checks.
+
+On CachyOS Linux x86-64 with .NET 10.0.12, Release results were:
+
+| Path | Baseline at `4e735f8` | Current |
+| --- | ---: | ---: |
+| `RequireAccessAsync` | 6.971 µs/op, 552 B/op | 3.429 µs/op, 192 B/op |
+| `Snapshot` | 3.760 µs/op, 240 B/op | 3.235 µs/op, 120 B/op |
+
+After timing, a separate 500-guard/500-snapshot verification pass observed
+1,000 storage-version reads. The timed loops had zero writes and no increase
+from the two setup HTTP requests. These are local measurements, not
+cross-platform performance guarantees; Windows and macOS were not measured.

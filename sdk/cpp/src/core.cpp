@@ -431,8 +431,43 @@ void ClientState::invalidate_locked(bool clear_pending) {
 }
 
 void ClientState::sync_storage_locked() {
-    if (persistent) return;
+    if (persistent) {
+        if (persistence_failed.load(std::memory_order_relaxed)) {
+            credential.reset();
+            claims.reset();
+            anchor.reset();
+            customer.reset();
+            transient = false;
+            retry_deadline.reset();
+            raise(ErrorKind::storage, "installation_storage_unavailable");
+        }
+        try {
+            if (!installed_storage) raise(ErrorKind::storage, "installation_storage_unavailable");
+            installed_storage->verify();
+        } catch (...) {
+            if (!persistence_failed.exchange(true, std::memory_order_relaxed) &&
+                current_generation < persistent_codec::max_generation) {
+                ++current_generation;
+            }
+            credential.reset();
+            claims.reset();
+            anchor.reset();
+            customer.reset();
+            transient = false;
+            retry_deadline.reset();
+            worker_cancelled.store(true, std::memory_order_relaxed);
+            wake_worker();
+            raise(ErrorKind::storage, "installation_storage_unavailable");
+        }
+#ifdef ORBIT_SDK_TESTING
+        note_access_benchmark_invalidation_check();
+#endif
+        return;
+    }
     const auto observed = storage->version();
+#ifdef ORBIT_SDK_TESTING
+    note_access_benchmark_invalidation_check();
+#endif
     if (observed != storage_version) {
         clear_all_locked();
         storage_version = observed;
@@ -515,21 +550,20 @@ std::string ClientState::account_path(std::string_view path,
     return result;
 }
 
-Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
-    const auto credential_expiry = credential && credential->expires_at
-        ? Json::Value(static_cast<Json::Int64>(*credential->expires_at)) : null_value();
-    Json::Value result(Json::objectValue);
-    result["access"] = credential ? "refresh_required" : "denied";
-    result["entitlements"] = Json::Value(Json::objectValue);
-    result["expires_at"] = null_value();
-    result["next_check_at"] = null_value();
-    result["credential_expires_at"] = credential_expiry;
-    result["reauthentication_required"] = !credential.has_value() ||
-        (credential->expires_at && *credential->expires_at <= capture_clock().wall_seconds + 86400);
-    result["offline_allowed"] = false;
-    result["remaining_offline_seconds"] = Json::UInt64(0);
-    result["policy_version"] = Json::Int64(0);
-    if (!claims || !anchor) return result;
+::orbit::Snapshot ClientState::snapshot_locked(bool tolerate_clock_error) {
+    ::orbit::Snapshot result;
+    result.access = credential ? ::orbit::Access::refresh_required : ::orbit::Access::denied;
+    result.reauthentication_required = !credential.has_value();
+    if (credential && credential->expires_at) {
+        result.credential_expires_at = ::orbit::Timestamp(std::chrono::seconds(*credential->expires_at));
+    }
+    if (!claims || !anchor) {
+        if (credential && credential->expires_at) {
+            result.reauthentication_required =
+                *credential->expires_at <= capture_clock().wall_seconds + 86400;
+        }
+        return result;
+    }
     std::int64_t now = 0;
     try {
         now = anchor->now();
@@ -543,32 +577,32 @@ Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
             persistent_record["access"] = null_value();
             persist_record_locked();
         }
+        if (credential && credential->expires_at) {
+            result.reauthentication_required =
+                *credential->expires_at <= capture_clock().wall_seconds + 86400;
+        }
         return result;
     }
-    result["expires_at"] = static_cast<Json::Int64>(claims->expires_at);
-    result["next_check_at"] = static_cast<Json::Int64>(claims->refresh_after);
-    result["reauthentication_required"] = !credential ||
+    result.expires_at = ::orbit::Timestamp(std::chrono::seconds(claims->expires_at));
+    result.next_check_at = ::orbit::Timestamp(std::chrono::seconds(claims->refresh_after));
+    result.reauthentication_required = !credential ||
         (credential->expires_at && *credential->expires_at <= now + 86400);
-    result["offline_allowed"] = claims->offline_allowed;
-    result["policy_version"] = static_cast<Json::Int64>(claims->policy_version);
-    std::string access;
-    if (claims->expires_at <= now) access = "expired";
-    else if (transient) access = claims->offline_allowed ? "offline" : "refresh_required";
-    else if (claims->refresh_after <= now) access = "refresh_required";
-    else access = "online";
-    result["access"] = access;
-    if (access == "online" || access == "offline") {
-        Json::Value entitlements(Json::objectValue);
-        for (const auto& item : claims->entitlements) entitlements[item.first] = item.second;
-        result["entitlements"] = std::move(entitlements);
-        if (claims->offline_allowed) {
-            result["remaining_offline_seconds"] = static_cast<Json::UInt64>(claims->expires_at - now);
-        }
+    result.offline_allowed = claims->offline_allowed;
+    result.policy_version = claims->policy_version;
+    if (claims->expires_at <= now) result.access = ::orbit::Access::expired;
+    else if (transient) result.access = claims->offline_allowed
+        ? ::orbit::Access::offline : ::orbit::Access::refresh_required;
+    else if (claims->refresh_after <= now) result.access = ::orbit::Access::refresh_required;
+    else result.access = ::orbit::Access::online;
+    if (result.access == ::orbit::Access::online || result.access == ::orbit::Access::offline) {
+        result.entitlements = claims->entitlements;
+        if (claims->offline_allowed)
+            result.remaining_offline = std::chrono::seconds(claims->expires_at - now);
     }
     return result;
 }
 
-Json::Value ClientState::snapshot() {
+::orbit::Snapshot ClientState::snapshot() {
     ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     sync_storage_locked();
@@ -662,7 +696,7 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     return {std::move(saved), std::move(verified)};
 }
 
-Json::Value ClientState::accept_reply(
+::orbit::Snapshot ClientState::accept_reply(
     const std::optional<Json::Value>& reply, const Error* response_error,
     std::uint64_t request_generation,
     const std::optional<Credential>& previous, std::optional<std::string_view> expected_licence,
@@ -761,7 +795,7 @@ Json::Value ClientState::accept_reply(
             ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
         retry_deadline = std::chrono::steady_clock::now() + delay;
         auto current = snapshot_locked(true);
-        if (current["access"] == "offline") return current;
+        if (current.access == ::orbit::Access::offline) return current;
         throw *failure;
     }
 
@@ -771,10 +805,10 @@ Json::Value ClientState::accept_reply(
     throw *failure;
 }
 
-Json::Value ClientState::activate(std::string_view key, std::string_view idempotency_key,
-                                  std::optional<std::string_view> previous,
-                                  const std::atomic_bool& cancelled,
-                                  std::optional<std::string_view> account_licence) {
+::orbit::Snapshot ClientState::activate(std::string_view key, std::string_view idempotency_key,
+                                        std::optional<std::string_view> previous,
+                                        const std::atomic_bool& cancelled,
+                                        std::optional<std::string_view> account_licence) {
     ClientOperation call(*this);
     const bool automatic = idempotency_key.empty();
     if ((account_licence ? !opaque(*account_licence) : (key.empty() || key.size() > 256)) ||
@@ -885,7 +919,7 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
                         account_licence, start, cancelled, true);
 }
 
-Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_needed) {
+::orbit::Snapshot ClientState::refresh(const std::atomic_bool& cancelled, bool if_needed) {
     ClientOperation call(*this);
     const auto before_serial = generation();
     auto serial_lock = lock_serial(cancelled);
@@ -898,9 +932,10 @@ Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_need
         throw_if_cancelled(cancelled);
         if (if_needed) {
             const auto current = snapshot_locked(true);
-            const auto access = current["access"].asString();
+            const bool refreshable = current.access == ::orbit::Access::refresh_required ||
+                current.access == ::orbit::Access::expired || current.access == ::orbit::Access::offline;
             const bool due = !retry_deadline || std::chrono::steady_clock::now() >= *retry_deadline;
-            if ((access != "refresh_required" && access != "expired" && access != "offline") || !due) return current;
+            if (!refreshable || !due) return current;
         }
         if (!credential) raise(ErrorKind::reauthentication_required, "reauthentication_required");
         saved = *credential;
@@ -921,30 +956,43 @@ Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_need
                         std::nullopt, start, cancelled);
 }
 
-Json::Value ClientState::require_access(std::string_view feature, const std::atomic_bool& cancelled) {
+::orbit::Snapshot ClientState::require_access(std::string_view feature, const std::atomic_bool& cancelled) {
     ClientOperation call(*this);
     throw_if_cancelled(cancelled);
     if (!valid_utf8(feature)) raise(ErrorKind::configuration, "configuration");
-    auto current = snapshot();
-    const auto access = current["access"].asString();
-    if (access == "refresh_required" || access == "expired" || access == "offline") {
+    bool refreshable = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        throw_if_cancelled(cancelled);
+        const auto current = snapshot_locked(true);
+        if (current.access == ::orbit::Access::online) {
+            if (!current.has_feature(feature)) {
+                raise(ErrorKind::feature_unavailable, "feature_unavailable");
+            }
+            return current;
+        }
+        refreshable = current.access == ::orbit::Access::refresh_required ||
+            current.access == ::orbit::Access::expired || current.access == ::orbit::Access::offline;
+    }
+    if (refreshable) {
         try {
-            current = refresh(cancelled, true);
+            (void)refresh(cancelled, true);
         } catch (const Error& error) {
             if (error.kind() != ErrorKind::transient) throw;
-            current = snapshot();
         }
     }
-    const auto current_access = current["access"].asString();
-    if (current_access != "online" && current_access != "offline") {
-        std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex);
+    sync_storage_locked();
+    throw_if_cancelled(cancelled);
+    const auto current = snapshot_locked(true);
+    if (current.access != ::orbit::Access::online && current.access != ::orbit::Access::offline) {
         if (credential && transient) raise(ErrorKind::transient, "network_unavailable");
         raise(ErrorKind::not_activated, "access_unavailable");
     }
-    if (!current["entitlements"].isMember(std::string(feature)) || !current["entitlements"][std::string(feature)].asBool()) {
+    if (!current.has_feature(feature)) {
         raise(ErrorKind::feature_unavailable, "feature_unavailable");
     }
-    throw_if_cancelled(cancelled);
     return current;
 }
 
@@ -1399,44 +1447,6 @@ namespace {
     return ::orbit::Timestamp(std::chrono::seconds(seconds));
 }
 
-std::optional<::orbit::Timestamp> optional_time(const Json::Value& value, const char* name) {
-    const auto seconds = optional_integer(value, name);
-    if (!seconds) return std::nullopt;
-    return public_time(*seconds);
-}
-
-::orbit::Access public_access(const Json::Value& value) {
-    const auto name = text(required(value, "access"));
-    if (name == "denied") return ::orbit::Access::denied;
-    if (name == "online") return ::orbit::Access::online;
-    if (name == "offline") return ::orbit::Access::offline;
-    if (name == "refresh_required") return ::orbit::Access::refresh_required;
-    if (name == "expired") return ::orbit::Access::expired;
-    invalid_response();
-}
-
-::orbit::Snapshot public_snapshot(const Json::Value& value) {
-    if (!value.isObject()) invalid_response();
-    ::orbit::Snapshot output;
-    output.access = public_access(value);
-    output.expires_at = optional_time(value, "expires_at");
-    output.next_check_at = optional_time(value, "next_check_at");
-    output.credential_expires_at = optional_time(value, "credential_expires_at");
-    output.reauthentication_required = boolean(required(value, "reauthentication_required"));
-    output.offline_allowed = boolean(required(value, "offline_allowed"));
-    output.remaining_offline = std::chrono::seconds(integer(required(value, "remaining_offline_seconds")));
-    const auto policy = integer(required(value, "policy_version"));
-    if (policy < 0 || policy > INT32_MAX) invalid_response();
-    output.policy_version = static_cast<std::int32_t>(policy);
-    const auto& entitlements = required(value, "entitlements");
-    if (!entitlements.isObject() || entitlements.size() > 64) invalid_response();
-    for (const auto& name : entitlements.getMemberNames()) {
-        if (!entitlements[name].isBool()) invalid_response();
-        output.entitlements.emplace(name, entitlements[name].asBool());
-    }
-    return output;
-}
-
 ::orbit::Customer public_customer(const Json::Value& value) {
     ::orbit::Customer output;
     output.id = text(required(value, "id"));
@@ -1675,7 +1685,7 @@ Snapshot Client::snapshot(const Cancellation* cancellation) const {
     if (detail::cancellation_flag(cancellation, inactive).load(std::memory_order_relaxed)) {
         detail::raise(ErrorKind::cancelled, "cancelled");
     }
-    return detail::public_snapshot(require_state(state_).snapshot());
+    return require_state(state_).snapshot();
 }
 
 Snapshot Client::activate(std::string_view licence_key,
@@ -1686,8 +1696,8 @@ Snapshot Client::activate(std::string_view licence_key,
     auto& state = require_state(state_);
     const auto operation = idempotency_key ? std::string(*idempotency_key)
         : (state.persistent ? std::string{} : new_installation_id());
-    return detail::public_snapshot(state.activate(licence_key, operation,
-        std::nullopt, detail::cancellation_flag(cancellation, inactive)));
+    return state.activate(licence_key, operation,
+        std::nullopt, detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::activate(std::string_view licence_key, const Cancellation* cancellation) const {
@@ -1703,18 +1713,18 @@ Snapshot Client::activate_previous(std::string_view licence_key,
     auto& state = require_state(state_);
     const auto operation = idempotency_key ? std::string(*idempotency_key)
         : (state.persistent ? std::string{} : new_installation_id());
-    return detail::public_snapshot(state.activate(licence_key, operation,
-        previous_credential, detail::cancellation_flag(cancellation, inactive)));
+    return state.activate(licence_key, operation,
+        previous_credential, detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::refresh(const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::public_snapshot(require_state(state_).refresh(detail::cancellation_flag(cancellation, inactive)));
+    return require_state(state_).refresh(detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::require_access(std::string_view feature, const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
-    return detail::public_snapshot(require_state(state_).require_access(feature, detail::cancellation_flag(cancellation, inactive)));
+    return require_state(state_).require_access(feature, detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::ensure_access(std::string_view feature,
@@ -1807,8 +1817,8 @@ Snapshot Client::activate_account(std::string_view licence_id,
     auto& state = require_state(state_);
     const auto operation = idempotency_key ? std::string(*idempotency_key)
         : (state.persistent ? std::string{} : new_installation_id());
-    return detail::public_snapshot(state.activate({}, operation, std::nullopt,
-        detail::cancellation_flag(cancellation, inactive), licence_id));
+    return state.activate({}, operation, std::nullopt,
+        detail::cancellation_flag(cancellation, inactive), licence_id);
 }
 
 Snapshot Client::activate_account_previous(
@@ -1819,8 +1829,8 @@ Snapshot Client::activate_account_previous(
     auto& state = require_state(state_);
     const auto operation = idempotency_key ? std::string(*idempotency_key)
         : (state.persistent ? std::string{} : new_installation_id());
-    return detail::public_snapshot(state.activate({}, operation, previous_credential,
-        detail::cancellation_flag(cancellation, inactive), licence_id));
+    return state.activate({}, operation, previous_credential,
+        detail::cancellation_flag(cancellation, inactive), licence_id);
 }
 
 void Client::logout_account(const Cancellation* cancellation) const {

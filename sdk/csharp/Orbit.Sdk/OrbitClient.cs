@@ -81,9 +81,10 @@ public sealed partial class OrbitClient : IDisposable
     private Snapshot SnapshotLocked()
     {
         SyncStorage();
+        long? now = null;
         if (anchor != null)
         {
-            try { _ = anchor.Now(); }
+            try { now = anchor.Now(); }
             catch (OrbitException)
             {
                 // Keep the credential for online reconciliation; the old grant
@@ -95,30 +96,28 @@ public sealed partial class OrbitClient : IDisposable
                 lifetime?.Signal();
             }
         }
-        return SnapshotState();
+        return SnapshotState(now);
     }
 
-    private Snapshot SnapshotState()
+    private Snapshot SnapshotState(long? now)
     {
         long? expiry = credential?.CredentialExpiresAt;
         if (expiry == 0) expiry = null;
-        var result = new Snapshot(credential == null ? Access.Denied : Access.RefreshRequired,
-            global::Orbit.Sdk.Snapshot.EmptyEntitlements, null, null,
-            global::Orbit.Sdk.Snapshot.FromUnixSeconds(expiry), credential == null, false, TimeSpan.Zero);
-        if (claims == null || anchor == null) return result;
-        long now;
-        try { now = anchor.Now(); }
-        catch (OrbitException) { return result; }
-        var access = claims.ExpiresAt <= now ? Access.Expired : transient
+        if (claims == null || anchor == null || now == null)
+            return new Snapshot(credential == null ? Access.Denied : Access.RefreshRequired,
+                global::Orbit.Sdk.Snapshot.EmptyEntitlements, null, null,
+                global::Orbit.Sdk.Snapshot.FromUnixSeconds(expiry), credential == null, false, TimeSpan.Zero);
+        var checkedNow = now.Value;
+        var access = claims.ExpiresAt <= checkedNow ? Access.Expired : transient
             ? (claims.OfflineAllowed ? Access.Offline : Access.RefreshRequired)
-            : claims.RefreshAfter <= now ? Access.RefreshRequired : Access.Online;
+            : claims.RefreshAfter <= checkedNow ? Access.RefreshRequired : Access.Online;
         var usable = access is Access.Online or Access.Offline;
         return new Snapshot(access, usable ? claims.Entitlements : global::Orbit.Sdk.Snapshot.EmptyEntitlements,
             global::Orbit.Sdk.Snapshot.FromUnixSeconds(claims.ExpiresAt),
             global::Orbit.Sdk.Snapshot.FromUnixSeconds(claims.RefreshAfter),
-            global::Orbit.Sdk.Snapshot.FromUnixSeconds(expiry), expiry != null && expiry <= now + 86400,
+            global::Orbit.Sdk.Snapshot.FromUnixSeconds(expiry), expiry != null && expiry <= checkedNow + 86400,
             claims.OfflineAllowed, usable && claims.OfflineAllowed
-                ? TimeSpan.FromSeconds(claims.ExpiresAt - now) : TimeSpan.Zero)
+                ? TimeSpan.FromSeconds(claims.ExpiresAt - checkedNow) : TimeSpan.Zero)
         { PolicyVersion = claims.PolicyVersion };
     }
 
@@ -255,10 +254,18 @@ public sealed partial class OrbitClient : IDisposable
     public async Task<Snapshot> RequireAccessAsync(string feature, CancellationToken cancellationToken = default)
     {
         OrbitException.CheckCancellation(cancellationToken);
-        var snapshot = Snapshot();
+        Snapshot snapshot;
         bool retryDue;
         lock (gate)
         {
+            snapshot = SnapshotLocked();
+            OrbitException.CheckCancellation(cancellationToken);
+            if (snapshot.Access == Access.Online)
+            {
+                if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
+                    throw new OrbitException(OrbitError.FeatureUnavailable, "feature_unavailable");
+                return snapshot;
+            }
             retryDue = RetryDueLocked();
         }
         if ((snapshot.Access is Access.RefreshRequired or Access.Expired or Access.Offline) && retryDue)
@@ -269,8 +276,7 @@ public sealed partial class OrbitClient : IDisposable
         lock (gate)
         {
             OrbitException.CheckCancellation(cancellationToken);
-            SyncStorage();
-            snapshot = SnapshotState();
+            snapshot = SnapshotLocked();
             if (snapshot.Access is not (Access.Online or Access.Offline))
             {
                 if (credential != null && transient)
@@ -440,7 +446,7 @@ public sealed partial class OrbitClient : IDisposable
                     lifetime.Restoring = false;
                     lifetime.Signal();
                 }
-                return SnapshotState();
+                return SnapshotLocked();
             }
         }
         catch (OrbitException caught)
@@ -467,7 +473,7 @@ public sealed partial class OrbitClient : IDisposable
                     catch (OrbitException) { nextRetryElapsedTicks = long.MaxValue; }
                     catch (OverflowException) { nextRetryElapsedTicks = long.MaxValue; }
                     catch (CryptographicException) { nextRetryElapsedTicks = long.MaxValue; }
-                    var snapshot = SnapshotState();
+                    var snapshot = SnapshotLocked();
                     lifetime?.Signal();
                     if (snapshot.Access == Access.Offline)
                     {

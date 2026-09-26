@@ -34,11 +34,13 @@ if (args is ["--native-protection"])
 
 if (args is ["--installed"]) return await InstalledTests.RunAsync();
 
+if (args is ["--benchmark-access"]) return await InstalledTests.RunBenchmarkAsync();
+
 if (args is ["--security"]) return await SecurityTests.RunAsync();
 
 if (args.Length != 1)
 {
-    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --security | --installed | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
+    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --security | --installed | --benchmark-access | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
     return 2;
 }
 

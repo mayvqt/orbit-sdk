@@ -1,5 +1,6 @@
 using Orbit.Sdk;
 #if ORBIT_LOCAL_DEVELOPMENT
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -60,7 +61,94 @@ internal static class InstalledTests
         return 2;
 #endif
     }
+    internal static async Task<int> RunBenchmarkAsync()
+    {
 #if ORBIT_LOCAL_DEVELOPMENT
+        try
+        {
+            await using var fixture = new Fixture();
+            await using var client = await fixture.Open();
+            await fixture.Activate(client);
+            for (var index = 0; index < 2_000; index++)
+            {
+                var guard = client.RequireAccessAsync("export").GetAwaiter().GetResult();
+                var snapshot = client.Snapshot();
+                Require(guard.Access == Access.Online && guard.HasFeature("export") &&
+                    snapshot.Access == Access.Online && snapshot.HasFeature("export"));
+            }
+
+            var requests = fixture.Server.RequestCount;
+            InstalledStorageDiagnostics.Begin();
+            try
+            {
+                var guard = Measure(() => client.RequireAccessAsync("export").GetAwaiter().GetResult());
+                var snapshot = Measure(client.Snapshot);
+                Require(fixture.Server.RequestCount == requests);
+
+                InstalledStorageDiagnostics.CountVersionReads(true);
+                const int verificationCalls = 500;
+                for (var index = 0; index < verificationCalls; index++)
+                {
+                    _ = client.RequireAccessAsync("export").GetAwaiter().GetResult();
+                    _ = client.Snapshot();
+                }
+                var versionReads = InstalledStorageDiagnostics.VersionReads;
+                Require(versionReads >= verificationCalls * 2 &&
+                    InstalledStorageDiagnostics.Writes == 0 && fixture.Server.RequestCount == requests);
+
+#if DEBUG
+                const string buildConfiguration = "Debug";
+#else
+                const string buildConfiguration = "Release";
+#endif
+                Console.WriteLine($"Access benchmark: OS={RuntimeInformation.OSDescription}; " +
+                    $"arch={RuntimeInformation.ProcessArchitecture}; runtime={RuntimeInformation.FrameworkDescription}; " +
+                    $"build={buildConfiguration}");
+                Console.WriteLine($"RequireAccessAsync: median {guard.MicrosecondsPerOperation:F3} us/op, " +
+                    $"{guard.BytesPerOperation:F1} allocated bytes/op (5 x 10000)");
+                Console.WriteLine($"Snapshot: median {snapshot.MicrosecondsPerOperation:F3} us/op, " +
+                    $"{snapshot.BytesPerOperation:F1} allocated bytes/op (5 x 10000)");
+                Console.WriteLine($"Warm-loop checks: storage version reads={versionReads}; writes=0; " +
+                    $"HTTP requests unchanged at {requests}");
+            }
+            finally { InstalledStorageDiagnostics.End(); }
+            return 0;
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine($"Access benchmark failed: {error.GetType().Name}: {error.Message}");
+            return 1;
+        }
+#else
+        await Task.CompletedTask;
+        Console.Error.WriteLine("Access benchmark requires OrbitLocalDevelopment=true");
+        return 2;
+#endif
+    }
+#if ORBIT_LOCAL_DEVELOPMENT
+    private readonly record struct AccessMeasurement(double MicrosecondsPerOperation, double BytesPerOperation);
+
+    private static AccessMeasurement Measure(Func<Snapshot> operation)
+    {
+        const int batchCount = 5;
+        const int callsPerBatch = 10_000;
+        var elapsed = new double[batchCount];
+        var allocated = new double[batchCount];
+        for (var batch = 0; batch < batchCount; batch++)
+        {
+            Snapshot? last = null;
+            var startBytes = GC.GetAllocatedBytesForCurrentThread();
+            var start = Stopwatch.GetTimestamp();
+            for (var index = 0; index < callsPerBatch; index++) last = operation();
+            elapsed[batch] = Stopwatch.GetElapsedTime(start).TotalMicroseconds / callsPerBatch;
+            allocated[batch] = (GC.GetAllocatedBytesForCurrentThread() - startBytes) / (double)callsPerBatch;
+            GC.KeepAlive(last);
+        }
+        Array.Sort(elapsed);
+        Array.Sort(allocated);
+        return new AccessMeasurement(elapsed[batchCount / 2], allocated[batchCount / 2]);
+    }
+
     private static void Require(bool condition)
     {
         if (!condition)

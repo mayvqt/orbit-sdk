@@ -3,6 +3,42 @@ using System.Text.Json;
 
 namespace Orbit.Sdk;
 
+#if ORBIT_LOCAL_DEVELOPMENT
+internal static class InstalledStorageDiagnostics
+{
+    private static long versionReads, writes;
+    private static int enabled, countVersionReads;
+
+    internal static long VersionReads => Interlocked.Read(ref versionReads);
+    internal static long Writes => Interlocked.Read(ref writes);
+
+    internal static void Begin()
+    {
+        Interlocked.Exchange(ref versionReads, 0);
+        Interlocked.Exchange(ref writes, 0);
+        Volatile.Write(ref countVersionReads, 0);
+        Volatile.Write(ref enabled, 1);
+    }
+
+    internal static void CountVersionReads(bool value) =>
+        Volatile.Write(ref countVersionReads, value ? 1 : 0);
+
+    internal static void End() => Volatile.Write(ref enabled, 0);
+
+    internal static void NoteVersionRead()
+    {
+        if (Volatile.Read(ref enabled) != 0 && Volatile.Read(ref countVersionReads) != 0)
+            Interlocked.Increment(ref versionReads);
+    }
+
+    internal static void NoteWrite()
+    {
+        if (Volatile.Read(ref enabled) != 0)
+            Interlocked.Increment(ref writes);
+    }
+}
+#endif
+
 internal interface IInstalledFiles : IDisposable
 {
     string Provider
@@ -75,6 +111,9 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
         try
         {
             files.Write(bytes);
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteWrite();
+#endif
             Record = value;
         }
         catch (Exception) { poisoned = true; throw Storage(); }
@@ -87,6 +126,9 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             lock (gate)
             {
                 Check();
+#if ORBIT_LOCAL_DEVELOPMENT
+                InstalledStorageDiagnostics.NoteVersionRead();
+#endif
                 return Record.Generation;
             }
         }
@@ -96,6 +138,9 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
         lock (gate)
         {
             Check();
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteVersionRead();
+#endif
             return (Record.Generation, Record.Stored);
         }
     }

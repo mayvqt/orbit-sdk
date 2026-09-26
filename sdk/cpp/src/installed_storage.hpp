@@ -13,6 +13,7 @@ class InstalledStorage {
 public:
     virtual ~InstalledStorage() = default;
     virtual bool initialization_needed() const noexcept = 0;
+    virtual void verify() = 0;
     virtual std::optional<std::string> load() = 0;
     virtual void initialize(std::string_view bytes) = 0;
     virtual void save(std::string_view bytes) = 0;
