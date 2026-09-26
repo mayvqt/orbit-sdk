@@ -9,11 +9,11 @@ under the [MIT licence](../LICENSE).
 Use Go 1.27.1 or newer. Add the versioned source module with:
 
 ```sh
-go get github.com/mayvqt/orbit-sdk/sdk/go@v0.1.0
+go get github.com/mayvqt/orbit-sdk/sdk/go@v0.2.0
 ```
 
 The module path is `github.com/mayvqt/orbit-sdk/sdk/go`; its repository release
-tag is `sdk/go/v0.1.0`. Import it with
+tag is `sdk/go/v0.2.0`. Import it with
 `import orbit "github.com/mayvqt/orbit-sdk/sdk/go"`.
 
 For a first run, follow the [console example](../../examples/go/licensed-export/README.md),

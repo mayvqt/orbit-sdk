@@ -28,7 +28,7 @@ config = Config(
 mode = os.environ.get("ORBIT_MODE", "key")
 operation_id = required("ORBIT_OPERATION_ID")
 
-with Client.connect(config, library_path=os.environ.get("ORBIT_FFI_LIBRARY")) as orbit:
+with Client.connect(config) as orbit:
     if mode == "key":
         orbit.activate(getpass("Licence key: "), operation_id)
     elif mode == "account":

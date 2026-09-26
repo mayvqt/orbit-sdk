@@ -1,6 +1,12 @@
 /target/
 **/bin/
 **/obj/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+/sdk/python/build/
+/sdk/python/dist/
+/build/
 .env
 .env.*
 *.log

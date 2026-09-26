@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbit-sdk"
+version = "0.2.0"
+description = "Native Python client for the Orbit installed-client protocol"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Orbit contributors" }]
+dependencies = ["cryptography>=50.0.1"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/mayvqt/orbit-sdk"
+Source = "https://github.com/mayvqt/orbit-sdk/tree/v0.2.0/sdk/python"
+Issues = "https://github.com/mayvqt/orbit-sdk/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orbit_sdk*"]

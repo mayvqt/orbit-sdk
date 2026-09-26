@@ -1,17 +1,18 @@
 # Python quickstart
 
-This example supports either licence-key activation or customer-account
-activation. It prompts for keys and passwords, reads public IDs from the
-environment, and prints only access metadata.
-
-From the SDK kit root, build the FFI on the target OS:
+Install the v0.2.0 package from the source release:
 
 ```sh
-cargo build --release --manifest-path sdk/ffi/Cargo.toml
+python -m pip install https://github.com/mayvqt/orbit-sdk/releases/download/v0.2.0/orbit_sdk-0.2.0-py3-none-any.whl
 ```
 
+For source development from the repository root, install with
+`python -m pip install ./sdk/python`, or set `PYTHONPATH=sdk/python` to use the
+checkout directly. Python 3.12 or newer is required. The Python client uses
+native Python logic and the `cryptography` package; no Rust build is needed.
+
 Set the public integration values and an installation ID that the host
-application has saved between runs:
+application saves between runs:
 
 ```sh
 export ORBIT_API_ORIGIN='https://orbit.example'
@@ -19,17 +20,16 @@ export ORBIT_APPLICATION_ID='application_id'
 export ORBIT_ENVIRONMENT_ID='environment_id'
 export ORBIT_ISSUER='https://issuer.example'
 export ORBIT_INSTALLATION_ID='persisted_installation_id'
-export ORBIT_FFI_LIBRARY="$PWD/target/release/liborbit_sdk_ffi.so"
+export ORBIT_OPERATION_ID='stable_activation_operation_id'
 ```
 
-For key activation, set `ORBIT_MODE=key` and `ORBIT_OPERATION_ID`, then enter
-the key at the hidden prompt. For account activation, set `ORBIT_MODE=account`
-and `ORBIT_OPERATION_ID`, then sign in and select an owned licence at the
-prompts. Keep that operation ID stable when retrying the same mutation after
-an uncertain result. On Windows, use the built
-`target/release/orbit_sdk_ffi.dll` path instead.
+For key activation, set `ORBIT_MODE=key` and enter the key at the hidden
+prompt. For account activation, set `ORBIT_MODE=account`, optionally set
+`ORBIT_USERNAME`, then sign in and select an owned licence at the prompts. Keep
+the operation ID stable when retrying the same mutation after an uncertain
+result.
 
-Run with Python 3.12 or newer and no third-party modules:
+Run the example with Python 3.12 or newer:
 
 ```sh
 python examples/python/quickstart.py

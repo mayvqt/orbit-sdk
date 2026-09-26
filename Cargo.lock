@@ -760,15 +760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orbit-sdk-ffi"
-version = "0.1.0"
-dependencies = [
- "orbit-sdk",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "orbit-sdk-native"
 version = "0.1.0"
 dependencies = [
