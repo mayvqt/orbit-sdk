@@ -61,7 +61,7 @@ static int number(const char *s, uint32_t base, uint32_t *out) {
                  : *s >= 'a' && *s <= 'f' ? (uint32_t)(*s - 'a' + 10)
                  : *s >= 'A' && *s <= 'F' ? (uint32_t)(*s - 'A' + 10)
                                           : 99;
-    if (d >= base || v > (ORBIT_CLIENT_ARENA_BYTES - d) / base)
+    if (d >= base || v > (UINT32_MAX - d) / base)
       return 0;
     v = v * base + d;
   }
@@ -235,6 +235,10 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
   }
   if (*status == 204) {
     rc = 0;
+    goto done;
+  }
+  if (has_length && content_length > ORBIT_CLIENT_ARENA_BYTES) {
+    rc = ORBIT_CLIENT_RESOURCE_LIMIT;
     goto done;
   }
   if (chunked) {

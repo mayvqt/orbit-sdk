@@ -66,7 +66,39 @@ static int check_response(const char *response, int valid,
   }
   return 0;
 }
+static int32_t count_receive(void *p, const uint8_t *b, uint32_t n) {
+  mock_t *m = p;
+  (void)b;
+  m->got += n;
+  return m->got <= ORBIT_CLIENT_ARENA_BYTES ? 0 : ORBIT_CLIENT_RESOURCE_LIMIT;
+}
+static int check_content_length_limit(void) {
+  static char response[ORBIT_CLIENT_ARENA_BYTES + 128];
+  const uint32_t chunks[] = {1, 31, 512};
+  for (uint32_t extra = 0; extra <= 1; ++extra) {
+    uint32_t length = ORBIT_CLIENT_ARENA_BYTES + extra;
+    int header = snprintf(response, sizeof(response),
+                          "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", length);
+    CHECK(header > 0 && (uint32_t)header + length < sizeof(response));
+    memset(response + header, 'x', length);
+    response[header + length] = 0;
+    for (uint32_t i = 0; i < sizeof(chunks) / sizeof(chunks[0]); ++i) {
+      uint16_t status = 0;
+      mock_t m = {response, 0, chunks[i], 0, 0, {0}, 0, &status};
+      orbit_tls_stream_t stream = {&m, connect_tls, write_tls, read_tls, close_tls};
+      orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
+                                {(const uint8_t *)"/test", 5},
+                                {(const uint8_t *)"{}", 2}, 1};
+      int32_t result = orbit_http_exchange(&stream, &q, &status, count_receive, &m);
+      CHECK(result == (extra ? ORBIT_CLIENT_RESOURCE_LIMIT : 0));
+      CHECK(m.got == (extra ? 0 : length));
+      CHECK(m.closed == 1);
+    }
+  }
+  return 0;
+}
 int main(void) {
+  CHECK(!check_content_length_limit());
   CHECK(!check_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", 1,
                         "hello"));
   CHECK(!check_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: "
