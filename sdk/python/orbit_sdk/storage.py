@@ -29,7 +29,7 @@ class StoredCredential:
     licence_id: str
     installation_id: str
     credential: str
-    credential_expires_at: int
+    credential_expires_at: int | None
     fingerprint: str | None = None
     fingerprint_provider: str | None = None
 
@@ -49,7 +49,7 @@ def valid_credential(value: StoredCredential, config: Any, device: Any) -> bool:
         and len(value.credential) == 43
         and value.credential.isascii()
         and all(c.isalnum() or c in "_-" for c in value.credential)
-        and 0 < value.credential_expires_at <= (1 << 63) - 1
+        and (value.credential_expires_at is None or 0 < value.credential_expires_at <= (1 << 63) - 1)
     )
 
 
@@ -84,7 +84,13 @@ def storage_entropy(config: Any, device: Any) -> bytes:
 
 def encode_record(config: Any, device: Any, generation: int, credential: StoredCredential | None) -> bytes:
     storage_entropy(config, device)
-    if not strict_int(generation, minimum=0, maximum=MAX_GENERATION) or credential is not None and not valid_credential(credential, config, device):
+    if (
+        not strict_int(generation, minimum=0, maximum=MAX_GENERATION)
+        or credential is not None and (
+            not valid_credential(credential, config, device)
+            or not strict_int(credential.credential_expires_at, minimum=1, maximum=MAX_GENERATION)
+        )
+    ):
         raise error(STORAGE, "storage_failed")
     record = {
         "sdk": "orbit.rust.storage",
@@ -227,7 +233,10 @@ class _LinuxLease:
             info = os.fstat(self.fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
                 raise error(STORAGE, "storage_failed")
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise error(STORAGE, "installation_in_use") from exc
             self.created = created
             self._verify(b"")
             if created:
@@ -238,9 +247,11 @@ class _LinuxLease:
                 finally:
                     os.close(directory_fd)
                 self._verify(b"")
-        except BaseException:
+        except BaseException as exc:
             self.close()
-            raise error(STORAGE, "storage_failed")
+            if isinstance(exc, OrbitError):
+                raise
+            raise error(STORAGE, "storage_failed") from exc
 
     def _verify(self, marker: bytes) -> None:
         import stat

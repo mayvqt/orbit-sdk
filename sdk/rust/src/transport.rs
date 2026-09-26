@@ -57,6 +57,7 @@ impl Default for Cancellation {
 pub struct Transport {
     client: Client,
     base: Url,
+    pub(crate) owner_cancel: Cancellation,
 }
 
 impl Transport {
@@ -66,7 +67,11 @@ impl Transport {
             .https_only(true)
             .build()
             .map_err(|_| Error::Configuration)?;
-        Ok(Self { client, base })
+        Ok(Self {
+            client,
+            base,
+            owner_cancel: Cancellation::new(),
+        })
     }
 
     #[cfg(feature = "local-development")]
@@ -97,7 +102,12 @@ impl Transport {
         Ok(Self {
             client,
             base: parsed,
+            owner_cancel: Cancellation::new(),
         })
+    }
+
+    pub(crate) fn canonical_origin(&self) -> String {
+        self.base.origin().ascii_serialization()
     }
 
     pub async fn get(&self, path: &str, cancel: &Cancellation) -> Result<Option<Value>> {
@@ -141,7 +151,7 @@ impl Transport {
         retry_safe: bool,
         cancel: &Cancellation,
     ) -> Result<Option<Value>> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || self.owner_cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let mut encoded = LimitedBody(Vec::new());
@@ -166,7 +176,7 @@ impl Transport {
         retry_safe: bool,
         cancel: &Cancellation,
     ) -> Result<Option<Value>> {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || self.owner_cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         let url = self.endpoint(path)?;
@@ -191,12 +201,13 @@ impl Transport {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(Error::Cancelled),
+            _ = self.owner_cancel.cancelled() => Err(Error::Cancelled),
             result = tokio::time::timeout(
                 OPERATION_TIMEOUT,
                 self.retry(method, url, body.as_deref(), authorization.as_ref(), retry_safe),
             ) => result.unwrap_or(Err(Error::transient())),
         };
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || self.owner_cancel.is_cancelled() {
             Err(Error::Cancelled)
         } else {
             result
@@ -873,6 +884,7 @@ pub(crate) mod tests {
     async fn lifecycle_tls_failure_is_never_retried() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let transport = Transport {
+            owner_cancel: Cancellation::new(),
             client: client_builder()
                 .no_proxy()
                 .https_only(true)

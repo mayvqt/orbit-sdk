@@ -118,7 +118,7 @@ size_t header_callback(char* data, size_t size, size_t count, void* opaque) {
 }
 
 int progress_callback(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
-    const auto& cancelled = *static_cast<const std::atomic_bool*>(opaque);
+    const auto& cancelled = *static_cast<const CancellationView*>(opaque);
     return cancelled.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
@@ -353,7 +353,7 @@ std::string Transport::endpoint(std::string_view path) const {
 
 HttpResponse Transport::attempt(std::string_view method, std::string_view url,
                                 std::string_view body, std::string_view bearer,
-                                const std::atomic_bool& cancelled, long timeout_ms) const {
+                                const CancellationView& cancelled, long timeout_ms) const {
 #ifdef ORBIT_SDK_TESTING
     if (test_handler_) return test_handler_(method, url, bearer, body, cancelled);
 #endif
@@ -438,7 +438,8 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
 std::optional<Json::Value> Transport::request(
     std::string_view method, std::string_view path, std::string_view body,
     std::string_view bearer, bool retry_safe,
-    const std::atomic_bool& cancelled) const {
+    const std::atomic_bool& caller_cancelled) const {
+    const CancellationView cancelled(caller_cancelled, owner_cancelled_);
     check_cancelled(cancelled.load(std::memory_order_relaxed));
     const auto url = endpoint(path);
     const auto deadline = std::chrono::steady_clock::now() + kOperationTimeout;

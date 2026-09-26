@@ -32,7 +32,8 @@ struct Credential {
     activation_id: String,
     licence_id: String,
     bearer: String,
-    expires_at: i64,
+    #[serde(deserialize_with = "Option::deserialize")]
+    expires_at: Option<i64>,
 }
 
 pub(super) fn entropy(config: &Config, device: &Device) -> Result<[u8; 32]> {
@@ -164,7 +165,7 @@ pub(super) mod tests {
             licence_id: "synthetic_licence".into(),
             installation_id: device.installation_id,
             credential: "s".repeat(43),
-            credential_expires_at: 1234,
+            credential_expires_at: Some(1234),
             fingerprint: device.fingerprint,
             fingerprint_provider: device.fingerprint_provider,
         }
@@ -217,7 +218,7 @@ pub(super) mod tests {
             ("bearer", json!("/".repeat(43))),
             ("activation_id", json!("")),
             ("licence_id", json!("invalid id")),
-            ("expires_at", json!(null)),
+            ("expires_at", json!("missing")),
             ("unknown", json!(true)),
         ] {
             let mut invalid = original.clone();

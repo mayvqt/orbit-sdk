@@ -58,7 +58,7 @@ internal static class WindowsStorageFiles
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass,
         [In] byte[] information, uint size);
 
-    internal static string PinDirectory(string directory, List<SafeFileHandle> pins)
+    internal static string PinDirectory(string directory, List<SafeFileHandle> pins, InstalledWindowsSecurity? security = null)
     {
         if (string.IsNullOrEmpty(directory) || !Path.IsPathFullyQualified(directory) ||
             directory.Length < 3 || !char.IsAsciiLetter(directory[0]) || directory[1] != ':' ||
@@ -67,7 +67,7 @@ internal static class WindowsStorageFiles
         var root = Path.GetPathRoot(path)!;
         if (new DriveInfo(root).DriveType is not (DriveType.Fixed or DriveType.Removable or DriveType.Ram)) throw Storage();
         var current = root;
-        Pin(current, pins);
+        Pin(current, pins, security);
         var components = path[root.Length..].Split(Path.DirectorySeparatorChar);
         if (components.Length == 0 || components.Any(string.IsNullOrEmpty)) throw Storage();
         foreach (var component in components)
@@ -78,27 +78,45 @@ internal static class WindowsStorageFiles
                 stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal)) && stem[3] is >= '1' and <= '9')
                 throw Storage();
             current = Path.Combine(current, component);
-            Pin(current, pins);
+            Pin(current, pins, security);
         }
+        if (security != null && OperatingSystem.IsWindows())
+            security.Check(pins[^1]);
         return path;
     }
 
-    private static void Pin(string path, List<SafeFileHandle> pins)
+    private static void Pin(string path, List<SafeFileHandle> pins, InstalledWindowsSecurity? security = null)
     {
         // Metadata-only access does not enforce the no-delete sharing boundary.
         var handle = CreateFileW(path, GenericRead, 3, IntPtr.Zero, 3, OpenReparsePoint | BackupSemantics, IntPtr.Zero);
-        try { _ = Information(handle, directory: true); pins.Add(handle); }
+        if (handle.IsInvalid && security != null && OperatingSystem.IsWindows() && Marshal.GetLastPInvokeError() is 2 or 3)
+        {
+            handle.Dispose();
+            security.CreateDirectory(path);
+            handle = CreateFileW(path, GenericRead, 3, IntPtr.Zero, 3, OpenReparsePoint | BackupSemantics, IntPtr.Zero);
+            try
+            {
+                security.Check(handle);
+            }
+            catch { handle.Dispose(); throw; }
+        }
+        try
+        {
+            _ = Information(handle, directory: true);
+            pins.Add(handle);
+        }
         catch { handle.Dispose(); throw; }
     }
 
-    private static long Information(SafeFileHandle handle, bool directory)
+    private static long Information(SafeFileHandle handle, bool directory, int maximum = MaximumCiphertext)
     {
         if (handle.IsClosed || handle.IsInvalid || GetFileType(handle) != 1 || !GetFileInformationByHandle(handle, out var info) ||
             (info.Attributes & FileAttributes.ReparsePoint) != 0 ||
             ((info.Attributes & FileAttributes.Directory) != 0) != directory || !directory && info.Links != 1)
             throw Storage();
         var length = ((ulong)info.SizeHigh << 32) | info.SizeLow;
-        if (!directory && length > MaximumCiphertext) throw Storage();
+        if (!directory && length > (ulong)maximum)
+            throw Storage();
         return directory ? 0 : (long)length;
     }
 
@@ -108,32 +126,45 @@ internal static class WindowsStorageFiles
         foreach (var handle in directories) _ = Information(handle, directory: true);
     }
 
-    internal static (SafeFileHandle Handle, bool Created) Lease(string path)
+    internal static (SafeFileHandle Handle, bool Created) Lease(string path, InstalledWindowsSecurity? security = null)
     {
-        var handle = CreateFileW(path, GenericRead | GenericWrite, 0, IntPtr.Zero, 1, OpenReparsePoint, IntPtr.Zero);
+        var handle = CreateFileW(path, GenericRead | GenericWrite, 0, SecurityAttributes(security), 1, OpenReparsePoint, IntPtr.Zero);
         var created = !handle.IsInvalid;
         if (!created)
         {
             var error = Marshal.GetLastPInvokeError();
             handle.Dispose();
-            if (error is not (80 or 183)) throw Storage();
+            if (error == 32 && security != null)
+                throw new OrbitException(OrbitError.Storage, "installation_in_use");
+            if (error is not (80 or 183))
+                throw Storage();
             handle = CreateFileW(path, GenericRead | GenericWrite, 0, IntPtr.Zero, 3, OpenReparsePoint, IntPtr.Zero);
         }
         try
         {
-            if (Information(handle, directory: false) != 0) throw Storage();
+            if (handle.IsInvalid && Marshal.GetLastPInvokeError() == 32 && security != null)
+                throw new OrbitException(OrbitError.Storage, "installation_in_use");
+            if (Information(handle, directory: false) != 0)
+                throw Storage();
             return (handle, created);
         }
         catch { handle.Dispose(); throw; }
     }
 
-    internal static byte[]? Read(string path, bool allowAbsent, IReadOnlyList<SafeFileHandle> directories)
+    internal static byte[]? Read(string path, bool allowAbsent, IReadOnlyList<SafeFileHandle> directories, InstalledWindowsSecurity? security = null)
     {
         CheckDirectories(directories);
         using var handle = CreateFileW(path, GenericRead, 1, IntPtr.Zero, 3, OpenReparsePoint, IntPtr.Zero);
-        if (handle.IsInvalid && allowAbsent && Marshal.GetLastPInvokeError() == 2) return null;
-        var length = Information(handle, directory: false);
-        if (length < 1) throw Storage();
+        if (handle.IsInvalid && allowAbsent && Marshal.GetLastPInvokeError() == 2)
+            return null;
+        var length = Information(handle, directory: false, security == null ? MaximumCiphertext : InstalledCodec.Limit * 2);
+        if (security != null && OperatingSystem.IsWindows())
+        {
+            security.Check(directories[^1]);
+            security.Check(handle);
+        }
+        if (length < 1)
+            throw Storage();
         using var stream = new FileStream(handle, FileAccess.Read);
         var bytes = new byte[(int)length];
         stream.ReadExactly(bytes);
@@ -141,22 +172,28 @@ internal static class WindowsStorageFiles
         return bytes;
     }
 
-    internal static void Write(string temporary, IReadOnlyList<SafeFileHandle> directories, byte[] ciphertext)
+    internal static void Write(string temporary, IReadOnlyList<SafeFileHandle> directories, byte[] ciphertext, InstalledWindowsSecurity? security = null)
     {
         CheckDirectories(directories);
         var created = false;
         var renamed = false;
         try
         {
-            using (var handle = CreateFileW(temporary, GenericRead | GenericWrite | DeleteAccess, 0, IntPtr.Zero, 1, OpenReparsePoint, IntPtr.Zero))
+            using (var handle = CreateFileW(temporary, GenericRead | GenericWrite | DeleteAccess, 0, SecurityAttributes(security), 1, OpenReparsePoint, IntPtr.Zero))
             {
                 created = !handle.IsInvalid;
-                if (Information(handle, directory: false) != 0) throw Storage();
+                if (Information(handle, directory: false) != 0)
+                    throw Storage();
+                if (security != null && OperatingSystem.IsWindows())
+                {
+                    security.Check(directories[^1]);
+                    security.Check(handle);
+                }
                 using var stream = new FileStream(handle, FileAccess.Write);
                 stream.Write(ciphertext);
                 stream.Flush(flushToDisk: true);
                 CheckDirectories(directories);
-                Replace(handle, directories[^1]);
+                Replace(handle, directories[^1], security == null ? MaximumCiphertext : InstalledCodec.Limit * 2);
                 renamed = true;
                 stream.Flush(flushToDisk: true);
             }
@@ -164,9 +201,9 @@ internal static class WindowsStorageFiles
         finally { if (created && !renamed) File.Delete(temporary); }
     }
 
-    internal static void Replace(SafeFileHandle source, SafeFileHandle directory)
+    internal static void Replace(SafeFileHandle source, SafeFileHandle directory, int maximum = MaximumCiphertext)
     {
-        _ = Information(source, directory: false);
+        _ = Information(source, directory: false, maximum);
         _ = Information(directory, directory: true);
         var retained = false;
         try
@@ -197,6 +234,13 @@ internal static class WindowsStorageFiles
         }
         finally { if (retained) directory.DangerousRelease(); }
     }
+
+    internal static void CheckInstalledLease(SafeFileHandle handle)
+    {
+        if (Information(handle, false) != 0)
+            throw Storage();
+    }
+    private static IntPtr SecurityAttributes(InstalledWindowsSecurity? security) => security != null && OperatingSystem.IsWindows() ? security.Attributes : IntPtr.Zero;
 
     private static OrbitException Storage() => new(OrbitError.Storage);
 }

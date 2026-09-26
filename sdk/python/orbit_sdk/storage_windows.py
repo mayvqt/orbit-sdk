@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 import ntpath
 import os
 import secrets
@@ -53,13 +54,16 @@ def _kernel32() -> Any:
     return ctypes.WinDLL("kernel32.dll", use_last_error=True)
 
 
-def _open_handle(path: str, access: int, share: int, creation: int, flags: int) -> int:
+def _open_handle(path: str, access: int, share: int, creation: int, flags: int, *, private: bool = False) -> int:
     kernel = _kernel32()
     kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
     kernel.CreateFileW.restype = ctypes.c_void_p
-    handle = kernel.CreateFileW(path, access, share, None, creation, flags, None)
-    if handle == _INVALID_HANDLE or handle is None:
-        raise error(STORAGE, "storage_failed")
+    from .storage_windows_security import private_attributes
+    with private_attributes() if private and creation == _CREATE_NEW else nullcontext(None) as attributes:
+        handle = kernel.CreateFileW(path, access, share, ctypes.byref(attributes) if attributes is not None else None, creation, flags, None)
+        if handle == _INVALID_HANDLE or handle is None:
+            code = "installation_in_use" if private and ctypes.get_last_error() == 32 else "storage_failed"
+            raise error(STORAGE, code)
     return int(handle)
 
 
@@ -100,8 +104,9 @@ def _check_regular(handle: int, *, minimum_size: int = 0, maximum_size: int | No
 
 class _DPAPI:
     @staticmethod
-    def _call(name: str, data: bytes, entropy: bytes, maximum: int) -> bytes:
-        if len(data) > (MAX_PLAINTEXT if name == "CryptProtectData" else MAX_CIPHERTEXT) or not 1 <= len(entropy) <= 1024:
+    def _call(name: str, data: bytes, entropy: bytes, maximum: int, input_limit: int | None = None) -> bytes:
+        limit = input_limit if input_limit is not None else MAX_PLAINTEXT if name == "CryptProtectData" else MAX_CIPHERTEXT
+        if len(data) > limit or not 1 <= len(entropy) <= 1024:
             raise error(STORAGE, "storage_failed")
         input_buffer = ctypes.create_string_buffer(data)
         entropy_buffer = ctypes.create_string_buffer(entropy)
@@ -137,6 +142,14 @@ class _DPAPI:
     @classmethod
     def unprotect(cls, data: bytes, entropy: bytes) -> bytes:
         return cls._call("CryptUnprotectData", data, entropy, MAX_PLAINTEXT)
+
+    @classmethod
+    def protect_envelope(cls, data: bytes, entropy: bytes) -> bytes:
+        return cls._call("CryptProtectData", data, entropy, 65 * 1024, 64 * 1024)
+
+    @classmethod
+    def unprotect_envelope(cls, data: bytes, entropy: bytes) -> bytes:
+        return cls._call("CryptUnprotectData", data, entropy, 64 * 1024, 65 * 1024)
 
 
 class WindowsStorage:
@@ -244,9 +257,11 @@ class WindowsStorage:
         finally:
             _close(handle)
 
-    def _write_replace(self, ciphertext: bytes) -> None:
-        if not ciphertext or len(ciphertext) > MAX_CIPHERTEXT:
+    def _write_replace(self, ciphertext: bytes, *, maximum: int = MAX_CIPHERTEXT) -> None:
+        if not ciphertext or len(ciphertext) > maximum:
             raise error(STORAGE, "storage_failed")
+        private = getattr(self, "_private", False)
+        from .storage_windows_security import check_private
         destination = ntpath.join(self._directory, DATA_FILE)
         try:
             existing = _open_handle(destination, _GENERIC_READ, 0, _OPEN_EXISTING, _FILE_FLAG_OPEN_REPARSE_POINT)
@@ -256,14 +271,22 @@ class WindowsStorage:
         else:
             try:
                 _check_regular(existing)
+                if private:
+                    if _info(existing).links != 1:
+                        raise error(STORAGE, "storage_failed")
+                    check_private(existing)
             finally:
                 _close(existing)
         suffix = secrets.token_hex(16)
         temporary_path = ntpath.join(self._directory, f"orbit-storage-{suffix}.tmp")
-        source = _open_handle(temporary_path, _GENERIC_WRITE | _DELETE, 0, _CREATE_NEW, _FILE_FLAG_OPEN_REPARSE_POINT)
+        source = _open_handle(temporary_path, _GENERIC_WRITE | _DELETE, 0, _CREATE_NEW, _FILE_FLAG_OPEN_REPARSE_POINT, private=private)
         replaced = False
         try:
             _check_regular(source)
+            if private:
+                if _info(source).links != 1:
+                    raise error(STORAGE, "storage_failed")
+                check_private(source)
             kernel = _kernel32()
             kernel.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
             kernel.WriteFile.restype = ctypes.c_int

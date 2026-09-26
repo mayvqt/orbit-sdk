@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
+import secrets
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterator
 
-from .clock import Anchor, Start, timestamp
+from .clock import Anchor, Start, elapsed_ns, timestamp, wall_seconds
 from .device import installation_id_new, lower_hex, opaque, valid_provider
 from .errors import (
     CANCELLED,
+    CLOCK_UNCERTAIN,
     CONFIGURATION,
     DENIED,
     INVALID_RESPONSE,
@@ -27,7 +30,8 @@ from .errors import (
 from .grants import Expected, Keys, verify
 from .jsonutil import fields, strict_int, text, unique_json
 from .storage import MemoryStorage, StoredCredential, WindowsStorage, SecretServiceStorage, valid_credential
-from .transport import CLIENT_PREFIX, JWKS_PATH, Transport
+from .persistent_storage import AccessState, InstallationStorage, PendingActivation, canonical_scope
+from .transport import CLIENT_PREFIX, JWKS_PATH, Transport, _safe_origin
 
 
 class StorageMode(str, Enum):
@@ -75,10 +79,39 @@ class Config:
 
 
 @dataclass(frozen=True)
+class AppConfig:
+    """Public trusted scope for the persistent ``Client.open`` convenience."""
+
+    api_origin: str
+    application_id: str
+    environment_id: str
+    issuer: str
+    fingerprint: str | None = None
+    fingerprint_provider: str | None = None
+
+
+@dataclass(frozen=True)
 class RegistrationResult:
     accepted: bool
     expires_at: str | None
     pending: PendingRegistration
+
+
+class _CombinedCancellation:
+    def __init__(self, lifecycle: threading.Event, caller: threading.Event) -> None:
+        self.lifecycle, self.caller = lifecycle, caller
+
+    def is_set(self) -> bool:
+        return self.lifecycle.is_set() or self.caller.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
+            if remaining <= 0:
+                return self.is_set()
+            self.lifecycle.wait(remaining)
+        return True
 
 
 class Cancellation:
@@ -253,12 +286,14 @@ class _AccountSession:
 
 
 class Client:
-    """Synchronous native Python client. Use ``with Client.connect(...)``."""
+    """Synchronous Orbit client. Use ``with Client.open(...)`` or ``connect``."""
 
-    def __init__(self, config: Config, transport: Any, storage: Any) -> None:
+    def __init__(self, config: Config, transport: Any, storage: Any, *, persistent: bool = False) -> None:
         self.config = config
         self.transport = transport
         self._storage = storage
+        self._persistent_storage = storage if persistent and isinstance(storage, InstallationStorage) else None
+        self._persistent = self._persistent_storage is not None
         version, credential = storage.load()
         if credential is not None and not valid_credential(credential, config, self._device(config)):
             raise error(STORAGE, "storage_failed")
@@ -278,6 +313,14 @@ class Client:
         self._device_value = self._device(config)
         self._keys: Keys | None = None
         self._keys_lock = threading.Lock()
+        self._persisted_access: AccessState | None = None
+        self._lifecycle_condition = threading.Condition()
+        self._lifecycle_stop = threading.Event()
+        self._lifecycle_thread: threading.Thread | None = None
+        self._close_deferred = False
+        self._last_checkpoint_elapsed = elapsed_ns() if self._persistent else 0
+        if self._persistent_storage is not None:
+            self._restore_cached_access()
 
     @staticmethod
     def _device(config: Config) -> _Device:
@@ -305,10 +348,228 @@ class Client:
         return cls(config, transport, storage)
 
     @classmethod
+    def open(cls, config: AppConfig, state_path: str | os.PathLike[str] | None = None) -> Client:
+        """Open a stable installation with private credential and grant storage."""
+        return cls._open_app(config, state_path, transport=None, start_worker=True)
+
+    @classmethod
+    def _open_for_test(
+        cls,
+        config: AppConfig,
+        state_path: str | os.PathLike[str],
+        transport: Any,
+        *,
+        start_worker: bool = False,
+    ) -> Client:
+        """Private injection point for persistent lifecycle and storage tests."""
+        return cls._open_app(config, state_path, transport=transport, start_worker=start_worker)
+
+    @classmethod
+    def _open_app(
+        cls,
+        app_config: AppConfig,
+        state_path: str | os.PathLike[str] | None,
+        *,
+        transport: Any | None,
+        start_worker: bool,
+    ) -> Client:
+        if not isinstance(app_config, AppConfig):
+            raise TypeError("config must be an orbit_sdk.AppConfig")
+        _validate_app_config(app_config)
+        # Validate the complete trusted origin before creating private state.
+        live_transport = transport if transport is not None else Transport(app_config.api_origin)
+        storage = InstallationStorage.open(state_path, app_config)
+        client = None
+        try:
+            config = Config(
+                api_origin=app_config.api_origin,
+                application_id=app_config.application_id,
+                environment_id=app_config.environment_id,
+                issuer=app_config.issuer,
+                installation_id=storage.installation_id,
+                fingerprint=app_config.fingerprint or "",
+                fingerprint_provider=app_config.fingerprint_provider or "",
+            )
+            _validate_config(config)
+            client = cls(config, live_transport, storage, persistent=True)
+            if storage.pending_activation is None:
+                try:
+                    client._refresh(None, respect_retry=False)
+                except OrbitError as exc:
+                    if exc.kind not in (TRANSIENT, REAUTHENTICATION_REQUIRED):
+                        raise
+            client._checkpoint_persistent_cache(force=True)
+            if start_worker:
+                client._start_lifecycle()
+            return client
+        except BaseException:
+            if client is not None:
+                client.close()
+            else:
+                storage.close()
+            raise
+
+    @classmethod
     def _for_test(cls, config: Config, transport: Any, storage: Any | None = None) -> Client:
         """Private deterministic dependency injection for the SDK test suite."""
         _validate_config(config)
         return cls(config, transport, storage if storage is not None else MemoryStorage())
+
+    def _restore_cached_access(self) -> None:
+        assert self._persistent_storage is not None
+        access = self._persistent_storage.access
+        if access is None:
+            return
+        try:
+            wall = wall_seconds()
+            if (
+                wall < access.wall_high_water
+                or access.server_high_water < access.received_server_time
+                or access.wall_high_water < access.received_wall_time
+                or abs((access.server_high_water - access.received_server_time) -
+                       (access.wall_high_water - access.received_wall_time)) > 30
+            ):
+                raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+            estimated = max(access.server_high_water, access.received_server_time + wall - access.received_wall_time)
+            if not 0 <= estimated <= (1 << 63) - 1:
+                raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+            keys = Keys.parse(access.jwks)
+            if len(keys._entries) != 1:
+                raise error(INVALID_RESPONSE, "invalid_jwks")
+            credential = self._credential
+            if credential is None:
+                raise error(INVALID_RESPONSE, "invalid_grant")
+            expected = Expected(
+                issuer=self.config.issuer,
+                application=self.config.application_id,
+                environment=self.config.environment_id,
+                licence=credential.licence_id,
+                activation=credential.activation_id,
+                installation=self.config.installation_id,
+                fingerprint=self.config.fingerprint or None,
+                fingerprint_provider=self.config.fingerprint_provider or None,
+                credential_expires_at=credential.credential_expires_at,
+                licence_expires_at=access.licence_expires_at,
+                now=access.received_server_time,
+            )
+            claims = verify(access.jws, keys, expected)
+            if (
+                claims["exp"] <= estimated
+                or credential.credential_expires_at is not None and credential.credential_expires_at <= estimated
+                or access.licence_expires_at is not None and access.licence_expires_at <= estimated
+            ):
+                raise error(INVALID_RESPONSE, "expired_grant")
+            anchor = Anchor(estimated, Start.capture())
+            anchor.now()
+        except OrbitError:
+            self._persistent_storage.clear_access()
+            self._persisted_access = None
+            return
+        self._keys = keys
+        self._persisted_access = access
+        self._claims, self._anchor = claims, anchor
+
+    def _checkpoint_persistent_cache(self, *, force: bool = False, propagate: bool = False) -> None:
+        if self._persistent_storage is None:
+            return
+        elapsed = elapsed_ns()
+        if not force and elapsed - self._last_checkpoint_elapsed < 60_000_000_000:
+            return
+        with self._state_lock:
+            access, anchor = self._persisted_access, self._anchor
+            if access is None or anchor is None or self._claims is None:
+                self._last_checkpoint_elapsed = elapsed
+                return
+            try:
+                server_now = anchor.now()
+                wall_now = wall_seconds()
+                server_delta = server_now - access.server_high_water
+                wall_delta = wall_now - access.wall_high_water
+                if server_delta < 0 or wall_delta < 0 or abs(server_delta - wall_delta) > 30:
+                    raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+                checkpoint = replace(access, server_high_water=server_now, wall_high_water=wall_now)
+                self._persistent_storage.checkpoint_access(checkpoint)
+                self._persisted_access = checkpoint
+            except OrbitError as exc:
+                if exc.kind == STORAGE:
+                    self._clear_all_locked()
+                    raise
+                try:
+                    self._persistent_storage.clear_access()
+                except BaseException as storage_error:
+                    self._clear_all_locked()
+                    raise error(STORAGE, "storage_failed") from storage_error
+                self._persisted_access = None
+                self._claims = None
+                self._anchor = None
+                self._generation += 1
+                if propagate:
+                    raise
+            self._last_checkpoint_elapsed = elapsed
+
+    def _start_lifecycle(self) -> None:
+        with self._lifecycle_condition:
+            if self._lifecycle_thread is not None:
+                return
+            thread = threading.Thread(target=self._lifecycle, name=f"orbit-sdk-client-{id(self):x}", daemon=True)
+            self._lifecycle_thread = thread
+            thread.start()
+
+    def _lifecycle(self) -> None:
+        try:
+            while not self._lifecycle_stop.is_set():
+                timeout = 60.0
+                try:
+                    with self._operation():
+                        self._checkpoint_persistent_cache()
+                        snapshot = self._snapshot()
+                        pending_activation = self._persistent_storage is not None and self._persistent_storage.pending_activation is not None
+                        needs_refresh = not pending_activation and snapshot["access"] in ("refresh_required", "expired", "offline")
+                        with self._state_lock:
+                            if needs_refresh and self._anchor is not None and self._claims is not None:
+                                try:
+                                    refresh_remaining = max(0.0, self._claims["refresh_after"] - self._anchor.now())
+                                except OrbitError:
+                                    refresh_remaining = 0.0
+                            else:
+                                refresh_remaining = 60.0
+                            retry = self._retry_deadline
+                        now = time.monotonic()
+                        retry_remaining = None if retry is None else max(0.0, retry - now)
+                        if needs_refresh and (retry_remaining is None or retry_remaining <= 0.0):
+                            try:
+                                self._refresh(self._lifecycle_stop, respect_retry=True)
+                            except OrbitError as exc:
+                                if exc.kind not in (TRANSIENT, CANCELLED, REAUTHENTICATION_REQUIRED, STALE_RESPONSE, CLOCK_UNCERTAIN, STORAGE):
+                                    pass
+                            with self._state_lock:
+                                retry = self._retry_deadline
+                            if retry is not None:
+                                timeout = min(timeout, max(0.0, retry - time.monotonic()))
+                            else:
+                                timeout = min(timeout, 1.0)
+                        elif needs_refresh and retry_remaining is not None:
+                            # A passed refresh deadline is no longer actionable while a
+                            # bounded retry is pending; wait for that retry instead.
+                            timeout = min(timeout, retry_remaining)
+                        else:
+                            timeout = min(timeout, refresh_remaining)
+                            if needs_refresh and retry_remaining is not None:
+                                timeout = min(timeout, retry_remaining)
+                except RuntimeError:
+                    return
+                except OrbitError:
+                    timeout = min(timeout, 5.0)
+                if self._lifecycle_stop.wait(timeout):
+                    return
+        finally:
+            with self._condition:
+                deferred = self._close_deferred
+            if deferred:
+                try:
+                    self._finish_close()
+                except OrbitError:
+                    pass
 
     @contextmanager
     def _operation(self, cancellation: Cancellation | None = None) -> Iterator[threading.Event | None]:
@@ -320,10 +581,10 @@ class Client:
             self._active += 1
         try:
             if cancellation is None:
-                yield None
+                yield self._lifecycle_stop if self._persistent else None
             else:
-                with cancellation._borrow():
-                    yield cancellation
+                with cancellation._borrow() as signal:
+                    yield _CombinedCancellation(self._lifecycle_stop, signal) if self._persistent else cancellation
         finally:
             with self._condition:
                 self._active -= 1
@@ -351,6 +612,7 @@ class Client:
         self._credential = None
         self._claims = None
         self._anchor = None
+        self._persisted_access = None
         self._transient = False
         self._retry_deadline = None
 
@@ -358,7 +620,7 @@ class Client:
         self._clear_access_locked()
         self._account = None
 
-    def _invalidate(self, *, clear_account: bool = True) -> int:
+    def _invalidate(self, *, clear_account: bool = True, preserve_pending: bool = False) -> int:
         with self._state_lock:
             if clear_account:
                 self._clear_all_locked()
@@ -366,7 +628,10 @@ class Client:
                 self._clear_access_locked()
             generation = self._generation
             try:
-                self._storage_version = self._storage.invalidate()
+                if self._persistent_storage is not None:
+                    self._storage_version = self._persistent_storage.invalidate(preserve_pending=preserve_pending)
+                else:
+                    self._storage_version = self._storage.invalidate()
             except BaseException as exc:
                 raise error(STORAGE, "storage_failed") from exc
             return generation
@@ -407,6 +672,13 @@ class Client:
                     self._claims = None
                     self._anchor = None
                     self._generation += 1
+                    self._persisted_access = None
+                    if self._persistent_storage is not None:
+                        try:
+                            self._persistent_storage.clear_access()
+                        except BaseException as exc:
+                            self._clear_all_locked()
+                            raise error(STORAGE, "storage_failed") from exc
             return self._snapshot_locked()
 
     def _snapshot_locked(self) -> dict[str, Any]:
@@ -430,7 +702,10 @@ class Client:
         expiry, refresh = claims["exp"], claims["refresh_after"]
         result["expires_at"] = expiry
         result["next_check_at"] = refresh
-        result["reauthentication_required"] = self._credential is None or self._credential.credential_expires_at <= now + 86400
+        result["reauthentication_required"] = (
+            self._credential is None
+            or self._credential.credential_expires_at is not None and self._credential.credential_expires_at <= now + 86400
+        )
         result["offline_allowed"] = claims["offline_allowed"]
         if expiry <= now:
             result["access"] = "expired"
@@ -451,7 +726,7 @@ class Client:
             self._sync_storage()
             self._invalidate(clear_account=True)
 
-    def activate(self, licence_key: str, idempotency_key: str, *, cancellation: Cancellation | None = None) -> dict[str, Any]:
+    def activate(self, licence_key: str, idempotency_key: str | None = None, *, cancellation: Cancellation | None = None) -> dict[str, Any]:
         with self._operation(cancellation) as cancel:
             return self._activate("key", licence_key, None, "", idempotency_key, cancel)
 
@@ -467,13 +742,15 @@ class Client:
         with self._operation(cancellation) as cancel:
             return self._activate("account", "", licence_id, previous_credential or "", idempotency_key, cancel)
 
-    def _activate(self, principal: str, key: str, licence: str | None, previous: str, operation_id: str, cancel: threading.Event | None) -> dict[str, Any]:
-        _validate_texts(key, licence or "", previous, operation_id)
+    def _activate(self, principal: str, key: str, licence: str | None, previous: str, operation_id: str | None, cancel: threading.Event | None) -> dict[str, Any]:
+        _validate_texts(key, licence or "", previous, operation_id or "")
         if principal == "key" and (not key or len(key.encode()) > 256):
             raise error(CONFIGURATION, "invalid_request")
         if principal == "account" and not opaque(licence or ""):
             raise error(CONFIGURATION, "invalid_request")
-        if not 16 <= len(operation_id.encode()) <= 128 or previous and not _bearer(previous):
+        if operation_id is not None and not 16 <= len(operation_id.encode()) <= 128 or previous and not _bearer(previous):
+            raise error(CONFIGURATION, "invalid_request")
+        if principal == "account" and operation_id is None or not self._persistent and operation_id is None:
             raise error(CONFIGURATION, "invalid_request")
         original = self._generation_now()
         self._acquire_serial(original, cancel)
@@ -485,7 +762,54 @@ class Client:
                 session = self._account
                 if principal == "account" and session is None:
                     raise error(REAUTHENTICATION_REQUIRED, "reauthentication_required")
-            generation = self._invalidate(clear_account=principal == "key")
+                saved_before = self._credential
+            effective_operation_id = operation_id
+            if self._persistent_storage is not None and principal == "key":
+                digest = _activation_input_digest(
+                    self.config,
+                    "key",
+                    key,
+                    None,
+                    previous,
+                )
+                pending = self._persistent_storage.pending_activation
+                if pending is not None:
+                    now = wall_seconds()
+                    if now < pending.created_at:
+                        raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+                    if now - pending.created_at > 86400:
+                        raise error(CONFIGURATION, "pending_activation_recovery_required")
+                    if pending.principal_kind != "key" or pending.input_digest != digest:
+                        raise error(CONFIGURATION, "pending_activation_conflict")
+                    if operation_id is not None and operation_id != pending.operation_id:
+                        raise error(CONFIGURATION, "pending_activation_conflict")
+                    effective_operation_id = pending.operation_id
+                    pending = PendingActivation(pending.operation_id, pending.principal_kind, pending.input_digest, pending.created_at)
+                else:
+                    effective_operation_id = operation_id or secrets.token_urlsafe(24)
+                    pending = PendingActivation(effective_operation_id, "key", digest, wall_seconds())
+                with self._state_lock:
+                    if self._generation != original:
+                        raise error(STALE_RESPONSE, "stale_response")
+                    version = self._persistent_storage.begin_activation(
+                        self._storage_version,
+                        pending,
+                        preserve_credential=bool(previous),
+                    )
+                    self._generation += 1
+                    generation = self._generation
+                    self._storage_version = version
+                    self._credential = saved_before if previous else None
+                    self._claims = None
+                    self._anchor = None
+                    self._persisted_access = None
+                    self._transient = False
+                    self._retry_deadline = None
+                    self._account = None
+            else:
+                if self._persistent_storage is not None and self._persistent_storage.pending_activation is not None:
+                    raise error(CONFIGURATION, "pending_activation_conflict")
+                generation = self._invalidate(clear_account=principal == "key")
             body: dict[str, Any] = {
                 "application_id": self.config.application_id,
                 "environment_id": self.config.environment_id,
@@ -493,8 +817,10 @@ class Client:
                 "fingerprint": self.config.fingerprint or None,
                 "fingerprint_provider": self.config.fingerprint_provider or None,
                 "previous_credential": previous or None,
-                "idempotency_key": operation_id,
+                "idempotency_key": effective_operation_id,
             }
+            if self._persistent:
+                body["credential_mode"] = "persistent"
             if principal == "key":
                 body["licence_key"] = key
             else:
@@ -515,6 +841,8 @@ class Client:
             return self._refresh(cancel, respect_retry=False)
 
     def _refresh(self, cancel: threading.Event | None, *, respect_retry: bool) -> dict[str, Any]:
+        if self._persistent_storage is not None and self._persistent_storage.pending_activation is not None:
+            raise error(CONFIGURATION, "pending_activation_recovery_required")
         generation = self._generation_now()
         self._acquire_serial(generation, cancel)
         try:
@@ -553,7 +881,7 @@ class Client:
     def _accept(self, response: bytes | None, response_error: OrbitError | None, generation: int, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> dict[str, Any]:
         self._check_generation(generation)
         verifying = response_error is None
-        result: tuple[StoredCredential, dict[str, Any], Anchor] | None = None
+        result: tuple[StoredCredential, dict[str, Any], Anchor, AccessState | None] | None = None
         failure = response_error
         if failure is None:
             try:
@@ -565,7 +893,7 @@ class Client:
         self._check_generation(generation)
         _check_cancel(cancel)
         if result is not None:
-            saved, claims, anchor = result
+            saved, claims, anchor, access = result
             self._check_generation(generation)
             with self._state_lock:
                 try:
@@ -580,7 +908,12 @@ class Client:
                     raise error(STALE_RESPONSE, "stale_response")
                 _check_cancel(cancel)
                 try:
-                    self._storage.save(self._storage_version, saved)
+                    if self._persistent_storage is not None:
+                        if access is None:
+                            raise error(STORAGE, "storage_failed")
+                        self._persistent_storage.save_verified(self._storage_version, saved, access)
+                    else:
+                        self._storage.save(self._storage_version, saved)
                 except OrbitError as exc:
                     self._clear_all_locked()
                     if exc.kind == STALE_RESPONSE:
@@ -590,6 +923,7 @@ class Client:
                     self._clear_all_locked()
                     raise error(STORAGE, "storage_failed") from exc
                 self._credential, self._claims, self._anchor = saved, claims, anchor
+                self._persisted_access = access
                 self._transient = False
                 self._retry_deadline = None
                 return self._snapshot_locked()
@@ -602,7 +936,10 @@ class Client:
                     self._generation += 1
                     self._claims = None
                     self._anchor = None
+                    self._persisted_access = None
                     generation = self._generation
+                    if self._persistent_storage is not None:
+                        self._persistent_storage.clear_access()
                 self._transient = True
                 self._retry_deadline = time.monotonic() + random.randrange(15, 45)
                 snapshot = self._snapshot_locked()
@@ -611,30 +948,43 @@ class Client:
             raise failure
         if failure.kind == CANCELLED:
             raise failure
+        preserve_pending = (
+            self._persistent_storage is not None
+            and self._persistent_storage.pending_activation is not None
+            and failure.kind not in (DENIED, REAUTHENTICATION_REQUIRED)
+        )
         with self._state_lock:
             if self._generation != generation:
                 raise error(STALE_RESPONSE, "stale_response")
             self._clear_all_locked()
             try:
-                self._storage_version = self._storage.invalidate()
+                self._storage_version = (
+                    self._persistent_storage.invalidate(preserve_pending=preserve_pending)
+                    if self._persistent_storage is not None
+                    else self._storage.invalidate()
+                )
             except BaseException as exc:
                 raise error(STORAGE, "storage_failed") from exc
         raise failure
 
-    def _verify_reply(self, data: bytes, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> tuple[StoredCredential, dict[str, Any], Anchor]:
+    def _verify_reply(self, data: bytes, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> tuple[StoredCredential, dict[str, Any], Anchor, AccessState | None]:
         reply = unique_json(data)
-        reply = fields(reply, {
+        expected_fields = {
             "activation_id": str,
             "installation_id": str,
             "credential": (str, type(None)),
-            "credential_expires_at": str,
+            "credential_expires_at": (str, type(None)) if self._persistent else str,
             "grant": (str, type(None)),
             "server_time": str,
             "binding_mode": str,
             "fingerprint_provider": (str, type(None)),
             "licence_expires_at": (str, type(None)),
             "secret_replay_expired": bool,
-        }, optional=("credential", "grant", "fingerprint_provider", "licence_expires_at"))
+        }
+        optional = ("credential", "grant", "fingerprint_provider", "licence_expires_at")
+        if not self._persistent:
+            optional += ("credential_expires_at",)
+        reply = fields(reply, expected_fields, optional=optional)
         if reply["secret_replay_expired"]:
             raise error(REAUTHENTICATION_REQUIRED, "secret_replay_expired")
         binding = "hwid" if self.config.fingerprint else "none"
@@ -648,8 +998,10 @@ class Client:
             raise error(INVALID_RESPONSE, "invalid_activation_response")
         anchor = Anchor(timestamp(reply["server_time"]), started)
         now = anchor.now()
-        expiry = timestamp(reply["credential_expires_at"])
-        if expiry <= now or expiry > now + 30 * 86400:
+        expiry = None if reply["credential_expires_at"] is None else timestamp(reply["credential_expires_at"])
+        if expiry is not None and (expiry <= now or expiry > now + 30 * 86400):
+            raise error(INVALID_RESPONSE, "invalid_activation_response")
+        if self._persistent and previous is None and expiry is not None:
             raise error(INVALID_RESPONSE, "invalid_activation_response")
         if previous is not None and (
             reply["activation_id"] != previous.activation_id
@@ -687,7 +1039,12 @@ class Client:
             now=anchor.now(),
         )
         claims = verify(token, keys, expected)
-        credential = reply["credential"] if reply["credential"] is not None else previous.credential if previous is not None else None
+        credential = (
+            reply["credential"]
+            if reply["credential"] is not None
+            else previous.credential if previous is not None
+            else None
+        )
         if credential is None or not _bearer(credential):
             raise error(INVALID_RESPONSE, "invalid_activation_response")
         stored = StoredCredential(
@@ -701,7 +1058,20 @@ class Client:
             fingerprint=self.config.fingerprint or None,
             fingerprint_provider=self.config.fingerprint_provider or None,
         )
-        return stored, claims, anchor
+        access = None
+        if self._persistent:
+            server_high_water = anchor.now()
+            wall_high_water = wall_seconds()
+            access = AccessState(
+                jws=token,
+                jwks=keys.single_jwks(token),
+                licence_expires_at=claims["licence_expires_at"],
+                received_server_time=timestamp(reply["server_time"]),
+                received_wall_time=started.wall,
+                server_high_water=server_high_water,
+                wall_high_water=wall_high_water,
+            )
+        return stored, claims, anchor, access
 
     def require_access(self, feature: str, *, cancellation: Cancellation | None = None) -> dict[str, Any]:
         with self._operation(cancellation) as cancel:
@@ -715,6 +1085,9 @@ class Client:
             snapshot = self._snapshot()
             _check_cancel(cancel)
             if snapshot["access"] not in ("online", "offline"):
+                with self._state_lock:
+                    if self._persistent and self._credential is not None and self._transient:
+                        raise error(TRANSIENT, "network_unavailable")
                 raise error(DENIED, "access_unavailable")
             if not snapshot["entitlements"].get(feature, False):
                 raise error(DENIED, "feature_unavailable")
@@ -961,17 +1334,49 @@ class Client:
         return result + (f"&after={after}" if after else "")
 
     def close(self) -> None:
+        thread: threading.Thread | None
         with self._condition:
             if self._closed:
                 return
             self._closed = True
-            while self._active:
+            self._lifecycle_stop.set()
+            with self._lifecycle_condition:
+                self._lifecycle_condition.notify_all()
+            thread = self._lifecycle_thread
+            from_lifecycle = thread is threading.current_thread()
+            while self._active and not from_lifecycle:
                 self._condition.wait()
-        with self._state_lock:
-            self._clear_all_locked()
-        close = getattr(self._storage, "close", None)
-        if close is not None:
-            close()
+            if from_lifecycle:
+                self._close_deferred = True
+                return
+        if thread is not None:
+            thread.join()
+        self._finish_close()
+
+    def _finish_close(self) -> None:
+        failure: OrbitError | None = None
+        try:
+            if self._persistent_storage is not None:
+                self._checkpoint_persistent_cache(force=True, propagate=True)
+        except OrbitError as exc:
+            failure = exc
+        except BaseException:
+            failure = error(STORAGE, "storage_failed")
+        finally:
+            with self._state_lock:
+                self._clear_all_locked()
+            close = getattr(self._storage, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except OrbitError as exc:
+                    if failure is None:
+                        failure = exc
+                except BaseException:
+                    if failure is None:
+                        failure = error(STORAGE, "storage_failed")
+        if failure is not None:
+            raise failure
 
     def __enter__(self) -> Client:
         with self._condition:
@@ -1020,7 +1425,56 @@ def _validate_config(config: Config) -> None:
         raise error(CONFIGURATION, "invalid_configuration")
     if bool(config.fingerprint) != bool(config.fingerprint_provider) or config.fingerprint and (not lower_hex(config.fingerprint, 64) or not valid_provider(config.fingerprint_provider)):
         raise error(CONFIGURATION, "invalid_configuration")
-    # Constructing the transport validates the public trusted HTTPS origin.
+    _safe_origin(config.api_origin)
+
+
+def _validate_app_config(config: AppConfig) -> None:
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an orbit_sdk.AppConfig")
+    values = (config.api_origin, config.application_id, config.environment_id, config.issuer)
+    if any(not isinstance(value, str) for value in values):
+        raise TypeError("Orbit SDK configuration values must be strings")
+    if config.fingerprint is not None and not isinstance(config.fingerprint, str):
+        raise TypeError("fingerprint must be text or None")
+    if config.fingerprint_provider is not None and not isinstance(config.fingerprint_provider, str):
+        raise TypeError("fingerprint_provider must be text or None")
+    runtime = Config(
+        api_origin=config.api_origin,
+        application_id=config.application_id,
+        environment_id=config.environment_id,
+        issuer=config.issuer,
+        installation_id="validation_installation_123",
+        fingerprint=config.fingerprint or "",
+        fingerprint_provider=config.fingerprint_provider or "",
+    )
+    _validate_config(runtime)
+
+
+def _activation_input_digest(
+    config: Config,
+    principal_kind: str,
+    licence_key: str,
+    licence_id: str | None,
+    previous_credential: str = "",
+) -> str:
+    value: dict[str, Any] = {
+        "scope": canonical_scope(config),
+        "installation": {
+            "id": config.installation_id,
+            "fingerprint": config.fingerprint or None,
+            "fingerprint_provider": config.fingerprint_provider or None,
+        },
+        "principal_kind": principal_kind,
+        "credential_mode": "persistent",
+    }
+    if principal_kind == "key":
+        value["licence_key"] = licence_key
+    else:
+        value["licence_id"] = licence_id
+    if previous_credential:
+        value["previous_credential_sha256"] = hashlib.sha256(previous_credential.encode("ascii")).hexdigest()
+    raw = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _validate_texts(*values: str) -> None:

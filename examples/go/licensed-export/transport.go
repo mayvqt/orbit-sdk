@@ -2,6 +2,11 @@
 
 package main
 
-import orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+import (
+	"context"
+	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+)
 
-func newTransport(origin string) (*orbit.Transport, error) { return orbit.NewTransport(origin) }
+func openClient(ctx context.Context, config orbit.AppConfig) (*orbit.Client, error) {
+	return orbit.Open(ctx, config)
+}

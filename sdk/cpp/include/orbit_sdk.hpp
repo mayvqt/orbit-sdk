@@ -26,6 +26,8 @@ enum class ErrorKind : std::uint32_t {
     storage = 9,
     clock_uncertain = 10,
     internal = 11,
+    installation_in_use = 12,
+    corrupt_state = 13,
 };
 
 class Error : public std::runtime_error {
@@ -71,10 +73,20 @@ struct Config {
     Storage storage;
 };
 
+// Non-secret configuration for an installed application. Client::open owns
+// the installation ID and its persistent state directory.
+struct AppConfig {
+    std::string api_origin;
+    std::string application_id;
+    std::string environment_id;
+    std::string issuer;
+    std::optional<Fingerprint> fingerprint;
+};
+
 class Client;
 
 namespace detail {
-struct ClientState;
+class ClientState;
 struct CancellationState;
 struct PendingRegistrationState;
 const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation*,
@@ -82,6 +94,8 @@ const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation*,
 #ifdef ORBIT_SDK_TESTING
 class Transport;
 class CredentialStorage;
+class InstalledStorage;
+::orbit::Client make_test_installed_client(Config, Transport, std::shared_ptr<InstalledStorage>);
 ::orbit::Client make_test_client(Config, Transport, std::shared_ptr<CredentialStorage>);
 #endif
 }
@@ -133,6 +147,8 @@ public:
     Client& operator=(Client&& other) noexcept;
 
     static Client connect(Config config);
+    static Client open(AppConfig config,
+                       std::optional<std::string> state_directory = std::nullopt);
 
     const Config& config() const noexcept;
     const std::string& installation_id() const noexcept;
@@ -141,6 +157,8 @@ public:
     std::string snapshot(const Cancellation* cancellation = nullptr) const;
     std::string activate(std::string_view licence_key,
                          std::string_view idempotency_key,
+                         const Cancellation* cancellation = nullptr) const;
+    std::string activate(std::string_view licence_key,
                          const Cancellation* cancellation = nullptr) const;
     std::string activate_previous(
         std::string_view licence_key,
@@ -153,6 +171,7 @@ public:
     void deactivate(std::string_view idempotency_key,
                     const Cancellation* cancellation = nullptr) const;
     void local_logout() const;
+    void close() const;
 
     RegistrationResult register_customer(
         std::string_view licence_key, std::string_view username,
@@ -191,6 +210,8 @@ public:
 private:
     explicit Client(std::shared_ptr<detail::ClientState> state) noexcept;
 #ifdef ORBIT_SDK_TESTING
+    friend Client detail::make_test_installed_client(Config, detail::Transport,
+        std::shared_ptr<detail::InstalledStorage>);
     friend Client detail::make_test_client(Config, detail::Transport,
                                             std::shared_ptr<detail::CredentialStorage>);
 #endif

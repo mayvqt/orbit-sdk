@@ -150,6 +150,7 @@ type expectedGrant struct {
 	issuer, application, environment, licence, activation, installation string
 	fingerprint, fingerprintProvider                                    *string
 	credentialExpiresAt                                                 int64
+	credentialPersistent                                                bool
 	licenceExpiresAt                                                    *int64
 	now                                                                 int64
 }
@@ -186,7 +187,11 @@ func verifyGrant(token string, keys grantKeys, expected expectedGrant) (*grantCl
 	if claims.OfflineAllowed {
 		allowance = 86400
 	}
-	if claims.Issuer != expected.issuer || claims.Audience != "orbit:"+expected.application+":"+expected.environment || claims.Subject == "" || len(claims.Subject) > 128 || (expected.licence != "" && claims.Subject != expected.licence) || claims.ID == "" || len(claims.ID) > 128 || claims.ApplicationID != expected.application || claims.EnvironmentID != expected.environment || claims.ActivationID != expected.activation || claims.InstallationID != expected.installation || !bound || claims.PolicyVersion < 1 || claims.IssuedAt < 0 || claims.NotBefore != claims.IssuedAt || claims.IssuedAt > saturatingAdd(expected.now, 30) || claims.IssuedAt < saturatingAdd(expected.now, -30) || claims.ExpiresAt <= expected.now || claims.ExpiresAt <= claims.IssuedAt || claims.ExpiresAt > saturatingAdd(claims.IssuedAt, allowance) || claims.ExpiresAt > expected.credentialExpiresAt || !equalInt(claims.LicenceExpiresAt, expected.licenceExpiresAt) || (claims.LicenceExpiresAt != nil && claims.ExpiresAt > *claims.LicenceExpiresAt) || claims.RefreshAfter <= claims.IssuedAt || claims.RefreshAfter > claims.ExpiresAt || claims.RefreshAfter > saturatingAdd(claims.IssuedAt, 75) || (claims.RefreshAfter < saturatingAdd(claims.IssuedAt, 45) && claims.RefreshAfter != claims.ExpiresAt) || !validEntitlements(claims.Entitlements) {
+	minimumRefresh, maximumRefresh := int64(45), int64(75)
+	if expected.credentialPersistent && claims.OfflineAllowed {
+		minimumRefresh, maximumRefresh = 675, 1125
+	}
+	if claims.Issuer != expected.issuer || claims.Audience != "orbit:"+expected.application+":"+expected.environment || claims.Subject == "" || len(claims.Subject) > 128 || (expected.licence != "" && claims.Subject != expected.licence) || claims.ID == "" || len(claims.ID) > 128 || claims.ApplicationID != expected.application || claims.EnvironmentID != expected.environment || claims.ActivationID != expected.activation || claims.InstallationID != expected.installation || !bound || claims.PolicyVersion < 1 || claims.IssuedAt < 0 || claims.NotBefore != claims.IssuedAt || claims.IssuedAt > saturatingAdd(expected.now, 30) || claims.IssuedAt < saturatingAdd(expected.now, -30) || claims.ExpiresAt <= expected.now || claims.ExpiresAt <= claims.IssuedAt || claims.ExpiresAt > saturatingAdd(claims.IssuedAt, allowance) || (!expected.credentialPersistent && claims.ExpiresAt > expected.credentialExpiresAt) || !equalInt(claims.LicenceExpiresAt, expected.licenceExpiresAt) || (claims.LicenceExpiresAt != nil && claims.ExpiresAt > *claims.LicenceExpiresAt) || claims.RefreshAfter <= claims.IssuedAt || claims.RefreshAfter > claims.ExpiresAt || claims.RefreshAfter > saturatingAdd(claims.IssuedAt, maximumRefresh) || (claims.RefreshAfter < saturatingAdd(claims.IssuedAt, minimumRefresh) && claims.RefreshAfter != claims.ExpiresAt) || !validEntitlements(claims.Entitlements) {
 		return nil, ErrInvalidResponse
 	}
 	return &claims, nil

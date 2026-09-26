@@ -5,6 +5,7 @@ mod clock;
 mod device;
 mod diagnostics;
 mod grants;
+mod installed;
 #[cfg(test)]
 mod parser_fuzz;
 mod setup;
@@ -24,10 +25,12 @@ pub use accounts::{
 };
 pub use device::{machine_fingerprint, native_fingerprint};
 pub use diagnostics::SupportSummary;
+pub use installed::AppConfig;
 pub use setup::Setup;
 pub use storage::{MemoryStorage, SecretServiceStorage, Storage, StoredCredential, WindowsStorage};
 pub use transport::{Cancellation, Transport};
 
+#[derive(Clone)]
 pub enum Error {
     Configuration,
     Cancelled,
@@ -45,6 +48,10 @@ pub enum Error {
     StaleResponse,
     Storage,
     ClockUncertain,
+    InstallationInUse,
+    CorruptState,
+    PendingActivation,
+    Closed,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +70,10 @@ impl std::fmt::Display for Error {
             Self::StaleResponse => "Discarded a superseded response",
             Self::Storage => "Credential storage failed",
             Self::ClockUncertain => "Online clock validation is required",
+            Self::InstallationInUse => "This installation is already open; share one client and do not delete its lock",
+            Self::CorruptState => "Installed state is missing or corrupt; restore a trusted backup or deliberately choose a new state directory",
+            Self::PendingActivation => "An activation is unresolved; retry the same input within 24 hours or explicitly resolve it",
+            Self::Closed => "The Orbit client is closed",
         })
     }
 }

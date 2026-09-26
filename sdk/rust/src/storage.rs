@@ -10,7 +10,8 @@ pub use windows::WindowsStorage;
 
 /// Sensitive bearer material: deliberately has no Debug or Serialize implementation.
 /// Adapters must use OS-protected storage, isolate each access context, and perform
-/// version-checked saves atomically with invalidate. Never use a plaintext file.
+/// version-checked saves atomically with invalidate. Private local Linux storage
+/// must enforce ownership, permissions, exclusive leases and durable atomic writes.
 #[derive(Clone)]
 pub struct StoredCredential {
     pub application_id: String,
@@ -19,7 +20,7 @@ pub struct StoredCredential {
     pub licence_id: String,
     pub installation_id: String,
     pub credential: String,
-    pub credential_expires_at: i64,
+    pub credential_expires_at: Option<i64>,
     pub fingerprint: Option<String>,
     pub fingerprint_provider: Option<String>,
 }
@@ -76,7 +77,7 @@ mod tests {
             licence_id: "licence".into(),
             installation_id: "installation".into(),
             credential: "synthetic".into(),
-            credential_expires_at: 123,
+            credential_expires_at: Some(123),
             fingerprint: None,
             fingerprint_provider: None,
         };

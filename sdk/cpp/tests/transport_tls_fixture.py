@@ -270,7 +270,8 @@ def main() -> None:
         if server.state.counts["/api/client/v1/status/proxy-html"] != 3:
             raise AssertionError("an HTML proxy failure did not remain transient")
         run_driver(args.driver, "cancel", endpoint, args.ca)
-        if server.state.counts["/api/client/v1/status/stall"] != 1:
+        run_driver(args.driver, "owner-cancel", endpoint, args.ca)
+        if server.state.counts["/api/client/v1/status/stall"] != 2:
             raise AssertionError("cancelled trusted TLS request did not reach the fixture")
         run_driver(args.driver, "stalled-deadline", endpoint, args.ca, timeout=20)
         run_driver(args.driver, "deadline", endpoint, args.ca, timeout=20)
@@ -280,7 +281,7 @@ def main() -> None:
         refused_port = reservation.getsockname()[1]
     run_driver(args.driver, "refused", f"https://127.0.0.1:{refused_port}", args.ca)
 
-    print("TLS transport checks passed: 20 driver scenarios plus retry/redirect assertions")
+    print("TLS transport checks passed: 21 driver scenarios plus retry/redirect assertions")
 
 
 if __name__ == "__main__":

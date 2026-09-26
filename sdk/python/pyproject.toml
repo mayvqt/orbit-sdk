@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orbit-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Native Python client for the Orbit installed-client protocol"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,7 +25,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/mayvqt/orbit-sdk"
-Source = "https://github.com/mayvqt/orbit-sdk/tree/v0.2.0/sdk/python"
+Source = "https://github.com/mayvqt/orbit-sdk/tree/v0.3.0/sdk/python"
 Issues = "https://github.com/mayvqt/orbit-sdk/issues"
 
 [tool.setuptools]

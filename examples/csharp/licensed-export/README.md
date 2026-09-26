@@ -1,53 +1,38 @@
 # C# licensing example
 
-Try licence activation and customer sign-in before adding the [SDK](../../../sdk/csharp/README.md)
-to your app. The example checks the `export` feature before producing a sample report.
+A console app checks the `export` feature before producing a sample report.
+Use .NET SDK 10.0.112 and the [C# SDK](../../../sdk/csharp/README.md).
 
-## Run the example
+## Run
 
-You need .NET SDK 10.0.112. In the Orbit dashboard, select your application and
-**Test** environment. Create a policy with `export` enabled and hardware locking
-off, then issue a licence. Open **Integration** for your API origin, application
-ID, environment ID and grant issuer. The issuer must match exactly; it may differ
-from the API origin.
-
-Run these commands from the extracted kit's root, replacing the four placeholders:
+In Orbit, select your application and **Test** environment. Create a policy with
+`export` enabled and hardware locking off, then issue a licence. Copy the four
+public values from **Integration**:
 
 ```sh
-dotnet restore examples/csharp/licensed-export/Orbit.LicensedExport.csproj --locked-mode
-dotnet build examples/csharp/licensed-export/Orbit.LicensedExport.csproj --no-restore -o out
-dotnet ./out/Orbit.LicensedExport.dll API_ORIGIN APP_ID ENVIRONMENT_ID ISSUER
+dotnet run --project examples/csharp/licensed-export -- API_ORIGIN APP_ID ENVIRONMENT_ID ISSUER
 ```
 
-These commands work on Windows and Linux. The default build requires HTTPS.
-For a local HTTP service only, add `-p:OrbitLocalDevelopment=true` to the build
-command; HTTP is limited to a literal loopback address such as `127.0.0.1`.
+Enter a licence key when first prompted, then enter `export`. Input is visible
+in this demo; never put a key or password in the command line. `status` displays
+access and expiry, and `quit` closes the application without deactivating it.
 
-Enter `activate`, paste your licence key at the prompt, then enter `export`.
-Use `status` to view access and expiry. Keep keys and passwords out of command-line
-arguments. Input is visible in this demo's terminal.
+The SDK saves this installation and refreshes access automatically. Run the same
+command after restart: a valid saved activation needs no key prompt. An optional
+fifth argument names a dedicated absolute state directory for a service account
+or persistent container volume.
 
-## Customer sign-in
+For an explicit local HTTP test service, add `-p:OrbitLocalDevelopment=true`
+before `--`. HTTP is restricted to literal loopback IPs; normal builds use HTTPS.
 
-For an Account or Both application, enter `register` and follow the prompts.
-Confirm the link in your email, then enter `login`, `licences` and `select`.
-Choose a licence before running `export`; signing in alone does not grant access.
+## Optional customer accounts
 
-| Command | What it does |
-| --- | --- |
-| `more` | Shows the next page of licences. |
-| `claim` | Adds another eligible licence key to the signed-in account. |
-| `resend` | Sends a new verification email for this session's pending registration. |
-| `recover` | Requests a password reset email. |
-| `email` | Starts an email change; confirm both mailbox links, then sign in again. |
-| `deactivate` | Releases this device slot once Orbit confirms the request. |
-| `logout` | Clears local access. |
-| `account-logout` | Also revokes the customer session and its activation credentials. |
-| `quit` | Closes the example. |
+For Account or Both mode, leave the initial key prompt empty and enter `register`.
+Confirm the email link, then use `login`, `licences` and `select` before `export`.
+Customer accounts belong to your software, separately from the Orbit dashboard.
 
-Neither logout command releases a device slot. Credentials stay in memory, so
-restart requires activation or sign-in again. Pass the printed installation ID as
-the optional final argument to reuse the same installation. The example refreshes
-access while open and checks it before every export.
+Other commands are `more`, `claim`, `resend`, `recover`, `email`, `logout`,
+`account-logout` and `deactivate`. Logout clears local access; account logout also
+requests session revocation. Only acknowledged deactivation releases a device slot.
 
-Source and examples use the [MIT licence](../../../sdk/LICENSE).
+Source and examples are [MIT licensed](../../../sdk/LICENSE).

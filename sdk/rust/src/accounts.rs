@@ -566,7 +566,7 @@ mod tests {
                     licence_id: "licence".into(),
                     installation_id: "installation_1234".into(),
                     credential: "s".repeat(43),
-                    credential_expires_at: 2_000_000_000,
+                    credential_expires_at: Some(2_000_000_000),
                     fingerprint: None,
                     fingerprint_provider: None,
                 },

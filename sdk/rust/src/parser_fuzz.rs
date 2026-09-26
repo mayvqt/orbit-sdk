@@ -34,7 +34,7 @@ fn bounded_parser_fuzz() {
         installation: "installation",
         fingerprint: None,
         fingerprint_provider: None,
-        credential_expires_at: 1_800_090_000,
+        credential_expires_at: Some(1_800_090_000),
         licence_expires_at: None,
         now: 1_800_000_000,
     };
@@ -95,7 +95,9 @@ fn bounded_parser_fuzz() {
                         );
                         assert!(
                             claims.exp > expected.now
-                                && claims.exp <= expected.credential_expires_at
+                                && expected
+                                    .credential_expires_at
+                                    .is_none_or(|expiry| claims.exp <= expiry)
                         );
                         assert!(token.as_ref().unwrap().len() <= 16_384);
                     }

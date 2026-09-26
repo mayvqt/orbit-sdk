@@ -6,11 +6,13 @@ namespace Orbit.Sdk;
 
 // Linux's fixed statx ABI avoids architecture-dependent libc struct stat layouts.
 // Missing libc/statx support fails closed; no pathname-only metadata fallback.
-internal sealed class LinuxStorageLease : IDisposable
+internal sealed partial class LinuxStorageLease : IDisposable
 {
     internal const string Name = "orbit-storage.lock";
-    internal static bool Supported => OperatingSystem.IsLinux() && RuntimeInformation.ProcessArchitecture == Architecture.X64;
-    private const int NoFollow = 0x20000, DirectoryFlag = 0x10000, CloseOnExec = 0x80000, NonBlock = 0x800;
+    internal static bool Supported => OperatingSystem.IsLinux() && RuntimeInformation.ProcessArchitecture is Architecture.X64 or Architecture.Arm64;
+    private static int NoFollow => RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? 1 << 15 : 1 << 17;
+    private static int DirectoryFlag => RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? 1 << 14 : 1 << 16;
+    private const int CloseOnExec = 0x80000, NonBlock = 0x800;
     private const uint RequiredMetadata = 0x30f; // type, mode, links, uid, inode, size
     private readonly List<(Descriptor Handle, string Name)> directories = [];
     private Descriptor? lease;
@@ -66,12 +68,12 @@ internal sealed class LinuxStorageLease : IDisposable
         return result;
     }
 
-    internal static LinuxStorageLease Open(string directory)
+    internal static LinuxStorageLease Open(string directory, bool installed = false)
     {
         var result = new LinuxStorageLease();
         try
         {
-            result.PinDirectory(directory);
+            result.PinDirectory(directory, installed);
             var final = result.directories[^1].Handle;
             var fd = OpenAt(final, Name, 2 | 0x40 | 0x80 | NoFollow | CloseOnExec | NonBlock, 0x180); // RDWR, CREAT, EXCL, 0600
             result.Created = fd >= 0;
@@ -82,11 +84,13 @@ internal sealed class LinuxStorageLease : IDisposable
             }
             result.lease = new Descriptor(fd);
             CheckPrivate(Read(result.lease, ""), UserId(), directory: false);
-            if (Flock(result.lease, 2 | 4) != 0) throw Storage(); // LOCK_EX | LOCK_NB
+            if (Flock(result.lease, 2 | 4) != 0)
+                throw new OrbitException(OrbitError.Storage, installed && Marshal.GetLastPInvokeError() == 11 ? "installation_in_use" : null); // LOCK_EX | LOCK_NB
             result.Check();
             if (result.Created && (Sync(result.lease) != 0 || Sync(final) != 0)) throw Storage();
             return result;
         }
+        catch (OrbitException) { result.Dispose(); throw; }
         catch (Exception) { result.Dispose(); throw Storage(); }
     }
 
@@ -99,7 +103,7 @@ internal sealed class LinuxStorageLease : IDisposable
         catch (Exception) { throw Storage(); }
     }
 
-    private void PinDirectory(string directory)
+    private void PinDirectory(string directory, bool create = false)
     {
         Directory = Normalize(directory);
         directories.Add((new Descriptor(OpenRoot("/", DirectoryFlag | NoFollow | CloseOnExec)), "/"));
@@ -107,7 +111,21 @@ internal sealed class LinuxStorageLease : IDisposable
         {
             var parent = directories[^1].Handle;
             _ = Read(parent, "");
-            directories.Add((new Descriptor(OpenAt(parent, component, DirectoryFlag | NoFollow | CloseOnExec, 0)), component));
+            var fd = OpenAt(parent, component, DirectoryFlag | NoFollow | CloseOnExec, 0);
+            if (fd < 0 && create && Marshal.GetLastPInvokeError() == 2)
+            {
+                if (MakeDirectory(parent, component, 0x1c0) != 0 && Marshal.GetLastPInvokeError() != 17)
+                    throw Storage();
+                fd = OpenAt(parent, component, DirectoryFlag | NoFollow | CloseOnExec, 0);
+                using var created = new Descriptor(fd);
+                CheckPrivate(Read(created, ""), UserId(), directory: true);
+                if (Sync(created) != 0 || Sync(parent) != 0)
+                    throw Storage();
+                fd = OpenAt(parent, component, DirectoryFlag | NoFollow | CloseOnExec, 0);
+            }
+            directories.Add((new Descriptor(fd), component));
+            if (create)
+                CheckLocal(directories[^1].Handle);
         }
         CheckDirectories();
     }

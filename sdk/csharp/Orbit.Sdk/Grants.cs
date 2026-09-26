@@ -8,7 +8,7 @@ internal sealed record GrantClaims(string LicenceId, long IssuedAt, long Expires
     bool OfflineAllowed, int PolicyVersion, IReadOnlyDictionary<string, bool> Entitlements);
 
 internal sealed record GrantExpected(OrbitConfig Config, Device Device, string? LicenceId, string ActivationId,
-    long CredentialExpiresAt, long? LicenceExpiresAt, long Now);
+    long? CredentialExpiresAt, long? LicenceExpiresAt, long Now);
 
 internal sealed class GrantKeys
 {
@@ -33,6 +33,16 @@ internal sealed class GrantKeys
                 throw JsonWire.Invalid();
         }
         return result;
+    }
+
+    internal JsonElement Export(string token)
+    {
+        if (!keys.TryGetValue(Header(token), out var key) || key is not JsonWebKey jwk)
+            throw JsonWire.Invalid();
+        return JsonSerializer.SerializeToElement(new
+        {
+            keys = new[] { new { kty = jwk.Kty, crv = jwk.Crv, alg = jwk.Alg, use = jwk.Use, kid = jwk.Kid, x = jwk.X, y = jwk.Y } }
+        });
     }
 
     internal bool Contains(string token) => keys.ContainsKey(Header(token));
@@ -113,7 +123,8 @@ internal sealed class GrantKeys
             expiry <= expected.Now || expiry <= issued || expiry > issued + (offline ? 86400 : 300) ||
             expiry > expected.CredentialExpiresAt || licenceExpiry != expected.LicenceExpiresAt ||
             (licenceExpiry != null && expiry > licenceExpiry) || refresh <= issued || refresh > expiry ||
-            refresh > issued + 75 || (refresh < issued + 45 && refresh != expiry)) throw JsonWire.Invalid();
+            refresh > issued + (expected.CredentialExpiresAt == null && offline ? 1125 : 75) || (refresh < issued + (expected.CredentialExpiresAt == null && offline ? 675 : 45) && refresh != expiry))
+            throw JsonWire.Invalid();
         return new GrantClaims(licence, issued, expiry, refresh, offline, (int)policy,
             JsonWire.Entitlements(JsonWire.Field(claims, "entitlements")));
     }

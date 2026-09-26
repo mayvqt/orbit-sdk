@@ -1,3 +1,4 @@
 [workspace]
 members = ["sdk/rust", "sdk/rust/native", "examples/rust/licensed-export", "examples/rust/licensed-backend"]
+exclude = ["sdk/embedded/rust"]
 resolver = "3"

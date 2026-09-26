@@ -50,7 +50,20 @@ internal static class WindowsDataProtection
         return Transform(ciphertext, entropy, protect: false);
     }
 
-    private static byte[] Transform(byte[] input, byte[] entropy, bool protect)
+    internal static byte[] ProtectInstalled(byte[] input, byte[] entropy)
+    {
+        if (!OperatingSystem.IsWindows() || input.Length > InstalledCodec.Limit || entropy.Length != 32)
+            throw Storage();
+        return Transform(input, entropy, true, InstalledCodec.Limit, InstalledCodec.Limit * 2);
+    }
+    internal static byte[] UnprotectInstalled(byte[] input, byte[] entropy)
+    {
+        if (!OperatingSystem.IsWindows() || input.Length is 0 or > InstalledCodec.Limit * 2 || entropy.Length != 32)
+            throw Storage();
+        return Transform(input, entropy, false, InstalledCodec.Limit, InstalledCodec.Limit * 2);
+    }
+
+    private static byte[] Transform(byte[] input, byte[] entropy, bool protect, int plaintextLimit = MaxPlaintextBytes, int ciphertextLimit = MaxCiphertextBytes)
     {
         byte[]? result = null;
         try
@@ -81,7 +94,7 @@ internal static class WindowsDataProtection
                     try { if (entropyHandle.IsAllocated) entropyHandle.Free(); }
                     finally { if (inputHandle.IsAllocated) inputHandle.Free(); }
                 }
-                var limit = protect ? MaxCiphertextBytes : MaxPlaintextBytes;
+                var limit = protect ? ciphertextLimit : plaintextLimit;
                 if (output.Length > limit || output.Length > 0 && output.Data == IntPtr.Zero || protect && output.Length == 0)
                     throw Storage();
                 result = new byte[(int)output.Length];

@@ -58,7 +58,13 @@ public sealed class OrbitException : Exception
             OrbitError.TransportSecurity => "Secure connection failed",
             OrbitError.ReauthenticationRequired => "Fresh licence authentication is required",
             OrbitError.StaleResponse => "Discarded a superseded response",
-            OrbitError.Storage => "Credential storage failed",
+            OrbitError.Storage => code switch
+            {
+                "installation_in_use" => "This installation is already open. Share its client or close the other process.",
+                "pending_activation" => "An activation is unresolved. Retry the same input or deliberately resolve it with Logout.",
+                "pending_activation_expired" => "Activation recovery expired. Deliberately resolve it before trying again.",
+                _ => "Credential storage failed. Preserve the state directory and contact application support."
+            },
             OrbitError.ClockUncertain => "Online clock validation is required",
             _ => "Orbit operation failed"
         };

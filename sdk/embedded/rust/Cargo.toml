@@ -1,0 +1,18 @@
+[package]
+name = "orbit-embedded"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Allocation-free Orbit licensing client for firmware"
+links = "orbit_embedded"
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+external-c = []
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

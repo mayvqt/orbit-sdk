@@ -2,7 +2,7 @@ using System.Text.Json.Serialization;
 
 namespace Orbit.Sdk;
 
-/// <summary>Sensitive bearer material for caller-supplied protected storage. Never write a plaintext file.</summary>
+/// <summary>Sensitive bearer material. Use an SDK storage provider; custom storage owns its protection.</summary>
 public sealed class StoredCredential
 {
     public required string ApplicationId { get; init; }
@@ -11,13 +11,14 @@ public sealed class StoredCredential
     public required string LicenceId { get; init; }
     public required string InstallationId { get; init; }
     [JsonIgnore] public required string Credential { get; init; }
+    /// <summary>Unix seconds; zero denotes an explicitly negotiated persistent credential.</summary>
     public required long CredentialExpiresAt { get; init; }
     public string? Fingerprint { get; init; }
     public string? FingerprintProvider { get; init; }
     public override string ToString() => "Orbit stored credential (redacted)";
 }
 
-public enum StorageCapability { MemoryOnly, CallerProtected, OperatingSystemProtected }
+public enum StorageCapability { MemoryOnly, CallerProtected, OperatingSystemProtected, PrivateFile }
 
 /// <summary>
 /// Implement using OS-protected storage. Version reads must observe other writers;

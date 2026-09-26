@@ -127,10 +127,10 @@ public sealed partial class OrbitClient
         finally { serial.Release(); }
     }
 
-    public Task<Snapshot> ActivateAccountAsync(string licenceId, string idempotencyKey, CancellationToken cancellationToken = default) =>
+    public Task<Snapshot> ActivateAccountAsync(string licenceId, string? idempotencyKey = null, CancellationToken cancellationToken = default) =>
         ActivateAccountWithPreviousAsync(licenceId, null, idempotencyKey, cancellationToken);
 
-    public Task<Snapshot> ActivateAccountWithPreviousAsync(string licenceId, string? previousCredential, string idempotencyKey,
+    public Task<Snapshot> ActivateAccountWithPreviousAsync(string licenceId, string? previousCredential, string? idempotencyKey,
         CancellationToken cancellationToken = default) => ActivateAsAsync(licenceId, true, previousCredential, idempotencyKey, cancellationToken);
 
     /// <summary>Clears local state synchronously. Await the returned task to confirm remote session revocation.</summary>

@@ -296,7 +296,7 @@ func signedGrantResponse(t *testing.T, activation bool) (string, grantKeys, stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply := grantReply{ActivationID: "activation_old", InstallationID: "installation_1234", CredentialExpiresAt: time.Unix(1800003600, 0).UTC().Format(time.RFC3339), Grant: &signed, ServerTime: time.Unix(1800000000, 0).UTC().Format(time.RFC3339), BindingMode: "none"}
+	reply := grantReply{ActivationID: "activation_old", InstallationID: "installation_1234", CredentialExpiresAt: optionalString(time.Unix(1800003600, 0).UTC().Format(time.RFC3339)), Grant: &signed, ServerTime: time.Unix(1800000000, 0).UTC().Format(time.RFC3339), BindingMode: "none"}
 	if activation {
 		credential := strings.Repeat("r", 43)
 		reply.Credential = &credential

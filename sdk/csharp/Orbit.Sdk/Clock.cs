@@ -46,6 +46,8 @@ internal readonly record struct ClockStart(long ElapsedTicks, long WallSeconds);
 
 internal sealed class ClockAnchor(long serverSeconds, ClockStart start)
 {
+    internal long ServerSeconds => serverSeconds;
+    internal long WallSeconds => start.WallSeconds;
     internal long Now()
     {
         try

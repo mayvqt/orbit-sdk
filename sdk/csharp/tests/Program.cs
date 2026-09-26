@@ -32,11 +32,13 @@ if (args is ["--native-protection"])
     }
 }
 
+if (args is ["--installed"]) return await InstalledTests.RunAsync();
+
 if (args is ["--security"]) return await SecurityTests.RunAsync();
 
 if (args.Length != 1)
 {
-    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --security | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
+    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --security | --installed | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
     return 2;
 }
 
@@ -64,7 +66,7 @@ foreach (var entry in cases)
         var device = new Device(JsonWire.String(json, "installation"), JsonWire.OptionalString(json, "fingerprint"),
             JsonWire.OptionalString(json, "fingerprint_provider"));
         var binding = new GrantExpected(config, device, JsonWire.OptionalString(json, "licence"), JsonWire.String(json, "activation"),
-            JsonWire.Integer(json, "credential_expires_at"), JsonWire.OptionalInteger(json, "licence_expires_at"), JsonWire.Integer(json, "now"));
+            JsonWire.OptionalInteger(json, "credential_expires_at"), JsonWire.OptionalInteger(json, "licence_expires_at"), JsonWire.Integer(json, "now"));
         _ = await keys.VerifyAsync(test["token"]!.GetValue<string>(), binding);
         valid = true;
     }

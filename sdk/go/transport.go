@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -27,8 +28,12 @@ const jwksPath = "/.well-known/orbit-jwks.json"
 // Transport owns a fixed trusted origin, mandatory certificate verification,
 // disabled redirects and bounded request/response resources.
 type Transport struct {
-	base   *url.URL
-	client *http.Client
+	base                 *url.URL
+	client               *http.Client
+	installationLifetime context.Context
+	installationMu       sync.Mutex
+	installationClosed   bool
+	installationRequests sync.WaitGroup
 }
 
 // NewTransport accepts only an HTTPS origin without credentials, path or query.
@@ -163,6 +168,24 @@ func (b *limitedBody) Write(data []byte) (int, error) {
 }
 
 func (t *Transport) request(ctx context.Context, method, route string, body []byte, token string, safe bool) (json.RawMessage, error) {
+	if t.installationLifetime != nil {
+		t.installationMu.Lock()
+		if t.installationClosed {
+			t.installationMu.Unlock()
+			return nil, ErrCancelled
+		}
+		t.installationRequests.Add(1)
+		t.installationMu.Unlock()
+		defer t.installationRequests.Done()
+		child, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(t.installationLifetime, cancel)
+		if t.installationLifetime.Err() != nil {
+			cancel()
+		}
+		defer func() { stop(); cancel() }()
+		ctx = child
+	}
+
 	if ctx.Err() != nil {
 		return nil, ErrCancelled
 	}
@@ -353,4 +376,11 @@ func errorCode(value string) bool {
 		}
 	}
 	return true
+}
+
+func (t *Transport) settleInstalledRequests() {
+	t.installationMu.Lock()
+	t.installationClosed = true
+	t.installationMu.Unlock()
+	t.installationRequests.Wait()
 }

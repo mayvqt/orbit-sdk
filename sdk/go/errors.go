@@ -55,7 +55,15 @@ func (e *Error) Error() string {
 	case StaleResponse:
 		return "Discarded a superseded response"
 	case StorageFailure:
-		return "Credential storage failed"
+		switch e.Code {
+		case "installation_in_use":
+			return "This installation is already open. Share the existing client or close the other process."
+		case "pending_activation":
+			return "An activation is unresolved. Retry the same input or deliberately resolve it with Logout."
+		case "pending_activation_expired":
+			return "Activation recovery expired. Deliberately resolve the pending activation before retrying."
+		}
+		return "Credential storage failed. Preserve the state directory and contact application support."
 	case ClockUncertain:
 		return "Online clock validation is required"
 	default:
@@ -112,3 +120,7 @@ var (
 	ErrStorage                  = &Error{Kind: StorageFailure}
 	ErrClockUncertain           = &Error{Kind: ClockUncertain}
 )
+
+var ErrInstallationInUse = &Error{Kind: StorageFailure, Code: "installation_in_use"}
+var ErrPendingActivation = &Error{Kind: StorageFailure, Code: "pending_activation"}
+var ErrPendingActivationExpired = &Error{Kind: StorageFailure, Code: "pending_activation_expired"}

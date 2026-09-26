@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <limits>
+#include <openssl/rand.h>
 #endif
 
 namespace orbit::detail::storage_linux_internal {
@@ -202,7 +204,7 @@ Lease::~Lease() = default;
 Lease::Lease(Lease&&) noexcept = default;
 Lease& Lease::operator=(Lease&&) noexcept = default;
 
-Lease Lease::open(std::string_view directory) {
+Lease Lease::open(std::string_view directory, bool installed_client) {
 #if defined(__linux__)
     auto state = std::make_unique<State>();
     state->normalized_directory = normalize(directory);
@@ -258,8 +260,16 @@ Lease Lease::open(std::string_view directory) {
     state->file.reset(lease_fd);
     struct stat lease_info{};
     if (::fstat(lease_fd, &lease_info) != 0 || !S_ISREG(lease_info.st_mode) ||
-        !private_file(lease_info) || lease_info.st_nlink != 1 ||
-        ::flock(lease_fd, LOCK_EX | LOCK_NB) != 0) {
+        !private_file(lease_info) || lease_info.st_nlink != 1) {
+        storage_failure();
+    }
+    if (::flock(lease_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            if (installed_client) {
+                throw Error(1, ErrorKind::installation_in_use, "installation_in_use", {});
+            }
+            storage_failure();
+        }
         storage_failure();
     }
     Lease result(std::move(state));
@@ -282,6 +292,7 @@ Lease Lease::open(std::string_view directory) {
     return result;
 #else
     (void)directory;
+    (void)installed_client;
     storage_failure();
 #endif
 }
@@ -353,6 +364,101 @@ void Lease::complete_write() {
         storage_failure();
     }
 #else
+    storage_failure();
+#endif
+}
+
+std::optional<std::string> Lease::read_installed_record() const {
+#if defined(__linux__)
+    verify();
+    const int directory = state_->directories.back().get();
+    const int fd = ::openat(directory, "orbit-installed.state",
+                            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno == ENOENT) return std::nullopt;
+        storage_failure();
+    }
+    Fd file(fd);
+    struct stat info{};
+    struct stat named{};
+    if (::fstat(fd, &info) != 0 ||
+        ::fstatat(directory, "orbit-installed.state", &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_inode(info, named) || !S_ISREG(info.st_mode) || !S_ISREG(named.st_mode) ||
+        !private_file(info) || !private_file(named) || info.st_nlink != 1 || named.st_nlink != 1 ||
+        info.st_size <= 0 || info.st_size > 64 * 1024) {
+        storage_failure();
+    }
+    std::string output(static_cast<std::size_t>(info.st_size), '\0');
+    std::size_t offset = 0;
+    while (offset < output.size()) {
+        const auto count = ::read(fd, output.data() + offset, output.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) storage_failure();
+        offset += static_cast<std::size_t>(count);
+    }
+    char extra = 0;
+    ssize_t count;
+    do { count = ::read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
+    if (count != 0) storage_failure();
+    verify();
+    return output;
+#else
+    storage_failure();
+#endif
+}
+
+void Lease::write_installed_record(std::string_view bytes, bool allow_missing) {
+#if defined(__linux__)
+    if (bytes.empty() || bytes.size() > 64 * 1024) storage_failure();
+    verify();
+    const auto existing = read_installed_record();
+    if (!existing && !allow_missing) storage_failure();
+    std::array<unsigned char, 12> random{};
+    if (RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) storage_failure();
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string temporary = "orbit-installed-";
+    for (const auto value : random) {
+        temporary.push_back(digits[value >> 4]);
+        temporary.push_back(digits[value & 15]);
+    }
+    temporary += ".tmp";
+    const int directory = state_->directories.back().get();
+    const int fd = ::openat(directory, temporary.c_str(),
+                            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                            0600);
+    if (fd < 0) storage_failure();
+    Fd file(fd);
+    struct TempCleanup {
+        int directory;
+        const std::string& name;
+        bool installed = false;
+        ~TempCleanup() { if (!installed) (void)::unlinkat(directory, name.c_str(), 0); }
+    } cleanup{directory, temporary};
+    begin_write();
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        const auto count = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) storage_failure();
+        offset += static_cast<std::size_t>(count);
+    }
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || !private_file(info) ||
+        info.st_nlink != 1 || info.st_size != static_cast<off_t>(bytes.size()) ||
+        ::fsync(fd) != 0) storage_failure();
+    const int sync_directory = ::openat(directory, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sync_directory < 0) storage_failure();
+    Fd directory_handle(sync_directory);
+    if (::renameat(directory, temporary.c_str(), directory,
+                   "orbit-installed.state") != 0 || ::fsync(directory_handle.get()) != 0) {
+        storage_failure();
+    }
+    cleanup.installed = true;
+    complete_write();
+    if (!read_installed_record()) storage_failure();
+#else
+    (void)bytes;
+    (void)allow_missing;
     storage_failure();
 #endif
 }

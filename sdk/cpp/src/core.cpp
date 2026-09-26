@@ -11,6 +11,7 @@
 #include <thread>
 
 #include <openssl/rand.h>
+#include <openssl/evp.h>
 
 namespace orbit::detail {
 namespace {
@@ -30,12 +31,6 @@ std::pair<std::int64_t, std::int64_t> current_clock() {
     if (provider) return provider();
 #endif
     return {elapsed_nanoseconds(), wall_seconds()};
-}
-
-ClockStart capture_clock() {
-    const auto value = current_clock();
-    if (value.first < 0 || value.second < 0) raise(ErrorKind::clock_uncertain, "clock_uncertain");
-    return {value.first, value.second};
 }
 
 [[noreturn]] void invalid_response() { raise(ErrorKind::invalid_response, "invalid_response"); }
@@ -192,8 +187,67 @@ std::int64_t integer(const Json::Value& value) {
 
 Json::Value null_value() { return Json::Value(Json::nullValue); }
 
-void throw_if_cancelled(const std::atomic_bool& cancelled) {
-    check_cancelled(cancelled.load(std::memory_order_relaxed));
+std::string sha256_hex(std::string_view input) {
+    std::array<unsigned char, 32> digest{};
+    unsigned int length = 0;
+    if (EVP_Digest(input.data(), input.size(), digest.data(), &length,
+                   EVP_sha256(), nullptr) != 1 || length != digest.size()) {
+        raise(ErrorKind::internal, "digest_failed");
+    }
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string output;
+    output.reserve(digest.size() * 2);
+    for (const auto value : digest) {
+        output.push_back(digits[value >> 4]);
+        output.push_back(digits[value & 15]);
+    }
+    return output;
+}
+
+std::string activation_input_digest(const Config& config, std::string_view key,
+                                    std::optional<std::string_view> previous,
+                                    std::string_view principal,
+                                    std::optional<std::string_view> account_licence) {
+    Json::Value input(Json::objectValue);
+    Json::Value scope(Json::objectValue);
+    scope["api_origin"] = config.api_origin;
+    scope["application_id"] = config.application_id;
+    scope["environment_id"] = config.environment_id;
+    scope["issuer"] = config.issuer;
+    input["scope"] = std::move(scope);
+    input["installation_id"] = config.installation_id.value_or("");
+    input["fingerprint"] = config.fingerprint
+        ? Json::Value(config.fingerprint->value) : null_value();
+    input["fingerprint_provider"] = config.fingerprint
+        ? Json::Value(config.fingerprint->provider) : null_value();
+    input["principal_kind"] = std::string(principal);
+    input["credential_mode"] = "persistent";
+    if (account_licence) input["licence_id"] = std::string(*account_licence);
+    else input["licence_key"] = std::string(key);
+    input["previous_credential_digest"] = previous
+        ? Json::Value(sha256_hex(*previous)) : null_value();
+    return sha256_hex(encode_json(input));
+}
+
+Json::Value persistent_access_cache(const Json::Value& reply,
+                                   const GrantClaims& claims,
+                                   const GrantKeys& keys, ClockStart start) {
+    const auto grant = text(required(reply, "grant"));
+    const auto received_server = timestamp(text(required(reply, "server_time")));
+    if (grant.size() > persistent_codec::max_jws || received_server <= 0 ||
+        start.wall_seconds <= 0) {
+        invalid_response();
+    }
+    Json::Value access(Json::objectValue);
+    access["jws"] = grant;
+    access["jwks"] = keys.jwks_for(grant);
+    access["licence_expires_at"] = claims.licence_expires_at
+        ? Json::Value(static_cast<Json::Int64>(*claims.licence_expires_at)) : null_value();
+    access["received_server_time"] = static_cast<Json::Int64>(received_server);
+    access["received_wall_time"] = static_cast<Json::Int64>(start.wall_seconds);
+    access["server_high_water"] = static_cast<Json::Int64>(received_server);
+    access["wall_high_water"] = static_cast<Json::Int64>(start.wall_seconds);
+    return access;
 }
 
 Json::Value customer_json(const Json::Value& input) {
@@ -268,6 +322,12 @@ Json::Value owned_licence(const Json::Value& input) {
 
 } // namespace
 
+ClockStart capture_clock() {
+    const auto value = current_clock();
+    if (value.first < 0 || value.second < 0) raise(ErrorKind::clock_uncertain, "clock_uncertain");
+    return {value.first, value.second};
+}
+
 std::int64_t ClockAnchor::now() const {
     const auto [elapsed, wall] = current_clock();
     if (server_seconds < 0 || elapsed_nanoseconds < 0 || wall_seconds < 0 ||
@@ -288,9 +348,20 @@ std::int64_t ClockAnchor::now() const {
 ClientState::ClientState(Config setup, Transport http,
                          std::shared_ptr<CredentialStorage> protected_storage,
                          std::uint64_t version,
-                         std::optional<Credential> saved)
+                         std::optional<Credential> saved, bool installed)
     : config(std::move(setup)), transport(std::move(http)), storage(std::move(protected_storage)),
-      storage_version(version), credential(std::move(saved)) {}
+      current_generation(installed ? version : 0), storage_version(version),
+      credential(std::move(saved)), persistent(installed) {
+    if (persistent) transport.bind_owner_cancellation(owner_cancelled);
+}
+
+void ClientState::throw_if_cancelled(const std::atomic_bool& cancelled) const {
+    check_cancelled(cancelled.load(std::memory_order_relaxed) ||
+        (persistent && owner_cancelled->load(std::memory_order_relaxed)));
+    if (persistence_failed.load(std::memory_order_relaxed)) {
+        raise(ErrorKind::storage, "installation_state_write_failed");
+    }
+}
 
 std::unique_lock<std::timed_mutex> ClientState::lock_serial(const std::atomic_bool& cancelled) {
     std::unique_lock<std::timed_mutex> lock(serial, std::defer_lock);
@@ -299,8 +370,15 @@ std::unique_lock<std::timed_mutex> ClientState::lock_serial(const std::atomic_bo
     return lock;
 }
 
-void ClientState::clear_access_locked() {
+void ClientState::advance_generation_locked() {
+    if (current_generation >= persistent_codec::max_generation) {
+        raise(ErrorKind::storage, "installation_generation_exhausted");
+    }
     ++current_generation;
+}
+
+void ClientState::clear_access_locked() {
+    advance_generation_locked();
     credential.reset();
     claims.reset();
     anchor.reset();
@@ -314,10 +392,19 @@ void ClientState::clear_all_locked() {
 }
 
 void ClientState::invalidate_locked() {
+    if (persistent) {
+        persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
+        persistent_record["credential"] = null_value();
+        persistent_record["pending_activation"] = null_value();
+        persistent_record["access"] = null_value();
+        persist_record_locked();
+        return;
+    }
     storage_version = storage->invalidate();
 }
 
 void ClientState::sync_storage_locked() {
+    if (persistent) return;
     const auto observed = storage->version();
     if (observed != storage_version) {
         clear_all_locked();
@@ -350,12 +437,15 @@ Credential ClientState::stored_credential(const Json::Value& value) const {
         !value.isMember("bearer") || !value.isMember("expires_at") ||
         !value["activation_id"].isString() || !value["licence_id"].isString() ||
         !value["bearer"].isString() ||
-        (value["expires_at"].type() != Json::intValue && value["expires_at"].type() != Json::uintValue) ||
-        !value["expires_at"].isInt64()) {
+        (!value["expires_at"].isNull() &&
+         ((value["expires_at"].type() != Json::intValue && value["expires_at"].type() != Json::uintValue) ||
+          !value["expires_at"].isInt64()))) {
         raise(ErrorKind::storage, "storage");
     }
     Credential saved{value["activation_id"].asString(), value["licence_id"].asString(),
-                     value["bearer"].asString(), value["expires_at"].asInt64()};
+                     value["bearer"].asString(), value["expires_at"].isNull()
+                         ? std::nullopt
+                         : std::optional<std::int64_t>(value["expires_at"].asInt64())};
     if (!opaque(saved.activation_id) || !opaque(saved.licence_id) || !bearer(saved.bearer)) {
         raise(ErrorKind::storage, "storage");
     }
@@ -367,7 +457,8 @@ Json::Value ClientState::credential_json(const Credential& value) const {
     result["activation_id"] = value.activation_id;
     result["licence_id"] = value.licence_id;
     result["bearer"] = value.bearer;
-    result["expires_at"] = static_cast<Json::Int64>(value.expires_at);
+    result["expires_at"] = value.expires_at
+        ? Json::Value(static_cast<Json::Int64>(*value.expires_at)) : null_value();
     return result;
 }
 
@@ -398,14 +489,16 @@ std::string ClientState::account_path(std::string_view path,
 }
 
 Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
-    const auto credential_expiry = credential ? Json::Value(static_cast<Json::Int64>(credential->expires_at)) : null_value();
+    const auto credential_expiry = credential && credential->expires_at
+        ? Json::Value(static_cast<Json::Int64>(*credential->expires_at)) : null_value();
     Json::Value result(Json::objectValue);
     result["access"] = credential ? "refresh_required" : "denied";
     result["entitlements"] = Json::Value(Json::objectValue);
     result["expires_at"] = null_value();
     result["next_check_at"] = null_value();
     result["credential_expires_at"] = credential_expiry;
-    result["reauthentication_required"] = !credential.has_value();
+    result["reauthentication_required"] = !credential.has_value() ||
+        (credential->expires_at && *credential->expires_at <= capture_clock().wall_seconds + 86400);
     result["offline_allowed"] = false;
     result["remaining_offline_seconds"] = Json::UInt64(0);
     if (!claims || !anchor) return result;
@@ -416,12 +509,18 @@ Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
         if (!tolerate_clock_error || error.kind() != ErrorKind::clock_uncertain) throw;
         claims.reset();
         anchor.reset();
-        ++current_generation;
+        advance_generation_locked();
+        if (persistent && !persistent_record.isNull()) {
+            persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
+            persistent_record["access"] = null_value();
+            persist_record_locked();
+        }
         return result;
     }
     result["expires_at"] = static_cast<Json::Int64>(claims->expires_at);
     result["next_check_at"] = static_cast<Json::Int64>(claims->refresh_after);
-    result["reauthentication_required"] = !credential || credential->expires_at <= now + 86400;
+    result["reauthentication_required"] = !credential ||
+        (credential->expires_at && *credential->expires_at <= now + 86400);
     result["offline_allowed"] = claims->offline_allowed;
     std::string access;
     if (claims->expires_at <= now) access = "expired";
@@ -441,6 +540,7 @@ Json::Value ClientState::snapshot_locked(bool tolerate_clock_error) {
 }
 
 Json::Value ClientState::snapshot() {
+    ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     sync_storage_locked();
     return snapshot_locked(true);
@@ -453,7 +553,12 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     const auto activation_id = text(required(reply, "activation_id"));
     const auto installation_id = text(required(reply, "installation_id"));
     const auto credential_value = optional_string(reply, "credential");
-    const auto expiry_text = text(required(reply, "credential_expires_at"));
+    const auto& expiry_value = required(reply, "credential_expires_at");
+    std::optional<std::int64_t> expiry;
+    if (!expiry_value.isNull()) {
+        if (!expiry_value.isString()) invalid_response();
+        expiry = timestamp(expiry_value.asString());
+    }
     const auto grant = optional_string(reply, "grant");
     const auto server_text = text(required(reply, "server_time"));
     const auto binding = text(required(reply, "binding_mode"));
@@ -472,8 +577,8 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     const auto server_time = timestamp(server_text);
     out_anchor = ClockAnchor{server_time, start.elapsed_nanoseconds, start.wall_seconds};
     auto now = out_anchor.now();
-    const auto expiry = timestamp(expiry_text);
-    if (expiry <= now || expiry > now + 30 * 86400) invalid_response();
+    if ((!persistent && !expiry) || (persistent && !previous && expiry)) invalid_response();
+    if (expiry && (*expiry <= now || *expiry > now + 30 * 86400)) invalid_response();
     if (previous && (activation_id != previous->activation_id || expiry != previous->expires_at || credential_value)) {
         invalid_response();
     }
@@ -530,7 +635,7 @@ Json::Value ClientState::accept_reply(
     const std::optional<Json::Value>& reply, const Error* response_error,
     std::uint64_t request_generation,
     const std::optional<Credential>& previous, std::optional<std::string_view> expected_licence,
-    ClockStart start, const std::atomic_bool& cancelled) {
+    ClockStart start, const std::atomic_bool& cancelled, bool mutation) {
     std::optional<std::pair<Credential, GrantClaims>> accepted;
     std::optional<ClockAnchor> accepted_anchor;
     std::optional<Error> failure;
@@ -554,26 +659,70 @@ Json::Value ClientState::accept_reply(
     if (current_generation != request_generation) raise(ErrorKind::stale_response, "stale_response");
     throw_if_cancelled(cancelled);
     if (accepted && accepted_anchor) {
-        try {
-            storage->save(storage_version, credential_json(accepted->first));
-        } catch (...) {
-            clear_all_locked();
-            throw;
+        if (persistent) {
+            auto candidate = persistent_record;
+            candidate["generation"] = static_cast<Json::UInt64>(current_generation);
+            candidate["credential"] = credential_json(accepted->first);
+            candidate["access"] = persistent_access_cache(
+                *reply, accepted->second, keys, start);
+            if (mutation) candidate["pending_activation"] = null_value();
+            commit_persistent_locked(std::move(candidate));
+        } else {
+            try {
+                storage->save(storage_version, credential_json(accepted->first));
+            } catch (...) {
+                clear_all_locked();
+                throw;
+            }
         }
         credential = accepted->first;
         claims = accepted->second;
         anchor = accepted_anchor;
         transient = false;
         retry_deadline.reset();
+        if (persistent) last_checkpoint = std::chrono::steady_clock::now();
+        wake_worker();
         return snapshot_locked(true);
     }
     if (!failure) raise(ErrorKind::internal, "internal");
+    if (failure->kind() == ErrorKind::cancelled) throw *failure;
+
+    if (persistent && mutation &&
+        failure->kind() != ErrorKind::denied &&
+        failure->kind() != ErrorKind::reauthentication_required) {
+        // The server may have committed an activation whose reply was lost or
+        // could not be verified. Keep its durable retry identity, but do not
+        // let the old cached grant authorize while that mutation is unresolved.
+        auto candidate = persistent_record;
+        candidate["access"] = null_value();
+        candidate["generation"] = static_cast<Json::UInt64>(current_generation);
+        commit_persistent_locked(std::move(candidate));
+        claims.reset();
+        anchor.reset();
+        transient = true;
+        if (failure->kind() == ErrorKind::transient) {
+            std::uint8_t entropy = 0;
+            const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
+                ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
+            retry_deadline = std::chrono::steady_clock::now() + delay;
+        }
+        wake_worker();
+        throw *failure;
+    }
+
     if (failure->kind() == ErrorKind::transient) {
         if (verifying) {
-            ++current_generation;
+            advance_generation_locked();
             claims.reset();
             anchor.reset();
             credential = previous;
+            if (persistent) {
+                persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
+                persistent_record["credential"] = credential
+                    ? credential_json(*credential) : null_value();
+                persistent_record["access"] = null_value();
+                persist_record_locked();
+            }
         }
         transient = true;
         std::uint8_t entropy = 0;
@@ -584,9 +733,10 @@ Json::Value ClientState::accept_reply(
         if (current["access"] == "offline") return current;
         throw *failure;
     }
-    if (failure->kind() == ErrorKind::cancelled) throw *failure;
+
     clear_all_locked();
     invalidate_locked();
+    wake_worker();
     throw *failure;
 }
 
@@ -594,27 +744,86 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
                                   std::optional<std::string_view> previous,
                                   const std::atomic_bool& cancelled,
                                   std::optional<std::string_view> account_licence) {
+    ClientOperation call(*this);
+    const bool automatic = idempotency_key.empty();
     if ((account_licence ? !opaque(*account_licence) : (key.empty() || key.size() > 256)) ||
-        idempotency_key.size() < 16 || idempotency_key.size() > 128 || !valid_utf8(key) ||
+        (!automatic && (idempotency_key.size() < 16 || idempotency_key.size() > 128)) ||
+        (automatic && (!persistent || account_licence)) || !valid_utf8(key) ||
         !valid_utf8(idempotency_key) || (previous && !valid_utf8(*previous))) {
         raise(ErrorKind::configuration, "configuration");
     }
     const auto before_serial = generation();
     auto serial_lock = lock_serial(cancelled);
     std::string account_token;
+    std::string operation_id(idempotency_key);
     std::uint64_t request_generation = 0;
     {
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
-        if (account_licence) {
+        throw_if_cancelled(cancelled);
+        if (persistent && account_licence) {
+            if (!persistent_record["pending_activation"].isNull()) {
+                raise(ErrorKind::configuration, "activation_pending_resolution_required");
+            }
             if (!customer) raise(ErrorKind::reauthentication_required, "reauthentication_required");
             account_token = customer->bearer;
             clear_access_locked();
+            invalidate_locked();
+        } else if (persistent) {
+            const auto digest = activation_input_digest(
+                config, key, previous, "key", std::nullopt);
+            const auto now = capture_clock().wall_seconds;
+            if (now <= 0) raise(ErrorKind::clock_uncertain, "clock_uncertain");
+            auto candidate = persistent_record;
+            const auto& pending = candidate["pending_activation"];
+            if (!pending.isNull()) {
+                if (!pending.isObject() || !pending["operation_id"].isString() ||
+                    pending["principal_kind"] != "key" ||
+                    pending["input_digest"].asString() != digest) {
+                    raise(ErrorKind::configuration, "activation_pending_input_mismatch");
+                }
+                const auto created = json_int64(pending["created_at"]);
+                if (now < created || now - created > 24 * 60 * 60) {
+                    raise(ErrorKind::reauthentication_required,
+                          "activation_pending_resolution_required");
+                }
+                operation_id = pending["operation_id"].asString();
+                if (!automatic && operation_id != idempotency_key) {
+                    raise(ErrorKind::configuration, "activation_pending_input_mismatch");
+                }
+            } else {
+                if (automatic) operation_id = new_installation_id();
+                candidate["pending_activation"] = Json::Value(Json::objectValue);
+                candidate["pending_activation"]["operation_id"] = operation_id;
+                candidate["pending_activation"]["principal_kind"] = "key";
+                candidate["pending_activation"]["input_digest"] = digest;
+                candidate["pending_activation"]["created_at"] = static_cast<Json::Int64>(now);
+                advance_generation_locked();
+                candidate["generation"] = static_cast<Json::UInt64>(current_generation);
+            }
+            // The retry identity and invalidation precede the network side
+            // effect in one durable transaction; unchanged retries need no write.
+            credential.reset();
+            claims.reset();
+            anchor.reset();
+            transient = false;
+            retry_deadline.reset();
+            candidate["credential"] = null_value();
+            candidate["access"] = null_value();
+            if (candidate != persistent_record) {
+                commit_persistent_locked(std::move(candidate));
+            }
         } else {
-            clear_all_locked();
+            if (account_licence) {
+                if (!customer) raise(ErrorKind::reauthentication_required, "reauthentication_required");
+                account_token = customer->bearer;
+                clear_access_locked();
+            } else {
+                clear_all_locked();
+            }
+            invalidate_locked();
         }
-        invalidate_locked();
         request_generation = current_generation;
     }
     Json::Value input(Json::objectValue);
@@ -624,7 +833,8 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
     input["fingerprint"] = config.fingerprint ? Json::Value(config.fingerprint->value) : null_value();
     input["fingerprint_provider"] = config.fingerprint ? Json::Value(config.fingerprint->provider) : null_value();
     input["previous_credential"] = previous ? Json::Value(std::string(*previous)) : null_value();
-    input["idempotency_key"] = std::string(idempotency_key);
+    input["idempotency_key"] = operation_id;
+    if (persistent) input["credential_mode"] = "persistent";
     if (account_licence) {
         input["customer_session"] = account_token;
         input["licence_id"] = std::string(*account_licence);
@@ -638,13 +848,14 @@ Json::Value ClientState::activate(std::string_view key, std::string_view idempot
     } catch (const Error& error) {
         if (error.kind() == ErrorKind::stale_response || error.kind() == ErrorKind::cancelled) throw;
         return accept_reply(std::nullopt, &error, request_generation,
-                            std::nullopt, account_licence, start, cancelled);
+                            std::nullopt, account_licence, start, cancelled, true);
     }
     return accept_reply(response, nullptr, request_generation, std::nullopt,
-                        account_licence, start, cancelled);
+                        account_licence, start, cancelled, true);
 }
 
 Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_needed) {
+    ClientOperation call(*this);
     const auto before_serial = generation();
     auto serial_lock = lock_serial(cancelled);
     Credential saved;
@@ -653,6 +864,7 @@ Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_need
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
+        throw_if_cancelled(cancelled);
         if (if_needed) {
             const auto current = snapshot_locked(true);
             const auto access = current["access"].asString();
@@ -679,6 +891,7 @@ Json::Value ClientState::refresh(const std::atomic_bool& cancelled, bool if_need
 }
 
 Json::Value ClientState::require_access(std::string_view feature, const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     throw_if_cancelled(cancelled);
     if (!valid_utf8(feature)) raise(ErrorKind::configuration, "configuration");
     auto current = snapshot();
@@ -692,7 +905,11 @@ Json::Value ClientState::require_access(std::string_view feature, const std::ato
         }
     }
     const auto current_access = current["access"].asString();
-    if (current_access != "online" && current_access != "offline") raise(ErrorKind::denied, "access_unavailable");
+    if (current_access != "online" && current_access != "offline") {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (persistent && credential && transient) raise(ErrorKind::transient, "network_unavailable");
+        raise(ErrorKind::denied, "access_unavailable");
+    }
     if (!current["entitlements"].isMember(std::string(feature)) || !current["entitlements"][std::string(feature)].asBool()) {
         raise(ErrorKind::denied, "feature_unavailable");
     }
@@ -701,6 +918,7 @@ Json::Value ClientState::require_access(std::string_view feature, const std::ato
 }
 
 void ClientState::deactivate(std::string_view idempotency_key, const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (idempotency_key.size() < 16 || idempotency_key.size() > 128 || !valid_utf8(idempotency_key)) {
         raise(ErrorKind::configuration, "configuration");
     }
@@ -728,6 +946,7 @@ void ClientState::deactivate(std::string_view idempotency_key, const std::atomic
 }
 
 void ClientState::local_logout() {
+    ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     clear_all_locked();
     invalidate_locked();
@@ -783,6 +1002,7 @@ void ClientState::accepted(const Json::Value& value) {
 std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> ClientState::register_customer(
     std::string_view licence_key, std::string_view username, std::string_view email,
     std::string_view password, const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (licence_key.empty() || licence_key.size() > 256 || username.size() > 128 ||
         email.size() > 254 || password.size() > 256 || !valid_utf8(licence_key) ||
         !valid_utf8(username) || !valid_utf8(email) || utf8_characters(password) < 8) {
@@ -821,6 +1041,7 @@ std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> ClientState::r
 
 void ClientState::resend_registration(const PendingRegistrationState& pending,
                                       const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (pending.application_id != config.application_id || pending.environment_id != config.environment_id) {
         raise(ErrorKind::configuration, "configuration");
     }
@@ -842,6 +1063,7 @@ void ClientState::resend_registration(const PendingRegistrationState& pending,
 
 Json::Value ClientState::login(std::string_view username, std::string_view password,
                                const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (username.empty() || username.size() > 128 || password.size() > 256 ||
         !valid_utf8(username) || !valid_utf8(password)) raise(ErrorKind::configuration, "configuration");
     const auto before_serial = generation();
@@ -891,6 +1113,7 @@ Json::Value ClientState::login(std::string_view username, std::string_view passw
 }
 
 Json::Value ClientState::account() {
+    ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     sync_storage_locked();
     if (!customer) return null_value();
@@ -899,6 +1122,7 @@ Json::Value ClientState::account() {
 
 Json::Value ClientState::owned_licences(std::optional<std::string_view> cursor,
                                         const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (cursor && !opaque(*cursor)) raise(ErrorKind::configuration, "configuration");
     const auto request_generation = generation();
     auto serial_lock = lock_serial(cancelled);
@@ -933,6 +1157,7 @@ Json::Value ClientState::owned_licences(std::optional<std::string_view> cursor,
 
 Json::Value ClientState::claim_licence(std::string_view key, std::string_view idempotency_key,
                                        const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (key.empty() || key.size() > 256 || idempotency_key.size() < 16 || idempotency_key.size() > 128 ||
         !valid_utf8(key) || !valid_utf8(idempotency_key)) raise(ErrorKind::configuration, "configuration");
     Json::Value body(Json::objectValue);
@@ -953,6 +1178,7 @@ Json::Value ClientState::claim_licence(std::string_view key, std::string_view id
 }
 
 void ClientState::account_logout(const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     std::optional<AccountSession> session;
     std::uint64_t request_generation = 0;
     {
@@ -980,6 +1206,7 @@ void ClientState::account_logout(const std::atomic_bool& cancelled) {
 
 void ClientState::request_email_change(std::string_view password, std::string_view email,
                                        const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (password.size() > 256 || email.size() > 254 || !valid_utf8(password) || !valid_utf8(email)) {
         raise(ErrorKind::configuration, "configuration");
     }
@@ -1001,6 +1228,7 @@ void ClientState::request_email_change(std::string_view password, std::string_vi
 
 void ClientState::request_password_recovery(std::string_view email,
                                             const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
     if (email.size() > 254 || !valid_utf8(email)) raise(ErrorKind::configuration, "configuration");
     Json::Value body(Json::objectValue);
     body["email"] = std::string(email);
@@ -1019,6 +1247,7 @@ void ClientState::request_password_recovery(std::string_view email,
 }
 
 std::string ClientState::customer_session_authorization() {
+    ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     sync_storage_locked();
     if (!customer) raise(ErrorKind::reauthentication_required, "reauthentication_required");
@@ -1052,6 +1281,56 @@ std::shared_ptr<ClientState> connect_state(Config config) {
                                          std::move(credential));
 }
 
+std::shared_ptr<ClientState> open_installed_state(
+    Config config, Transport transport, std::shared_ptr<InstalledStorage> installed) {
+    auto raw_record = installed->load();
+    Json::Value record;
+    if (installed->initialization_needed()) {
+        config.installation_id = new_installation_id();
+        record = persistent_codec::empty_record(config, installed->provider());
+        const auto bytes = persistent_codec::encode(config, installed->provider(), record);
+        installed->initialize(bytes);
+    } else {
+        if (!raw_record) raise(ErrorKind::corrupt_state, "installation_state_corrupt");
+        record = persistent_codec::decode(config, installed->provider(), *raw_record);
+        config.installation_id = record["installation"]["id"].asString();
+        record = persistent_codec::decode(config, installed->provider(), *raw_record);
+    }
+    const auto generation_value = json_int64(record["generation"]);
+    std::optional<Credential> credential;
+    if (!record["credential"].isNull()) {
+        const auto& saved = record["credential"];
+        std::optional<std::int64_t> expiry;
+        if (!saved["expires_at"].isNull()) expiry = json_int64(saved["expires_at"]);
+        credential = Credential{saved["activation_id"].asString(),
+                                saved["licence_id"].asString(),
+                                saved["bearer"].asString(), expiry};
+    }
+    auto state = std::make_shared<ClientState>(
+        std::move(config), std::move(transport), nullptr,
+        static_cast<std::uint64_t>(generation_value), std::move(credential), true);
+    state->installed_storage = std::move(installed);
+    state->persistent_record = std::move(record);
+
+    if (state->credential && state->persistent_record["pending_activation"].isNull()) {
+        std::atomic_bool cancelled{false};
+        try {
+            (void)state->refresh(cancelled, false);
+        } catch (const Error& error) {
+            if (error.kind() == ErrorKind::transient) {
+                (void)state->restore_persistent_cache(true);
+            } else if (error.kind() == ErrorKind::storage ||
+                       error.kind() == ErrorKind::corrupt_state ||
+                       error.kind() == ErrorKind::internal ||
+                       error.kind() == ErrorKind::configuration) {
+                throw;
+            }
+        }
+    }
+    state->start_worker();
+    return state;
+}
+
 #ifdef ORBIT_SDK_TESTING
 void set_test_clock(TestClock clock) {
     std::lock_guard<std::mutex> lock(test_clock_mutex);
@@ -1078,6 +1357,15 @@ void set_test_clock(TestClock clock) {
     auto state = std::make_shared<ClientState>(std::move(config), std::move(transport),
                                                std::move(storage), loaded.first,
                                                std::move(credential));
+    return ::orbit::Client(std::move(state));
+}
+
+::orbit::Client make_test_installed_client(
+    Config config, Transport transport, std::shared_ptr<InstalledStorage> installed) {
+    config.installation_id.reset();
+    config.api_origin = transport.origin();
+    auto state = open_installed_state(std::move(config), std::move(transport),
+                                      std::move(installed));
     return ::orbit::Client(std::move(state));
 }
 #endif
@@ -1136,6 +1424,32 @@ Client& Client::operator=(Client&& other) noexcept {
 
 Client Client::connect(Config config) { return Client(detail::connect_state(std::move(config))); }
 
+Client Client::open(AppConfig app,
+                    std::optional<std::string> state_directory) {
+    Config config;
+    config.api_origin = std::move(app.api_origin);
+    config.application_id = std::move(app.application_id);
+    config.environment_id = std::move(app.environment_id);
+    config.issuer = std::move(app.issuer);
+    config.fingerprint = std::move(app.fingerprint);
+    if (!detail::opaque(config.application_id) || !detail::opaque(config.environment_id) ||
+        config.issuer.empty() || config.issuer.size() > 2048 || !detail::valid_utf8(config.issuer) ||
+        std::any_of(config.issuer.begin(), config.issuer.end(), [](unsigned char c) {
+            return c < 0x20 || c == 0x7f;
+        }) || (config.fingerprint &&
+            (!detail::valid_lower_hex(config.fingerprint->value, 64) ||
+             !detail::valid_provider(config.fingerprint->provider)))) {
+        detail::raise(ErrorKind::configuration, "configuration");
+    }
+    (void)detail::capture_clock();
+    detail::Transport transport(config.api_origin);
+    config.api_origin = transport.origin();
+    auto installed = detail::open_installed_storage(config, std::move(state_directory));
+    auto state = detail::open_installed_state(
+        std::move(config), std::move(transport), std::move(installed));
+    return Client(std::move(state));
+}
+
 const Config& Client::config() const noexcept {
     static const Config empty;
     return state_ ? state_->config : empty;
@@ -1169,6 +1483,13 @@ std::string Client::activate(std::string_view licence_key, std::string_view idem
         std::nullopt, detail::cancellation_flag(cancellation, inactive)));
 }
 
+std::string Client::activate(std::string_view licence_key,
+                             const Cancellation* cancellation) const {
+    std::atomic_bool inactive{false};
+    return detail::encode_json(require_state(state_).activate(licence_key, {},
+        std::nullopt, detail::cancellation_flag(cancellation, inactive)));
+}
+
 std::string Client::activate_previous(std::string_view licence_key,
                                       std::optional<std::string_view> previous_credential,
                                       std::string_view idempotency_key,
@@ -1194,6 +1515,8 @@ void Client::deactivate(std::string_view idempotency_key, const Cancellation* ca
 }
 
 void Client::local_logout() const { require_state(state_).local_logout(); }
+
+void Client::close() const { require_state(state_).close(); }
 
 RegistrationResult Client::register_customer(
     std::string_view licence_key, std::string_view username, std::string_view email,

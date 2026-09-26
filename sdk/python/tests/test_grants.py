@@ -14,7 +14,7 @@ class GrantVectorTests(unittest.TestCase):
     def test_all_shared_grant_vectors(self) -> None:
         corpus = fixture_data()
         self.assertEqual(corpus["format_version"], 1)
-        self.assertEqual(len(corpus["cases"]), 91)
+        self.assertEqual(len(corpus["cases"]), 101)
         for case in corpus["cases"]:
             data = dict(corpus["expected"])
             data.update(case.get("expected") or {})
