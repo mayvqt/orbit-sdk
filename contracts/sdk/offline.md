@@ -200,6 +200,39 @@ that this happened. Do not promise complete rollback resistance without a truste
 hardware counter or online authority. Retaining the signed absolute expiry and
 checking available clock evidence remains mandatory.
 
+## Embedded memory and persistence
+
+Long-term offline support is an explicit embedded build feature. Keep the
+connected-only default's RAM, stack and reserved-flash budgets unchanged. The
+portable implementation remains heapless; caller-owned buffers impose hard
+limits. As with compact connected responses, a file that does not fit the chosen
+profile returns a resource-limit error before changing durable state. Never
+truncate a signed file, allocate an unbounded fallback or accept only a prefix.
+Document the profile's accepted file size and test its exact boundary.
+
+The current connected journal holds a record of at most 1024 bytes in two
+independently erasable slots, with board examples reserving 8 KiB in total.
+That reservation is not sufficient for two full-size offline files plus their
+metadata. Offline-enabled board profiles need explicitly sized, reserved storage
+and updated firmware/image-end checks. Do not increase the connected record-size
+macro and thereby put a full file into every existing stack frame or client
+object. Reuse transaction memory and bounded chunk I/O where practical.
+
+An imported file and its installation/sequence/clock metadata must form one
+recoverable durable state, even if the port stores immutable file contents
+separately. Torn import, renewal, mode switch or floor checkpoint must fail closed;
+an older file must never be restored with a newer file's metadata, or vice versa.
+Each port must preserve its existing flash intent markers and exclusive ownership
+rules. A compact profile may use smaller bounded files, but every supported
+board needs a tested storage configuration for its documented offline profile.
+
+Reboot or deep sleep requires trustworthy time continuity before offline access.
+A signed file does not make a reset uptime counter or unset RTC trustworthy.
+Ports must supply trusted UTC and elapsed-time evidence satisfying the same
+high-water rules, or return a clock error while preserving the installed file
+for renewal/recovery. Report native board execution separately from compilation
+and synthetic power-failure tests.
+
 ## Acceptance
 
 Use shared signed vectors across every verifying SDK: valid six-/twelve-month
