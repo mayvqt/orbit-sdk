@@ -30,6 +30,17 @@ with Python, reorder signed JSON fields, and enforce immutable entitlements and
 bounded strict keys. This is verifier coverage; installed import, renewal and
 restart integration are still pending and need their own lifecycle checks.
 
+## Seller download-ticket verification
+
+```sh
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --download-vectors contracts/sdk/download-tickets.json
+```
+
+All 110 shared cases check purpose, signature, scope, endpoint, artifact metadata
+and expiry. Additional checks cover exact fractional expiry, copied and bounded
+trusted keys, duplicate JWKS fields, endpoint syntax and redacted results. No
+storage provider or external server is contacted.
+
 ## Security and lifecycle
 
 ```sh

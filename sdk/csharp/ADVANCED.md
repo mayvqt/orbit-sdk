@@ -100,6 +100,45 @@ implemented; ordinary cached access grants are not long-term licence files.
 See the [offline contract](../../contracts/sdk/offline.md) and
 [verifier checks](tests/README.md#long-term-offline-file-verification).
 
+## Seller-hosted downloads
+
+Use `DownloadTicketVerifier` on a seller's protected download endpoint. Configure
+the public app key, the exact HTTPS endpoint URL and a trusted connected-purpose
+JWKS from Orbit. Do not choose the audience from the incoming Host header or take
+keys from the ticket. The verifier performs no network requests and needs no
+management credential.
+
+```csharp
+using Orbit.Sdk;
+
+static DownloadTicket AuthorizeArtifact(
+    DownloadTicketVerifier verifier, string bearerTicket,
+    string releaseId, string artifactId, string sha256, long byteLength)
+{
+    var ticket = verifier.Verify(bearerTicket);
+    if (ticket.ReleaseId != releaseId || ticket.ArtifactId != artifactId ||
+        ticket.Sha256 != sha256 || ticket.ByteLength != byteLength)
+        throw new UnauthorizedAccessException("Download is not authorized.");
+    return ticket;
+}
+```
+
+Create the verifier once with
+`new DownloadTicketVerifier(appKey, endpointUrl, File.ReadAllBytes("trusted-jwks.json"))`.
+Pass artifact metadata from your own registry to the function. Invalid or expired
+tickets raise `OrbitException` with `OrbitError.Denied` and code
+`invalid_download_ticket`. Times are immutable `DateTimeOffset` values; the
+optional `Verify` clock argument is for trusted application clocks and tests.
+
+After authorization, serve the matching file or redirect to a short provider URL
+that expires no later than `ticket.ExpiresAt`. Return `Cache-Control: no-store`
+and keep tickets, redirect URLs and provider credentials out of logs. Sellers
+own the storage and bandwidth; Orbit does not store or proxy file bytes. Permanent
+public URLs remain shareable. See the [download contract](../../contracts/sdk/downloads.md)
+and the [complete Python seller endpoint](../../examples/python/seller-downloads/README.md).
+The C# verifier is implemented; Orbit release management and the installed SDK's
+update/download helpers are still pending in this candidate.
+
 ## Customer accounts and backend identity
 
 `RegisterAsync`, `ResendRegistrationAsync`, password recovery and email-change
