@@ -442,6 +442,64 @@ pub(crate) fn origin(base: &str, scheme: &str) -> Result<Url> {
     Ok(parsed)
 }
 
+pub(crate) fn download_endpoint(value: &str) -> Result<Url> {
+    // Check the original URI before `Url::parse`: the WHATWG parser repairs
+    // forms such as `https:///host/path` and discards empty user information.
+    // The configured audience is the exact caller string, so accept only an
+    // unambiguous raw authority and use the parser only after that check.
+    let rest = value.strip_prefix("https://").ok_or(Error::Configuration)?;
+    if value.chars().any(|c| c.is_control() || c.is_whitespace())
+        || value.contains(['\\', '?', '#'])
+    {
+        return Err(Error::Configuration);
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains(['@', '%', '\\']) {
+        return Err(Error::Configuration);
+    }
+    let port = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']').ok_or(Error::Configuration)?;
+        let address = &bracketed[..close];
+        if !address.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Err(Error::Configuration);
+        }
+        match &bracketed[close + 1..] {
+            "" => None,
+            suffix if suffix.starts_with(':') => Some(&suffix[1..]),
+            _ => return Err(Error::Configuration),
+        }
+    } else {
+        if authority.contains(['[', ']']) {
+            return Err(Error::Configuration);
+        }
+        match authority.split_once(':') {
+            Some((host, port)) if !host.is_empty() && !port.contains(':') => Some(port),
+            Some(_) => return Err(Error::Configuration),
+            None => None,
+        }
+    };
+    if let Some(port) = port {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || !port.parse::<u16>().is_ok_and(|number| number != 0)
+        {
+            return Err(Error::Configuration);
+        }
+    }
+    let parsed = Url::parse(value).map_err(|_| Error::Configuration)?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(Error::Configuration);
+    }
+    Ok(parsed)
+}
+
 struct LimitedBody(Vec<u8>);
 
 impl Write for LimitedBody {

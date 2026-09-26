@@ -1299,7 +1299,9 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "local-development")]
     use crate::Access;
+    #[cfg(feature = "local-development")]
     use crate::Cancellation;
     struct Directory(PathBuf);
     impl Directory {
@@ -2922,6 +2924,7 @@ mod tests {
         encode(&header, &claims, &key).unwrap()
     }
 
+    #[cfg(feature = "local-development")]
     async fn open_offline_fixture(
         directory: &Directory,
         fixture: &crate::transport::tests::Fixture,

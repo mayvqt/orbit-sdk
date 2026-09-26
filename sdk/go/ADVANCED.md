@@ -33,6 +33,28 @@ sequence/time floors resist ordinary file replay and clock changes, while a pers
 restores a complete old disk or VM snapshot can roll local history back. Do not promise
 protection against whole-machine rollback.
 
+## Seller-side download tickets
+
+Use a separate verifier on the seller's protected endpoint. It takes the public app
+key, the endpoint's exact HTTPS URL, and trusted connected-purpose JWKS bytes:
+
+```go
+verifier, err := orbit.NewDownloadTicketVerifier(appKey, endpointURL, trustedJWKS)
+if err != nil { return err }
+ticket, err := verifier.Verify(bearerToken)
+if err != nil { return err }
+artifact, ok := registry[ticket.ArtifactID()]
+if !ok || artifact.ReleaseID != ticket.ReleaseID() || artifact.SHA256 != ticket.SHA256() || artifact.ByteLength != ticket.ByteLength() {
+	return errors.New("unknown artifact")
+}
+```
+
+The verifier uses only copied trusted keys, pins the exact endpoint audience and
+app-key scope, and returns typed metadata. It does not fetch keys or files. Compare
+the metadata to your own registry before serving an object or issuing a short-lived
+storage URL; do not use the token or artifact ID as a path. A valid ticket is replayable
+until its short expiry.
+
 ## macOS build and validation
 
 Build installed clients on macOS 10.12 or newer with cgo enabled and the Xcode Command Line Tools installed. The macOS files link the system IOKit and CoreFoundation frameworks for platform identity and use `mach_continuous_time` for sleep-inclusive elapsed time. A filesystem that rejects `F_FULLFSYNC` fails closed; the SDK does not fall back to ordinary fsync for file contents. When cgo is disabled, Open returns `ErrNativeSupportRequired`.
@@ -55,7 +77,7 @@ Pass an explicit ID as the final optional argument to retain control over an unc
 
 ## Native result types and customer accounts
 
-Snapshots expose `time.Time` dates, `time.Duration` offline allowance and `HasFeature`. Account and licence dates and durations also use Go's native time types. Display metadata does not authorize protected work; call `RequireAccess` immediately before each protected operation.
+Snapshots expose `time.Time` dates, `time.Duration` offline allowance and `HasFeature`. Account and licence dates and durations also use Go's native time types. `OwnedLicence.OfflineFileDuration` is zero when long-term files are disabled; otherwise the policy duration is from one day through 366 days. Display metadata does not authorize protected work; call `RequireAccess` immediately before each protected operation.
 
 Use `Register` and optional `ResendRegistration`, then complete the email link before `Login`. `ClaimLicence` adds a key to an account; `OwnedLicences` returns one bounded page and accepts its `NextCursor` on the next call. `Logout` clears local access. `LogoutAccount` also requests remote customer-session revocation. Ordinary session expiry does not expire the separate installation credential.
 

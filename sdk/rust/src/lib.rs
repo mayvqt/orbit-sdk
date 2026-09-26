@@ -1,15 +1,20 @@
-//! Orbit v1 key and customer SDK. Check access before each protected operation.
+//! Orbit key and customer SDK. Check access before each protected operation.
 mod access;
 mod accounts;
 mod app_key;
 mod clock;
 mod device;
 mod diagnostics;
+pub mod downloads;
 mod grants;
 mod installed;
 mod offline;
 #[cfg(test)]
 mod parser_fuzz;
+// Session verification is internal and its metadata is consumed by the
+// floating lifecycle batch; this batch intentionally adds no public API.
+#[allow(dead_code)]
+mod sessions;
 #[cfg(all(
     test,
     feature = "local-development",
@@ -28,6 +33,7 @@ pub use accounts::{
 pub use app_key::{AppEnvironment, AppKey};
 pub use device::{machine_fingerprint, native_fingerprint};
 pub use diagnostics::SupportSummary;
+pub use downloads::{DownloadTicket, DownloadTicketVerifier};
 pub use installed::{MachineBinding, Options};
 pub use offline::OfflineRequest;
 #[cfg(test)]

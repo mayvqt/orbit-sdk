@@ -42,7 +42,7 @@ pub struct Claims {
     pub offline_allowed: bool,
     pub licence_expires_at: Option<i64>,
 }
-fn entitlements<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn entitlements<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, bool>, D::Error> {
     struct Entries;
@@ -160,6 +160,25 @@ impl Keys {
             return Err(Error::Configuration);
         }
         Self::from_jwks(jwks).map_err(|_| Error::Configuration)
+    }
+    pub(crate) fn parse_connected(data: &[u8], environment: &str) -> Result<Self> {
+        if data.is_empty() || data.len() > 16 * 1024 {
+            return Err(Error::InvalidResponse);
+        }
+        let prefix = match environment {
+            "test" => "test-",
+            "live" => "live-",
+            _ => return Err(Error::InvalidResponse),
+        };
+        let jwks: Jwks = serde_json::from_slice(data).map_err(|_| Error::InvalidResponse)?;
+        if jwks.keys.iter().any(|key| {
+            !key.kid.starts_with(prefix)
+                || key.kid.len() == prefix.len()
+                || !crate::access::opaque(&key.kid)
+        }) {
+            return Err(Error::InvalidResponse);
+        }
+        Self::from_jwks(jwks).map_err(|_| Error::InvalidResponse)
     }
     pub(crate) fn decoding_key(&self, kid: &str) -> Option<&DecodingKey> {
         self.0.get(kid)

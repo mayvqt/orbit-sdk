@@ -90,6 +90,11 @@ pub struct OwnedLicence {
     pub offline_allowed: bool,
     #[serde(rename = "offline_seconds", deserialize_with = "deserialize_duration")]
     pub offline_duration: Duration,
+    #[serde(
+        rename = "offline_file_seconds",
+        deserialize_with = "deserialize_offline_file_duration"
+    )]
+    pub offline_file_duration: Duration,
     pub entitlements: BTreeMap<String, bool>,
 }
 
@@ -717,6 +722,19 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+fn deserialize_offline_file_duration<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let seconds = u64::deserialize(deserializer)?;
+    if seconds != 0 && !(86_400..=31_622_400).contains(&seconds) {
+        return Err(serde::de::Error::custom("invalid offline file duration"));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(crate) fn from_unix_seconds(seconds: i64) -> Option<SystemTime> {
     if seconds >= 0 {
         UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))
@@ -744,7 +762,7 @@ mod tests {
             "expiry_mode":"duration", "first_used_at":"2026-01-01T00:00:00Z",
             "expires_at":"2026-01-02T00:00:00Z", "duration_seconds":3600,
             "device_limit":1, "hwid_locked":false, "offline_allowed":true,
-            "offline_seconds":900, "entitlements":{"export":true}
+            "offline_seconds":900, "offline_file_seconds":86400, "entitlements":{"export":true}
         }))
         .unwrap();
         assert_eq!(
@@ -753,12 +771,27 @@ mod tests {
         );
         assert_eq!(licence.duration, Some(Duration::from_secs(3600)));
         assert_eq!(licence.offline_duration, Duration::from_secs(900));
+        assert_eq!(licence.offline_file_duration, Duration::from_secs(86_400));
+        let page: OwnedLicences = serde_json::from_value(json!({
+            "items":[{
+                "id":"licence", "policy_name":"Export", "state":"active",
+                "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
+                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "offline_allowed":true, "offline_seconds":900,
+                "offline_file_seconds":86400, "entitlements":{"export":true}
+            }], "next_cursor":null
+        }))
+        .unwrap();
+        assert_eq!(
+            page.items[0].offline_file_duration,
+            Duration::from_secs(86_400)
+        );
         let boundary: OwnedLicence = serde_json::from_value(json!({
             "id":"licence", "policy_name":"Export", "state":"active",
             "expiry_mode":"duration", "first_used_at":"1969-12-31T23:59:59Z",
             "expires_at":"9999-12-31T23:59:59Z", "duration_seconds":i64::MAX,
             "device_limit":1, "hwid_locked":false, "offline_allowed":true,
-            "offline_seconds":i64::MAX, "entitlements":{"export":true}
+            "offline_seconds":i64::MAX, "offline_file_seconds":31622400, "entitlements":{"export":true}
         }))
         .unwrap();
         assert_eq!(
@@ -773,13 +806,17 @@ mod tests {
             boundary.offline_duration,
             Duration::from_secs(i64::MAX as u64)
         );
+        assert_eq!(
+            boundary.offline_file_duration,
+            Duration::from_secs(31_622_400)
+        );
         assert!(boundary.expires_at.is_some());
         assert!(
             serde_json::from_value::<OwnedLicence>(json!({
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
                 "duration_seconds":-1, "device_limit":1, "hwid_locked":false,
-                "offline_allowed":false, "offline_seconds":0, "entitlements":{}
+                "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":0, "entitlements":{}
             }))
             .is_err()
         );
@@ -788,10 +825,32 @@ mod tests {
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
                 "duration_seconds":null, "device_limit":1, "hwid_locked":false,
-                "offline_allowed":false, "offline_seconds":-1, "entitlements":{}
+                "offline_allowed":false, "offline_seconds":-1, "offline_file_seconds":0, "entitlements":{}
             }))
             .is_err()
         );
+        for seconds in [-1, 1, 86_399, 31_622_401] {
+            let value = json!({
+                "id":"licence", "policy_name":"Export", "state":"active",
+                "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
+                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":seconds,
+                "entitlements":{}
+            });
+            assert!(serde_json::from_value::<OwnedLicence>(value).is_err());
+        }
+        let mut missing_file_duration = json!({
+            "id":"licence", "policy_name":"Export", "state":"active",
+            "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
+            "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+            "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":0,
+            "entitlements":{}
+        });
+        missing_file_duration
+            .as_object_mut()
+            .unwrap()
+            .remove("offline_file_seconds");
+        assert!(serde_json::from_value::<OwnedLicence>(missing_file_duration).is_err());
     }
 
     fn client() -> Client {

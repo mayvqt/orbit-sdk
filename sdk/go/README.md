@@ -73,6 +73,42 @@ func run() error {
 
 The app key is public configuration, not a secret. Keep licence keys and passwords out of source, command-line arguments and logs. Orbit never saves them. The SDK automatically uses native machine identity when available; see [advanced options](ADVANCED.md#installed-options-and-machine-binding) to disable binding for shared images or supply an application-owned provider.
 
+## Verify seller download tickets
+
+If you serve protected artifacts, verify Orbit's short-lived bearer ticket on your
+seller backend before selecting the artifact from your own registry. Configure the
+exact HTTPS endpoint and a trusted connected-purpose JWKS; never accept keys or a
+destination URL from the ticket. This verifier makes no network request and returns
+only the signed artifact metadata.
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+)
+
+func main() {
+	appKey := os.Getenv("ORBIT_APP_KEY")
+	ticketToken := os.Getenv("ORBIT_DOWNLOAD_TICKET") // Authorization: Bearer value
+	keys, err := os.ReadFile("connected-jwks.json")
+	if err != nil { panic(err) }
+	verifier, err := orbit.NewDownloadTicketVerifier(appKey, "https://downloads.example.com/artifacts", keys)
+	if err != nil { panic(err) }
+	ticket, err := verifier.Verify(ticketToken)
+	if err != nil { panic(err) }
+	// Match all returned metadata against the seller's artifact registry.
+	fmt.Printf("licensed artifact %s (%s, %d bytes)\n", ticket.ArtifactID(), ticket.SHA256(), ticket.ByteLength())
+}
+```
+
+The ticket expires within 120 seconds and can be replayed until then. Treat the
+bearer as sensitive, do not log it, and never use an artifact ID as an unchecked
+filesystem path. See [seller download guidance](ADVANCED.md#seller-side-download-tickets).
+
 The state directory is private to the current user: owner-only files on Linux and macOS, and current-user DPAPI on Windows. On macOS 10.12 or newer, builds need cgo and the Xcode Command Line Tools; the installed client links IOKit and CoreFoundation. With CGO_ENABLED=0, installed-client setup returns ErrNativeSupportRequired rather than using a weaker clock or storage path. The macOS implementation has not yet been validated on native Apple hardware.
 
 `Options{StatePath: ...}` selects a dedicated absolute directory for a service account or persistent container volume. Share one `*Client` in the process; another process opening the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.

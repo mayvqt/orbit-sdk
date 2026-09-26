@@ -111,6 +111,42 @@ ID and clear its saved activation and cached grant before recovery.
 Native macOS compilation and runtime checks are pending; this workspace was checked
 on Linux only and has no Apple SDK or hardware.
 
+## Verify seller download tickets
+
+If you serve protected artifacts, verify Orbit's short-lived bearer ticket on your
+seller backend before selecting an object from your own registry. Configure the exact
+HTTPS endpoint and a trusted connected-purpose JWKS; never take keys or a destination
+URL from the ticket. This verifier makes no network request.
+
+```rust
+use orbit_sdk::DownloadTicketVerifier;
+use std::{env, error::Error, fs};
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let app_key = env::var("ORBIT_APP_KEY")?;
+    let bearer = env::var("ORBIT_DOWNLOAD_TICKET")?;
+    let keys = fs::read("connected-jwks.json")?;
+    let verifier = DownloadTicketVerifier::new(
+        &app_key,
+        "https://downloads.example.com/artifacts",
+        &keys,
+    )?;
+    let ticket = verifier.verify(&bearer)?;
+    // Match all returned fields against the seller's artifact registry.
+    println!("artifact {}: {} bytes, sha256 {}", ticket.artifact_id(), ticket.byte_length(), ticket.sha256());
+    Ok(())
+}
+```
+
+The ticket expires within 120 seconds and can be replayed until then. Treat the
+bearer as sensitive, never log it, and never use an artifact ID as an unchecked
+filesystem path. Match the verified metadata against your registry before serving
+an object or issuing a short-lived storage URL.
+
+Account licence results retain dates as `SystemTime` and allowances as `Duration`.
+`OwnedLicence::offline_file_duration` is zero when long-term offline files are
+disabled; an enabled policy uses a duration from one day through 366 days.
+
 Activation retries use a securely generated, durable operation ID automatically. Use
 `activate_with_id` when your application needs to supply an ID for an uncertain retry.
 The purchase key is never persisted. Customer account methods are available on the

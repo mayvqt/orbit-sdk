@@ -54,34 +54,36 @@ type loginReply struct {
 }
 
 type OwnedLicence struct {
-	ID              string          `json:"id"`
-	PolicyName      string          `json:"policy_name"`
-	State           string          `json:"state"`
-	ExpiryMode      string          `json:"expiry_mode"`
-	FirstUsedAt     *time.Time      `json:"first_used_at"`
-	ExpiresAt       *time.Time      `json:"expires_at"`
-	Duration        *time.Duration  `json:"-"`
-	DeviceLimit     int32           `json:"device_limit"`
-	HWIDLocked      bool            `json:"hwid_locked"`
-	OfflineAllowed  bool            `json:"offline_allowed"`
-	OfflineDuration time.Duration   `json:"-"`
-	Entitlements    map[string]bool `json:"entitlements"`
+	ID                  string          `json:"id"`
+	PolicyName          string          `json:"policy_name"`
+	State               string          `json:"state"`
+	ExpiryMode          string          `json:"expiry_mode"`
+	FirstUsedAt         *time.Time      `json:"first_used_at"`
+	ExpiresAt           *time.Time      `json:"expires_at"`
+	Duration            *time.Duration  `json:"-"`
+	DeviceLimit         int32           `json:"device_limit"`
+	HWIDLocked          bool            `json:"hwid_locked"`
+	OfflineAllowed      bool            `json:"offline_allowed"`
+	OfflineDuration     time.Duration   `json:"-"`
+	OfflineFileDuration time.Duration   `json:"-"`
+	Entitlements        map[string]bool `json:"entitlements"`
 }
 
 func (licence *OwnedLicence) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		ID              string          `json:"id"`
-		PolicyName      string          `json:"policy_name"`
-		State           string          `json:"state"`
-		ExpiryMode      string          `json:"expiry_mode"`
-		FirstUsedAt     *string         `json:"first_used_at"`
-		ExpiresAt       *string         `json:"expires_at"`
-		DurationSeconds *int64          `json:"duration_seconds"`
-		DeviceLimit     int32           `json:"device_limit"`
-		HWIDLocked      bool            `json:"hwid_locked"`
-		OfflineAllowed  bool            `json:"offline_allowed"`
-		OfflineSeconds  int64           `json:"offline_seconds"`
-		Entitlements    map[string]bool `json:"entitlements"`
+		ID                 string          `json:"id"`
+		PolicyName         string          `json:"policy_name"`
+		State              string          `json:"state"`
+		ExpiryMode         string          `json:"expiry_mode"`
+		FirstUsedAt        *string         `json:"first_used_at"`
+		ExpiresAt          *string         `json:"expires_at"`
+		DurationSeconds    *int64          `json:"duration_seconds"`
+		DeviceLimit        int32           `json:"device_limit"`
+		HWIDLocked         bool            `json:"hwid_locked"`
+		OfflineAllowed     bool            `json:"offline_allowed"`
+		OfflineSeconds     int64           `json:"offline_seconds"`
+		OfflineFileSeconds int64           `json:"offline_file_seconds"`
+		Entitlements       map[string]bool `json:"entitlements"`
 	}
 	if err := decodeJSON(data, &wire); err != nil {
 		return ErrInvalidResponse
@@ -117,10 +119,14 @@ func (licence *OwnedLicence) UnmarshalJSON(data []byte) error {
 	if wire.OfflineSeconds < 0 || wire.OfflineSeconds > math.MaxInt64/int64(time.Second) {
 		return ErrInvalidResponse
 	}
+	if wire.OfflineFileSeconds != 0 && (wire.OfflineFileSeconds < 86400 || wire.OfflineFileSeconds > 366*86400) {
+		return ErrInvalidResponse
+	}
 	*licence = OwnedLicence{ID: wire.ID, PolicyName: wire.PolicyName, State: wire.State, ExpiryMode: wire.ExpiryMode,
 		FirstUsedAt: firstUsedAt, ExpiresAt: expiresAt, Duration: duration, DeviceLimit: wire.DeviceLimit,
 		HWIDLocked: wire.HWIDLocked, OfflineAllowed: wire.OfflineAllowed, OfflineDuration: time.Duration(wire.OfflineSeconds) * time.Second,
-		Entitlements: wire.Entitlements}
+		OfflineFileDuration: time.Duration(wire.OfflineFileSeconds) * time.Second,
+		Entitlements:        wire.Entitlements}
 	return nil
 }
 

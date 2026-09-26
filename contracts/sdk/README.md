@@ -56,7 +56,7 @@ The pending seller-hosted delivery feature is defined in
 download authorization or SDK helpers are implemented.
 
 [download-tickets.json](download-tickets.json) has 110 synthetic cases (10 valid,
-100 invalid), consumed by the Python, C# and C++ seller-endpoint verifiers.
+100 invalid), consumed by the Python, Go, Rust, C# and C++ seller-endpoint verifiers.
 `expected` pins the public app key, exact endpoint and verification time. Each
 case may override that context or the trusted JWKS. The fixture signing keys are the same public test
 material described above. These checks cover ticket verification; server
@@ -70,7 +70,7 @@ separate session-grant purpose. It is an implementation baseline; ordinary
 activation grants do not provide concurrent-session enforcement.
 
 [session-grants.json](session-grants.json) supplies 184 signed cases (23 valid,
-161 invalid), consumed by the internal Python and C# verifiers. Its expected
+161 invalid), consumed by the internal Python, Go, Rust and C# verifiers. Its expected
 context extends the connected corpus with `session_id`, exact `sequence` and
 the configured Test/Live `key_environment`. Cases cover process/sequence binding,
 120-second intervals, active retries without deadline extension, exact expiry,
