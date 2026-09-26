@@ -1,0 +1,45 @@
+{
+  "name": "@orbit/installed-sdk",
+  "version": "0.4.0",
+  "description": "Installed Orbit client for desktop JavaScript and TypeScript applications",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mayvqt/orbit-sdk.git",
+    "directory": "sdk/typescript-installed"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "import": "./index.mjs"
+    },
+    "./electron": {
+      "types": "./electron.d.mts",
+      "import": "./electron.mjs"
+    }
+  },
+  "files": [
+    "src/**",
+    "index.mjs",
+    "index.d.mts",
+    "electron.mjs",
+    "electron.d.mts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec",
+    "typecheck": "tsc --noEmit --strict --target es2022 --module nodenext --lib es2022,dom index.d.mts electron.d.mts ../../examples/typescript-installed/client.mts"
+  },
+  "dependencies": {
+    "koffi": "^3.1.6"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
+  }
+}

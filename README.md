@@ -24,8 +24,10 @@ guide includes installation, supported platforms and a working example:
 | Python | [SDK](sdk/python/README.md) | [Quickstart](examples/python/README.md) |
 | Embedded C / Rust | [SDK](sdk/embedded/README.md) | [Boards](examples/embedded/README.md) |
 | JavaScript/TypeScript | [Backend SDK](sdk/typescript/README.md) | [Backend example](examples/typescript/backend.mjs) |
+| Node.js / Electron | [Installed SDK](sdk/typescript-installed/README.md) | [Installed client](examples/typescript-installed/client.mts), [Electron main process](examples/typescript-installed/main.mjs) |
 
-Use the TypeScript backend SDK for online checks on your server. Use the
+Use the TypeScript backend SDK for online checks on your server, and the
+installed SDK for Node.js desktop applications and Electron's main process. Use the
 embedded SDK for caller-owned buffers and platform adapters on small devices.
 If you're calling the API without an SDK, see the [HTTP guide](examples/http/README.md).
 The [Rust backend example](examples/rust/licensed-backend/README.md) shows how

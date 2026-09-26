@@ -1,0 +1,99 @@
+# `@orbit/installed-sdk` candidate
+
+This directory contains the unreleased v0.4.0 installed JavaScript/TypeScript
+client. It is a separate package from the trusted-backend SDK and does not
+require a management credential. The app key names the API scope; it is not a
+secret. No v0.4 package or release is published from this checkout.
+
+Install this source package locally while evaluating it:
+
+```sh
+npm install --save /path/to/Orbit-SDK/sdk/typescript-installed
+```
+
+Node.js 22 or newer is required. The package uses Koffi for native clocks,
+identity, and protected storage. Linux and macOS use private leased files; the
+Linux profile is exercised on this host, while macOS awaits a native run.
+Windows uses current-user DPAPI plus private DACLs, pinned parent handles, and
+an exclusive lease; it awaits a native Windows run. The default POSIX record is
+not encrypted. Windows DPAPI protects it from other Windows users, while
+same-user applications remain inside DPAPI's documented trust boundary.
+
+Electron can use asynchronous `safeStorage` from the main process. On Linux the
+adapter requires a recognized protected backend and rejects missing,
+`basic_text`, and unknown backends. Electron's Windows record combines
+`safeStorage` encryption with the same protected file and lease handling. The
+Electron 44.4.5 asynchronous safeStorage API is the documented baseline; use a
+consistent signed macOS application so Keychain recognizes updates as the same
+app. [Electron safeStorage documentation](https://github.com/electron/electron/blob/v44.4.5/docs/api/safe-storage.md)
+
+## Basic use
+
+```js
+import { Client, FeatureUnavailableError, NotActivatedError } from "@orbit/installed-sdk";
+
+const client = await Client.open(process.env.ORBIT_APP_KEY);
+try {
+  const access = await client.ensureAccess("export", async () => {
+    // Replace this with the application's own trusted key-entry UI.
+    return process.env.ORBIT_LICENCE_KEY ?? null;
+  });
+  if (access.has("export")) await exportProtectedData();
+} catch (error) {
+  if (error instanceof NotActivatedError) {
+    showActivationRequired();
+  } else if (error instanceof FeatureUnavailableError) {
+    showFeatureUnavailable();
+  } else {
+    throw error;
+  }
+} finally {
+  await client.close();
+}
+```
+
+`ensureAccess` asks for a key only when there is no usable installation
+credential. Network, storage, feature-policy, cancellation, and invalid-response
+errors propagate without prompting. `requireAccess` never prompts. Activation
+retries reuse a durable operation ID and require the same input. An
+`AbortSignal` can cancel an operation; `close()` cancels in-flight work and
+releases the exclusive installation lease.
+
+For a policy reset that requires proof of the prior credential, pass
+`previousCredential` to `activate` or `activateAccount`. The retry proof stores
+only its digest; the credential is sent in the activation request and is not
+written to installation state.
+
+The account surface includes `login`, `account`, `ownedLicences`,
+`claimLicence`, registration/resend, email-change/password-recovery requests,
+and `logoutAccount`. Customer sessions and pending registration credentials
+stay in memory and are cleared when their handles or client are closed. Access
+grants and the persistent activation credential are protected by the selected
+installation-storage profile.
+
+The `Client.open(appKey)` default uses a best-effort `machine_v1` binding. Set
+`machineBinding: false` to request an unbound installation, or pass a
+`DeviceBinding` with a caller-managed 32-byte SHA-256 hex fingerprint and a
+`custom:` provider. The server still enforces hardware-locked licence policy.
+Identity unavailability never substitutes a random fingerprint.
+
+## Electron main process
+
+Import `@orbit/installed-sdk/electron` from the main process after
+`app.whenReady()`. The adapter rejects non-main-process calls and invalid
+client options. Keep `Client`, licence keys, and account tokens in main;
+expose only the application's needed operation through a narrow preload API.
+Authorize the operation in the main process even when the renderer requests it.
+The example under [`examples/typescript-installed`](../../examples/typescript-installed)
+uses exactly one protected operation and never returns credentials to the
+renderer.
+
+## Current coverage
+
+The candidate consumes all 27 shared app-key vectors and 104 connected grant
+vectors. Linux runs exercise native storage and machine identity, including
+lease and record replacement checks. Electron storage boundary tests use an
+encrypted test mock; they do not replace native Electron, macOS, Windows,
+physical suspend/resume, or production backend testing.
+Long-term offline files, floating sessions, downloads, and usage accounting
+are outside this package's current API.
