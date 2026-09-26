@@ -78,18 +78,34 @@ class MacOSBindingsTests(unittest.TestCase):
             self.assertNotEqual(fingerprint, machine_fingerprint("app", "live", "macos", UUID))
             core.CFRelease.assert_has_calls([call(12), call(11)])
             io.IOObjectRelease.assert_called_with(10)
-            for failure in ["type", "length", "copy"]:
+            for failure in ["type", "length", "copy", "embedded_nul", "truncated", "nonascii"]:
                 with self.subTest(failure=failure):
                     core.CFGetTypeID.return_value = 8 if failure == "type" else 7
-                    core.CFStringGetLength.return_value = 37 if failure == "length" else 36
+                    core.CFStringGetLength.return_value = 257 if failure == "length" else 36
                     core.CFStringGetCString.side_effect = None if failure == "copy" else copy
                     core.CFStringGetCString.return_value = failure != "copy"
+                    malformed = {
+                        "embedded_nul": b"00112233445566778899aabbccddeeff\0bad",
+                        "truncated": b"00112233445566778899aabbccddeeff",
+                        "nonascii": b"\xff" * 36,
+                    }.get(failure)
+                    if malformed is not None:
+                        def copy_bad(_value, buffer, _size, _encoding):
+                            buffer.value = malformed
+                            return True
+                        core.CFStringGetCString.side_effect = copy_bad
                     core.CFRelease.reset_mock()
                     io.IOObjectRelease.reset_mock()
                     with self.assertRaises(OrbitError):
                         native_fingerprint("app", "test")
                     core.CFRelease.assert_has_calls([call(12), call(11)])
                     io.IOObjectRelease.assert_called_once_with(10)
+            def copy_spaced(_value, buffer, _size, _encoding):
+                buffer.value = (" \t" + UUID + "\r\n").encode("ascii")
+                return True
+            core.CFStringGetLength.return_value = 40
+            core.CFStringGetCString.side_effect = copy_spaced
+            self.assertEqual(native_fingerprint("app", "test"), fingerprint)
 
     @unittest.skipUnless(os.name == "posix", "POSIX file adapter")
     def test_darwin_private_state_reopens_and_rejects_replaced_lease(self):

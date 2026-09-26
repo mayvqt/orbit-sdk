@@ -78,12 +78,18 @@ def platform_uuid() -> str:
         value = io.IORegistryEntryCreateCFProperty(service, key, None, 0)
         if not value or core.CFGetTypeID(value) != core.CFStringGetTypeID():
             raise ValueError("invalid platform identity")
-        if not 1 <= core.CFStringGetLength(value) <= 36:
+        length = core.CFStringGetLength(value)
+        if not 1 <= length <= 256:
             raise ValueError("invalid platform identity")
-        buffer = ctypes.create_string_buffer(37)
+        buffer = ctypes.create_string_buffer(257)
         if not core.CFStringGetCString(value, buffer, len(buffer), 0x08000100):
             raise ValueError("invalid platform identity")
-        return buffer.value.decode("ascii", "strict")
+        raw = buffer.value
+        if len(raw) != length:
+            # ASCII has one byte per CF character. Reject embedded NULs and
+            # truncated/native conversion results instead of hashing a prefix.
+            raise ValueError("invalid platform identity")
+        return raw.decode("ascii", "strict")
     finally:
         if value:
             core.CFRelease(value)
