@@ -114,6 +114,9 @@ removing duplicate storage and clock checks. `snapshot()` measured 23.0 µs,
 down from 24.3 µs. These timings exclude activation and network refresh and
 vary with the machine and filesystem; they are not latency guarantees.
 Each call still checks storage validity and trusted elapsed time.
+On Windows, the native timer function is resolved once per process, while
+every check reads a fresh timer value. The lookup path has mocked regression
+coverage; native Windows timing has not been measured in this Linux run.
 
 ## Errors and sensitive output
 

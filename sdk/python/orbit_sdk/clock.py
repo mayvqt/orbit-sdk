@@ -7,12 +7,21 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from functools import cache
 
 from .errors import CLOCK_UNCERTAIN, INVALID_RESPONSE, error
 
 _RFC3339 = re.compile(
     r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$"
 )
+
+
+@cache
+def _windows_interrupt_clock():
+    function = ctypes.WinDLL("api-ms-win-core-realtime-l1-1-1.dll").QueryInterruptTimePrecise
+    function.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+    function.restype = None
+    return function
 
 
 def elapsed_ns() -> int:
@@ -23,10 +32,8 @@ def elapsed_ns() -> int:
         return value
     if sys.platform == "win32":
         try:
-            function = ctypes.WinDLL("api-ms-win-core-realtime-l1-1-1.dll").QueryInterruptTimePrecise
+            function = _windows_interrupt_clock()
             value = ctypes.c_ulonglong()
-            function.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
-            function.restype = None
             function(ctypes.byref(value))
             if value.value > ((1 << 63) - 1) // 100:
                 raise ValueError
