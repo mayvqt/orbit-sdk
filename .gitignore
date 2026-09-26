@@ -12,3 +12,5 @@
 *.log
 *.tmp
 .DS_Store
+
+/sdk/embedded/rust/target/

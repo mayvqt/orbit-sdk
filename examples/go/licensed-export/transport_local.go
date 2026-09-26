@@ -3,14 +3,14 @@
 package main
 
 import (
-	"strings"
-
+	"context"
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+	"strings"
 )
 
-func newTransport(origin string) (*orbit.Transport, error) {
-	if strings.HasPrefix(origin, "http:") {
-		return orbit.NewLocalTransport(origin)
+func openClient(ctx context.Context, config orbit.AppConfig) (*orbit.Client, error) {
+	if strings.HasPrefix(config.APIOrigin, "http:") {
+		return orbit.OpenLocal(ctx, config)
 	}
-	return orbit.NewTransport(origin)
+	return orbit.Open(ctx, config)
 }

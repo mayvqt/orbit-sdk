@@ -122,7 +122,13 @@ func openSecretStorageLease(directory string) (_ *nativeSecretStorage, created b
 		return nil, false, ErrStorage
 	}
 	files.lease = os.NewFile(uintptr(lock), "Orbit storage lease")
-	if syscall.Flock(lock, syscall.LOCK_EX|syscall.LOCK_NB) != nil || files.check() != nil {
+	if lockErr := syscall.Flock(lock, syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
+		if lockErr == syscall.EWOULDBLOCK {
+			return nil, false, ErrInstallationInUse
+		}
+		return nil, false, ErrStorage
+	}
+	if files.check() != nil {
 		return nil, false, ErrStorage
 	}
 	if created && (files.lease.Sync() != nil || files.directories[len(files.directories)-1].file.Sync() != nil) {

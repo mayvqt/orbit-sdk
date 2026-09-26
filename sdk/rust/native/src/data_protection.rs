@@ -8,12 +8,15 @@ use windows_sys::Win32::{
     },
 };
 
-const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
-const MAX_CIPHERTEXT_BYTES: usize = 64 * 1024;
+const MAX_PLAINTEXT_BYTES: usize = 64 * 1024;
+const MAX_CIPHERTEXT_BYTES: usize = 96 * 1024;
 const MAX_ENTROPY_BYTES: usize = 1024;
 
 /// Protect bytes for the current Windows user, requiring caller-supplied scope entropy.
 pub fn protect_user_data(plaintext: &[u8], entropy: &[u8]) -> Option<Vec<u8>> {
+    if !crate::private_storage::process_user_context() {
+        return None;
+    }
     if plaintext.len() > MAX_PLAINTEXT_BYTES || !(1..=MAX_ENTROPY_BYTES).contains(&entropy.len()) {
         return None;
     }
@@ -44,6 +47,9 @@ pub fn protect_user_data(plaintext: &[u8], entropy: &[u8]) -> Option<Vec<u8>> {
 
 /// Unprotect bytes with the same current-user context and scope entropy.
 pub fn unprotect_user_data(ciphertext: &[u8], entropy: &[u8]) -> Option<Vec<u8>> {
+    if !crate::private_storage::process_user_context() {
+        return None;
+    }
     if ciphertext.len() > MAX_CIPHERTEXT_BYTES || !(1..=MAX_ENTROPY_BYTES).contains(&entropy.len())
     {
         return None;

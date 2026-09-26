@@ -103,6 +103,24 @@ class Keys:
         header, *_ = parse_header(token)
         return header["kid"] in self._entries
 
+    def single_jwks(self, token: str) -> dict[str, Any]:
+        """Return only the validated public key that verifies ``token``."""
+        header, *_ = parse_header(token)
+        public = self._entries.get(header["kid"])
+        if public is None:
+            _invalid()
+        numbers = public.public_numbers()
+        encode = lambda value: base64.urlsafe_b64encode(value.to_bytes(32, "big")).rstrip(b"=").decode("ascii")
+        return {"keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "alg": "ES256",
+            "use": "sig",
+            "kid": header["kid"],
+            "x": encode(numbers.x),
+            "y": encode(numbers.y),
+        }]}
+
 
 @dataclass(frozen=True)
 class Expected:
@@ -114,7 +132,7 @@ class Expected:
     installation: str
     fingerprint: str | None
     fingerprint_provider: str | None
-    credential_expires_at: int
+    credential_expires_at: int | None
     licence_expires_at: int | None
     now: int
 
@@ -176,6 +194,8 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         and expected.fingerprint is not None
         and expected.fingerprint_provider is not None
     )
+    persistent_offline = expected.credential_expires_at is None and claims["offline_allowed"]
+    refresh_minimum, refresh_maximum = (675, 1125) if persistent_offline else (45, 75)
     allowance = 86400 if claims["offline_allowed"] else 300
     iat, nbf, exp = claims["iat"], claims["nbf"], claims["exp"]
     sat_add = lambda left, right: max(-(1 << 63), min((1 << 63) - 1, left + right))
@@ -193,12 +213,12 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         or iat < 0 or nbf != iat
         or iat > sat_add(expected.now, 30) or iat < sat_add(expected.now, -30)
         or exp <= expected.now or exp <= iat or exp > sat_add(iat, allowance)
-        or exp > expected.credential_expires_at
+        or expected.credential_expires_at is not None and exp > expected.credential_expires_at
         or claims["licence_expires_at"] != expected.licence_expires_at
         or claims["licence_expires_at"] is not None and exp > claims["licence_expires_at"]
         or claims["refresh_after"] <= iat or claims["refresh_after"] > exp
-        or claims["refresh_after"] > sat_add(iat, 75)
-        or claims["refresh_after"] < sat_add(iat, 45) and claims["refresh_after"] != exp
+        or claims["refresh_after"] > sat_add(iat, refresh_maximum)
+        or claims["refresh_after"] < sat_add(iat, refresh_minimum) and claims["refresh_after"] != exp
     ):
         _invalid()
     return claims

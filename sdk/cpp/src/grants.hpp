@@ -44,7 +44,7 @@ struct GrantExpected {
     std::string_view installation;
     std::optional<std::string_view> fingerprint;
     std::optional<std::string_view> fingerprint_provider;
-    std::int64_t credential_expires_at = 0;
+    std::optional<std::int64_t> credential_expires_at;
     std::optional<std::int64_t> licence_expires_at;
     std::int64_t now = 0;
 };
@@ -53,10 +53,13 @@ class GrantKeys {
 public:
     static GrantKeys parse(const Json::Value& jwks);
     bool contains(std::string_view token) const;
+    std::size_t size() const noexcept { return keys_.size(); }
+    Json::Value jwks_for(std::string_view token) const;
     GrantClaims verify(std::string_view token, const GrantExpected& expected) const;
 
 private:
     std::map<std::string, std::shared_ptr<EVP_PKEY>> keys_;
+    std::map<std::string, Json::Value> public_keys_;
 };
 
 std::string grant_kid(std::string_view token);

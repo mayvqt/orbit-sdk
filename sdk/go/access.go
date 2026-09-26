@@ -30,8 +30,10 @@ const (
 type StorageCapability string
 
 const (
-	StorageMemoryOnly      StorageCapability = "memory_only"
-	StorageCallerProtected StorageCapability = "caller_provided_protected"
+	StorageMemoryOnly               StorageCapability = "memory_only"
+	StoragePrivateFile              StorageCapability = "private_file"
+	StorageOperatingSystemProtected StorageCapability = "operating_system_protected"
+	StorageCallerProtected          StorageCapability = "caller_provided_protected"
 )
 
 // Snapshot is safe display metadata, not reusable authorization. Unix timestamps
@@ -70,6 +72,9 @@ type Client struct {
 	mu                sync.Mutex
 	state             accessState
 	serial            chan struct{}
+	installed         *installedStorage
+	lifecycle         *installedLifecycle
+	closed            bool
 	keys              grantKeys // Accessed only while holding the serial operation gate.
 }
 
@@ -133,6 +138,9 @@ func clearAccess(state *accessState) {
 }
 func clearState(state *accessState) { clearAccess(state); state.account = nil }
 func (c *Client) syncStorageLocked() error {
+	if c.closed {
+		return ErrCancelled
+	}
 	version, err := c.storage.Version()
 	if err != nil {
 		clearState(&c.state)
@@ -150,6 +158,7 @@ func (c *Client) invalidateLocked() error {
 		return ErrStorage
 	}
 	c.state.storageVersion = version
+	c.wakeInstalled()
 	return nil
 }
 func (c *Client) generation() (uint64, error) {
@@ -184,6 +193,11 @@ func (c *Client) Snapshot() (Snapshot, error) {
 			c.state.claims = nil
 			c.state.anchor = nil
 			c.state.generation++
+			if c.installed != nil {
+				if err := c.installed.dropCache(); err != nil {
+					return Snapshot{}, err
+				}
+			}
 		}
 	}
 	return c.snapshotLocked(), nil
@@ -194,7 +208,9 @@ func (c *Client) snapshotLocked() Snapshot {
 	if state.credential != nil {
 		snapshot.Access = AccessRefreshRequired
 		expiry := state.credential.CredentialExpiresAt
-		snapshot.CredentialExpiresAt = &expiry
+		if expiry != 0 {
+			snapshot.CredentialExpiresAt = &expiry
+		}
 		snapshot.ReauthenticationRequired = false
 	}
 	if state.claims == nil || state.anchor == nil {
@@ -208,7 +224,7 @@ func (c *Client) snapshotLocked() Snapshot {
 	expiry, refresh := claims.ExpiresAt, claims.RefreshAfter
 	snapshot.ExpiresAt = &expiry
 	snapshot.NextCheckAt = &refresh
-	snapshot.ReauthenticationRequired = snapshot.CredentialExpiresAt == nil || *snapshot.CredentialExpiresAt <= saturatingAdd(now, 86400)
+	snapshot.ReauthenticationRequired = snapshot.CredentialExpiresAt != nil && *snapshot.CredentialExpiresAt <= saturatingAdd(now, 86400)
 	snapshot.OfflineAllowed = claims.OfflineAllowed
 	switch {
 	case claims.ExpiresAt <= now:
@@ -244,14 +260,23 @@ func (c *Client) Logout() error {
 	return c.invalidateLocked()
 }
 
-func (c *Client) Activate(ctx context.Context, key, idempotencyKey string) (Snapshot, error) {
-	return c.ActivateWithPrevious(ctx, key, "", idempotencyKey)
+func (c *Client) Activate(ctx context.Context, key string, operationID ...string) (Snapshot, error) {
+	if len(operationID) > 1 {
+		return Snapshot{}, ErrConfiguration
+	}
+	id := ""
+	if len(operationID) == 1 {
+		id = operationID[0]
+	}
+	return c.ActivateWithPrevious(ctx, key, "", id)
 }
 func (c *Client) ActivateWithPrevious(ctx context.Context, key, previousCredential, idempotencyKey string) (Snapshot, error) {
 	return c.activate(ctx, key, "", previousCredential, idempotencyKey)
 }
 func (c *Client) activate(ctx context.Context, key, licence, previousCredential, idempotencyKey string) (Snapshot, error) {
-	if (licence == "" && (key == "" || len(key) > 256)) || (licence != "" && !opaque(licence)) || !validOperationID(idempotencyKey) || (previousCredential != "" && !bearer(previousCredential)) {
+	ctx, stop := c.operationContext(ctx)
+	defer stop()
+	if (licence == "" && (key == "" || len(key) > 256)) || (licence != "" && !opaque(licence)) || (idempotencyKey != "" && !validOperationID(idempotencyKey)) || (idempotencyKey == "" && c.installed == nil) || (previousCredential != "" && !bearer(previousCredential)) {
 		return Snapshot{}, ErrConfiguration
 	}
 	generation, err := c.generation()
@@ -271,6 +296,18 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 		c.mu.Unlock()
 		return Snapshot{}, ErrStaleResponse
 	}
+	if c.installed != nil {
+		if licence != "" && c.state.account == nil {
+			c.mu.Unlock()
+			return Snapshot{}, ErrReauthenticationRequired
+		}
+		id, version, err := c.installed.begin(key, licence, previousCredential, idempotencyKey)
+		if err != nil {
+			c.mu.Unlock()
+			return Snapshot{}, err
+		}
+		idempotencyKey, c.state.storageVersion = id, version
+	}
 	body := c.scopeBody(map[string]any{"installation_id": c.device.InstallationID, "fingerprint": c.device.Fingerprint, "fingerprint_provider": c.device.FingerprintProvider, "previous_credential": optionalString(previousCredential), "idempotency_key": idempotencyKey})
 	if licence == "" {
 		clearState(&c.state)
@@ -284,9 +321,13 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 		body["licence_id"] = licence
 		clearAccess(&c.state)
 	}
-	if err := c.invalidateLocked(); err != nil {
-		c.mu.Unlock()
-		return Snapshot{}, err
+	if c.installed == nil {
+		if err := c.invalidateLocked(); err != nil {
+			c.mu.Unlock()
+			return Snapshot{}, err
+		}
+	} else {
+		body["credential_mode"] = "persistent"
 	}
 	generation = c.state.generation
 	c.mu.Unlock()
@@ -309,6 +350,8 @@ func (c *Client) Refresh(ctx context.Context) (Snapshot, error) {
 }
 
 func (c *Client) refresh(ctx context.Context, respectRetry bool) (Snapshot, error) {
+	ctx, stop := c.operationContext(ctx)
+	defer stop()
 	generation, err := c.generation()
 	if err != nil {
 		return Snapshot{}, err
@@ -422,6 +465,14 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		return Snapshot{}, ErrCancelled
 	}
 	if snapshot.Access != AccessOnline && snapshot.Access != AccessOffline {
+		if c.installed != nil {
+			c.mu.Lock()
+			unavailableDuringOutage := c.state.credential != nil && c.state.transient
+			c.mu.Unlock()
+			if unavailableDuringOutage {
+				return Snapshot{}, ErrTransient
+			}
+		}
 		return Snapshot{}, &Error{Kind: Denied, Code: "access_unavailable"}
 	}
 	if !snapshot.Entitlements[feature] {
@@ -460,7 +511,13 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 		if budget.Err() != nil {
 			err = ErrTransient
 		} else {
-			if err := c.storage.Save(c.state.storageVersion, *saved); err != nil {
+			var saveErr error
+			if c.installed != nil {
+				saveErr = c.installed.commit(c.state.storageVersion, saved, response, c.keys, anchor)
+			} else {
+				saveErr = c.storage.Save(c.state.storageVersion, *saved)
+			}
+			if err := saveErr; err != nil {
 				clearState(&c.state)
 				if errors.Is(err, ErrStaleResponse) {
 					return Snapshot{}, ErrStaleResponse
@@ -471,8 +528,12 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 			c.state.claims = claims
 			c.state.anchor = anchor
 			c.state.transient = false
+			if c.lifecycle != nil {
+				c.lifecycle.restoring = false
+			}
 			c.state.nextRetry = 0
 			c.state.retryAt = time.Time{}
+			c.wakeInstalled()
 			return c.snapshotLocked(), nil
 		}
 	}
@@ -488,7 +549,13 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 			// never save this unverified reply or its clock anchor.
 			c.state.generation++
 			c.state.claims = nil
+			if c.installed != nil {
+				if e := c.installed.dropCache(); e != nil {
+					return Snapshot{}, e
+				}
+			}
 		}
+		wasTransient := c.state.transient
 		c.state.transient = true
 		c.state.nextRetry = delaySeconds
 		c.state.retryAt = time.Now().Add(time.Duration(delaySeconds) * time.Second)
@@ -497,8 +564,15 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 				c.state.nextRetry = saturatingAdd(now, delaySeconds)
 			}
 		}
+		c.wakeInstalled()
 		snapshot := c.snapshotLocked()
 		if snapshot.Access == AccessOffline {
+			if c.installed != nil && (!wasTransient || c.lifecycle.restoring) {
+				c.lifecycle.restoring = false
+				if e := c.checkpointLocked(true); e != nil {
+					return Snapshot{}, e
+				}
+			}
 			return snapshot, nil
 		}
 		return Snapshot{}, err
@@ -507,7 +581,13 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 		return Snapshot{}, ErrCancelled
 	}
 	clearState(&c.state)
-	if storageErr := c.invalidateLocked(); storageErr != nil {
+	if c.installed != nil && !errors.Is(err, ErrDenied) {
+		version, storageErr := c.installed.invalidate(false)
+		if storageErr != nil {
+			return Snapshot{}, storageErr
+		}
+		c.state.storageVersion = version
+	} else if storageErr := c.invalidateLocked(); storageErr != nil {
 		return Snapshot{}, storageErr
 	}
 	if errors.Is(err, ErrCancelled) {
@@ -520,7 +600,7 @@ type grantReply struct {
 	ActivationID        string  `json:"activation_id"`
 	InstallationID      string  `json:"installation_id"`
 	Credential          *string `json:"credential"`
-	CredentialExpiresAt string  `json:"credential_expires_at"`
+	CredentialExpiresAt *string `json:"credential_expires_at"`
 	Grant               *string `json:"grant"`
 	ServerTime          string  `json:"server_time"`
 	BindingMode         string  `json:"binding_mode"`
@@ -531,7 +611,8 @@ type grantReply struct {
 
 func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous *StoredCredential, licence string, started requestStart) (*StoredCredential, *grantClaims, *timeAnchor, error) {
 	var reply grantReply
-	if decodeJSON(data, &reply) != nil {
+	var fields map[string]json.RawMessage
+	if decodeJSON(data, &reply) != nil || json.Unmarshal(data, &fields) != nil || fields["credential_expires_at"] == nil {
 		return nil, nil, nil, ErrInvalidResponse
 	}
 	if reply.SecretReplayExpired {
@@ -553,8 +634,14 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	expiry, err := timestamp(reply.CredentialExpiresAt)
-	if err != nil || expiry <= now || expiry > saturatingAdd(now, 30*86400) {
+	expiry := int64(0)
+	if reply.CredentialExpiresAt != nil {
+		expiry, err = timestamp(*reply.CredentialExpiresAt)
+		if err != nil || expiry <= now || expiry > saturatingAdd(now, 30*86400) {
+			return nil, nil, nil, ErrInvalidResponse
+		}
+	}
+	if previous == nil && ((c.installed != nil && expiry != 0) || (c.installed == nil && expiry == 0)) {
 		return nil, nil, nil, ErrInvalidResponse
 	}
 	if previous != nil && (reply.ActivationID != previous.ActivationID || expiry != previous.CredentialExpiresAt || reply.Credential != nil) {
@@ -590,7 +677,7 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if licence == "" && previous != nil {
 		licence = previous.LicenceID
 	}
-	claims, err := verifyGrant(*reply.Grant, c.keys, expectedGrant{issuer: c.config.Issuer, application: c.config.ApplicationID, environment: c.config.EnvironmentID, licence: licence, activation: reply.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, credentialExpiresAt: expiry, licenceExpiresAt: licenceExpiry, now: now})
+	claims, err := verifyGrant(*reply.Grant, c.keys, expectedGrant{issuer: c.config.Issuer, application: c.config.ApplicationID, environment: c.config.EnvironmentID, licence: licence, activation: reply.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, credentialExpiresAt: expiry, credentialPersistent: expiry == 0, licenceExpiresAt: licenceExpiry, now: now})
 	if err != nil {
 		return nil, nil, nil, err
 	}

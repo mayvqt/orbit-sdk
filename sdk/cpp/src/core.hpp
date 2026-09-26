@@ -1,11 +1,14 @@
 #pragma once
 
 #include "grants.hpp"
+#include "installed_storage.hpp"
+#include "persistent_codec.hpp"
 #include "platform.hpp"
 #include "transport.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -14,6 +17,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace orbit::detail {
 
@@ -31,13 +35,15 @@ struct Credential {
     std::string activation_id;
     std::string licence_id;
     std::string bearer;
-    std::int64_t expires_at = 0;
+    std::optional<std::int64_t> expires_at;
 };
 
 struct ClockStart {
     std::int64_t elapsed_nanoseconds = 0;
     std::int64_t wall_seconds = 0;
 };
+
+ClockStart capture_clock();
 
 struct ClockAnchor {
     std::int64_t server_seconds = 0;
@@ -56,9 +62,14 @@ public:
     ClientState(Config config, Transport transport,
                 std::shared_ptr<CredentialStorage> storage,
                 std::uint64_t storage_version,
-                std::optional<Credential> credential);
+                std::optional<Credential> credential, bool persistent = false);
 
+    ~ClientState() noexcept;
     Json::Value snapshot();
+    void close();
+    void start_worker();
+    void begin_call();
+    void end_call() noexcept;
     Json::Value activate(std::string_view key, std::string_view idempotency_key,
                          std::optional<std::string_view> previous,
                          const std::atomic_bool& cancelled,
@@ -88,6 +99,12 @@ public:
 
     std::uint64_t generation();
     void sync_storage_locked();
+    void persist_record_locked();
+    void commit_persistent_locked(Json::Value record);
+    void checkpoint_persistent_locked(bool force);
+    bool restore_persistent_cache(bool allow_offline);
+    void worker_loop() noexcept;
+    void wake_worker() noexcept;
     std::string account_path(std::string_view path,
                              std::optional<std::string_view> cursor = std::nullopt) const;
     Json::Value account_body(Json::Value value) const;
@@ -110,6 +127,21 @@ public:
     bool transient = false;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
     GrantKeys keys;
+    bool persistent = false;
+    std::atomic_bool persistence_failed{false};
+    std::shared_ptr<std::atomic_bool> owner_cancelled = std::make_shared<std::atomic_bool>(false);
+    std::shared_ptr<InstalledStorage> installed_storage;
+    Json::Value persistent_record;
+    std::thread worker;
+    std::atomic_bool worker_cancelled{false};
+    std::atomic_uint64_t worker_epoch{0};
+    std::mutex lifecycle_mutex;
+    std::condition_variable lifecycle_changed;
+    bool worker_started = false;
+    bool closing = false;
+    bool closed = false;
+    std::chrono::steady_clock::time_point last_checkpoint{};
+    std::size_t active_calls = 0;
 
 private:
     friend std::shared_ptr<ClientState> connect_state(Config);
@@ -117,6 +149,7 @@ private:
     friend ::orbit::Client make_test_client(Config, Transport,
                                              std::shared_ptr<CredentialStorage>);
 #endif
+    void throw_if_cancelled(const std::atomic_bool& cancelled) const;
     void check_generation(std::uint64_t request_generation,
                           const std::atomic_bool& cancelled);
     std::unique_lock<std::timed_mutex> lock_serial(const std::atomic_bool& cancelled);
@@ -131,7 +164,8 @@ private:
                              const std::optional<Credential>& previous,
                              std::optional<std::string_view> expected_licence,
                              ClockStart start,
-                             const std::atomic_bool& cancelled);
+                             const std::atomic_bool& cancelled, bool mutation = false);
+    void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();
     void invalidate_locked();
@@ -147,13 +181,27 @@ private:
     static void accepted(const Json::Value& value);
 };
 
+class ClientOperation {
+public:
+    explicit ClientOperation(ClientState& state) : state_(&state) { state_->begin_call(); }
+    ~ClientOperation() { if (state_) state_->end_call(); }
+    ClientOperation(const ClientOperation&) = delete;
+    ClientOperation& operator=(const ClientOperation&) = delete;
+private:
+    ClientState* state_;
+};
+
 std::shared_ptr<ClientState> connect_state(Config config);
+std::shared_ptr<ClientState> open_installed_state(
+    Config config, Transport transport, std::shared_ptr<InstalledStorage> installed);
 
 #ifdef ORBIT_SDK_TESTING
 using TestClock = std::function<std::pair<std::int64_t, std::int64_t>()>;
 void set_test_clock(TestClock clock);
 ::orbit::Client make_test_client(Config config, Transport transport,
                                  std::shared_ptr<CredentialStorage> storage);
+::orbit::Client make_test_installed_client(
+    Config config, Transport transport, std::shared_ptr<InstalledStorage> storage);
 #endif
 
 } // namespace orbit::detail

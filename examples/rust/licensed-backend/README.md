@@ -35,7 +35,7 @@ On a Unix host, create a file readable only by its owner (`chmod 600`) containin
 
 Replace the synthetic values locally. Keep the file outside Git, container
 images and public client bundles. The example checks private Unix file
-permissions and rejects symlinks, oversized files and unknown fields. From the extracted Rust kit, run:
+permissions and rejects symlinks, oversized files and unknown fields. From this repository’s root, run:
 
 ```sh
 cargo build --locked -p orbit-licensed-backend

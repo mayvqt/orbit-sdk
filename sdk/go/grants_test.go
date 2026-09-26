@@ -60,12 +60,16 @@ func TestSharedGrantVectors(t *testing.T) {
 				Installation        string  `json:"installation"`
 				Fingerprint         *string `json:"fingerprint"`
 				FingerprintProvider *string `json:"fingerprint_provider"`
-				CredentialExpiresAt int64   `json:"credential_expires_at"`
+				CredentialExpiresAt *int64  `json:"credential_expires_at"`
 				LicenceExpiresAt    *int64  `json:"licence_expires_at"`
 				Now                 int64   `json:"now"`
 			}
 			if err := json.Unmarshal(encoded, &expected); err != nil {
 				t.Fatal(err)
+			}
+			expiry := int64(0)
+			if expected.CredentialExpiresAt != nil {
+				expiry = *expected.CredentialExpiresAt
 			}
 			jwks := corpus.JWKS
 			if vector.JWKS != nil {
@@ -73,7 +77,7 @@ func TestSharedGrantVectors(t *testing.T) {
 			}
 			keys, err := parseKeys(jwks)
 			if err == nil {
-				_, err = verifyGrant(vector.Token, keys, expectedGrant{issuer: expected.Issuer, application: expected.Application, environment: expected.Environment, licence: expected.Licence, activation: expected.Activation, installation: expected.Installation, fingerprint: expected.Fingerprint, fingerprintProvider: expected.FingerprintProvider, credentialExpiresAt: expected.CredentialExpiresAt, licenceExpiresAt: expected.LicenceExpiresAt, now: expected.Now})
+				_, err = verifyGrant(vector.Token, keys, expectedGrant{issuer: expected.Issuer, application: expected.Application, environment: expected.Environment, licence: expected.Licence, activation: expected.Activation, installation: expected.Installation, fingerprint: expected.Fingerprint, fingerprintProvider: expected.FingerprintProvider, credentialExpiresAt: expiry, credentialPersistent: expected.CredentialExpiresAt == nil, licenceExpiresAt: expected.LicenceExpiresAt, now: expected.Now})
 			}
 			if (err == nil) != vector.Valid {
 				t.Fatalf("valid = %v, expected %v; error: %v", err == nil, vector.Valid, err)

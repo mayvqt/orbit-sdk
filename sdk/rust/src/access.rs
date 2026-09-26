@@ -60,11 +60,13 @@ pub(crate) struct State {
     pub(crate) generation: u64,
     pub(crate) storage_version: u64,
     pub(crate) account: Option<Session>,
-    credential: Option<StoredCredential>,
-    claims: Option<Claims>,
-    anchor: Option<Anchor>,
+    pub(crate) credential: Option<StoredCredential>,
+    pub(crate) claims: Option<Claims>,
+    pub(crate) anchor: Option<Anchor>,
+    pub(crate) restored: bool,
     transient: bool,
     retry_deadline: Option<Instant>,
+    last_failure: Option<Error>,
 }
 pub(crate) struct Inner {
     pub(crate) config: Config,
@@ -73,7 +75,22 @@ pub(crate) struct Inner {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) state: Mutex<State>,
     pub(crate) serial: tokio::sync::Mutex<()>,
-    keys: Mutex<Keys>,
+    pub(crate) keys: Mutex<Keys>,
+    pub(crate) installed: Option<Arc<crate::installed::InstalledStorage>>,
+    pub(crate) worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) close_serial: tokio::sync::Mutex<()>,
+    pub(crate) closed: std::sync::atomic::AtomicBool,
+}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.transport.owner_cancel.cancel();
+        if let Some(storage) = &self.installed {
+            if let Ok(state) = self.state.get_mut() {
+                let _ = storage.checkpoint(state.anchor.as_ref(), true);
+            }
+            storage.close();
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Client(pub(crate) Arc<Inner>);
@@ -87,7 +104,8 @@ struct Reply {
     activation_id: String,
     installation_id: String,
     credential: Option<String>,
-    credential_expires_at: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    credential_expires_at: Option<String>,
     grant: Option<String>,
     server_time: String,
     binding_mode: String,
@@ -165,13 +183,16 @@ impl Client {
     pub fn with_storage(
         config: Config,
         device: Device,
-        transport: Transport,
+        mut transport: Transport,
         storage: Arc<dyn Storage>,
     ) -> Result<Self> {
         if !valid_configuration(&config, &device) {
             return Err(Error::Configuration);
         }
         clock::elapsed_clock()?;
+        // Cloned transports may share their HTTP connection pool, but each
+        // client owns a separate cancellation lifetime.
+        transport.owner_cancel = Cancellation::new();
         let (version, credential) = storage.load()?;
         if let Some(saved) = &credential
             && !valid_stored_credential(saved, &config, &device)
@@ -190,11 +211,17 @@ impl Client {
                 credential,
                 claims: None,
                 anchor: None,
+                restored: false,
                 transient: false,
                 retry_deadline: None,
+                last_failure: None,
             }),
             serial: tokio::sync::Mutex::new(()),
             keys: Mutex::new(Keys::default()),
+            installed: None,
+            worker: Mutex::new(None),
+            close_serial: tokio::sync::Mutex::new(()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })))
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
@@ -208,6 +235,9 @@ impl Client {
             state.claims = None;
             state.anchor = None;
             state.generation = state.generation.wrapping_add(1);
+            if let Some(storage) = &self.0.installed {
+                state.storage_version = storage.clear_cached(false, false)?;
+            }
         }
         Self::snapshot_state(&state)
     }
@@ -215,7 +245,7 @@ impl Client {
         let credential_expiry = state
             .credential
             .as_ref()
-            .map(|value| value.credential_expires_at);
+            .and_then(|value| value.credential_expires_at);
         let mut snapshot = Snapshot {
             access: if state.credential.is_some() {
                 Access::RefreshRequired
@@ -238,9 +268,11 @@ impl Client {
             snapshot.expires_at = Some(claims.exp);
             snapshot.next_check_at = Some(claims.refresh_after);
             snapshot.reauthentication_required =
-                credential_expiry.is_none_or(|expiry| expiry <= now + 86400);
+                credential_expiry.is_some_and(|expiry| expiry <= now + 86400);
             snapshot.offline_allowed = claims.offline_allowed;
-            snapshot.access = if claims.exp <= now {
+            snapshot.access = if state.restored {
+                Access::RefreshRequired
+            } else if claims.exp <= now {
                 Access::Expired
             } else if state.transient {
                 if claims.offline_allowed {
@@ -263,6 +295,9 @@ impl Client {
         Ok(snapshot)
     }
     pub(crate) fn sync_storage(&self, state: &mut State) -> Result<()> {
+        if self.0.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let version = self.0.storage.version()?;
         if version != state.storage_version {
             clear(state);
@@ -322,39 +357,63 @@ impl Client {
             ActivationPrincipal::Key(key) => !key.is_empty() && key.len() <= 256,
             ActivationPrincipal::Account(licence) => opaque(licence),
         };
-        if !valid_principal || !(16..=128).contains(&idempotency_key.len()) {
+        if !valid_principal
+            || (!(16..=128).contains(&idempotency_key.len())
+                && !(self.0.installed.is_some() && idempotency_key.is_empty()))
+        {
             return Err(Error::Configuration);
         }
         let generation = self.generation()?;
         let _serial = tokio::select! {guard=self.0.serial.lock()=>guard,_=cancel.cancelled()=>return Err(Error::Cancelled)};
         self.check_generation(generation)?;
-        let (generation, customer_session) = {
+        let (generation, customer_session, operation) = {
             let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
             if state.generation != generation {
                 return Err(Error::StaleResponse);
             }
-            let customer_session = match principal {
-                ActivationPrincipal::Key(_) => {
-                    clear(&mut state);
-                    None
-                }
-                ActivationPrincipal::Account(_) => {
-                    let token = state
+            let session = match principal {
+                ActivationPrincipal::Key(_) => None,
+                ActivationPrincipal::Account(_) => Some(
+                    state
                         .account
                         .as_ref()
                         .ok_or(Error::ReauthenticationRequired)?
                         .token
-                        .clone();
-                    clear_access(&mut state);
-                    Some(token)
-                }
+                        .clone(),
+                ),
             };
-            state.storage_version = self.0.storage.invalidate()?;
-            (state.generation, customer_session)
+            let operation = if let Some(storage) = &self.0.installed {
+                let (operation, version) =
+                    storage.prepare_activation(principal, previous_credential, idempotency_key)?;
+                state.storage_version = version;
+                state.generation = state.generation.wrapping_add(1);
+                state.claims = None;
+                state.anchor = None;
+                state.restored = false;
+                state.transient = false;
+                state.retry_deadline = None;
+                state.last_failure = None;
+                if matches!(principal, ActivationPrincipal::Key(_)) {
+                    state.account = None;
+                }
+                operation
+            } else {
+                if matches!(principal, ActivationPrincipal::Key(_)) {
+                    clear(&mut state);
+                } else {
+                    clear_access(&mut state);
+                }
+                state.storage_version = self.0.storage.invalidate()?;
+                idempotency_key.to_owned()
+            };
+            (state.generation, session, operation)
         };
         let mut input = json!({"application_id":self.0.config.application_id,"environment_id":self.0.config.environment_id,
             "installation_id":self.0.device.installation_id,"fingerprint":self.0.device.fingerprint,
-            "fingerprint_provider":self.0.device.fingerprint_provider,"previous_credential":previous_credential,"idempotency_key":idempotency_key});
+            "fingerprint_provider":self.0.device.fingerprint_provider,"previous_credential":previous_credential,"idempotency_key":operation});
+        if self.0.installed.is_some() {
+            input["credential_mode"] = json!("persistent");
+        }
         let expected_licence = match principal {
             ActivationPrincipal::Key(key) => {
                 input["licence_key"] = json!(key);
@@ -385,13 +444,20 @@ impl Client {
     pub async fn refresh(&self, cancel: &Cancellation) -> Result<Snapshot> {
         self.refresh_inner(cancel, false).await
     }
-    async fn refresh_if_needed(&self, cancel: &Cancellation) -> Result<Snapshot> {
+    pub(crate) async fn refresh_if_needed(&self, cancel: &Cancellation) -> Result<Snapshot> {
         self.refresh_inner(cancel, true).await
     }
     async fn refresh_inner(&self, cancel: &Cancellation, respect_retry: bool) -> Result<Snapshot> {
         let generation = self.generation()?;
         let _serial = tokio::select! {guard=self.0.serial.lock()=>guard,_=cancel.cancelled()=>return Err(Error::Cancelled)};
         self.check_generation(generation)?;
+        if let Some(storage) = &self.0.installed
+            && storage.activation_pending()?
+        {
+            // A replacement may already have revoked the old bearer. Its
+            // unrelated denial must never resolve the pending activation.
+            return Err(Error::PendingActivation);
+        }
         if respect_retry {
             let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
             self.sync_storage(&mut state)?;
@@ -410,6 +476,12 @@ impl Client {
                 Access::RefreshRequired | Access::Expired | Access::Offline
             ) || !retry_due
             {
+                if self.0.installed.is_some()
+                    && snapshot.access != Access::Offline
+                    && let Some(error) = &state.last_failure
+                {
+                    return Err(error.clone());
+                }
                 return Ok(snapshot);
             }
         }
@@ -488,7 +560,13 @@ impl Client {
         ) {
             match self.refresh_if_needed(cancel).await {
                 Ok(value) => value,
-                Err(Error::Transient { .. }) => self.snapshot()?,
+                Err(error @ Error::Transient { .. }) => {
+                    let snapshot = self.snapshot()?;
+                    if self.0.installed.is_some() && snapshot.access != Access::Offline {
+                        return Err(error);
+                    }
+                    snapshot
+                }
                 Err(error) => return Err(error),
             }
         } else {
@@ -547,12 +625,20 @@ impl Client {
             return Err(Error::Cancelled);
         }
         match result {
-            Ok((credential, claims, anchor)) => {
-                if let Err(error) = self
-                    .0
-                    .storage
-                    .save(state.storage_version, credential.clone())
-                {
+            Ok((credential, claims, anchor, cache)) => {
+                let persisted = if let Some(storage) = &self.0.installed {
+                    storage.commit_access(
+                        state.storage_version,
+                        &credential,
+                        cache,
+                        previous.is_none(),
+                    )
+                } else {
+                    self.0
+                        .storage
+                        .save(state.storage_version, credential.clone())
+                };
+                if let Err(error) = persisted {
                     clear(&mut state);
                     return Err(error);
                 }
@@ -560,7 +646,9 @@ impl Client {
                 state.claims = Some(claims);
                 state.anchor = Some(anchor);
                 state.transient = false;
+                state.restored = false;
                 state.retry_deadline = None;
+                state.last_failure = None;
                 Self::snapshot_state(&state)
             }
             Err(error @ Error::Transient { .. }) => {
@@ -569,8 +657,19 @@ impl Client {
                     // only the prior credential and invalidate cached authority.
                     state.generation = state.generation.wrapping_add(1);
                     state.claims = None;
+                    state.anchor = None;
+                    if let Some(storage) = &self.0.installed {
+                        state.storage_version = storage.clear_cached(false, false)?;
+                    }
                 }
+                if state.restored
+                    && let Some(storage) = &self.0.installed
+                {
+                    storage.checkpoint(state.anchor.as_ref(), true)?;
+                }
+                state.restored = false;
                 state.transient = true;
+                state.last_failure = Some(error.clone());
                 state.retry_deadline = Some(Instant::now() + transient_retry_delay());
                 let snapshot = Self::snapshot_state(&state)?;
                 if snapshot.access == Access::Offline {
@@ -581,8 +680,24 @@ impl Client {
             }
             Err(Error::Cancelled) => Err(Error::Cancelled),
             Err(error) => {
-                clear(&mut state);
-                state.storage_version = self.0.storage.invalidate()?;
+                if let Some(storage) = &self.0.installed {
+                    let definitive = matches!(error, Error::Denied { .. });
+                    state.generation = state.generation.wrapping_add(1);
+                    state.claims = None;
+                    state.anchor = None;
+                    state.restored = false;
+                    state.transient = false;
+                    state.retry_deadline = Some(Instant::now() + transient_retry_delay());
+                    state.last_failure = Some(error.clone());
+                    if definitive {
+                        state.credential = None;
+                        state.account = None;
+                    }
+                    state.storage_version = storage.clear_cached(definitive, definitive)?;
+                } else {
+                    clear(&mut state);
+                    state.storage_version = self.0.storage.invalidate()?;
+                }
                 Err(error)
             }
         }
@@ -594,7 +709,7 @@ impl Client {
         expected_licence: Option<&str>,
         started: clock::Start,
         cancel: &Cancellation,
-    ) -> Result<(StoredCredential, Claims, Anchor)> {
+    ) -> Result<(StoredCredential, Claims, Anchor, crate::installed::Cache)> {
         let reply: Reply = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
         if reply.secret_replay_expired {
             return Err(Error::ReauthenticationRequired);
@@ -613,8 +728,14 @@ impl Client {
         }
         let anchor = Anchor::from_request(timestamp(&reply.server_time)?, started);
         let now = anchor.now()?;
-        let expiry = timestamp(&reply.credential_expires_at)?;
-        if expiry <= now || expiry > now.saturating_add(30 * 86400) {
+        let expiry = reply
+            .credential_expires_at
+            .as_deref()
+            .map(timestamp)
+            .transpose()?;
+        if expiry.is_some_and(|expiry| expiry <= now || expiry > now.saturating_add(30 * 86400))
+            || (previous.is_none() && (self.0.installed.is_some() != expiry.is_none()))
+        {
             return Err(Error::InvalidResponse);
         }
         if let Some(previous) = previous
@@ -688,7 +809,23 @@ impl Client {
             fingerprint: self.0.device.fingerprint.clone(),
             fingerprint_provider: self.0.device.fingerprint_provider.clone(),
         };
-        Ok((saved, claims, anchor))
+        let (received_server_time, received_wall_time) = anchor.receipt();
+        let jwks = self
+            .0
+            .keys
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .public_key(&token)?;
+        let cache = crate::installed::Cache {
+            jws: token,
+            jwks: serde_json::from_value(jwks).map_err(|_| Error::InvalidResponse)?,
+            licence_expires_at: licence_expiry,
+            received_server_time,
+            received_wall_time,
+            server_high_water: now,
+            wall_high_water: clock::wall()?,
+        };
+        Ok((saved, claims, anchor, cache))
     }
 }
 pub(crate) fn clear(state: &mut State) {
@@ -702,6 +839,8 @@ fn clear_access(state: &mut State) {
     state.credential = None;
     state.transient = false;
     state.retry_deadline = None;
+    state.restored = false;
+    state.last_failure = None;
 }
 
 fn transient_retry_delay() -> Duration {
@@ -729,7 +868,7 @@ mod tests {
             licence_id: "licence".into(),
             installation_id: "installation_1234".into(),
             credential: "a".repeat(43),
-            credential_expires_at: NOW + 3600,
+            credential_expires_at: Some(NOW + 3600),
             fingerprint: None,
             fingerprint_provider: None,
         }

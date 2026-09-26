@@ -39,6 +39,7 @@ def sign_grant(
     offline: bool = False,
     server_time: int | None = None,
     credential_expires_at: int | None = None,
+    persistent: bool = False,
 ) -> tuple[str, int, int]:
     now = int(time.time()) if server_time is None else server_time
     credential_expiry = now + 3600 if credential_expires_at is None else credential_expires_at
@@ -57,7 +58,7 @@ def sign_grant(
         "binding_mode": "hwid" if config.fingerprint else "none",
         "policy_version": 1,
         "entitlements": {"export": True, "sync": False},
-        "refresh_after": now + 60,
+        "refresh_after": now + (900 if persistent and offline else 60),
         "offline_allowed": offline,
         "licence_expires_at": None,
     }
@@ -74,11 +75,11 @@ def sign_grant(
     return signing_input + "." + b64url(signature), now, credential_expiry
 
 
-def activation_reply(config: Config, *, account: bool = False, offline: bool = False, previous: bool = False, credential_expiry: int | None = None) -> bytes:
+def activation_reply(config: Config, *, account: bool = False, offline: bool = False, previous: bool = False, credential_expiry: int | None = None, persistent: bool = False) -> bytes:
     licence = "licence" if account else "licence"
-    token, server_time, expiry = sign_grant(config, licence_id=licence, offline=offline, credential_expires_at=credential_expiry)
+    token, server_time, expiry = sign_grant(config, licence_id=licence, offline=offline, credential_expires_at=credential_expiry, persistent=persistent and credential_expiry is None)
     instant = dt.datetime.fromtimestamp(server_time, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    expiry_text = dt.datetime.fromtimestamp(expiry, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    expiry_text = None if persistent and credential_expiry is None else dt.datetime.fromtimestamp(expiry, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     body = {
         "activation_id": "activation",
         "installation_id": config.installation_id,

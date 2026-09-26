@@ -14,6 +14,23 @@ public sealed class Transport : IDisposable
 {
     private readonly Uri origin;
     private readonly HttpClient client;
+    internal string CanonicalOrigin => origin.GetLeftPart(UriPartial.Authority);
+    internal CancellationToken? InstallationCancellation
+    {
+        get; set;
+    }
+    private readonly object installedGate = new();
+    private int installedRequests;
+    private bool installedClosed;
+    private TaskCompletionSource installedIdle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    internal Task SettleInstalledAsync()
+    {
+        lock (installedGate)
+        {
+            installedClosed = true;
+            return installedRequests == 0 ? Task.CompletedTask : installedIdle.Task;
+        }
+    }
     public Transport(string origin) : this(ParseOrigin(origin, "https"), false) { }
 
     private Transport(Uri origin, bool local)
@@ -108,7 +125,26 @@ public sealed class Transport : IDisposable
         return RequestAsync(HttpMethod.Post, path, bytes, null, retrySafe, cancellationToken);
     }
 
-    private async Task<JsonElement?> RequestAsync(HttpMethod method, string path, byte[]? body, string? bearer,
+    private async Task<JsonElement?> RequestAsync(HttpMethod method, string path, byte[]? body, string? bearer, bool retrySafe, CancellationToken cancellationToken)
+    {
+        if (InstallationCancellation is not { } lifetime)
+            return await RequestCoreAsync(method, path, body, bearer, retrySafe, cancellationToken).ConfigureAwait(false);
+        lock (installedGate)
+        {
+            if (installedClosed)
+                throw new OrbitException(OrbitError.Cancelled);
+            if (installedRequests++ == 0)
+                installedIdle = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        try
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime);
+            return await RequestCoreAsync(method, path, body, bearer, retrySafe, linked.Token).ConfigureAwait(false);
+        }
+        finally { lock (installedGate) { if (--installedRequests == 0) installedIdle.TrySetResult(); } }
+    }
+
+    private async Task<JsonElement?> RequestCoreAsync(HttpMethod method, string path, byte[]? body, string? bearer,
         bool retrySafe, CancellationToken cancellationToken)
     {
         OrbitException.CheckCancellation(cancellationToken);

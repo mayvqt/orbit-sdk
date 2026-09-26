@@ -97,16 +97,20 @@ void run(std::string_view scenario, std::string_view origin,
         expect_error([&] {
             (void)transport.get("/api/client/v1/status/header-limit", not_cancelled);
         }, ErrorKind::invalid_response);
-    } else if (scenario == "cancel") {
+    } else if (scenario == "cancel" || scenario == "owner-cancel") {
         std::atomic_bool cancelled{false};
+        auto owner = std::make_shared<std::atomic_bool>(false);
+        auto cancellable = transport;
+        if (scenario == "owner-cancel") cancellable.bind_owner_cancellation(owner);
         const auto started = std::chrono::steady_clock::now();
         std::thread cancel_after_request([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            cancelled.store(true, std::memory_order_relaxed);
+            if (scenario == "owner-cancel") owner->store(true, std::memory_order_relaxed);
+            else cancelled.store(true, std::memory_order_relaxed);
         });
         try {
             expect_error([&] {
-                (void)transport.get("/api/client/v1/status/stall", cancelled);
+                (void)cancellable.get("/api/client/v1/status/stall", cancelled);
             }, ErrorKind::cancelled);
         } catch (...) {
             cancel_after_request.join();

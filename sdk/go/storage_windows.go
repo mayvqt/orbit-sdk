@@ -27,6 +27,7 @@ type nativeWindowsStorage struct {
 	directories  []syscall.Handle
 	lease        syscall.Handle
 	allowMissing bool
+	security     *installedWindowsSecurity
 }
 
 // OpenWindowsStorage opens an existing dedicated absolute local directory in
@@ -53,7 +54,11 @@ func OpenWindowsStorage(directory string, config Config, device Device) (*Window
 	return &WindowsStorage{state: &protectedStorageState{files: files, scope: scope}}, nil
 }
 
-func openWindowsStorageFiles(directory string) (_ *nativeWindowsStorage, err error) {
+func openWindowsStorageFiles(directory string) (*nativeWindowsStorage, error) {
+	return openWindowsStorageFilesWithSecurity(directory, nil)
+}
+
+func openWindowsStorageFilesWithSecurity(directory string, security *installedWindowsSecurity) (_ *nativeWindowsStorage, err error) {
 	directory = filepath.Clean(filepath.FromSlash(directory))
 	volume := filepath.VolumeName(directory)
 	if !filepath.IsAbs(directory) || len(volume) != 2 || volume[1] != ':' || len(directory) <= 3 || strings.Contains(directory[2:], ":") || strings.ContainsRune(directory, 0) {
@@ -67,7 +72,7 @@ func openWindowsStorageFiles(directory string) (_ *nativeWindowsStorage, err err
 	if !localStorageDrive(volume + `\`) {
 		return nil, ErrStorage
 	}
-	files := &nativeWindowsStorage{directory: directory, lease: syscall.InvalidHandle}
+	files := &nativeWindowsStorage{directory: directory, lease: syscall.InvalidHandle, security: security}
 	defer func() {
 		if err != nil {
 			_ = files.close()
@@ -92,16 +97,25 @@ func openWindowsStorageFiles(directory string) (_ *nativeWindowsStorage, err err
 			return nil, ErrStorage
 		}
 	}
+	if security != nil && security.check(files.directories[len(files.directories)-1]) != nil {
+		return nil, ErrStorage
+	}
 	lock := filepath.Join(directory, storageLockName)
-	handle, openErr := openStorageHandle(lock, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, syscall.CREATE_NEW, 0)
+	handle, openErr := files.openPrivate(lock, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, syscall.CREATE_NEW, 0)
 	created := openErr == nil
 	if openErr == syscall.ERROR_FILE_EXISTS || openErr == syscall.ERROR_ALREADY_EXISTS {
-		handle, openErr = openStorageHandle(lock, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, syscall.OPEN_EXISTING, 0)
+		handle, openErr = files.openPrivate(lock, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, syscall.OPEN_EXISTING, 0)
 	}
 	if openErr != nil {
+		if security != nil && openErr == syscall.Errno(32) {
+			return nil, ErrInstallationInUse
+		}
 		return nil, ErrStorage
 	}
 	files.lease = handle
+	if security != nil && security.check(handle) != nil {
+		return nil, ErrStorage
+	}
 	info, checkErr := storageHandleInfo(handle, false)
 	if checkErr != nil || info.FileSizeHigh != 0 || info.FileSizeLow != 0 || files.checkDirectories() != nil {
 		return nil, ErrStorage
@@ -145,6 +159,9 @@ func storageHandleInfo(handle syscall.Handle, directory bool) (syscall.ByHandleF
 }
 
 func (s *nativeWindowsStorage) checkDirectories() error {
+	if s.security != nil && (len(s.directories) == 0 || s.security.check(s.directories[len(s.directories)-1]) != nil || s.security.check(s.lease) != nil) {
+		return ErrStorage
+	}
 	for _, handle := range s.directories {
 		if _, err := storageHandleInfo(handle, true); err != nil {
 			return ErrStorage
@@ -168,7 +185,10 @@ func (s *nativeWindowsStorage) ciphertext() ([]byte, error) {
 	file := os.NewFile(uintptr(handle), "Orbit protected storage")
 	defer file.Close()
 	info, err := storageHandleInfo(handle, false)
-	if err != nil || info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > storageCiphertextLimit {
+	if err != nil || info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > s.ciphertextLimit() {
+		return nil, ErrStorage
+	}
+	if s.security != nil && s.security.check(handle) != nil {
 		return nil, ErrStorage
 	}
 	data := make([]byte, int(info.FileSizeLow))
@@ -205,7 +225,10 @@ func (s *nativeWindowsStorage) write(scope storageScope, version uint64, credent
 	if err != nil || len(ciphertext) == 0 || len(ciphertext) > storageCiphertextLimit {
 		return ErrStorage
 	}
-	if s.checkDirectories() != nil {
+	return s.writeCiphertext(ciphertext)
+}
+func (s *nativeWindowsStorage) writeCiphertext(ciphertext []byte) error {
+	if len(ciphertext) == 0 || len(ciphertext) > int(s.ciphertextLimit()) || s.checkDirectories() != nil {
 		return ErrStorage
 	}
 	destination := filepath.Join(s.directory, storageDataName)
@@ -213,11 +236,17 @@ func (s *nativeWindowsStorage) write(scope storageScope, version uint64, credent
 		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, syscall.OPEN_EXISTING, 0)
 	if err == nil {
 		_, checkErr := storageHandleInfo(old, false)
+		if checkErr == nil && s.security != nil {
+			checkErr = s.security.check(old)
+		}
 		closeErr := syscall.CloseHandle(old)
 		if checkErr != nil || closeErr != nil {
 			return ErrStorage
 		}
 	} else if err != syscall.ERROR_FILE_NOT_FOUND || !s.allowMissing {
+		return ErrStorage
+	}
+	if s.security != nil && s.setInstalledMarker(true) != nil {
 		return ErrStorage
 	}
 	var random [12]byte
@@ -227,7 +256,7 @@ func (s *nativeWindowsStorage) write(scope storageScope, version uint64, credent
 	temporary := filepath.Join(s.directory, "orbit-storage."+hex.EncodeToString(random[:])+".tmp")
 	const deleteAccess = 0x00010000
 	const writeThrough = 0x80000000
-	handle, err := openStorageHandle(temporary, syscall.GENERIC_WRITE|deleteAccess, 0, syscall.CREATE_NEW, writeThrough)
+	handle, err := s.openPrivate(temporary, syscall.GENERIC_WRITE|deleteAccess, 0, syscall.CREATE_NEW, writeThrough)
 	if err != nil {
 		return ErrStorage
 	}
@@ -236,10 +265,16 @@ func (s *nativeWindowsStorage) write(scope storageScope, version uint64, credent
 	if _, err := storageHandleInfo(handle, false); err != nil {
 		return ErrStorage
 	}
+	if s.security != nil && s.security.check(handle) != nil {
+		return ErrStorage
+	}
 	if count, err := file.Write(ciphertext); err != nil || count != len(ciphertext) {
 		return ErrStorage
 	}
 	if file.Sync() != nil || s.checkDirectories() != nil || replaceStorageFile(handle, s.directories[len(s.directories)-1]) != nil || file.Sync() != nil || file.Close() != nil {
+		return ErrStorage
+	}
+	if s.security != nil && s.setInstalledMarker(false) != nil {
 		return ErrStorage
 	}
 	s.allowMissing = false
@@ -333,6 +368,37 @@ func (s *nativeWindowsStorage) close() error {
 	s.directories = nil
 	s.directory = ""
 	if failed {
+		return ErrStorage
+	}
+	return nil
+}
+
+func (s *nativeWindowsStorage) openPrivate(path string, access, share, creation, flags uint32) (syscall.Handle, error) {
+	if s.security != nil {
+		return s.security.open(path, access|0x20000, share, creation, flags)
+	}
+	return openStorageHandle(path, access, share, creation, flags)
+}
+func (s *nativeWindowsStorage) ciphertextLimit() uint32 {
+	if s.security != nil {
+		return installedLimit * 2
+	}
+	return storageCiphertextLimit
+}
+
+func (s *nativeWindowsStorage) setInstalledMarker(pending bool) error {
+	if _, err := syscall.Seek(s.lease, 0, 0); err != nil {
+		return ErrStorage
+	}
+	if pending {
+		var written uint32
+		if syscall.WriteFile(s.lease, []byte{1}, &written, nil) != nil || written != 1 {
+			return ErrStorage
+		}
+	} else if syscall.SetEndOfFile(s.lease) != nil {
+		return ErrStorage
+	}
+	if syscall.FlushFileBuffers(s.lease) != nil {
 		return ErrStorage
 	}
 	return nil

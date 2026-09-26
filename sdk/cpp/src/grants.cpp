@@ -232,6 +232,7 @@ GrantKeys GrantKeys::parse(const Json::Value& jwks) {
             kid.empty() || kid.size() > 128 ||
             std::any_of(kid.begin(), kid.end(), [](unsigned char c) { return c > 0x7f; })) invalid();
         if (!result.keys_.emplace(kid, p256_key(x, y)).second) invalid();
+        result.public_keys_.emplace(kid, jwk);
     }
     return result;
 }
@@ -243,6 +244,16 @@ std::string grant_kid(std::string_view token) {
 bool GrantKeys::contains(std::string_view token) const {
     const auto parsed = parse_token(token);
     return keys_.find(std::string(parsed.kid)) != keys_.end();
+}
+
+Json::Value GrantKeys::jwks_for(std::string_view token) const {
+    const auto parsed = parse_token(token);
+    const auto found = public_keys_.find(std::string(parsed.kid));
+    if (found == public_keys_.end()) invalid();
+    Json::Value result(Json::objectValue);
+    result["keys"] = Json::Value(Json::arrayValue);
+    result["keys"].append(found->second);
+    return result;
 }
 
 GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expected) const {
@@ -267,6 +278,9 @@ GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expec
             return std::numeric_limits<std::int64_t>::min();
         return value + delta;
     };
+    const bool persistent_offline = !expected.credential_expires_at && claims.offline_allowed;
+    const auto refresh_minimum = persistent_offline ? 675 : 45;
+    const auto refresh_maximum = persistent_offline ? 1125 : 75;
     if (claims.issuer != expected.issuer || claims.audience != audience ||
         claims.subject.empty() || claims.subject.size() > 128 ||
         (expected.licence && claims.subject != *expected.licence) ||
@@ -278,12 +292,12 @@ GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expec
         add_saturated(claims.issued_at, -30) > expected.now || claims.expires_at <= expected.now ||
         claims.expires_at <= claims.issued_at ||
         claims.expires_at > add_saturated(claims.issued_at, allowance) ||
-        claims.expires_at > expected.credential_expires_at ||
+        (expected.credential_expires_at && claims.expires_at > *expected.credential_expires_at) ||
         claims.licence_expires_at != expected.licence_expires_at ||
         (claims.licence_expires_at && claims.expires_at > *claims.licence_expires_at) ||
         claims.refresh_after <= claims.issued_at || claims.refresh_after > claims.expires_at ||
-        claims.refresh_after > add_saturated(claims.issued_at, 75) ||
-        (claims.refresh_after < add_saturated(claims.issued_at, 45) && claims.refresh_after != claims.expires_at)) {
+        claims.refresh_after > add_saturated(claims.issued_at, refresh_maximum) ||
+        (claims.refresh_after < add_saturated(claims.issued_at, refresh_minimum) && claims.refresh_after != claims.expires_at)) {
         invalid();
     }
     return claims;

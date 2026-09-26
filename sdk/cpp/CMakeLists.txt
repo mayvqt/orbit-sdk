@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(orbit_sdk_cpp VERSION 0.2.0 LANGUAGES CXX)
+project(orbit_sdk_cpp VERSION 0.3.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -39,13 +39,17 @@ endif()
 set(ORBIT_SDK_SOURCES
     src/core.cpp
     src/grants.cpp
+    src/installed_storage.cpp
     src/json.cpp
+    src/persistent_codec.cpp
     src/platform.cpp
+    src/persistent_client.cpp
     src/storage.cpp
     src/storage_codec.cpp
     src/storage_linux.cpp
     src/storage_linux_helper.cpp
     src/storage_linux_lease.cpp
+    src/storage_linux_installed.cpp
     src/storage_windows.cpp
     src/transport.cpp
 )

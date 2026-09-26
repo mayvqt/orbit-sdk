@@ -74,9 +74,9 @@ fn entitlements<'de, D: serde::Deserializer<'de>>(
     }
     deserializer.deserialize_map(Entries)
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct Jwk {
+pub(crate) struct Jwk {
     kty: String,
     crv: String,
     alg: String,
@@ -86,12 +86,13 @@ struct Jwk {
     x: String,
     y: String,
 }
-#[derive(Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Jwks {
+    pub(crate) keys: Vec<Jwk>,
 }
 #[derive(Default)]
-pub struct Keys(BTreeMap<String, DecodingKey>);
+pub struct Keys(BTreeMap<String, DecodingKey>, BTreeMap<String, Jwk>);
 impl Keys {
     pub fn parse(value: serde_json::Value) -> Result<Self> {
         let jwks: Jwks = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
@@ -99,6 +100,7 @@ impl Keys {
             return Err(Error::InvalidResponse);
         }
         let mut keys = BTreeMap::new();
+        let mut public_keys = BTreeMap::new();
         for key in jwks.keys {
             if key.kty != "EC"
                 || key.crv != "P-256"
@@ -114,11 +116,22 @@ impl Keys {
             }
             let public = DecodingKey::from_ec_components(&key.x, &key.y)
                 .map_err(|_| Error::InvalidResponse)?;
+            public_keys.insert(key.kid.clone(), key.clone());
             if keys.insert(key.kid, public).is_some() {
                 return Err(Error::InvalidResponse);
             }
         }
-        Ok(Self(keys))
+        Ok(Self(keys, public_keys))
+    }
+    pub(crate) fn public_key(&self, token: &str) -> Result<serde_json::Value> {
+        let key = self
+            .1
+            .get(&header(token)?.kid)
+            .ok_or(Error::InvalidResponse)?;
+        serde_json::to_value(Jwks {
+            keys: vec![key.clone()],
+        })
+        .map_err(|_| Error::InvalidResponse)
     }
     pub fn contains(&self, token: &str) -> Result<bool> {
         Ok(self.0.contains_key(&header(token)?.kid))
@@ -158,7 +171,7 @@ pub struct Expected<'a> {
     pub installation: &'a str,
     pub fingerprint: Option<&'a str>,
     pub fingerprint_provider: Option<&'a str>,
-    pub credential_expires_at: i64,
+    pub credential_expires_at: Option<i64>,
     pub licence_expires_at: Option<i64>,
     pub now: i64,
 }
@@ -180,6 +193,12 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
         .map_err(|_| Error::InvalidResponse)?
         .claims;
     let allowance = if claims.offline_allowed { 86400 } else { 300 };
+    let (refresh_min, refresh_max) =
+        if expected.credential_expires_at.is_none() && claims.offline_allowed {
+            (675, 1125)
+        } else {
+            (45, 75)
+        };
     let bound = match (expected.fingerprint, expected.fingerprint_provider) {
         (None, None) => {
             claims.binding_mode == "none"
@@ -213,15 +232,17 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
         || claims.exp <= expected.now
         || claims.exp <= claims.iat
         || claims.exp > claims.iat.saturating_add(allowance)
-        || claims.exp > expected.credential_expires_at
+        || expected
+            .credential_expires_at
+            .is_some_and(|expiry| claims.exp > expiry)
         || claims.licence_expires_at != expected.licence_expires_at
         || claims
             .licence_expires_at
             .is_some_and(|expiry| claims.exp > expiry)
         || claims.refresh_after <= claims.iat
         || claims.refresh_after > claims.exp
-        || claims.refresh_after > claims.iat.saturating_add(75)
-        || (claims.refresh_after < claims.iat.saturating_add(45)
+        || claims.refresh_after > claims.iat.saturating_add(refresh_max)
+        || (claims.refresh_after < claims.iat.saturating_add(refresh_min)
             && claims.refresh_after != claims.exp)
     {
         return Err(Error::InvalidResponse);
@@ -242,11 +263,14 @@ mod tests {
             "installation_id":"installation","binding_mode":"none","policy_version":1,"entitlements":{"export":true},"refresh_after":NOW+60,"offline_allowed":false})
     }
     fn keys() -> Keys {
-        Keys(BTreeMap::from([(
-            "test-key".into(),
-            DecodingKey::from_ec_pem(include_bytes!("../tests/fixtures/es256-test-public.pem"))
-                .unwrap(),
-        )]))
+        Keys(
+            BTreeMap::from([(
+                "test-key".into(),
+                DecodingKey::from_ec_pem(include_bytes!("../tests/fixtures/es256-test-public.pem"))
+                    .unwrap(),
+            )]),
+            BTreeMap::new(),
+        )
     }
     pub(super) fn expected() -> Expected<'static> {
         Expected {
@@ -258,7 +282,7 @@ mod tests {
             installation: "installation",
             fingerprint: None,
             fingerprint_provider: None,
-            credential_expires_at: NOW + 3600,
+            credential_expires_at: Some(NOW + 3600),
             licence_expires_at: None,
             now: NOW,
         }

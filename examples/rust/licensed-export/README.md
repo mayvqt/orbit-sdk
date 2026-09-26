@@ -1,53 +1,30 @@
-# Rust licensing example
+# Rust licensed export example
 
-Try licence activation and customer sign-in before adding the [SDK](../../../sdk/rust/README.md)
-to your app. The example checks the `export` feature before producing a sample report.
+A small console application that remembers activation across restarts and checks the
+`export` entitlement before creating a synthetic report.
 
-## Run the example
-
-You need Rust/Cargo 1.98.1 or newer. In the Orbit dashboard, select your application and
-**Test** environment. Create a policy with `export` enabled and hardware locking
-off, then issue a licence. Open **Integration** for your API origin, application
-ID, environment ID and grant issuer. The issuer must match exactly; it may differ
-from the API origin.
-
-Run these commands from the extracted kit's root, replacing the four placeholders:
+Use Rust/Cargo 1.98.1 or newer. From this repository's root:
 
 ```sh
-cargo build --locked -p orbit-licensed-export
-./target/debug/orbit-licensed-export API_ORIGIN APP_ID ENVIRONMENT_ID ISSUER
+cargo run -p orbit-licensed-export -- \
+  https://orbit.example.com APP_ID ENVIRONMENT_ID https://orbit.example.com
 ```
 
-On Windows, run `.\target\debug\orbit-licensed-export.exe` with the same arguments.
-The default build requires HTTPS. For a local HTTP service only, add
-`--features local-development` to the build command; HTTP is limited to a literal
-loopback address such as `127.0.0.1`.
+Copy the four public values from **Integration** in your dashboard. The policy must
+include `export`. The example checks existing access first, then asks for a key only
+when activation is unavailable. Purchase keys are entered locally, never passed on the
+command line. Try `export`, `status`, then `quit`; launch again to reuse the activation.
 
-Enter `activate`, paste your licence key at the prompt, then enter `export`.
-Use `status` to view access and expiry. Keep keys and passwords out of command-line
-arguments. Input is visible in this demo's terminal.
+The SDK owns refresh scheduling and installation identity. State uses the OS user state
+directory by default. Add an absolute dedicated directory as the final argument for a
+service or persistent container volume. Only one process can open that directory;
+share a client within your application. `quit` closes the client without releasing its
+device slot. An eligible original offline grant can cover a recognized outage after
+an online recovery attempt. Security failures and strict-online licences fail closed.
 
-## Customer sign-in
+For an isolated local Orbit fixture, build with `--features local-development` and use
+an HTTP literal loopback address. HTTPS certificate checks remain enabled otherwise.
 
-For an Account or Both application, enter `register` and follow the prompts.
-Confirm the link in your email, then enter `login`, `licences` and `select`.
-Choose a licence before running `export`; signing in alone does not grant access.
-
-| Command | What it does |
-| --- | --- |
-| `more` | Shows the next page of licences. |
-| `claim` | Adds another eligible licence key to the signed-in account. |
-| `resend` | Sends a new verification email for this session's pending registration. |
-| `recover` | Requests a password reset email. |
-| `email` | Starts an email change; confirm both mailbox links, then sign in again. |
-| `deactivate` | Releases this device slot once Orbit confirms the request. |
-| `logout` | Clears local access. |
-| `account-logout` | Also revokes the customer session and its activation credentials. |
-| `quit` | Closes the example. |
-
-Neither logout command releases a device slot. Credentials stay in memory, so
-restart requires activation or sign-in again. Pass the printed installation ID as
-the optional final argument to reuse the same installation. The example refreshes
-access while open and checks it before every export.
-
-Source and examples use the [MIT licence](../../../sdk/LICENSE).
+See the [SDK guide](../../../sdk/rust/README.md) for integration and the
+[account APIs](../../../sdk/rust/advanced.md#customer-accounts) for optional customer
+registration and username/password sign-in.

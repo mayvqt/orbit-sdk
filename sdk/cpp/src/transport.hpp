@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace orbit::detail {
 
@@ -17,14 +18,31 @@ struct HttpResponse {
     std::string retry_after;
 };
 
+class CancellationView {
+public:
+    CancellationView(const std::atomic_bool& caller,
+                     std::shared_ptr<const std::atomic_bool> owner = {})
+        : caller_(caller), owner_(std::move(owner)) {}
+    bool load(std::memory_order order = std::memory_order_seq_cst) const noexcept {
+        return caller_.load(order) || (owner_ && owner_->load(order));
+    }
+private:
+    const std::atomic_bool& caller_;
+    std::shared_ptr<const std::atomic_bool> owner_;
+};
+
 class Transport {
 public:
     using TestHandler = std::function<HttpResponse(
         std::string_view method, std::string_view url,
         std::string_view authorization, std::string_view body,
-        const std::atomic_bool& cancelled)>;
+        const CancellationView& cancelled)>;
 
     explicit Transport(std::string_view origin);
+    void bind_owner_cancellation(std::shared_ptr<const std::atomic_bool> owner) {
+        owner_cancelled_ = std::move(owner);
+    }
+    const std::string& origin() const noexcept { return origin_; }
     std::optional<Json::Value> get(std::string_view path,
                                    const std::atomic_bool& cancelled) const;
     std::optional<Json::Value> get_bearer(std::string_view path,
@@ -50,9 +68,10 @@ private:
     std::string endpoint(std::string_view path) const;
     HttpResponse attempt(std::string_view method, std::string_view url,
                          std::string_view body, std::string_view bearer,
-                         const std::atomic_bool& cancelled, long timeout_ms) const;
+                         const CancellationView& cancelled, long timeout_ms) const;
 
     std::string origin_;
+    std::shared_ptr<const std::atomic_bool> owner_cancelled_;
 #ifdef ORBIT_SDK_TESTING
     TestHandler test_handler_;
     std::string trusted_test_ca_file_;

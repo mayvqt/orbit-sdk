@@ -80,7 +80,7 @@ public sealed partial class OrbitClient : IDisposable
     /// <summary>Releases an internally created transport. Injected transports remain caller-owned.</summary>
     public void Dispose()
     {
-        if (ownsTransport && Interlocked.Exchange(ref disposed, 1) == 0) transport.Dispose();
+        DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 
     public Snapshot Snapshot()
@@ -101,6 +101,8 @@ public sealed partial class OrbitClient : IDisposable
                 claims = null;
                 anchor = null;
                 generation++;
+                installed?.DropCache();
+                lifetime?.Signal();
             }
         }
         return SnapshotState();
@@ -108,7 +110,9 @@ public sealed partial class OrbitClient : IDisposable
 
     private Snapshot SnapshotState()
     {
-        var expiry = credential?.CredentialExpiresAt;
+        long? expiry = credential?.CredentialExpiresAt;
+        if (expiry == 0)
+            expiry = null;
         var result = new Snapshot(credential == null ? Access.Denied : Access.RefreshRequired,
             global::Orbit.Sdk.Snapshot.EmptyEntitlements, null, null, expiry, credential == null, false, 0);
         if (claims == null || anchor == null) return result;
@@ -120,13 +124,15 @@ public sealed partial class OrbitClient : IDisposable
             : claims.RefreshAfter <= now ? Access.RefreshRequired : Access.Online;
         var usable = access is Access.Online or Access.Offline;
         return new Snapshot(access, usable ? claims.Entitlements : global::Orbit.Sdk.Snapshot.EmptyEntitlements,
-            claims.ExpiresAt, claims.RefreshAfter, expiry, expiry == null || expiry <= now + 86400,
+            claims.ExpiresAt, claims.RefreshAfter, expiry, expiry != null && expiry <= now + 86400,
             claims.OfflineAllowed, usable && claims.OfflineAllowed ? claims.ExpiresAt - now : 0)
         { PolicyVersion = claims.PolicyVersion };
     }
 
     private void SyncStorage()
     {
+        if (Volatile.Read(ref disposed) != 0)
+            throw new OrbitException(OrbitError.Cancelled);
         long version;
         try { version = storage.Version; }
         catch (Exception)
@@ -140,7 +146,11 @@ public sealed partial class OrbitClient : IDisposable
 
     private void InvalidateStorage()
     {
-        try { storageVersion = storage.Invalidate(); }
+        try
+        {
+            storageVersion = storage.Invalidate();
+            lifetime?.Signal();
+        }
         catch (Exception) { Clear(); throw new OrbitException(OrbitError.Storage); }
     }
 
@@ -172,17 +182,19 @@ public sealed partial class OrbitClient : IDisposable
         lock (gate) { Clear(); InvalidateStorage(); }
     }
 
-    public Task<Snapshot> ActivateAsync(string licenceKey, string idempotencyKey,
+    public Task<Snapshot> ActivateAsync(string licenceKey, string? idempotencyKey = null,
         CancellationToken cancellationToken = default) => ActivateWithPreviousAsync(licenceKey, null, idempotencyKey, cancellationToken);
 
-    public Task<Snapshot> ActivateWithPreviousAsync(string licenceKey, string? previousCredential, string idempotencyKey,
+    public Task<Snapshot> ActivateWithPreviousAsync(string licenceKey, string? previousCredential, string? idempotencyKey,
         CancellationToken cancellationToken = default) => ActivateAsAsync(licenceKey, false, previousCredential, idempotencyKey, cancellationToken);
 
     private async Task<Snapshot> ActivateAsAsync(string principal, bool account, string? previousCredential,
-        string idempotencyKey, CancellationToken cancellationToken)
+        string? idempotencyKey, CancellationToken cancellationToken)
     {
+        using var ownedOperation = InstallationOperation(cancellationToken);
+        cancellationToken = ownedOperation?.Token ?? cancellationToken;
         if ((account ? !JsonWire.Opaque(principal) : principal.Length is < 1 or > 256) ||
-            !JsonWire.OperationId(idempotencyKey) || (previousCredential != null && !JsonWire.Bearer(previousCredential)))
+            (idempotencyKey == null ? installed == null : !JsonWire.OperationId(idempotencyKey)) || (previousCredential != null && !JsonWire.Bearer(previousCredential)))
             throw new OrbitException(OrbitError.Configuration);
         var expected = Generation();
         await EnterSerialAsync(cancellationToken).ConfigureAwait(false);
@@ -194,11 +206,16 @@ public sealed partial class OrbitClient : IDisposable
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
                 customerSession = account ? (session?.Token ?? throw new OrbitException(OrbitError.ReauthenticationRequired)) : null;
+                if (installed != null)
+                    (idempotencyKey, storageVersion) = installed.Begin(principal, account, previousCredential, idempotencyKey);
                 Clear(account);
-                InvalidateStorage();
+                if (installed == null)
+                    InvalidateStorage();
                 expected = generation;
             }
             var body = DeviceBody();
+            if (installed != null)
+                body["credential_mode"] = "persistent";
             body["previous_credential"] = previousCredential;
             body["idempotency_key"] = idempotencyKey;
             if (account) { body["customer_session"] = customerSession; body["licence_id"] = principal; }
@@ -211,6 +228,8 @@ public sealed partial class OrbitClient : IDisposable
 
     public async Task<Snapshot> RefreshAsync(CancellationToken cancellationToken = default)
     {
+        using var ownedOperation = InstallationOperation(cancellationToken);
+        cancellationToken = ownedOperation?.Token ?? cancellationToken;
         var expected = Generation();
         await EnterSerialAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -220,6 +239,8 @@ public sealed partial class OrbitClient : IDisposable
             {
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
+                if (installed?.Record.PendingActivation != null)
+                    throw new OrbitException(OrbitError.Storage, "pending_activation");
                 saved = credential ?? throw new OrbitException(OrbitError.ReauthenticationRequired);
             }
             return await RequestGrantAsync($"/api/client/v1/activations/{saved.ActivationId}/validate",
@@ -255,7 +276,11 @@ public sealed partial class OrbitClient : IDisposable
             SyncStorage();
             snapshot = SnapshotState();
             if (snapshot.Access is not (Access.Online or Access.Offline))
+            {
+                if (installed != null && credential != null && transient)
+                    throw new OrbitException(OrbitError.Transient);
                 throw new OrbitException(OrbitError.Denied, "access_unavailable");
+            }
             if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
                 throw new OrbitException(OrbitError.Denied, "feature_unavailable");
             return snapshot;
@@ -276,6 +301,8 @@ public sealed partial class OrbitClient : IDisposable
 
     private async Task<Snapshot> RefreshIfDueAsync(CancellationToken cancellationToken)
     {
+        using var ownedOperation = InstallationOperation(cancellationToken);
+        cancellationToken = ownedOperation?.Token ?? cancellationToken;
         await EnterSerialAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -287,6 +314,8 @@ public sealed partial class OrbitClient : IDisposable
                 OrbitException.CheckCancellation(cancellationToken);
                 if (snapshot.Access is not (Access.RefreshRequired or Access.Expired or Access.Offline) || !RetryDueLocked())
                     return snapshot;
+                if (installed?.Record.PendingActivation != null)
+                    throw new OrbitException(OrbitError.Storage, "pending_activation");
                 saved = credential ?? throw new OrbitException(OrbitError.ReauthenticationRequired);
                 expected = generation;
             }
@@ -374,8 +403,15 @@ public sealed partial class OrbitClient : IDisposable
             {
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
-                if (operation.IsCancellationRequested) throw new OrbitException(OrbitError.Transient);
-                try { storage.Save(storageVersion, verified.Credential); }
+                if (operation.IsCancellationRequested)
+                    throw new OrbitException(OrbitError.Transient);
+                try
+                {
+                    if (installed != null)
+                        installed.Commit(storageVersion, verified.Credential, response!.Value, keys, verified.Anchor);
+                    else
+                        storage.Save(storageVersion, verified.Credential);
+                }
                 catch (Exception error)
                 {
                     throw new OrbitException(error is OrbitException { Error: OrbitError.StaleResponse } ? OrbitError.StaleResponse : OrbitError.Storage);
@@ -385,6 +421,11 @@ public sealed partial class OrbitClient : IDisposable
                 anchor = verified.Anchor;
                 transient = false;
                 nextRetryElapsedTicks = 0;
+                if (lifetime != null)
+                {
+                    lifetime.Restoring = false;
+                    lifetime.Signal();
+                }
                 return SnapshotState();
             }
         }
@@ -404,19 +445,33 @@ public sealed partial class OrbitClient : IDisposable
                         // Keep only the credential that was already stored for a later retry.
                         generation++;
                         claims = null;
+                        installed?.DropCache();
                     }
+                    var wasTransient = transient;
                     transient = true;
                     try { nextRetryElapsedTicks = CreateRetryDeadline(Clock.ElapsedTicks()); }
                     catch (OrbitException) { nextRetryElapsedTicks = long.MaxValue; }
                     catch (OverflowException) { nextRetryElapsedTicks = long.MaxValue; }
                     catch (CryptographicException) { nextRetryElapsedTicks = long.MaxValue; }
                     var snapshot = SnapshotState();
-                    if (snapshot.Access == Access.Offline) return snapshot;
+                    lifetime?.Signal();
+                    if (snapshot.Access == Access.Offline)
+                    {
+                        if (lifetime != null && (!wasTransient || lifetime.Restoring))
+                        {
+                            lifetime.Restoring = false;
+                            CheckpointInstalled(true);
+                        }
+                        return snapshot;
+                    }
                 }
                 else if (error.Error != OrbitError.Cancelled)
                 {
                     Clear();
-                    InvalidateStorage();
+                    if (installed != null && error.Error != OrbitError.Denied)
+                        storageVersion = installed.Invalidate(clearPending: false);
+                    else
+                        InvalidateStorage();
                 }
                 throw error;
             }
@@ -433,10 +488,14 @@ public sealed partial class OrbitClient : IDisposable
             JsonWire.String(reply, "binding_mode") != (device.Fingerprint == null ? "none" : "hwid")) throw JsonWire.Invalid();
         var verifiedAnchor = new ClockAnchor(JsonWire.Timestamp(JsonWire.String(reply, "server_time")), started);
         var now = verifiedAnchor.Now();
-        var expiry = JsonWire.Timestamp(JsonWire.String(reply, "credential_expires_at"));
+        var expiryField = JsonWire.Field(reply, "credential_expires_at");
+        long? expiry = expiryField.ValueKind == JsonValueKind.Null ? null : JsonWire.Timestamp(JsonWire.Text(expiryField));
+        if (previous == null && (installed == null ? expiry == null : expiry != null))
+            throw JsonWire.Invalid();
         var bearer = JsonWire.OptionalString(reply, "credential");
         if (expiry <= now || expiry > now + 30 * 86400 || (previous != null &&
-            (activation != previous.ActivationId || expiry != previous.CredentialExpiresAt || bearer != null))) throw JsonWire.Invalid();
+            (activation != previous.ActivationId || expiry != (previous.CredentialExpiresAt == 0 ? null : (long?)previous.CredentialExpiresAt) || bearer != null)))
+            throw JsonWire.Invalid();
         var token = JsonWire.String(reply, "grant");
         if (!keys.Contains(token))
         {
@@ -450,9 +509,14 @@ public sealed partial class OrbitClient : IDisposable
         if (bearer == null || !JsonWire.Bearer(bearer)) throw JsonWire.Invalid();
         var saved = new StoredCredential
         {
-            ApplicationId = config.ApplicationId, EnvironmentId = config.EnvironmentId,
-            ActivationId = activation, LicenceId = verified.LicenceId, InstallationId = device.InstallationId,
-            Credential = bearer, CredentialExpiresAt = expiry, Fingerprint = device.Fingerprint,
+            ApplicationId = config.ApplicationId,
+            EnvironmentId = config.EnvironmentId,
+            ActivationId = activation,
+            LicenceId = verified.LicenceId,
+            InstallationId = device.InstallationId,
+            Credential = bearer,
+            CredentialExpiresAt = expiry ?? 0,
+            Fingerprint = device.Fingerprint,
             FingerprintProvider = device.FingerprintProvider
         };
         return (saved, verified, verifiedAnchor);

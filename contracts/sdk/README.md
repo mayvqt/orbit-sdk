@@ -5,8 +5,8 @@ These Orbit-authored shared SDK fixtures are available under the
 
 [grants.json](grants.json) contains fixed ES256 tokens signed with the existing
 synthetic key in `sdk/rust/tests/fixtures`. This is public test material, never a
-production signing key. Eight valid and 83 invalid cases cover scope, claim types,
-time/lifetime limits, binding, duplicate fields, boolean entitlements, JOSE headers,
+production signing key. Twelve valid and 89 invalid cases cover scope, claim types,
+time/lifetime limits, negotiated refresh timing, binding, duplicate fields, boolean entitlements, JOSE headers,
 signature/encoding rejection and bounded trusted JWKS handling.
 
 The grant-verifying Rust, Go, C#, C++, and Python SDKs consume the same bytes

@@ -18,10 +18,13 @@ bindings and expiry values. Keep the SDK and corpus from the same download.
 
 ```sh
 dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --security
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --installed
 ```
 
 This suite checks cancellation, retries, logout, offline expiry, malformed
-responses, device parsing and credential storage. Test HTTP servers bind to
+responses, device parsing and credential storage. The installed suite also covers
+first activation, restart, cached access, uncertain mutations, private file ownership,
+clock failure, cancellation and automatic refresh. Test HTTP servers bind to
 loopback only. The build flag permits those local test connections; ordinary
 application builds require HTTPS.
 

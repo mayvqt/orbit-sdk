@@ -1,6 +1,7 @@
 #include "core.hpp"
 
 #include "error.hpp"
+#include "storage_windows.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -17,6 +19,9 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
 
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
@@ -55,7 +60,7 @@ Corpus load_corpus() {
     std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     auto value = parse_json(bytes, 2 * 1024 * 1024);
     require(value["format_version"].asInt() == 1, "unexpected grant corpus version");
-    require(value["cases"].isArray() && value["cases"].size() == 91, "shared corpus must contain all 91 vectors");
+    require(value["cases"].isArray() && value["cases"].size() == 101, "shared corpus must contain all 101 vectors");
     return {value, value["jwks"], value["expected"]};
 }
 
@@ -193,7 +198,7 @@ GrantExpected vector_expected(const Json::Value& value) {
     return GrantExpected{
         issuer, application, environment,
         lic, activation, installation, fp, prov,
-        value["credential_expires_at"].asInt64(),
+        value["credential_expires_at"].isNull() ? std::nullopt : std::optional<std::int64_t>(value["credential_expires_at"].asInt64()),
         value["licence_expires_at"].isNull() ? std::nullopt : std::optional<std::int64_t>(value["licence_expires_at"].asInt64()),
         value["now"].asInt64(),
     };
@@ -220,7 +225,7 @@ void test_shared_grant_vectors(const Corpus& corpus) {
         require(accepted == expected_valid, "grant vector mismatch: " + text(item, "name"));
         expected_valid ? ++valid : ++invalid;
     }
-    require(valid == 8 && invalid == 83, "grant corpus valid/invalid case counts changed");
+    require(valid == 12 && invalid == 89, "grant corpus valid/invalid case counts changed");
 
     std::string strict_token;
     for (const auto& item : corpus.value["cases"]) {
@@ -299,16 +304,23 @@ struct TestStorage final : CredentialStorage {
     }
 };
 
-Json::Value activation_reply(const Json::Value& corpus, bool offline = false) {
+Json::Value activation_reply(const Json::Value& corpus, bool offline = false,
+                             std::string_view installation = "installation_123456",
+                             bool persistent = false, bool include_credential = true) {
     const auto wanted = offline ? "desktop-valid" : "strict-valid";
     for (const auto& item : corpus["cases"]) {
         if (item["name"] == wanted) {
             Json::Value reply(Json::objectValue);
             reply["activation_id"] = "activation";
-            reply["installation_id"] = "installation_123456";
-            reply["credential"] = std::string(43, 'c');
-            reply["credential_expires_at"] = "2027-01-16T09:00:00Z";
-            reply["grant"] = token_for_installation(text(item, "token"), "installation_123456");
+            reply["installation_id"] = std::string(installation);
+            if (include_credential) reply["credential"] = std::string(43, 'c');
+            reply["credential_expires_at"] = persistent
+                ? Json::Value(Json::nullValue) : Json::Value("2027-01-16T09:00:00Z");
+            auto grant = token_for_installation(text(item, "token"), installation);
+            if (persistent && offline) {
+                grant = token_with_claim(grant, "refresh_after", Json::Int64{1800000900});
+            }
+            reply["grant"] = std::move(grant);
             reply["server_time"] = "2027-01-15T08:00:00Z";
             reply["binding_mode"] = "none";
             reply["fingerprint_provider"] = Json::nullValue;
@@ -341,7 +353,13 @@ struct ApiFixture {
     std::atomic_int forced_jwks_failures{0};
     std::atomic_bool offline_refresh{false};
     std::atomic_bool offline_activation{false};
+    std::atomic_bool persistent_mode{false};
+    std::atomic_bool malformed_activation{false};
+    std::atomic_bool finite_persistent_response{false};
+    std::atomic_bool missing_expiry{false};
     std::atomic_bool pre_epoch_server_time{false};
+    std::string last_activation_idempotency;
+    std::string last_previous_credential;
     std::shared_ptr<Gate> activation_gate;
     std::shared_ptr<Gate> sessions_gate;
     std::shared_ptr<Gate> logout_gate;
@@ -356,7 +374,7 @@ struct ApiFixture {
 
     Transport::TestHandler handler() {
         return [this](std::string_view method, std::string_view url, std::string_view bearer_value,
-                      std::string_view body, const std::atomic_bool& cancelled) {
+                      std::string_view body, const CancellationView& cancelled) {
             (void)cancelled;
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -383,17 +401,33 @@ struct ApiFixture {
                 if (activation_gate) activation_gate->block();
                 ++activation_calls;
                 const auto input = parse_json(body);
-                require(input["installation_id"].asString() == "installation_123456", "activation installation mismatch");
+                require(input["installation_id"].isString() &&
+                            input["installation_id"].asString().size() >= 16,
+                        "activation installation mismatch");
                 require(input["application_id"].asString() == "app" && input["environment_id"].asString() == "test",
                         "activation scope missing");
-                auto reply = activation_reply(corpus, offline_activation.load());
+                const auto installation = input["installation_id"].asString();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    last_activation_idempotency = input["idempotency_key"].asString();
+                    last_previous_credential = input["previous_credential"].isString()
+                        ? input["previous_credential"].asString() : std::string{};
+                }
+                if (input["credential_mode"] == "persistent") persistent_mode = true;
+                if (malformed_activation.load()) return HttpResponse{200, R"({"bad":true})", {}};
+                auto reply = activation_reply(corpus, offline_activation.load(), installation,
+                    persistent_mode.load() && !finite_persistent_response.load());
+                if (missing_expiry.load()) reply.removeMember("credential_expires_at");
                 if (pre_epoch_server_time.load()) reply["server_time"] = "1969-12-31T23:59:59Z";
                 return HttpResponse{200, encode_json(reply), {}};
             }
             if (route.find("/api/client/v1/activations/") == 0 && route.find("/validate") != std::string_view::npos) {
                 ++validate_calls;
                 if (offline_refresh.load()) return HttpResponse{503, "{}", "0"};
-                return HttpResponse{200, encode_json(activation_reply(corpus, true)), {}};
+                Json::Value input_value = parse_json(body);
+                const auto installation = input_value["installation_id"].asString();
+                return HttpResponse{200, encode_json(activation_reply(
+                    corpus, offline_activation.load(), installation, persistent_mode.load(), false)), {}};
             }
             if (route == "/api/client/v1/sessions") {
                 if (sessions_gate) sessions_gate->block();
@@ -474,6 +508,19 @@ struct ApiFixture {
 
 Client client_for(ApiFixture& fixture) {
     return make_test_client(config(), Transport("https://example.test", fixture.handler()), fixture.storage);
+}
+
+std::string persistent_test_path() {
+    return (std::filesystem::temp_directory_path() /
+            ("orbit-cpp-installed-test-" + new_installation_id())).string();
+}
+
+Client persistent_client_for(ApiFixture& fixture, const std::string& path) {
+    auto setup = config();
+    setup.installation_id.reset();
+    auto storage = open_installed_storage(setup, path);
+    return make_test_installed_client(setup,
+        Transport("https://example.test", fixture.handler()), std::move(storage));
 }
 
 void test_activation_accounts_and_proofs(const Corpus& corpus) {
@@ -759,6 +806,473 @@ struct FakeClock {
     }
 };
 
+template <class Predicate>
+bool wait_for_condition(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+void test_persistent_close_cancels_foreground(const Corpus& corpus) {
+    FakeClock clock;
+    for (const bool activation : {false, true}) {
+        const auto path = persistent_test_path();
+        auto setup = config();
+        setup.installation_id.reset();
+        ApiFixture fixture(corpus.value);
+        fixture.offline_activation = true;
+        auto delegate = fixture.handler();
+        std::atomic_bool block{false}, entered{false}, observed_cancel{false};
+        auto state = open_installed_state(setup, Transport("https://example.test",
+            [&](auto method, auto url, auto bearer_value, auto body, const auto& cancelled) {
+                if (block.load() && url.find("/activations") != std::string_view::npos) {
+                    entered = true;
+                    observed_cancel = wait_for_condition([&] { return cancelled.load(); });
+                }
+                // Deliberately return a successful response after observing close.
+                return delegate(method, url, bearer_value, body, cancelled);
+            }), open_installed_storage(setup, path));
+        std::atomic_bool inactive{false};
+        if (!activation) (void)state->activate("close-key", {}, std::nullopt, inactive);
+        block = true;
+        std::atomic_int first{-1}, queued{-1};
+        std::thread request([&] {
+            try {
+                if (activation) (void)state->activate("close-key", {}, std::nullopt, inactive);
+                else (void)state->refresh(inactive);
+            } catch (const Error& error) { first = static_cast<int>(error.kind()); }
+        });
+        const bool request_entered = wait_for_condition([&] { return entered.load(); });
+        std::thread waiting([&] {
+            try { (void)state->refresh(inactive); }
+            catch (const Error& error) { queued = static_cast<int>(error.kind()); }
+        });
+        const bool both_active = wait_for_condition([&] {
+            std::lock_guard<std::mutex> lock(state->lifecycle_mutex);
+            return state->active_calls == 2;
+        });
+        const auto started = std::chrono::steady_clock::now();
+        state->close();
+        request.join();
+        waiting.join();
+        require(request_entered && both_active && observed_cancel &&
+                    std::chrono::steady_clock::now() - started < std::chrono::seconds(1),
+                "installed close must cancel foreground transport and serial waits promptly");
+        require(first == static_cast<int>(ErrorKind::cancelled) &&
+                    queued == static_cast<int>(ErrorKind::cancelled),
+                "close must reject both late success and queued foreground work");
+        auto storage = open_installed_storage(setup, path);
+        const auto record = persistent_codec::decode(setup, storage->provider(), *storage->load());
+        require(activation ? (record["credential"].isNull() && !record["pending_activation"].isNull())
+                           : (!record["credential"].isNull() && !record["access"].isNull()),
+                "close must preserve saved activation or unresolved replay identity without late acceptance");
+        storage.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
+
+void test_owner_cancellation_during_backoff() {
+    auto owner = std::make_shared<std::atomic_bool>(false);
+    std::atomic_bool inactive{false};
+    std::atomic_int requests{0}, result{-1};
+    Transport transport("https://example.test", [&](auto, auto, auto, auto, const auto&) {
+        ++requests;
+        return HttpResponse{503, "{}", "10"};
+    });
+    transport.bind_owner_cancellation(owner);
+    std::thread request([&] {
+        try { (void)transport.get("/api/client/v1/status", inactive); }
+        catch (const Error& error) { result = static_cast<int>(error.kind()); }
+    });
+    const bool started = wait_for_condition([&] { return requests.load() != 0; });
+    const auto cancelled_at = std::chrono::steady_clock::now();
+    owner->store(true);
+    request.join();
+    require(started && requests == 1 && result == static_cast<int>(ErrorKind::cancelled) &&
+                std::chrono::steady_clock::now() - cancelled_at < std::chrono::seconds(1),
+            "owner cancellation must interrupt transport retry backoff");
+}
+
+class FailingInstalledStorage final : public InstalledStorage {
+public:
+    explicit FailingInstalledStorage(std::shared_ptr<InstalledStorage> wrapped)
+        : wrapped_(std::move(wrapped)) {}
+    bool initialization_needed() const noexcept override { return wrapped_->initialization_needed(); }
+    std::optional<std::string> load() override { return wrapped_->load(); }
+    void initialize(std::string_view bytes) override { wrapped_->initialize(bytes); }
+    void save(std::string_view bytes) override {
+        if (fail.load()) {
+            ++failed_writes;
+            throw Error(1, ErrorKind::storage, "installation_state_write_failed", {});
+        }
+        wrapped_->save(bytes);
+    }
+    std::string_view provider() const noexcept override { return wrapped_->provider(); }
+    std::atomic_bool fail{false};
+    std::atomic_int failed_writes{0};
+private:
+    std::shared_ptr<InstalledStorage> wrapped_;
+};
+
+void test_persistent_worker_stops_on_storage_failure(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    auto setup = config();
+    setup.installation_id.reset();
+    ApiFixture fixture(corpus.value);
+    fixture.offline_activation = true;
+    auto storage = std::make_shared<FailingInstalledStorage>(open_installed_storage(setup, path));
+    auto state = open_installed_state(setup, Transport("https://example.test", fixture.handler()), storage);
+    std::atomic_bool inactive{false};
+    (void)state->activate("disk-failure-key", {}, std::nullopt, inactive);
+    storage->fail = true;
+    clock.advance(900);
+    state->wake_worker();
+    const bool failed = wait_for_condition([&] { return state->persistence_failed.load(); });
+    bool authority_cleared = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        authority_cleared = !state->claims && !state->anchor;
+    }
+    state->close();
+    require(failed && authority_cleared && state->worker_cancelled.load() &&
+                fixture.validate_calls == 1 && storage->failed_writes == 1,
+            "one failed refresh persistence must clear runtime authority and stop worker retries");
+    storage.reset();
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_invalid_cache_clock_recovers_credential(const Corpus& corpus) {
+    FakeClock clock;
+    for (const int mutation : {0, 1, 2}) {
+        for (const bool outage : {false, true}) {
+            const auto path = persistent_test_path();
+            ApiFixture first(corpus.value);
+            first.offline_activation = true;
+            auto client = persistent_client_for(first, path);
+            (void)client.activate("invalid-cache-clock-key");
+            client.close();
+            auto setup = config();
+            setup.installation_id.reset();
+            {
+                auto storage = open_installed_storage(setup, path);
+                auto record = persistent_codec::decode(setup, storage->provider(), *storage->load());
+                auto& access = record["access"];
+                if (mutation == 0) access["server_high_water"] = Json::Int64(json_int64(access["received_server_time"]) - 1);
+                else if (mutation == 1) access["wall_high_water"] = Json::Int64(json_int64(access["received_wall_time"]) - 1);
+                else access["server_high_water"] = Json::Int64(json_int64(access["server_high_water"]) + 40);
+                storage->save(persistent_codec::encode(setup, storage->provider(), record));
+            }
+            ApiFixture recovery(corpus.value);
+            recovery.persistent_mode = true;
+            recovery.offline_activation = true;
+            recovery.offline_refresh = outage;
+            auto reopened = persistent_client_for(recovery, path);
+            const auto snapshot = parse_json(reopened.snapshot());
+            require(snapshot["access"] == (outage ? "refresh_required" : "online") &&
+                        !snapshot["reauthentication_required"].asBool() &&
+                        recovery.activation_calls == 0 && recovery.validate_calls == (outage ? 3 : 1),
+                    "invalid cache clock must preserve the credential for online validation only");
+            reopened.close();
+            if (outage) {
+                {
+                    auto storage = open_installed_storage(setup, path);
+                    const auto record = persistent_codec::decode(setup, storage->provider(), *storage->load());
+                    require(record["access"].isNull() && !record["credential"].isNull(),
+                            "invalid offline cache must be durably discarded without removing credential");
+                }
+                recovery.offline_refresh = false;
+                auto online = persistent_client_for(recovery, path);
+                require(parse_json(online.snapshot())["access"] == "online" && recovery.activation_calls == 0,
+                        "saved credential must recover after invalid clock cache and boot outage");
+                online.close();
+            }
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    }
+}
+
+#if defined(_WIN32)
+void test_windows_interrupted_installed_write(const Corpus& corpus) {
+    FakeClock clock;
+    using storage_windows::InstalledWriteFault;
+    for (const auto stage : {InstalledWriteFault::fenced, InstalledWriteFault::temporary_written,
+                             InstalledWriteFault::replaced}) {
+        const auto path = persistent_test_path();
+        ApiFixture fixture(corpus.value);
+        fixture.offline_activation = true;
+        auto client = persistent_client_for(fixture, path);
+        (void)client.activate("interrupted-invalidation-key");
+        client.close();
+        auto setup = config();
+        setup.installation_id.reset();
+        {
+            auto storage = open_installed_storage(setup, path);
+            auto record = persistent_codec::decode(setup, storage->provider(), *storage->load());
+            require(!record["access"].isNull(), "fault test needs prior signed authority");
+            record["access"] = Json::nullValue;
+            record["credential"] = Json::nullValue;
+            storage_windows::set_installed_write_fault(stage);
+            try {
+                expect_error([&] { storage->save(persistent_codec::encode(setup, storage->provider(), record)); },
+                             ErrorKind::storage);
+            } catch (...) {
+                storage_windows::set_installed_write_fault(InstalledWriteFault::none);
+                throw;
+            }
+            storage_windows::set_installed_write_fault(InstalledWriteFault::none);
+        }
+        expect_error([&] { (void)open_installed_storage(setup, path); }, ErrorKind::storage);
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
+#endif
+
+void test_persistent_online_restart_and_offline_recovery(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    std::int64_t original_expiry = 0;
+    std::string installation;
+    {
+        ApiFixture first(corpus.value);
+        first.offline_activation = true;
+        auto client = persistent_client_for(first, path);
+        require(first.activation_calls == 0 && first.validate_calls == 0,
+                "fresh installed open must not make a network request");
+        installation = client.installation_id();
+        const auto activated = parse_json(client.activate("persistent-license-key"));
+        require(activated["access"] == "online" &&
+                    activated["credential_expires_at"].isNull(),
+                "persistent activation must explicitly negotiate a null credential expiry");
+        require(first.persistent_mode.load() && first.activation_calls == 1,
+                "key-first activation must request persistent credential mode");
+        original_expiry = json_int64(activated["expires_at"]);
+        client.close();
+    }
+#if defined(__linux__)
+    struct stat directory_info{};
+    struct stat file_info{};
+    const auto data_path = (std::filesystem::path(path) / "orbit-installed.state").string();
+    require(::stat(path.c_str(), &directory_info) == 0 &&
+                (directory_info.st_mode & 0777) == 0700,
+            "installed state directory must be private");
+    require(::stat(data_path.c_str(), &file_info) == 0 &&
+                (file_info.st_mode & 0777) == 0600,
+            "installed state file must be private");
+#endif
+    {
+        std::ifstream input(std::filesystem::path(path) / "orbit-installed.state", std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(input)), {});
+        require(bytes.find("persistent-license-key") == std::string::npos,
+                "persistent state must not contain the raw licence key");
+    }
+    {
+        ApiFixture online(corpus.value);
+        online.persistent_mode = true;
+        online.offline_activation = true;
+        auto client = persistent_client_for(online, path);
+        require(client.installation_id() == installation && online.validate_calls == 1 &&
+                    online.activation_calls == 0,
+                "restart must reuse the installation and validate without asking for a key");
+        const auto state = parse_json(client.snapshot());
+        require(state["access"] == "online" &&
+                    json_int64(state["expires_at"]) == original_expiry,
+                "online restart must retain the original signed grant deadline");
+        client.close();
+    }
+    {
+        ApiFixture offline(corpus.value);
+        offline.persistent_mode = true;
+        offline.offline_activation = true;
+        offline.offline_refresh = true;
+        auto client = persistent_client_for(offline, path);
+        const auto state = parse_json(client.snapshot());
+        require(offline.validate_calls == 3 && state["access"] == "offline" &&
+                    json_int64(state["expires_at"]) == original_expiry,
+                "transient validation may restore only the original offline-enabled grant");
+        require(parse_json(client.require_access("export"))["access"] == "offline",
+                "offline restart must still enforce access through require_access");
+        client.close();
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_uncertain_activation_reuses_identity(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    std::string first_operation;
+    {
+        ApiFixture malformed(corpus.value);
+        malformed.malformed_activation = true;
+        auto client = persistent_client_for(malformed, path);
+        expect_error([&] { (void)client.activate("same-key-after-restart"); },
+                     ErrorKind::invalid_response);
+        {
+            std::lock_guard<std::mutex> lock(malformed.mutex);
+            first_operation = malformed.last_activation_idempotency;
+        }
+        require(first_operation.size() >= 16 && malformed.activation_calls == 1,
+                "uncertain activation must save its operation identity before sending");
+        expect_error([&] { (void)client.activate("different-key"); }, ErrorKind::configuration);
+        require(malformed.activation_calls == 1,
+                "changed activation input must not be sent while recovery is pending");
+        client.close();
+    }
+    {
+        ApiFixture recovered(corpus.value);
+        recovered.persistent_mode = true;
+        recovered.offline_activation = true;
+        auto client = persistent_client_for(recovered, path);
+        require(recovered.validate_calls == 0,
+                "open with pending activation must leave its retry identity untouched");
+        (void)client.activate("same-key-after-restart");
+        {
+            std::lock_guard<std::mutex> lock(recovered.mutex);
+            require(recovered.last_activation_idempotency == first_operation,
+                    "same uncertain key must reuse its operation ID after restart");
+        }
+        client.close();
+    }
+    auto setup = config();
+    setup.installation_id.reset();
+    {
+        auto installed = open_installed_storage(setup, path);
+        const auto bytes = installed->load();
+        require(bytes.has_value(), "accepted retry must leave a durable installation record");
+        const auto record = persistent_codec::decode(setup, installed->provider(), *bytes);
+        require(record["pending_activation"].isNull(),
+                "verified durable acceptance must clear the pending mutation");
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_previous_rebind_and_expiry_contract(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    {
+        ApiFixture fixture(corpus.value);
+        fixture.offline_activation = true;
+        auto client = persistent_client_for(fixture, path);
+        const std::string supplied(43, 'p');
+        (void)client.activate_previous("rebind-key", supplied,
+                                        "explicit-rebind-operation-123");
+        {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            require(fixture.last_previous_credential == supplied,
+                    "fresh persistent installation must send the caller's previous credential");
+        }
+        client.close();
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+
+    for (const bool omit_expiry : {true, false}) {
+        const auto invalid_path = persistent_test_path();
+        ApiFixture fixture(corpus.value);
+        fixture.finite_persistent_response = !omit_expiry;
+        fixture.missing_expiry = omit_expiry;
+        auto client = persistent_client_for(fixture, invalid_path);
+        expect_error([&] { (void)client.activate("persistent-mode-key"); },
+                     ErrorKind::invalid_response);
+        client.close();
+        std::filesystem::remove_all(invalid_path, ignored);
+    }
+}
+
+void test_persistent_strict_outage_is_not_activation_required(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    {
+        ApiFixture fixture(corpus.value);
+        auto client = persistent_client_for(fixture, path);
+        (void)client.activate("strict-restart-key");
+        client.close();
+    }
+    {
+        ApiFixture outage(corpus.value);
+        outage.persistent_mode = true;
+        outage.offline_refresh = true;
+        auto client = persistent_client_for(outage, path);
+        expect_error([&] { (void)client.require_access("export"); }, ErrorKind::transient);
+        expect_error([&] { (void)client.require_access("export"); }, ErrorKind::transient);
+        require(outage.activation_calls == 0 && outage.validate_calls == 3,
+                "strict outage must preserve activation and honor the refresh backoff");
+        client.close();
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_close_discards_invalid_clock(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    {
+        ApiFixture fixture(corpus.value);
+        fixture.offline_activation = true;
+        auto client = persistent_client_for(fixture, path);
+        (void)client.activate("clock-checkpoint-key");
+        clock.wall.fetch_sub(1);
+        expect_error([&] { client.close(); }, ErrorKind::clock_uncertain);
+        client.close();
+    }
+    auto setup = config();
+    setup.installation_id.reset();
+    {
+        auto installed = open_installed_storage(setup, path);
+        const auto record = persistent_codec::decode(
+            setup, installed->provider(), *installed->load());
+        require(record["access"].isNull() && !record["credential"].isNull(),
+                "failed clock checkpoint must discard the grant durably and release the lease");
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_persistent_storage_format_and_contention() {
+    Config setup = config();
+    setup.installation_id.reset();
+    const auto path = persistent_test_path();
+    setup.installation_id = new_installation_id();
+    auto record = persistent_codec::empty_record(setup, installed_provider());
+    const auto bytes = persistent_codec::encode(setup, installed_provider(), record);
+    auto decoded = persistent_codec::decode(setup, installed_provider(), bytes);
+    require(decoded["format"].asInt() == 2 && decoded["credential"].isNull(),
+            "format-2 initialization record must contain required nullable fields");
+    expect_error([&] {
+        (void)persistent_codec::decode(setup, installed_provider() == "private_file"
+            ? "windows_dpapi" : "private_file", bytes);
+    }, ErrorKind::corrupt_state);
+    auto changed_scope = setup;
+    changed_scope.issuer += "/other";
+    expect_error([&] { (void)persistent_codec::decode(changed_scope, installed_provider(), bytes); },
+                 ErrorKind::corrupt_state);
+    const std::string duplicate = "{\"sdk\":\"orbit.installed-client\",\"sdk\":\"tampered\"," +
+        bytes.substr(bytes.find(',') + 1);
+    expect_error([&] { (void)persistent_codec::decode(setup, installed_provider(), duplicate); },
+                 ErrorKind::corrupt_state);
+
+    {
+        auto installed = open_installed_storage(setup, path);
+        require(installed->initialization_needed(), "new store must request durable initialization");
+        installed->initialize(bytes);
+        expect_error([&] { (void)open_installed_storage(setup, path); },
+                     ErrorKind::installation_in_use);
+    }
+    std::filesystem::remove(std::filesystem::path(path) / "orbit-installed.state");
+    expect_error([&] { (void)open_installed_storage(setup, path); }, ErrorKind::corrupt_state);
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
 void test_clock_anchor_bounds() {
     FakeClock clock;
     const auto elapsed = clock.elapsed.load();
@@ -830,10 +1344,23 @@ int main() {
         test_activation_accounts_and_proofs(corpus);
         test_unauthenticated_generation_fences(corpus);
         test_clock_anchor_bounds();
+        test_persistent_storage_format_and_contention();
+        test_persistent_close_cancels_foreground(corpus);
+        test_owner_cancellation_during_backoff();
+        test_persistent_worker_stops_on_storage_failure(corpus);
+        test_persistent_invalid_cache_clock_recovers_credential(corpus);
+#if defined(_WIN32)
+        test_windows_interrupted_installed_write(corpus);
+#endif
+        test_persistent_close_discards_invalid_clock(corpus);
+        test_persistent_strict_outage_is_not_activation_required(corpus);
+        test_persistent_online_restart_and_offline_recovery(corpus);
+        test_persistent_uncertain_activation_reuses_identity(corpus);
+        test_persistent_previous_rebind_and_expiry_contract(corpus);
         test_pre_epoch_server_time(corpus);
         test_jwks_recovery_and_offline_clock(corpus);
         test_logout_generation_fences_late_responses(corpus);
-        std::cout << "C++ SDK tests passed (91 grant vectors, strict JSON, transport, access, account and race cases).\n";
+        std::cout << "C++ SDK tests passed (101 grant vectors, strict JSON, transport, access, account and race cases).\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "C++ SDK test failure: " << error.what() << '\n';

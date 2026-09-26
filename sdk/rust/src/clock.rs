@@ -52,6 +52,16 @@ impl Anchor {
             wall: start.wall,
         }
     }
+    pub(crate) fn receipt(&self) -> (i64, i64) {
+        (self.server, self.wall)
+    }
+    pub(crate) fn restored(server: i64, wall: i64) -> Result<Self> {
+        Ok(Self {
+            server,
+            wall,
+            elapsed: elapsed_clock()?,
+        })
+    }
     pub fn now(&self) -> Result<i64> {
         let elapsed = elapsed_clock()?
             .checked_sub(self.elapsed)

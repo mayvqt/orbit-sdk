@@ -63,3 +63,11 @@ mod tests {
         println!("SDK elapsed={slept:?}, active elapsed={active:?}");
     }
 }
+
+#[cfg(target_os = "windows")]
+mod private_storage;
+#[cfg(target_os = "windows")]
+pub use private_storage::{
+    create_private_storage_directory, create_private_storage_file, private_storage_object,
+    process_user_context, storage_file_single_link,
+};

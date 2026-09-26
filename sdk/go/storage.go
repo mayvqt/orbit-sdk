@@ -15,7 +15,7 @@ type StoredCredential struct {
 	LicenceID           string
 	InstallationID      string
 	Credential          string
-	CredentialExpiresAt int64
+	CredentialExpiresAt int64 // Zero denotes an explicitly negotiated persistent credential.
 	Fingerprint         *string
 	FingerprintProvider *string
 }

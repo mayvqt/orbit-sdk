@@ -1,6 +1,6 @@
 [package]
 name = "orbit-sdk"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
@@ -25,7 +25,7 @@ time = { version = "=0.3.55", features = ["parsing"] }
 rustix = { version = "=1.1.4", features = ["time", "fs", "process"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-orbit-sdk-native = { path = "native", version = "=0.1.0" }
+orbit-sdk-native = { path = "native", version = "=0.3.0" }
 
 [lints.rust]
 unsafe_code = "forbid"

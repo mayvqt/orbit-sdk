@@ -52,7 +52,7 @@ func nativeSleepReply(t *testing.T, key *ecdsa.PrivateKey, offline bool) string 
 	}
 	credential := strings.Repeat("s", 43)
 	reply, err := json.Marshal(grantReply{ActivationID: "activation", InstallationID: "installation_1234",
-		Credential: &credential, CredentialExpiresAt: time.Unix(now+86400, 0).UTC().Format(time.RFC3339),
+		Credential: &credential, CredentialExpiresAt: optionalString(time.Unix(now+86400, 0).UTC().Format(time.RFC3339)),
 		Grant: &signed, ServerTime: time.Unix(now, 0).UTC().Format(time.RFC3339), BindingMode: "none"})
 	if err != nil {
 		t.Fatal(err)

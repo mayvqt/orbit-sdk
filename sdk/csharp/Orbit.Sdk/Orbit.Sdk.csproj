@@ -7,7 +7,7 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreConfigFile>$(MSBuildThisFileDirectory)../NuGet.Config</RestoreConfigFile>
     <PackageId>Orbit.Sdk</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.3.0</Version>
     <Description>Orbit licensing client SDK.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <IsPackable>true</IsPackable>

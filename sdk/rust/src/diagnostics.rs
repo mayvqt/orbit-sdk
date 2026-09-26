@@ -84,6 +84,10 @@ impl Error {
             Self::StaleResponse => "stale_response",
             Self::Storage => "storage",
             Self::ClockUncertain => "clock_uncertain",
+            Self::InstallationInUse => "installation_in_use",
+            Self::CorruptState => "corrupt_state",
+            Self::PendingActivation => "pending_activation",
+            Self::Closed => "closed",
         }
     }
 

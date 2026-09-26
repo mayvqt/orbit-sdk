@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
 )
@@ -54,47 +53,42 @@ func main() {
 func run() error {
 	args := os.Args[1:]
 	if len(args) != 4 && len(args) != 5 {
-		return errors.New("Usage: orbit-licensed-export URL APP_ID ENVIRONMENT_ID ISSUER [INSTALLATION_ID]")
+		return errors.New("Usage: orbit-licensed-export URL APP_ID ENVIRONMENT_ID ISSUER [ABSOLUTE_STATE_DIRECTORY]")
 	}
-	device, err := orbit.NewInstallation()
-	if err != nil {
-		return err
-	}
-	if len(args) == 5 {
-		device.InstallationID = args[4]
-	}
-	transport, err := newTransport(args[0])
-	if err != nil {
-		return err
-	}
-	defer transport.CloseIdleConnections()
-	client, err := orbit.NewClient(orbit.Config{ApplicationID: args[1], EnvironmentID: args[2], Issuer: args[3]}, device, transport)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Installation ID: %s (public; reuse this ID after restart)\n", device.InstallationID)
-	fmt.Println("This example keeps bearer credentials in memory. Use a protected Storage adapter in your application.")
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if state, err := client.Snapshot(); err == nil && (state.Access == orbit.AccessRefreshRequired || state.Access == orbit.AccessOffline || state.Access == orbit.AccessExpired) {
-					_, _ = client.RequireAccess(ctx, "export")
-				}
-			}
-		}
-	}()
-	defer func() { cancel(); _ = client.Logout(); <-done }()
+	defer cancel()
+	config := orbit.AppConfig{APIOrigin: args[0], ApplicationID: args[1], EnvironmentID: args[2], Issuer: args[3]}
+	if len(args) == 5 {
+		config.StatePath = args[4]
+	}
+	client, err := openClient(ctx, config)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
 	input := bufio.NewScanner(os.Stdin)
 	input.Buffer(make([]byte, 1024), 64*1024)
 	c := console{input: input, client: client}
+	if _, err := client.RequireAccess(ctx, "export"); err != nil {
+		var failure *orbit.Error
+		if errors.As(err, &failure) && failure.Kind == orbit.Denied && failure.Code == "access_unavailable" {
+			fmt.Println("Activate with a licence key, or leave it empty to use the account commands.")
+			key, promptErr := c.prompt("Licence key: ", false)
+			if promptErr != nil {
+				if errors.Is(promptErr, io.EOF) {
+					return nil
+				}
+				return promptErr
+			}
+			if key != "" {
+				if _, err = client.Activate(ctx, key); err != nil {
+					c.reportError(err)
+				}
+			}
+		} else {
+			c.reportError(err)
+		}
+	}
 	fmt.Println(commands)
 	for {
 		command, err := c.prompt("orbit> ", false)
@@ -122,11 +116,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		if err != nil {
 			return err
 		}
-		operation, err := operationID()
-		if err != nil {
-			return err
-		}
-		state, err := c.client.Activate(ctx, key, operation)
+		state, err := c.client.Activate(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -290,7 +280,7 @@ func (c *console) command(ctx context.Context, command string) error {
 			fmt.Printf("Local access cleared; server release was not confirmed: %v\n", err)
 			c.printSupport(err)
 		} else {
-			fmt.Println("Device slot released; new activation follows the policy cooldown.")
+			fmt.Println("Device slot released.")
 		}
 	case "logout":
 		if err := c.client.Logout(); err != nil {
