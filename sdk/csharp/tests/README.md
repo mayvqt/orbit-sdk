@@ -13,6 +13,10 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- con
 
 The shared corpus checks valid grants and rejects incorrect signatures, claims,
 bindings and expiry values. Keep the SDK and corpus from the same download.
+It also checks native ES256 verification with exported/reimported public keys,
+concurrent calls and rejection of an invalid retained EC point. Signature checks
+use .NET's built-in `ECDsa` with the fixed 64-byte P1363 encoding; Orbit checks
+the exact scope, purpose and signed lifetime separately.
 
 ## Long-term offline-file verification
 

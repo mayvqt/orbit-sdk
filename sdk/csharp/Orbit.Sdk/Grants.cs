@@ -1,6 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
-using Microsoft.IdentityModel.JsonWebTokens;
-using Microsoft.IdentityModel.Tokens;
 
 namespace Orbit.Sdk;
 
@@ -13,7 +13,7 @@ internal sealed record GrantExpected(OrbitConfig Config, Device Device, string? 
 
 internal sealed class GrantKeys
 {
-    private readonly Dictionary<string, SecurityKey> keys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ECParameters> keys = new(StringComparer.Ordinal);
 
     internal static GrantKeys Parse(JsonElement value)
     {
@@ -24,81 +24,72 @@ internal sealed class GrantKeys
         {
             JsonWire.ExactFields(key, "kty", "crv", "alg", "use", "kid", "x", "y");
             var kid = JsonWire.String(key, "kid");
-            var x = JsonWire.String(key, "x");
-            var y = JsonWire.String(key, "y");
+            var x = JsonWire.DecodeBase64(JsonWire.String(key, "x"));
+            var y = JsonWire.DecodeBase64(JsonWire.String(key, "y"));
             if (JsonWire.String(key, "kty") != "EC" || JsonWire.String(key, "crv") != "P-256" ||
                 JsonWire.String(key, "alg") != "ES256" || JsonWire.String(key, "use") != "sig" ||
                 kid.Length is < 1 or > 128 || !kid.All(char.IsAscii) ||
-                JsonWire.DecodeBase64(x).Length != 32 || JsonWire.DecodeBase64(y).Length != 32 ||
-                !result.keys.TryAdd(kid, new JsonWebKey { Kty = "EC", Crv = "P-256", Alg = "ES256", Use = "sig", Kid = kid, X = x, Y = y }))
+                x.Length != 32 || y.Length != 32)
                 throw JsonWire.Invalid();
+            var parameters = new ECParameters { Curve = ECCurve.NamedCurves.nistP256, Q = new ECPoint { X = x, Y = y } };
+            try
+            {
+                // Validate retained points as well as the selected signing key.
+                // Keep only public parameters; verification owns its native handle.
+                using var publicKey = ECDsa.Create(parameters);
+                if (!result.keys.TryAdd(kid, parameters)) throw JsonWire.Invalid();
+            }
+            catch (Exception error) when (error is CryptographicException or ArgumentException)
+            { throw JsonWire.Invalid(); }
         }
         return result;
     }
 
     internal JsonElement Export(string token)
     {
-        if (!keys.TryGetValue(Header(token), out var key) || key is not JsonWebKey jwk)
-            throw JsonWire.Invalid();
+        var kid = ParseToken(token).Kid;
+        if (!keys.TryGetValue(kid, out var key)) throw JsonWire.Invalid();
         return JsonSerializer.SerializeToElement(new
         {
-            keys = new[] { new { kty = jwk.Kty, crv = jwk.Crv, alg = jwk.Alg, use = jwk.Use, kid = jwk.Kid, x = jwk.X, y = jwk.Y } }
+            keys = new[] { new { kty = "EC", crv = "P-256", alg = "ES256", use = "sig", kid,
+                x = JsonWire.EncodeBase64(key.Q.X!), y = JsonWire.EncodeBase64(key.Q.Y!) } }
         });
     }
 
-    internal bool Contains(string token) => keys.ContainsKey(Header(token));
+    internal bool Contains(string token) => keys.ContainsKey(ParseToken(token).Kid);
 
-    private static string Header(string token)
+    private static (string Kid, string Signed, byte[] Signature, JsonElement Claims) ParseToken(string token)
     {
-        if (token.Length > 16384) throw JsonWire.Invalid();
+        if (token == null || token.Length > 16384) throw JsonWire.Invalid();
         var parts = token.Split('.');
-        if (parts.Length != 3 || JsonWire.DecodeBase64(parts[2]).Length != 64) throw JsonWire.Invalid();
+        if (parts.Length != 3) throw JsonWire.Invalid();
+        var signature = JsonWire.DecodeBase64(parts[2]);
+        if (signature.Length != 64) throw JsonWire.Invalid();
         var header = JsonWire.Parse(JsonWire.DecodeBase64(parts[0]));
         JsonWire.ExactFields(header, "alg", "typ", "kid");
-        // Parse the exact signed payload before passing it to JOSE; duplicate fields
-        // must never disappear into a library's claim dictionary.
-        _ = JsonWire.Parse(JsonWire.DecodeBase64(parts[1]));
+        var claims = JsonWire.Parse(JsonWire.DecodeBase64(parts[1]));
         var kid = JsonWire.String(header, "kid");
         if (JsonWire.String(header, "alg") != "ES256" || JsonWire.String(header, "typ") != "orbit-access+jwt" ||
             kid.Length is < 1 or > 128 || !kid.All(char.IsAscii)) throw JsonWire.Invalid();
-        return kid;
+        return (kid, parts[0] + "." + parts[1], signature, claims);
     }
 
-    internal async Task<GrantClaims> VerifyAsync(string token, GrantExpected expected)
+    internal ValueTask<GrantClaims> VerifyAsync(string token, GrantExpected expected)
     {
-        var kid = Header(token);
-        if (!keys.TryGetValue(kid, out var key)) throw JsonWire.Invalid();
+        var parsed = ParseToken(token);
+        if (!keys.TryGetValue(parsed.Kid, out var key)) throw JsonWire.Invalid();
         var audience = $"orbit:{expected.Config.ApplicationId}:{expected.Config.EnvironmentId}";
-        var handler = new JsonWebTokenHandler { MaximumTokenSizeInBytes = 16384 };
-        TokenValidationResult validated;
         try
         {
-            validated = await handler.ValidateTokenAsync(token, new TokenValidationParameters
-            {
-                RequireSignedTokens = true,
-                RequireExpirationTime = true,
-                ValidateIssuerSigningKey = true,
-                IssuerSigningKey = key,
-                TryAllIssuerSigningKeys = false,
-                ValidAlgorithms = [SecurityAlgorithms.EcdsaSha256],
-                ValidTypes = ["orbit-access+jwt"],
-                ValidateIssuer = true,
-                ValidIssuer = expected.Config.Issuer,
-                ValidateAudience = true,
-                ValidAudience = audience,
-                IgnoreTrailingSlashWhenValidatingAudience = false,
-                // Verified server time + suspend-aware elapsed time owns lifetime,
-                // rather than the process wall clock used by the JOSE default.
-                ValidateLifetime = false,
-                ClockSkew = TimeSpan.Zero,
-                IncludeTokenOnFailedValidation = false,
-                LogTokenId = false
-            }).ConfigureAwait(false);
+            using var publicKey = ECDsa.Create(key);
+            if (!publicKey.VerifyData(Encoding.ASCII.GetBytes(parsed.Signed), parsed.Signature,
+                HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation)) throw JsonWire.Invalid();
         }
-        catch (Exception error) when (error is SecurityTokenException or ArgumentException or InvalidOperationException)
+        catch (Exception error) when (error is CryptographicException or ArgumentException)
         { throw JsonWire.Invalid(); }
-        if (!validated.IsValid) throw JsonWire.Invalid();
-        var claims = JsonWire.Parse(JsonWire.DecodeBase64(token.Split('.')[1]));
+        // Scope, purpose, duplicates and exact numeric lifetimes belong to the
+        // Orbit contract. Built-in cryptography only verifies the ES256 bytes.
+        var claims = parsed.Claims;
         var licence = JsonWire.String(claims, "sub");
         var jti = JsonWire.String(claims, "jti");
         var issued = JsonWire.Integer(claims, "iat");
@@ -134,7 +125,7 @@ internal sealed class GrantKeys
             (licenceExpiry != null && expiry > licenceExpiry) || refresh <= issued || refresh > expiry ||
             refresh > issued + (expected.CredentialExpiresAt == null && offline ? 1125 : 75) || (refresh < issued + (expected.CredentialExpiresAt == null && offline ? 675 : 45) && refresh != expiry))
             throw JsonWire.Invalid();
-        return new GrantClaims(licence, issued, expiry, refresh, offline, (int)policy,
-            JsonWire.Entitlements(JsonWire.Field(claims, "entitlements")));
+        return ValueTask.FromResult(new GrantClaims(licence, issued, expiry, refresh, offline, (int)policy,
+            JsonWire.Entitlements(JsonWire.Field(claims, "entitlements"))));
     }
 }

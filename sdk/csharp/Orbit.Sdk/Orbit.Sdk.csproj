@@ -17,7 +17,6 @@
   </PropertyGroup>
   <ItemGroup>
     <None Include="../../LICENSE" Pack="true" PackagePath="" Link="LICENSE" />
-    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="[8.23.0]" />
   </ItemGroup>
   <Target Name="BuildOrbitMacOSShim" BeforeTargets="PrepareForBuild;GenerateNuspec"
           Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(OrbitMacOSShimPath)' == ''">

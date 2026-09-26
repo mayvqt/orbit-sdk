@@ -4,6 +4,8 @@ License a desktop app or customer-hosted service with .NET 10. The installed
 client remembers an activation, checks it online first, and keeps verified
 offline access only when the signed grant allows it.
 
+The SDK uses .NET's built-in cryptography and has no NuGet package dependencies.
+
 ## Quickstart
 
 This `0.4.0` API is an unreleased candidate available in the source checkout.
