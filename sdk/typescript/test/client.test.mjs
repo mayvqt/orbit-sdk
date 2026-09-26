@@ -169,7 +169,7 @@ test("decision binds the server-derived customer and keeps management auth separ
     fetchImpl: async (url, options) => {
       calls.push({ url: new URL(url), options });
       if (calls.length === 1) return jsonResponse(currentSession("customer_from_orbit"));
-      return jsonResponse({ allowed: true, reason: "allowed", checked_at: utcSecond(Date.now()) });
+      return jsonResponse({ allowed: true, reason: "allowed", checked_at: utcSecond(Date.now()), customer_id: "untrusted_extra_field" });
     },
   });
 
@@ -181,6 +181,8 @@ test("decision binds the server-derived customer and keeps management auth separ
     customerId: "customer_from_request",
   });
   assert.equal(decision.allowed, true);
+  assert.equal(decision.customer_id, "customer_from_orbit");
+  assert.equal(Object.isFrozen(decision), true);
   assert.equal(calls.length, 2);
   assert.equal(calls[1].url.pathname, "/api/management/v1/licence-decisions");
   assert.equal(calls[1].options.headers.get("authorization"), "Bearer management-secret");
@@ -214,6 +216,7 @@ test("an authenticated feature denial is returned as denied", async () => {
     allowed: false,
     reason: "entitlement_denied",
     checked_at: decision.checked_at,
+    customer_id: "customer_verified",
   });
 });
 
@@ -257,6 +260,8 @@ test("requireFeature returns the decision when access is allowed", async () => {
     entitlement: "export",
   });
   assert.equal(decision.allowed, true);
+  assert.equal(decision.customer_id, "customer_verified");
+  assert.equal(callNumber, 2);
 });
 
 test("requireFeature throws OrbitAccessDeniedError with the reason when access is denied", async () => {

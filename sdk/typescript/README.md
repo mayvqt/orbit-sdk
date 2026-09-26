@@ -27,15 +27,13 @@ const orbit = new OrbitBackendClient({
   managementToken: process.env.ORBIT_MANAGEMENT_TOKEN,
 });
 
-const subject = await orbit.verifyCurrentCustomerSession(customerSession);
-await assertOrbitCustomerLinkedTo(authenticatedUser, subject.customer_id);
-
-await orbit.requireFeature({
+const decision = await orbit.requireFeature({
   customerSession,
   licenceId: request.body.licence_id,
   activationId: request.body.activation_id,
   entitlement: "export",
 });
+await assertOrbitCustomerLinkedTo(authenticatedUser, decision.customer_id);
 // requireFeature throws OrbitAccessDeniedError when access is denied, so
 // protected work below only runs once Orbit has approved this request.
 ```
@@ -63,8 +61,10 @@ own account and resource before doing protected work. The customer-session
 bearer may arrive in an `Authorization` header; send it only to the configured
 Orbit origin. `verifyCurrentCustomerSession` asks Orbit to validate it and
 returns the Orbit-derived customer ID. `decideFeature` (and `requireFeature`)
-verify the session again and send that ID to the authoritative management
-decision endpoint. Neither accepts a customer ID argument.
+verify the session and send that ID to the authoritative management decision
+endpoint. Their immutable result includes the same verified `customer_id`, so
+you can check your application's account link without a separate session
+lookup. Neither accepts a customer ID argument.
 
 Never take a customer ID from the request body, use an offline grant as
 backend identity proof or treat sign-in alone as licence access. If your app
@@ -79,7 +79,8 @@ const decision = await orbit.decideFeature({
   entitlement: "export",
 });
 if (!decision.allowed) throw new Error("Feature access denied");
-// Perform the operation, scoped to authenticatedUser and subject.customer_id.
+await assertOrbitCustomerLinkedTo(authenticatedUser, decision.customer_id);
+// Perform the operation, scoped to authenticatedUser and decision.customer_id.
 ```
 
 Use `decideFeature` when you want to inspect a denial's `reason` yourself, and
@@ -91,6 +92,12 @@ The selected licence and activation IDs are selectors. Orbit checks current
 ownership, activation validity, licence state, customer state and the exact
 entitlement. `allowed: true` means Orbit approved this online request; your
 app still needs its own resource authorization and transaction rules.
+
+Reuse one client for the configured application environment. Each feature
+decision makes two requests: a fresh customer-session verification and the
+management decision. Using the returned `customer_id` avoids the third request
+needed by a separate preliminary session lookup. Authorization is checked on
+each call; it is not cached across protected operations.
 
 ## Management methods
 

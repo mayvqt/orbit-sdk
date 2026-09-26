@@ -45,6 +45,8 @@ export interface LicenceDecision {
   readonly allowed: boolean;
   readonly reason: LicenceDecisionReason;
   readonly checked_at: string;
+  /** Customer identity verified online for this decision, never caller input. */
+  readonly customer_id: string;
 }
 
 export interface DecideFeatureInput {

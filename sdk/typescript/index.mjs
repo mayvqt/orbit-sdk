@@ -201,6 +201,7 @@ export class OrbitBackendClient {
       allowed: decision.allowed,
       reason: decision.reason,
       checked_at: decision.checked_at,
+      customer_id: subject.customer_id,
     });
   }
 
