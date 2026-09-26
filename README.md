@@ -1,8 +1,19 @@
 # Orbit SDKs
 
-Start with the **Test** environment in Orbit. Open your application's
-**Integration** page and copy the API origin, application ID, environment ID,
-and grant issuer. Each guide includes installation and a working quickstart:
+Add licence activation and feature checks to your application with one public
+app key. This checkout contains the **unreleased v0.4 candidate**. It is a
+pre-1.0 API and may change; no v0.4 packages or release tags are available yet.
+
+1. Select your application's **Test** environment in Orbit and copy the
+   **App key** from **Integration**.
+2. Create a policy with your feature enabled (for example, `export`), then
+   issue a Test licence using that policy.
+3. Install an SDK from this checkout using its language guide. Open the client
+   with the app key and check access before running the protected feature.
+
+The desktop SDKs remember activation and refresh access automatically. Their
+`ensure_access` helper asks for a licence key when activation is needed. Each
+guide includes installation, supported platforms and a working example:
 
 | Language | Setup | Example |
 | --- | --- | --- |
@@ -14,15 +25,20 @@ and grant issuer. Each guide includes installation and a working quickstart:
 | Embedded C / Rust | [SDK](sdk/embedded/README.md) | [Boards](examples/embedded/README.md) |
 | JavaScript/TypeScript | [Backend SDK](sdk/typescript/README.md) | [Backend example](examples/typescript/backend.mjs) |
 
+Use the TypeScript backend SDK for online checks on your server. Use the
+embedded SDK for caller-owned buffers and platform adapters on small devices.
 If you're calling the API without an SDK, see the [HTTP guide](examples/http/README.md).
 The [Rust backend example](examples/rust/licensed-backend/README.md) shows how
 to verify a customer session and check a feature on your own server. Shared
 signed-grant fixtures are in [contracts/sdk](contracts/sdk/README.md).
 
-Test and Live have separate IDs and data. Keep licence keys, passwords, sessions,
+The app key is public and can be included in your application. Test and Live
+have separate keys, IDs and data. Keep licence keys, passwords, sessions,
 activation credentials, and management tokens out of source and logs. A
 management token belongs only on your backend. Check access before protected
 work.
 
-This source is [MIT licensed](LICENSE). Keep each SDK folder intact; the
-language setup guides list any additional files needed by that SDK.
+This public SDK source is [MIT licensed](LICENSE). Orbit's server and dashboard
+are separate private software. Keep each SDK folder intact when installing
+manually; the language guides list any additional files it needs. Registry
+publishing is planned separately from this local candidate.
