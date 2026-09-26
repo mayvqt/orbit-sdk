@@ -13,7 +13,7 @@ Copy the API origin, application ID, environment ID and issuer from Orbit's
 
 // Configure once with public values from Integration.
 auto orbit = orbit::Client::open({
-    "https://orbit.example", "application_id", "environment_id", "issuer"
+    "https://orbit.mayvie.dev", "application_id", "environment_id", "issuer"
 });
 
 // Reuse access after a restart; ask for a key only when none is available.
@@ -36,9 +36,10 @@ state without deactivating it; destruction also closes the last copy.
 
 ## Build
 
-CMake discovers installed dependencies without downloading them:
+Clone the release; CMake discovers installed dependencies without downloading them:
 
 ```sh
+git clone --depth 1 --branch v0.3.0 https://github.com/mayvqt/orbit-sdk.git && cd orbit-sdk
 cmake -S sdk/cpp -B build/orbit-cpp -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build build/orbit-cpp
 cmake --install build/orbit-cpp --prefix /path/to/prefix

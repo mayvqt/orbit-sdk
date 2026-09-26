@@ -25,6 +25,21 @@ Secret Service adapters remain available through `WindowsStorage::open` and
 `/usr/bin/secret-tool`. Provider failures do not select a fallback. These explicit
 adapters retain credentials; cached restart access belongs to the installed client.
 
+## Storage and clock guarantees
+
+Windows uses current-user DPAPI and a private protected DACL. Linux uses an owner-only
+credential file (0700 directories, 0600 files), including headless installations. The
+selected provider never falls back to a different store. Corrupt or missing established
+state requires deliberate recovery; it never silently allocates a new installation.
+An interrupted state write leaves a durable recovery marker, so restart cannot restore
+a credential or grant from before an incomplete invalidation. Windows services must
+open and use storage under their process account, without thread impersonation.
+
+Sleep counts toward expiry. A clock rollback or inconsistent saved evidence requires
+online validation. Local files cannot reliably detect restored VM/disk snapshots or
+clock rollback above the last saved high-water value. Enforcement is not tamper-proof
+against someone controlling the local account or machine.
+
 ## Mutation identity and rebinding
 
 `activate(key, operation_id, cancel)` retains caller control over operation IDs.
