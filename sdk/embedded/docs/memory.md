@@ -43,8 +43,8 @@ Clang 22.1.8, `--target=arm-none-eabi -mcpu=cortex-m0plus -mthumb -Os
 
 | Linked portable module | Read-only code/data | Writable globals |
 | --- | ---: | ---: |
-| Grant verifier, strict JSON, in-place prepare, JWKS importer | 12,480 bytes | 0 |
-| Full client plus verifier, wire format and journal | 26,456 bytes | 0 |
+| Grant verifier, strict JSON, in-place prepare, JWKS importer | 12,488 bytes | 0 |
+| Full client plus verifier, wire format and journal | 26,666 bytes | 0 |
 
 These are linked library modules, **not firmware images**. Compiler runtime
 helpers remain unresolved until a real target toolchain links them. Crypto,
@@ -63,7 +63,7 @@ Run `tests/measure_arm.py --output /tmp/orbit-arm-size` with the installed LLVM
 tools to reproduce the portable figures. The full client has no heap calls;
 platform TLS and crypto implementations may allocate internally.
 
-The linked x86-64 Linux example with GCC 16.2.1 `-Os` has 44,286 bytes of code
+The linked x86-64 Linux example with GCC 16.2.1 `-Os` has 44,550 bytes of code
 and read-only data, 1,120 bytes of initialized data, and 41,840 bytes of BSS.
 Its dynamically linked OpenSSL/libcurl, process stack and runtime allocations
 are additional; this host measurement is not an MCU flash estimate.
