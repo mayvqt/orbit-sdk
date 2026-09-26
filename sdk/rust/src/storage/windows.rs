@@ -20,7 +20,11 @@ impl fmt::Debug for WindowsStorage {
 }
 
 impl WindowsStorage {
-    pub fn open(directory: impl AsRef<Path>, config: &Config, device: &Device) -> Result<Self> {
+    pub(crate) fn open(
+        directory: impl AsRef<Path>,
+        config: &Config,
+        device: &Device,
+    ) -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
             Ok(Self {

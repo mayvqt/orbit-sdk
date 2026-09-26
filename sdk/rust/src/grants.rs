@@ -171,6 +171,9 @@ pub struct Expected<'a> {
     pub installation: &'a str,
     pub fingerprint: Option<&'a str>,
     pub fingerprint_provider: Option<&'a str>,
+    /// Permit mode=none while the runtime sent optional identity metadata.
+    /// Shared contract vectors intentionally leave this false.
+    pub allow_unbound_fingerprint: bool,
     pub credential_expires_at: Option<i64>,
     pub licence_expires_at: Option<i64>,
     pub now: i64,
@@ -192,6 +195,15 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
     let claims: Claims = decode::<Claims>(token, key, &validation)
         .map_err(|_| Error::InvalidResponse)?
         .claims;
+    if claims.binding_mode == "none" {
+        let payload = token.split('.').nth(1).ok_or(Error::InvalidResponse)?;
+        let fields: serde_json::Value =
+            serde_json::from_slice(&canonical(payload)?).map_err(|_| Error::InvalidResponse)?;
+        let fields = fields.as_object().ok_or(Error::InvalidResponse)?;
+        if fields.contains_key("fingerprint") || fields.contains_key("fingerprint_provider") {
+            return Err(Error::InvalidResponse);
+        }
+    }
     let allowance = if claims.offline_allowed { 86400 } else { 300 };
     let (refresh_min, refresh_max) =
         if expected.credential_expires_at.is_none() && claims.offline_allowed {
@@ -206,9 +218,13 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
                 && claims.fingerprint_provider.is_none()
         }
         (Some(fingerprint), Some(provider)) => {
-            claims.binding_mode == "hwid"
+            (claims.binding_mode == "hwid"
                 && claims.fingerprint.as_deref() == Some(fingerprint)
-                && claims.fingerprint_provider.as_deref() == Some(provider)
+                && claims.fingerprint_provider.as_deref() == Some(provider))
+                || (expected.allow_unbound_fingerprint
+                    && claims.binding_mode == "none"
+                    && claims.fingerprint.is_none()
+                    && claims.fingerprint_provider.is_none())
         }
         _ => false,
     };
@@ -282,6 +298,7 @@ mod tests {
             installation: "installation",
             fingerprint: None,
             fingerprint_provider: None,
+            allow_unbound_fingerprint: false,
             credential_expires_at: Some(NOW + 3600),
             licence_expires_at: None,
             now: NOW,
@@ -312,6 +329,18 @@ mod tests {
         let mut timed = expected();
         timed.licence_expires_at = Some(NOW + 250);
         assert!(verify(&sign(&claims(), None), &keys(), &timed).is_err());
+    }
+    #[test]
+    fn unbound_grants_must_omit_fingerprint_claims() {
+        let mut value = claims();
+        value["fingerprint"] = serde_json::Value::Null;
+        value["fingerprint_provider"] = serde_json::Value::Null;
+        let mut expected = expected();
+        expected.fingerprint =
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        expected.fingerprint_provider = Some("machine_v1");
+        expected.allow_unbound_fingerprint = true;
+        assert!(verify(&sign(&value, None), &keys(), &expected).is_err());
     }
     #[test]
     fn scope_types_lifetime_and_missing_claims_fail_closed() {

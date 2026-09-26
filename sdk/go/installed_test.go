@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,15 +22,19 @@ import (
 )
 
 type installedFixture struct {
-	t          *testing.T
-	key        *ecdsa.PrivateKey
-	mode       atomic.Int32 // 0 online, 1 outage, 2 denied, 3 malformed, 4 missing expiry, 5 finite expiry
-	validation atomic.Int32
-	activation atomic.Int32
-	mu         sync.Mutex
-	operations []string
-	previous   string
-	offline    bool
+	t                          *testing.T
+	key                        *ecdsa.PrivateKey
+	mode                       atomic.Int32 // 0 online, 1 outage, 2 denied, 3 malformed, 4 missing expiry, 5 finite expiry
+	validation                 atomic.Int32
+	activation                 atomic.Int32
+	accountActivation          atomic.Int32
+	loseFirstAccountActivation atomic.Bool
+	malformedOwnedLicences     atomic.Bool
+	loginFailures              atomic.Int32
+	mu                         sync.Mutex
+	operations                 []string
+	previous                   string
+	offline                    bool
 }
 
 func newInstalledFixture(t *testing.T, offline bool) *installedFixture {
@@ -40,21 +45,39 @@ func newInstalledFixture(t *testing.T, offline bool) *installedFixture {
 	}
 	return &installedFixture{t: t, key: key, offline: offline}
 }
-func installedConfig(path string) AppConfig {
-	return AppConfig{APIOrigin: "https://orbit.example.test", Issuer: "https://orbit.example.test", ApplicationID: "app", EnvironmentID: "test", StatePath: path}
+func installedOptions(path string) Options {
+	return Options{StatePath: path, BindingMode: BindingDisabled}
 }
 func (f *installedFixture) open(path string) (*Client, error) {
+	return f.openWith(path, installedOptions(path))
+}
+func (f *installedFixture) openWith(path string, options Options) (*Client, error) {
 	transport := testTransport(f.t, f.respond)
-	return openInstalled(context.Background(), installedConfig(path), transport)
+	return openInstalled(context.Background(), testAppKey(), options, transport)
 }
 func (f *installedFixture) respond(request *http.Request) (*http.Response, error) {
 	if request.URL.Path == jwksPath {
 		data, _ := json.Marshal(map[string]any{"keys": []jsonWebKey{{KeyType: "EC", Curve: "P-256", Algorithm: "ES256", Purpose: "sig", KeyID: "installed-test", X: base64.RawURLEncoding.EncodeToString(f.key.X.FillBytes(make([]byte, 32))), Y: base64.RawURLEncoding.EncodeToString(f.key.Y.FillBytes(make([]byte, 32)))}}})
 		return testResponse(request, 200, string(data)), nil
 	}
+	if request.Method == http.MethodGet && request.URL.Path == clientPrefix+"licences" {
+		if f.malformedOwnedLicences.Swap(false) {
+			return testResponse(request, 200, `{malformed`), nil
+		}
+		return testResponse(request, 200, `{"items":[],"next_cursor":null}`), nil
+	}
 	var body map[string]any
 	if json.NewDecoder(request.Body).Decode(&body) != nil {
 		f.t.Error("invalid request")
+	}
+	if request.URL.Path == clientPrefix+"sessions" {
+		if f.loginFailures.Load() > 0 && f.loginFailures.Add(-1) >= 0 {
+			return testResponse(request, http.StatusUnauthorized, `{"error":{"code":"invalid_credentials","message":"Denied","request_id":"fixture"}}`), nil
+		}
+		username, _ := body["username"].(string)
+		now := time.Now().UTC().Truncate(time.Second)
+		reply, _ := json.Marshal(map[string]any{"customer": map[string]any{"id": "customer_" + username, "username": username, "email": username + "@example.test", "suspended": false, "created_at": now.Format(time.RFC3339)}, "session": strings.Repeat("s", 43), "expires_at": now.Add(time.Hour).Format(time.RFC3339)})
+		return testResponse(request, 200, string(reply)), nil
 	}
 	activation := request.URL.Path == clientPrefix+"activations"
 	if activation {
@@ -63,6 +86,15 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 		f.operations = append(f.operations, body["idempotency_key"].(string))
 		f.previous, _ = body["previous_credential"].(string)
 		f.mu.Unlock()
+		if body["licence_id"] != nil {
+			attempt := f.accountActivation.Add(1)
+			if f.loseFirstAccountActivation.Load() {
+				if attempt >= 3 {
+					f.loseFirstAccountActivation.Store(false)
+				}
+				return nil, syscall.ECONNRESET
+			}
+		}
 		if body["credential_mode"] != "persistent" {
 			f.t.Error("persistent mode was not negotiated")
 		}
@@ -88,14 +120,18 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 	if !f.offline {
 		expiry = now + 300
 	}
-	claims := jwt.MapClaims{"iss": "https://orbit.example.test", "aud": "orbit:app:test", "sub": "licence", "jti": "grant", "iat": now, "nbf": now, "exp": expiry, "application_id": "app", "environment_id": "test", "activation_id": "activation", "installation_id": body["installation_id"], "fingerprint": nil, "fingerprint_provider": nil, "binding_mode": "none", "policy_version": 1, "offline_allowed": f.offline, "refresh_after": refresh, "licence_expires_at": nil, "entitlements": map[string]bool{"export": true}}
+	licenceID := "licence"
+	if selected, ok := body["licence_id"].(string); ok {
+		licenceID = selected
+	}
+	claims := jwt.MapClaims{"iss": "https://orbit.example.test", "aud": "orbit:app:test", "sub": licenceID, "jti": "grant", "iat": now, "nbf": now, "exp": expiry, "application_id": "app", "environment_id": "test", "activation_id": "activation", "installation_id": body["installation_id"], "binding_mode": "none", "policy_version": 1, "offline_allowed": f.offline, "refresh_after": refresh, "licence_expires_at": nil, "entitlements": map[string]bool{"export": true}}
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"], token.Header["kid"] = "orbit-access+jwt", "installed-test"
 	signed, err := token.SignedString(f.key)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	reply := map[string]any{"activation_id": "activation", "installation_id": body["installation_id"], "credential": nil, "credential_expires_at": nil, "grant": signed, "server_time": time.Unix(now, 0).UTC().Format(time.RFC3339), "binding_mode": "none", "fingerprint_provider": nil, "licence_expires_at": nil, "secret_replay_expired": false}
+	reply := map[string]any{"activation_id": "activation", "installation_id": body["installation_id"], "credential": nil, "credential_expires_at": nil, "grant": signed, "server_time": time.Unix(now, 0).UTC().Format(time.RFC3339), "binding_mode": "none", "fingerprint_provider": body["fingerprint_provider"], "licence_expires_at": nil, "secret_replay_expired": false}
 	if activation {
 		reply["credential"] = strings.Repeat("c", 43)
 	}
@@ -129,7 +165,7 @@ func TestInstalledActivationAndOnlineRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state")
 	c := mustInstalledOpen(t, f, path)
 	id := c.device.InstallationID
-	if _, err := c.RequireAccess(context.Background(), "export"); !errors.Is(err, &Error{Kind: Denied, Code: "access_unavailable"}) {
+	if _, err := c.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrNotActivated) {
 		t.Fatal(err)
 	}
 	mustInstalledActivate(t, c)
@@ -146,8 +182,82 @@ func TestInstalledActivationAndOnlineRestart(t *testing.T) {
 	if _, err := c.RequireAccess(context.Background(), "export"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.RequireAccess(context.Background(), "missing"); !errors.Is(err, &Error{Kind: Denied, Code: "feature_unavailable"}) {
+	if _, err := c.RequireAccess(context.Background(), "missing"); !errors.Is(err, ErrFeatureUnavailable) {
 		t.Fatal(err)
+	}
+}
+
+func TestInstalledMachineFingerprintMismatchRotatesInstallationAndClearsAuthority(t *testing.T) {
+	f := newInstalledFixture(t, true)
+	path := filepath.Join(t.TempDir(), "state")
+	first := Options{StatePath: path, BindingMode: BindingCustom, Fingerprint: strings.Repeat("a", 64), FingerprintProvider: "custom:test-device"}
+	client, err := f.openWith(path, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldInstallation := client.device.InstallationID
+	mustInstalledActivate(t, client)
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.mode.Store(1)
+	second := first
+	second.Fingerprint = strings.Repeat("b", 64)
+	client, err = f.openWith(path, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if client.device.InstallationID == oldInstallation {
+		t.Fatal("changed machine identity retained the old installation ID")
+	}
+	if client.installed.record.Credential != nil || client.installed.record.Access != nil || client.installed.record.Pending != nil {
+		t.Fatal("changed machine identity retained old credential, grant, or pending operation")
+	}
+	state, err := client.Snapshot()
+	if err != nil || state.Access != AccessDenied || state.HasFeature("export") || f.validation.Load() != 0 {
+		t.Fatalf("changed identity restored cached authority or tried the old credential: %+v, validations=%d, %v", state, f.validation.Load(), err)
+	}
+}
+
+func TestEnsureAccessDoesNotPromptDuringOutage(t *testing.T) {
+	f := newInstalledFixture(t, false)
+	path := filepath.Join(t.TempDir(), "state")
+	client := mustInstalledOpen(t, f, path)
+	mustInstalledActivate(t, client)
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.mode.Store(1)
+	client = mustInstalledOpen(t, f, path)
+	prompted := false
+	_, err := client.EnsureAccess(context.Background(), "export", func(context.Context) (string, error) {
+		prompted = true
+		return "replacement-key", nil
+	})
+	if !errors.Is(err, ErrTransient) || prompted {
+		t.Fatalf("outage prompted for activation or returned the wrong error: %v, prompted=%v", err, prompted)
+	}
+}
+
+func TestEnsureAccessPromptsForMissingActivationOnly(t *testing.T) {
+	f := newInstalledFixture(t, false)
+	client := mustInstalledOpen(t, f, filepath.Join(t.TempDir(), "state"))
+	prompted := false
+	state, err := client.EnsureAccess(context.Background(), "export", func(context.Context) (string, error) {
+		prompted = true
+		return "synthetic-key", nil
+	})
+	if err != nil || !prompted || !state.HasFeature("export") {
+		t.Fatalf("missing activation was not prompted and activated: %+v, %v", state, err)
+	}
+	prompted = false
+	_, err = client.EnsureAccess(context.Background(), "missing", func(context.Context) (string, error) {
+		prompted = true
+		return "replacement-key", nil
+	})
+	if !errors.Is(err, ErrFeatureUnavailable) || prompted {
+		t.Fatalf("feature denial prompted for a new key: %v, prompted=%v", err, prompted)
 	}
 }
 func TestInstalledRestartOfflineKeepsOriginalGrant(t *testing.T) {
@@ -157,7 +267,7 @@ func TestInstalledRestartOfflineKeepsOriginalGrant(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state")
 			c := mustInstalledOpen(t, f, path)
 			mustInstalledActivate(t, c)
-			original := c.state.claims.ExpiresAt
+			original := time.Unix(c.state.claims.ExpiresAt, 0).UTC()
 			if c.Close() != nil {
 				t.Fatal("close failed")
 			}
@@ -168,7 +278,7 @@ func TestInstalledRestartOfflineKeepsOriginalGrant(t *testing.T) {
 			}
 			result, err := c.RequireAccess(context.Background(), "export")
 			if offline {
-				if err != nil || result.Access != AccessOffline || *result.ExpiresAt != original {
+				if err != nil || result.Access != AccessOffline || result.ExpiresAt == nil || *result.ExpiresAt != original {
 					t.Fatal("offline deadline moved or access failed", err)
 				}
 			} else if err == nil {
@@ -227,6 +337,122 @@ func TestInstalledPendingDenialExpiryAndResolution(t *testing.T) {
 	f.mode.Store(2)
 	if _, err := c.Activate(context.Background(), "synthetic-key"); !errors.Is(err, ErrDenied) || c.installed.record.Pending != nil {
 		t.Fatal("definitive denial retained pending identity", err)
+	}
+}
+
+func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.T) {
+	t.Run("same customer resumes after restart", func(t *testing.T) {
+		f := newInstalledFixture(t, false)
+		f.loseFirstAccountActivation.Store(true)
+		path := filepath.Join(t.TempDir(), "state")
+		client := mustInstalledOpen(t, f, path)
+		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ActivateAccount(context.Background(), "licence_account"); !errors.Is(err, ErrTransient) {
+			t.Fatalf("lost account activation did not stay uncertain: %v", err)
+		}
+		f.mu.Lock()
+		if len(f.operations) != 3 {
+			t.Fatalf("expected three bounded same-ID replay attempts, got %d", len(f.operations))
+		}
+		pendingID := f.operations[0]
+		for _, id := range f.operations[1:] {
+			if id != pendingID {
+				t.Fatal("uncertain retries changed their operation ID")
+			}
+		}
+		f.mu.Unlock()
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		assertInstalledFileOmits(t, path, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
+
+		client = mustInstalledOpen(t, f, path)
+		f.loginFailures.Store(1)
+		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); !errors.Is(err, &Error{Kind: Denied, Code: "invalid_credentials"}) {
+			t.Fatalf("synthetic failed login returned %v", err)
+		}
+		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
+			t.Fatal(err)
+		}
+		f.malformedOwnedLicences.Store(true)
+		if _, err := client.OwnedLicences(context.Background(), ""); !errors.Is(err, ErrInvalidResponse) {
+			t.Fatalf("malformed owned-licences response returned %v", err)
+		}
+		if account, err := client.Account(); err != nil || account != nil {
+			t.Fatalf("failed account request retained a login session: %+v, %v", account, err)
+		}
+		if _, err := client.CustomerSessionProof(); !errors.Is(err, ErrReauthenticationRequired) {
+			t.Fatalf("failed account request retained session proof: %v", err)
+		}
+		state, err := client.Snapshot()
+		if err != nil || state.Access != AccessDenied || state.HasFeature("export") {
+			t.Fatalf("failed account request retained access authority: %+v, %v", state, err)
+		}
+		client.installed.mu.Lock()
+		storedPendingID := ""
+		if client.installed.record.Pending != nil {
+			storedPendingID = client.installed.record.Pending.OperationID
+		}
+		client.installed.mu.Unlock()
+		if storedPendingID != pendingID {
+			t.Fatalf("unrelated account failure discarded uncertain activation ID: got %q want %q", storedPendingID, pendingID)
+		}
+		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ActivateAccount(context.Background(), "licence_account"); err != nil {
+			t.Fatalf("same customer could not resume activation: %v", err)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if len(f.operations) != 4 || f.operations[3] != pendingID {
+			t.Fatalf("restart did not reuse the pending operation ID: %#v", f.operations)
+		}
+		assertInstalledFileOmits(t, path, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
+	})
+
+	t.Run("different customer cannot reuse pending activation", func(t *testing.T) {
+		f := newInstalledFixture(t, false)
+		f.loseFirstAccountActivation.Store(true)
+		path := filepath.Join(t.TempDir(), "state")
+		client := mustInstalledOpen(t, f, path)
+		if _, err := client.Login(context.Background(), "alice", "account-password-marker"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ActivateAccount(context.Background(), "licence_account"); !errors.Is(err, ErrTransient) {
+			t.Fatalf("lost account activation did not stay uncertain: %v", err)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+		client = mustInstalledOpen(t, f, path)
+		if _, err := client.Login(context.Background(), "bob", "another-password-marker"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ActivateAccount(context.Background(), "licence_account"); !errors.Is(err, ErrPendingActivation) {
+			t.Fatalf("different customer reused the pending activation: %v", err)
+		}
+		f.mu.Lock()
+		if len(f.operations) != 3 {
+			t.Fatalf("conflicting customer caused another network mutation: %d attempts", len(f.operations))
+		}
+		f.mu.Unlock()
+		assertInstalledFileOmits(t, path, "account-password-marker", "another-password-marker", strings.Repeat("s", 43), "licence_key_marker")
+	})
+}
+
+func assertInstalledFileOmits(t *testing.T, path string, secrets ...string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(path, installedDataName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("installed state persisted sensitive account input %q", secret)
+		}
 	}
 }
 func TestInstalledExplicitPreviousCredential(t *testing.T) {
@@ -348,7 +574,7 @@ func TestInstalledCodecRejectsUnknownMissingDuplicateAndSecretFields(t *testing.
 	}
 	bad = append(bad, []byte(strings.Replace(string(data), `"credential":{`, `"credential":{"password":"secret",`, 1)))
 	for _, encoded := range bad {
-		if _, err := decodeInstalled(encoded, r.Scope, r.Provider, nil, nil); err == nil {
+		if _, err := decodeInstalled(encoded, r.Scope, r.Provider); err == nil {
 			t.Fatal("malformed installed record accepted")
 		}
 	}

@@ -90,11 +90,11 @@ func TestWindowsStorageRejectsScopeAndCorruptFiles(t *testing.T) {
 			config, device, _ := storageFixture()
 			switch change {
 			case "issuer":
-				config.Issuer += "other"
+				config.issuer += "other"
 			case "application":
-				config.ApplicationID += "other"
+				config.applicationID += "other"
 			case "environment":
-				config.EnvironmentID += "other"
+				config.environmentID += "other"
 			case "installation":
 				device.InstallationID += "other"
 			case "fingerprint":

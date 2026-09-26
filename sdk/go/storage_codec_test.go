@@ -14,10 +14,11 @@ import (
 	"testing"
 )
 
-func storageFixture() (Config, Device, StoredCredential) {
-	config := Config{Issuer: "issuer", ApplicationID: "app", EnvironmentID: "test"}
+func storageFixture() (AppKey, Device, StoredCredential) {
+	config := testAppKey()
+	config.issuer = "issuer"
 	device := Device{InstallationID: "installation_1234"}
-	credential := StoredCredential{ApplicationID: config.ApplicationID, EnvironmentID: config.EnvironmentID,
+	credential := StoredCredential{ApplicationID: config.applicationID, EnvironmentID: config.environmentID,
 		InstallationID: device.InstallationID, ActivationID: "activation", LicenceID: "licence",
 		Credential: strings.Repeat("c", 43), CredentialExpiresAt: 1800003600}
 	return config, device, credential
@@ -42,11 +43,11 @@ func TestStorageEntropyFraming(t *testing.T) {
 		t.Fatal("storage entropy does not match the fixed domain and u32 framing")
 	}
 	config, device, _ := storageFixture()
-	for _, change := range []func(*Config, *Device){
-		func(c *Config, _ *Device) { c.Issuer += "x" },
-		func(c *Config, _ *Device) { c.ApplicationID += "x" },
-		func(c *Config, _ *Device) { c.EnvironmentID += "x" },
-		func(_ *Config, d *Device) { d.InstallationID += "x" },
+	for _, change := range []func(*AppKey, *Device){
+		func(c *AppKey, _ *Device) { c.issuer += "x" },
+		func(c *AppKey, _ *Device) { c.applicationID += "x" },
+		func(c *AppKey, _ *Device) { c.environmentID += "x" },
+		func(_ *AppKey, d *Device) { d.InstallationID += "x" },
 	} {
 		otherConfig, otherDevice := config, device
 		change(&otherConfig, &otherDevice)
@@ -55,9 +56,9 @@ func TestStorageEntropyFraming(t *testing.T) {
 			t.Fatal("a changed scope reused storage entropy")
 		}
 	}
-	config.Issuer, config.ApplicationID = "a", "bc"
+	config.issuer, config.applicationID = "a", "bc"
 	one, _ := newStorageScope(config, device)
-	config.Issuer, config.ApplicationID = "ab", "c"
+	config.issuer, config.applicationID = "ab", "c"
 	two, _ := newStorageScope(config, device)
 	if one.entropy == two.entropy {
 		t.Fatal("scope framing permits component-boundary ambiguity")
@@ -126,8 +127,8 @@ func TestStorageCodecRejectsCorruptAndUnknownRecords(t *testing.T) {
 	if _, err := encodeStorageRecord(scope, math.MaxUint64, nil); !errors.Is(err, ErrStorage) {
 		t.Fatal("unbounded generation was encoded")
 	}
-	config := scope.config
-	config.Issuer += "other"
+	config := scope.key
+	config.issuer += "other"
 	other, _ := newStorageScope(config, scope.device)
 	if _, _, err := decodeStorageRecord(other, valid); !errors.Is(err, ErrStorage) {
 		t.Fatal("wrong scope was accepted by the private codec")
@@ -193,7 +194,7 @@ func TestProtectedStorageGenerationPoisonAndClose(t *testing.T) {
 	if _, err := storage.Version(); !errors.Is(err, ErrStorage) {
 		t.Fatal("failed adapter did not remain poisoned")
 	}
-	if storage.Close() != nil || storage.Close() != nil || storage.state.scope.config.Issuer != "" {
+	if storage.Close() != nil || storage.Close() != nil || storage.state.scope.key.issuer != "" {
 		t.Fatal("close did not clear scope and release ownership")
 	}
 	if _, _, err := storage.Load(); !errors.Is(err, ErrStorage) || !errors.Is(storage.Save(1, credential), ErrStorage) {

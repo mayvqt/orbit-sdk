@@ -32,7 +32,11 @@ impl fmt::Debug for SecretServiceStorage {
 }
 
 impl SecretServiceStorage {
-    pub fn open(directory: impl AsRef<Path>, config: &Config, device: &Device) -> Result<Self> {
+    pub(crate) fn open(
+        directory: impl AsRef<Path>,
+        config: &Config,
+        device: &Device,
+    ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             // Reject unencodable configuration before touching a lease or service.

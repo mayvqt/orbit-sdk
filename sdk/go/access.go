@@ -6,16 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
-
-// Config fixes the public scope and exact deployment issuer for one client.
-type Config struct {
-	ApplicationID string
-	EnvironmentID string
-	Issuer        string
-}
 
 type Access string
 
@@ -36,19 +32,23 @@ const (
 	StorageCallerProtected          StorageCapability = "caller_provided_protected"
 )
 
-// Snapshot is safe display metadata, not reusable authorization. Unix timestamps
-// are seconds. An absent entitlement always denies that feature.
+// Snapshot is safe display metadata, not reusable authorization. An absent
+// entitlement always denies that feature.
 type Snapshot struct {
 	Access                   Access
 	Entitlements             map[string]bool
-	ExpiresAt                *int64
-	NextCheckAt              *int64
-	CredentialExpiresAt      *int64
+	ExpiresAt                *time.Time
+	NextCheckAt              *time.Time
+	CredentialExpiresAt      *time.Time
 	ReauthenticationRequired bool
 	OfflineAllowed           bool
-	RemainingOfflineSeconds  uint64
+	RemainingOffline         time.Duration
 	StorageCapability        StorageCapability
 }
+
+// HasFeature reports whether the snapshot's current access includes feature.
+func (s Snapshot) HasFeature(feature string) bool { return s.Entitlements[feature] }
+
 type accessState struct {
 	generation     uint64
 	storageVersion uint64
@@ -64,7 +64,7 @@ type accessState struct {
 // Client is safe for concurrent use. Create a separate context for each selected
 // principal/licence. Do not copy a Client after use; share its pointer.
 type Client struct {
-	config            Config
+	key               AppKey
 	device            Device
 	transport         *Transport
 	storage           Storage
@@ -80,12 +80,16 @@ type Client struct {
 
 func (*Client) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte("[Orbit client]")) }
 
-func NewClient(config Config, device Device, transport *Transport) (*Client, error) {
-	return NewClientWithStorage(config, device, transport, &MemoryStorage{})
+func NewClient(key AppKey, device Device, transport *Transport) (*Client, error) {
+	return NewClientWithStorage(key, device, transport, &MemoryStorage{})
 }
 
-func NewClientWithStorage(config Config, device Device, transport *Transport, storage Storage) (*Client, error) {
-	if !opaque(config.ApplicationID) || !opaque(config.EnvironmentID) || config.Issuer == "" || !opaque(device.InstallationID) || len(device.InstallationID) < 16 || (device.Fingerprint == nil) != (device.FingerprintProvider == nil) || device.Fingerprint != nil && !lowerHex(*device.Fingerprint, 64) || device.FingerprintProvider != nil && !validProvider(*device.FingerprintProvider) || transport == nil || transport.base == nil || storage == nil {
+func NewClientWithStorage(key AppKey, device Device, transport *Transport, storage Storage) (*Client, error) {
+	return newClientWithStorage(key, device, transport, storage, false)
+}
+
+func newClientWithStorage(key AppKey, device Device, transport *Transport, storage Storage, allowFingerprintChange bool) (*Client, error) {
+	if !opaque(key.applicationID) || !opaque(key.environmentID) || key.issuer == "" || !opaque(device.InstallationID) || len(device.InstallationID) < 16 || (device.Fingerprint == nil) != (device.FingerprintProvider == nil) || device.Fingerprint != nil && !lowerHex(*device.Fingerprint, 64) || device.FingerprintProvider != nil && !validProvider(*device.FingerprintProvider) || transport == nil || transport.base == nil || storage == nil || key.apiOrigin != transport.base.Scheme+"://"+transport.base.Host {
 		return nil, ErrConfiguration
 	}
 	if _, err := elapsedClock(); err != nil {
@@ -95,7 +99,7 @@ func NewClientWithStorage(config Config, device Device, transport *Transport, st
 	if err != nil {
 		return nil, ErrStorage
 	}
-	if credential != nil && (credential.ApplicationID != config.ApplicationID || credential.EnvironmentID != config.EnvironmentID || credential.InstallationID != device.InstallationID || !equalString(credential.Fingerprint, device.Fingerprint) || !equalString(credential.FingerprintProvider, device.FingerprintProvider) || !opaque(credential.ActivationID) || !opaque(credential.LicenceID) || !bearer(credential.Credential)) {
+	if credential != nil && (credential.ApplicationID != key.applicationID || credential.EnvironmentID != key.environmentID || credential.InstallationID != device.InstallationID || !allowFingerprintChange && (!equalString(credential.Fingerprint, device.Fingerprint) || !equalString(credential.FingerprintProvider, device.FingerprintProvider)) || !opaque(credential.ActivationID) || !opaque(credential.LicenceID) || !bearer(credential.Credential)) {
 		return nil, ErrStorage
 	}
 	device.Fingerprint = cloneString(device.Fingerprint)
@@ -104,7 +108,7 @@ func NewClientWithStorage(config Config, device Device, transport *Transport, st
 	if _, ok := storage.(*MemoryStorage); ok {
 		capability = StorageMemoryOnly
 	}
-	return &Client{config: config, device: device, transport: transport, storage: storage, storageCapability: capability, state: accessState{storageVersion: version, credential: cloneCredential(credential)}, serial: make(chan struct{}, 1), keys: make(grantKeys)}, nil
+	return &Client{key: key, device: device, transport: transport, storage: storage, storageCapability: capability, state: accessState{storageVersion: version, credential: cloneCredential(credential)}, serial: make(chan struct{}, 1), keys: make(grantKeys)}, nil
 }
 
 func (c *Client) lockOperation(ctx context.Context, generation uint64) error {
@@ -161,6 +165,18 @@ func (c *Client) invalidateLocked() error {
 	c.wakeInstalled()
 	return nil
 }
+func (c *Client) invalidateLockedPreservingPending() error {
+	if c.installed == nil {
+		return c.invalidateLocked()
+	}
+	version, err := c.installed.invalidatePreservingPending()
+	if err != nil {
+		return ErrStorage
+	}
+	c.state.storageVersion = version
+	c.wakeInstalled()
+	return nil
+}
 func (c *Client) generation() (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -205,11 +221,14 @@ func (c *Client) Snapshot() (Snapshot, error) {
 func (c *Client) snapshotLocked() Snapshot {
 	snapshot := Snapshot{Access: AccessDenied, Entitlements: make(map[string]bool), ReauthenticationRequired: true, StorageCapability: c.storageCapability}
 	state := &c.state
+	var credentialExpiry *int64
 	if state.credential != nil {
 		snapshot.Access = AccessRefreshRequired
 		expiry := state.credential.CredentialExpiresAt
 		if expiry != 0 {
-			snapshot.CredentialExpiresAt = &expiry
+			credentialExpiry = &expiry
+			at := time.Unix(expiry, 0).UTC()
+			snapshot.CredentialExpiresAt = &at
 		}
 		snapshot.ReauthenticationRequired = false
 	}
@@ -221,10 +240,10 @@ func (c *Client) snapshotLocked() Snapshot {
 		return snapshot
 	}
 	claims := state.claims
-	expiry, refresh := claims.ExpiresAt, claims.RefreshAfter
-	snapshot.ExpiresAt = &expiry
-	snapshot.NextCheckAt = &refresh
-	snapshot.ReauthenticationRequired = snapshot.CredentialExpiresAt != nil && *snapshot.CredentialExpiresAt <= saturatingAdd(now, 86400)
+	expiresAt, nextCheckAt := time.Unix(claims.ExpiresAt, 0).UTC(), time.Unix(claims.RefreshAfter, 0).UTC()
+	snapshot.ExpiresAt = &expiresAt
+	snapshot.NextCheckAt = &nextCheckAt
+	snapshot.ReauthenticationRequired = credentialExpiry != nil && *credentialExpiry <= saturatingAdd(now, 86400)
 	snapshot.OfflineAllowed = claims.OfflineAllowed
 	switch {
 	case claims.ExpiresAt <= now:
@@ -245,7 +264,7 @@ func (c *Client) snapshotLocked() Snapshot {
 			snapshot.Entitlements[name] = allowed
 		}
 		if claims.OfflineAllowed {
-			snapshot.RemainingOfflineSeconds = uint64(claims.ExpiresAt - now)
+			snapshot.RemainingOffline = time.Duration(claims.ExpiresAt-now) * time.Second
 		}
 	}
 	return snapshot
@@ -261,23 +280,33 @@ func (c *Client) Logout() error {
 }
 
 func (c *Client) Activate(ctx context.Context, key string, operationID ...string) (Snapshot, error) {
-	if len(operationID) > 1 {
+	if len(operationID) > 1 || len(operationID) == 1 && !validOperationID(operationID[0]) {
 		return Snapshot{}, ErrConfiguration
 	}
-	id := ""
-	if len(operationID) == 1 {
-		id = operationID[0]
-	}
-	return c.ActivateWithPrevious(ctx, key, "", id)
+	return c.ActivateWithPrevious(ctx, key, "", operationID...)
 }
-func (c *Client) ActivateWithPrevious(ctx context.Context, key, previousCredential, idempotencyKey string) (Snapshot, error) {
+func (c *Client) ActivateWithPrevious(ctx context.Context, key, previousCredential string, operationIDs ...string) (Snapshot, error) {
+	if len(operationIDs) > 1 || len(operationIDs) == 1 && !validOperationID(operationIDs[0]) {
+		return Snapshot{}, ErrConfiguration
+	}
+	idempotencyKey := ""
+	if len(operationIDs) == 1 {
+		idempotencyKey = operationIDs[0]
+	}
 	return c.activate(ctx, key, "", previousCredential, idempotencyKey)
 }
 func (c *Client) activate(ctx context.Context, key, licence, previousCredential, idempotencyKey string) (Snapshot, error) {
 	ctx, stop := c.operationContext(ctx)
 	defer stop()
-	if (licence == "" && (key == "" || len(key) > 256)) || (licence != "" && !opaque(licence)) || (idempotencyKey != "" && !validOperationID(idempotencyKey)) || (idempotencyKey == "" && c.installed == nil) || (previousCredential != "" && !bearer(previousCredential)) {
+	if (licence == "" && (key == "" || len(key) > 256)) || (licence != "" && !opaque(licence)) || (idempotencyKey != "" && !validOperationID(idempotencyKey)) || (previousCredential != "" && !bearer(previousCredential)) {
 		return Snapshot{}, ErrConfiguration
+	}
+	if idempotencyKey == "" && c.installed == nil {
+		device, err := NewInstallation()
+		if err != nil {
+			return Snapshot{}, err
+		}
+		idempotencyKey = device.InstallationID
 	}
 	generation, err := c.generation()
 	if err != nil {
@@ -297,11 +326,15 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 		return Snapshot{}, ErrStaleResponse
 	}
 	if c.installed != nil {
+		customerID := ""
 		if licence != "" && c.state.account == nil {
 			c.mu.Unlock()
 			return Snapshot{}, ErrReauthenticationRequired
 		}
-		id, version, err := c.installed.begin(key, licence, previousCredential, idempotencyKey)
+		if licence != "" {
+			customerID = c.state.account.account.Customer.ID
+		}
+		id, version, err := c.installed.begin(key, licence, customerID, previousCredential, idempotencyKey, c.device.Fingerprint, c.device.FingerprintProvider)
 		if err != nil {
 			c.mu.Unlock()
 			return Snapshot{}, err
@@ -405,7 +438,21 @@ func (c *Client) credentialBody(saved *StoredCredential) map[string]any {
 
 // Deactivate clears activation access before the request while retaining a
 // customer login. Only a nil error confirms server-side slot release.
-func (c *Client) Deactivate(ctx context.Context, idempotencyKey string) error {
+func (c *Client) Deactivate(ctx context.Context, ids ...string) error {
+	if len(ids) > 1 || len(ids) == 1 && !validOperationID(ids[0]) {
+		return ErrConfiguration
+	}
+	idempotencyKey := ""
+	if len(ids) == 1 {
+		idempotencyKey = ids[0]
+	}
+	if idempotencyKey == "" {
+		device, err := NewInstallation()
+		if err != nil {
+			return err
+		}
+		idempotencyKey = device.InstallationID
+	}
 	if !validOperationID(idempotencyKey) {
 		return ErrConfiguration
 	}
@@ -440,6 +487,29 @@ func (c *Client) Deactivate(ctx context.Context, idempotencyKey string) error {
 	return nil
 }
 
+// EnsureAccess asks for a key only when access is not activated. It never
+// calls the prompt after an outage, feature denial, or another failure.
+func (c *Client) EnsureAccess(ctx context.Context, feature string, askForKey func(context.Context) (string, error)) (Snapshot, error) {
+	snapshot, err := c.RequireAccess(ctx, feature)
+	if !errors.Is(err, ErrNotActivated) {
+		return snapshot, err
+	}
+	if askForKey == nil {
+		return Snapshot{}, ErrNotActivated
+	}
+	key, err := askForKey(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if strings.TrimSpace(key) == "" {
+		return Snapshot{}, ErrNotActivated
+	}
+	if _, err := c.Activate(ctx, key); err != nil {
+		return Snapshot{}, err
+	}
+	return c.RequireAccess(ctx, feature)
+}
+
 // RequireAccess refreshes when needed, rechecks invalidation and expiry, and
 // permits offline work only within a verified policy grant after an outage.
 func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, error) {
@@ -465,18 +535,16 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		return Snapshot{}, ErrCancelled
 	}
 	if snapshot.Access != AccessOnline && snapshot.Access != AccessOffline {
-		if c.installed != nil {
-			c.mu.Lock()
-			unavailableDuringOutage := c.state.credential != nil && c.state.transient
-			c.mu.Unlock()
-			if unavailableDuringOutage {
-				return Snapshot{}, ErrTransient
-			}
+		c.mu.Lock()
+		unavailableDuringOutage := c.state.transient
+		c.mu.Unlock()
+		if unavailableDuringOutage {
+			return Snapshot{}, ErrTransient
 		}
-		return Snapshot{}, &Error{Kind: Denied, Code: "access_unavailable"}
+		return Snapshot{}, ErrNotActivated
 	}
 	if !snapshot.Entitlements[feature] {
-		return Snapshot{}, &Error{Kind: Denied, Code: "feature_unavailable"}
+		return Snapshot{}, ErrFeatureUnavailable
 	}
 	return snapshot, nil
 }
@@ -618,11 +686,7 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if reply.SecretReplayExpired {
 		return nil, nil, nil, ErrReauthenticationRequired
 	}
-	binding := "none"
-	if c.device.Fingerprint != nil {
-		binding = "hwid"
-	}
-	if !opaque(reply.ActivationID) || reply.InstallationID != c.device.InstallationID || !equalString(reply.FingerprintProvider, c.device.FingerprintProvider) || reply.BindingMode != binding || reply.Grant == nil {
+	if !opaque(reply.ActivationID) || reply.InstallationID != c.device.InstallationID || !equalString(reply.FingerprintProvider, c.device.FingerprintProvider) || (reply.BindingMode != "none" && reply.BindingMode != "hwid") || reply.BindingMode == "hwid" && c.device.Fingerprint == nil || reply.Grant == nil {
 		return nil, nil, nil, ErrInvalidResponse
 	}
 	server, err := timestamp(reply.ServerTime)
@@ -677,9 +741,12 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if licence == "" && previous != nil {
 		licence = previous.LicenceID
 	}
-	claims, err := verifyGrant(*reply.Grant, c.keys, expectedGrant{issuer: c.config.Issuer, application: c.config.ApplicationID, environment: c.config.EnvironmentID, licence: licence, activation: reply.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, credentialExpiresAt: expiry, credentialPersistent: expiry == 0, licenceExpiresAt: licenceExpiry, now: now})
+	claims, err := verifyGrant(*reply.Grant, c.keys, expectedGrant{issuer: c.key.issuer, application: c.key.applicationID, environment: c.key.environmentID, licence: licence, activation: reply.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, allowUnboundFingerprint: true, credentialExpiresAt: expiry, credentialPersistent: expiry == 0, licenceExpiresAt: licenceExpiry, now: now})
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if claims.BindingMode != reply.BindingMode {
+		return nil, nil, nil, ErrInvalidResponse
 	}
 	credential := ""
 	if reply.Credential != nil {
@@ -690,11 +757,21 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if !bearer(credential) {
 		return nil, nil, nil, ErrInvalidResponse
 	}
-	saved := &StoredCredential{ApplicationID: c.config.ApplicationID, EnvironmentID: c.config.EnvironmentID, ActivationID: reply.ActivationID, LicenceID: claims.Subject, InstallationID: c.device.InstallationID, Credential: credential, CredentialExpiresAt: expiry, Fingerprint: cloneString(c.device.Fingerprint), FingerprintProvider: cloneString(c.device.FingerprintProvider)}
+	saved := &StoredCredential{ApplicationID: c.key.applicationID, EnvironmentID: c.key.environmentID, ActivationID: reply.ActivationID, LicenceID: claims.Subject, InstallationID: c.device.InstallationID, Credential: credential, CredentialExpiresAt: expiry, Fingerprint: cloneString(c.device.Fingerprint), FingerprintProvider: cloneString(c.device.FingerprintProvider)}
 	return saved, claims, anchor, nil
 }
-func bearer(value string) bool           { return len(value) == 43 && asciiToken(value) }
-func validOperationID(value string) bool { return len(value) >= 16 && len(value) <= 128 }
+func bearer(value string) bool { return len(value) == 43 && asciiToken(value) }
+func validOperationID(value string) bool {
+	if !utf8.ValidString(value) || len(value) < 16 || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
 func optionalString(value string) *string {
 	if value == "" {
 		return nil

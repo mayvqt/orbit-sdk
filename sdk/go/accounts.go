@@ -5,21 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 // Customer and Account contain display metadata; login grants no feature access.
 type Customer struct {
-	ID        string `json:"id"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	Suspended bool   `json:"suspended"`
-	CreatedAt string `json:"created_at"`
+	ID        string    `json:"id"`
+	Username  string    `json:"username"`
+	Email     string    `json:"email"`
+	Suspended bool      `json:"suspended"`
+	CreatedAt time.Time `json:"created_at"`
 }
 type Account struct {
 	Customer  Customer
-	ExpiresAt string
+	ExpiresAt time.Time
 }
 
 // CustomerSessionProof holds sensitive login proof only in memory. Possession
@@ -56,15 +58,72 @@ type OwnedLicence struct {
 	PolicyName      string          `json:"policy_name"`
 	State           string          `json:"state"`
 	ExpiryMode      string          `json:"expiry_mode"`
-	FirstUsedAt     *string         `json:"first_used_at"`
-	ExpiresAt       *string         `json:"expires_at"`
-	DurationSeconds *int64          `json:"duration_seconds"`
+	FirstUsedAt     *time.Time      `json:"first_used_at"`
+	ExpiresAt       *time.Time      `json:"expires_at"`
+	Duration        *time.Duration  `json:"-"`
 	DeviceLimit     int32           `json:"device_limit"`
 	HWIDLocked      bool            `json:"hwid_locked"`
 	OfflineAllowed  bool            `json:"offline_allowed"`
-	OfflineSeconds  int32           `json:"offline_seconds"`
+	OfflineDuration time.Duration   `json:"-"`
 	Entitlements    map[string]bool `json:"entitlements"`
 }
+
+func (licence *OwnedLicence) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ID              string          `json:"id"`
+		PolicyName      string          `json:"policy_name"`
+		State           string          `json:"state"`
+		ExpiryMode      string          `json:"expiry_mode"`
+		FirstUsedAt     *string         `json:"first_used_at"`
+		ExpiresAt       *string         `json:"expires_at"`
+		DurationSeconds *int64          `json:"duration_seconds"`
+		DeviceLimit     int32           `json:"device_limit"`
+		HWIDLocked      bool            `json:"hwid_locked"`
+		OfflineAllowed  bool            `json:"offline_allowed"`
+		OfflineSeconds  int64           `json:"offline_seconds"`
+		Entitlements    map[string]bool `json:"entitlements"`
+	}
+	if err := decodeJSON(data, &wire); err != nil {
+		return ErrInvalidResponse
+	}
+	parse := func(value *string) (*time.Time, error) {
+		if value == nil {
+			return nil, nil
+		}
+		seconds, err := timestamp(*value)
+		if err != nil {
+			return nil, err
+		}
+		at := time.Unix(seconds, 0).UTC()
+		return &at, nil
+	}
+	firstUsedAt, err := parse(wire.FirstUsedAt)
+	if err != nil {
+		return err
+	}
+	expiresAt, err := parse(wire.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	var duration *time.Duration
+	if wire.DurationSeconds != nil {
+		seconds := *wire.DurationSeconds
+		if seconds < 0 || seconds > math.MaxInt64/int64(time.Second) {
+			return ErrInvalidResponse
+		}
+		value := time.Duration(seconds) * time.Second
+		duration = &value
+	}
+	if wire.OfflineSeconds < 0 || wire.OfflineSeconds > math.MaxInt64/int64(time.Second) {
+		return ErrInvalidResponse
+	}
+	*licence = OwnedLicence{ID: wire.ID, PolicyName: wire.PolicyName, State: wire.State, ExpiryMode: wire.ExpiryMode,
+		FirstUsedAt: firstUsedAt, ExpiresAt: expiresAt, Duration: duration, DeviceLimit: wire.DeviceLimit,
+		HWIDLocked: wire.HWIDLocked, OfflineAllowed: wire.OfflineAllowed, OfflineDuration: time.Duration(wire.OfflineSeconds) * time.Second,
+		Entitlements: wire.Entitlements}
+	return nil
+}
+
 type OwnedLicences struct {
 	Items      []OwnedLicence `json:"items"`
 	NextCursor *string        `json:"next_cursor"`
@@ -86,7 +145,7 @@ func (Registration) MarshalJSON() ([]byte, error) { return nil, ErrConfiguration
 // PendingRegistration keeps the scoped resend proof private in memory.
 type PendingRegistration struct {
 	Accepted         bool
-	ExpiresAt        string
+	ExpiresAt        time.Time
 	resendCredential string
 	applicationID    string
 	environmentID    string
@@ -154,7 +213,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (Account,
 		return Account{}, ErrStaleResponse
 	}
 	clearState(&c.state)
-	if err := c.invalidateLocked(); err != nil {
+	if err := c.invalidateLockedPreservingPending(); err != nil {
 		c.mu.Unlock()
 		return Account{}, err
 	}
@@ -171,7 +230,8 @@ func (c *Client) Login(ctx context.Context, username, password string) (Account,
 	if err := c.finishAccount(ctx, generation, err); err != nil {
 		return Account{}, err
 	}
-	account := Account{Customer: reply.Customer, ExpiresAt: reply.ExpiresAt}
+	expires, _ := timestamp(reply.ExpiresAt)
+	account := Account{Customer: reply.Customer, ExpiresAt: time.Unix(expires, 0).UTC()}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.syncStorageLocked(); err != nil {
@@ -187,12 +247,25 @@ func (c *Client) Login(ctx context.Context, username, password string) (Account,
 	return account, nil
 }
 
-func (c *Client) ActivateAccount(ctx context.Context, licenceID, idempotencyKey string) (Snapshot, error) {
-	return c.ActivateAccountWithPrevious(ctx, licenceID, "", idempotencyKey)
+func (c *Client) ActivateAccount(ctx context.Context, licenceID string, operationIDs ...string) (Snapshot, error) {
+	if len(operationIDs) > 1 || len(operationIDs) == 1 && !validOperationID(operationIDs[0]) {
+		return Snapshot{}, ErrConfiguration
+	}
+	if len(operationIDs) == 1 {
+		return c.ActivateAccountWithPrevious(ctx, licenceID, "", operationIDs[0])
+	}
+	return c.ActivateAccountWithPrevious(ctx, licenceID, "")
 }
-func (c *Client) ActivateAccountWithPrevious(ctx context.Context, licenceID, previousCredential, idempotencyKey string) (Snapshot, error) {
+func (c *Client) ActivateAccountWithPrevious(ctx context.Context, licenceID, previousCredential string, operationIDs ...string) (Snapshot, error) {
+	if len(operationIDs) > 1 || len(operationIDs) == 1 && !validOperationID(operationIDs[0]) {
+		return Snapshot{}, ErrConfiguration
+	}
 	if !opaque(licenceID) {
 		return Snapshot{}, ErrConfiguration
+	}
+	idempotencyKey := ""
+	if len(operationIDs) == 1 {
+		idempotencyKey = operationIDs[0]
 	}
 	return c.activate(ctx, "", licenceID, previousCredential, idempotencyKey)
 }
@@ -268,8 +341,22 @@ func (c *Client) OwnedLicences(ctx context.Context, after string) (OwnedLicences
 	return page, nil
 }
 
-func (c *Client) ClaimLicence(ctx context.Context, key, idempotencyKey string) (OwnedLicence, error) {
-	if key == "" || len(key) > 256 || !validOperationID(idempotencyKey) {
+func (c *Client) ClaimLicence(ctx context.Context, key string, operationIDs ...string) (OwnedLicence, error) {
+	if len(operationIDs) > 1 || len(operationIDs) == 1 && !validOperationID(operationIDs[0]) || key == "" || len(key) > 256 {
+		return OwnedLicence{}, ErrConfiguration
+	}
+	idempotencyKey := ""
+	if len(operationIDs) == 1 {
+		idempotencyKey = operationIDs[0]
+	}
+	if idempotencyKey == "" {
+		device, err := NewInstallation()
+		if err != nil {
+			return OwnedLicence{}, err
+		}
+		idempotencyKey = device.InstallationID
+	}
+	if !validOperationID(idempotencyKey) {
 		return OwnedLicence{}, ErrConfiguration
 	}
 	var licence OwnedLicence
@@ -302,10 +389,11 @@ func (c *Client) Register(ctx context.Context, input Registration) (*PendingRegi
 	if _, err := timestamp(reply.ExpiresAt); err != nil {
 		return nil, err
 	}
-	return &PendingRegistration{Accepted: true, ExpiresAt: reply.ExpiresAt, resendCredential: reply.ResendCredential, applicationID: c.config.ApplicationID, environmentID: c.config.EnvironmentID}, nil
+	expires, _ := timestamp(reply.ExpiresAt)
+	return &PendingRegistration{Accepted: true, ExpiresAt: time.Unix(expires, 0).UTC(), resendCredential: reply.ResendCredential, applicationID: c.key.applicationID, environmentID: c.key.environmentID}, nil
 }
 func (c *Client) ResendRegistration(ctx context.Context, pending *PendingRegistration) error {
-	if pending == nil || pending.applicationID != c.config.ApplicationID || pending.environmentID != c.config.EnvironmentID || !bearer(pending.resendCredential) {
+	if pending == nil || pending.applicationID != c.key.applicationID || pending.environmentID != c.key.environmentID || !bearer(pending.resendCredential) {
 		return ErrConfiguration
 	}
 	data, err := c.publicPost(ctx, clientPrefix+"registrations/resend", map[string]any{"resend_credential": pending.resendCredential})
@@ -325,12 +413,12 @@ func (c *Client) RequestPasswordRecovery(ctx context.Context, email string) erro
 	return checkAccepted(data)
 }
 func (c *Client) scopeBody(body map[string]any) map[string]any {
-	body["application_id"] = c.config.ApplicationID
-	body["environment_id"] = c.config.EnvironmentID
+	body["application_id"] = c.key.applicationID
+	body["environment_id"] = c.key.environmentID
 	return body
 }
 func (c *Client) accountPath(route, after string) string {
-	result := route + "?application_id=" + c.config.ApplicationID + "&environment_id=" + c.config.EnvironmentID
+	result := route + "?application_id=" + c.key.applicationID + "&environment_id=" + c.key.environmentID
 	if after != "" {
 		result += "&after=" + after
 	}
@@ -399,7 +487,7 @@ func (c *Client) finishAccount(ctx context.Context, generation uint64, err error
 	}
 	if err != nil && !errors.Is(err, ErrTransient) && !errors.Is(err, ErrCancelled) && !errors.Is(err, &Error{Kind: Denied, Code: "session_expired"}) {
 		clearState(&c.state)
-		if storageErr := c.invalidateLocked(); storageErr != nil {
+		if storageErr := c.invalidateLockedPreservingPending(); storageErr != nil {
 			return storageErr
 		}
 	}
@@ -417,8 +505,8 @@ func checkLogin(reply loginReply) error {
 	if !opaque(customer.ID) || customer.Suspended || len(customer.Username) < 3 || len(customer.Username) > 32 || !errorCode(customer.Username) || len(customer.Email) == 0 || len(customer.Email) > 254 || !bearer(reply.Session) {
 		return ErrInvalidResponse
 	}
-	if _, err := timestamp(customer.CreatedAt); err != nil {
-		return err
+	if customer.CreatedAt.IsZero() || customer.CreatedAt.Nanosecond() != 0 {
+		return ErrInvalidResponse
 	}
 	if _, err := timestamp(reply.ExpiresAt); err != nil {
 		return err
@@ -429,11 +517,9 @@ func checkLicence(licence OwnedLicence) error {
 	if !opaque(licence.ID) || licence.DeviceLimit < 1 || licence.DeviceLimit > 100 || !validEntitlements(licence.Entitlements) || utf8.RuneCountInString(licence.PolicyName) > 80 {
 		return ErrInvalidResponse
 	}
-	for _, date := range []*string{licence.FirstUsedAt, licence.ExpiresAt} {
-		if date != nil {
-			if _, err := timestamp(*date); err != nil {
-				return err
-			}
+	for _, date := range []*time.Time{licence.FirstUsedAt, licence.ExpiresAt} {
+		if date != nil && (date.IsZero() || date.Nanosecond() != 0) {
+			return ErrInvalidResponse
 		}
 	}
 	return nil

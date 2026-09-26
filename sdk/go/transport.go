@@ -39,7 +39,10 @@ type Transport struct {
 // NewTransport accepts only an HTTPS origin without credentials, path or query.
 func NewTransport(base string) (*Transport, error) { return newTransport(base, "https", false) }
 
-func newTransport(base, scheme string, local bool) (*Transport, error) {
+// validateOrigin accepts only a bare scheme://host[:port] origin: no path
+// beyond "/", query, fragment or userinfo. AppKey parsing reuses this exact
+// check for the origin it decodes.
+func validateOrigin(base, scheme string, local bool) (*url.URL, error) {
 	if strings.IndexFunc(base, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
 		return nil, ErrConfiguration
 	}
@@ -66,6 +69,14 @@ func newTransport(base, scheme string, local bool) (*Transport, error) {
 		if err != nil || number < 1 || number > 65535 {
 			return nil, ErrConfiguration
 		}
+	}
+	return parsed, nil
+}
+
+func newTransport(base, scheme string, local bool) (*Transport, error) {
+	parsed, err := validateOrigin(base, scheme, local)
+	if err != nil {
+		return nil, err
 	}
 	transport := &http.Transport{
 		Proxy:                  http.ProxyFromEnvironment,

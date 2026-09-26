@@ -1,108 +1,65 @@
 # Orbit Rust SDK
 
-Add licence activation and feature checks to desktop or customer-hosted Rust software.
-The installed client remembers activation, refreshes access, and restores eligible
-cached access after a restart. Source is under the [MIT licence](../LICENSE).
-
-## Install and setup
-
-Use Rust/Cargo 1.98.1 or newer. Pin the public source release:
+Use the installed client to activate a licence and check protected features. The
+current workspace version is an unreleased v0.4.0 candidate; build it from this
+checkout rather than relying on a release tag or registry package.
 
 ```toml
 [dependencies]
-orbit-sdk = { git = "https://github.com/mayvqt/orbit-sdk", tag = "v0.3.0" }
+orbit-sdk = { path = "../Orbit-SDK/sdk/rust" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Copy the public origin, issuer, application ID and environment ID from **Integration**
-in your Orbit dashboard. These values are not secrets.
+Copy the public app key from **Integration** in your Orbit dashboard. Set it once
+before launching your app:
 
-```rust,ignore
-use orbit_sdk::{AppConfig, Cancellation, Client};
-
-let orbit = Client::open(AppConfig {
-    api_origin: "https://orbit.mayvie.dev".into(),
-    issuer: grant_issuer.into(),
-    application_id: application_id.into(),
-    environment_id: environment_id.into(),
-    fingerprint: None,
-    fingerprint_provider: None,
-}, None).await?;
-let cancel = Cancellation::new();
+```sh
+export ORBIT_APP_KEY='orbit_app_test_…'
 ```
 
-`None` selects the current user's state directory. For a service or container, pass
-`Some(Path::new("/absolute/dedicated/directory"))` on a persistent local volume.
-Share one cloned `Client` within your process. A second opener for the same directory
-returns `InstallationInUse`; leave its lock file in place.
+```rust
+use orbit_sdk::Client;
+use std::{error::Error, io::{self, Write}};
 
-## Activation
-
-First try the protected action. Ask for a purchase key only when access is unavailable:
-
-```rust,ignore
-match orbit.require_access("export", &cancel).await {
-    Ok(_) => {},
-    Err(orbit_sdk::Error::Denied { code, .. }) if code == "access_unavailable" => {
-        let key = prompt_for_licence_key();
-        orbit.activate_key(&key, &cancel).await?;
-        orbit.require_access("export", &cancel).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let app_key = std::env::var("ORBIT_APP_KEY")?;
+    let orbit = Client::open(&app_key).await?;
+    let access = orbit.ensure_access("export", || {
+        print!("Licence key: ");
+        io::stdout().flush().ok()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok()?;
+        Some(input.trim().to_owned())
+    }).await;
+    if let Err(error) = access {
+        let _ = orbit.close().await;
+        return Err(error.into());
     }
-    Err(error) => return Err(error.into()),
+    println!("Export authorized: synthetic report");
+    orbit.close().await?;
+    Ok(())
 }
 ```
 
-The SDK creates and remembers installation and activation retry identities. Retry the
-same key after an uncertain response; a different key is rejected until you reconcile
-the pending activation. Keys, passwords and customer sessions are never saved.
+`ensure_access` asks for a key only when no activation exists. It never opens a prompt
+for a temporary service outage or a licence that lacks the feature. Use `require_access`
+before each later protected operation. `Error::NotActivated` and
+`Error::FeatureUnavailable` are typed results; `error.code()` retains stable protocol
+codes.
 
-## Check access and restarts
+The zero-argument options use native `machine_v1` identity when available and the
+current user's default state directory. Orbit stores only the scoped fingerprint,
+never the raw machine identifier. To use an explicit persistent directory or change
+binding policy, call `Client::open_with_options` with `Options`. Identity changes rotate
+the installation ID and clear its saved activation and cached grant before recovery.
 
-Call `require_access("export", &cancel).await?` immediately before every export.
-Use `snapshot()` only to display status. Unknown or disabled features are denied.
-`Client::open` tries online validation before permitting any restored offline access;
-only a recognized temporary outage and an originally signed offline allowance qualify.
-Strict-online licences require online validation after every restart.
+Activation retries use a securely generated, durable operation ID automatically. Use
+`activate_with_id` when your application needs to supply an ID for an uncertain retry.
+The purchase key is never persisted. Customer account methods are available on the
+same client; see [advanced APIs](advanced.md#customer-accounts).
 
-Refresh scheduling belongs to the client. Persistent credentials are revocable and do
-not grant unlimited access: each signed grant still has a fixed expiry. Closing the app
-keeps the activation for its next launch:
-
-```rust,ignore
-orbit.close().await?;
-```
-
-Close cancels work, joins scheduling and checkpoints clock evidence before releasing
-the local lease. It does not release the purchased device slot. `deactivate` deliberately
-releases that slot after Orbit confirms the request.
-
-State is private to the current user: DPAPI on Windows, owner-only files on Linux.
-[Storage and clock guarantees](advanced.md#storage-and-clock-guarantees) explain
-recovery, sleep and clock rollback.
-
-## Optional: username/password sign-in
-
-Customer accounts belong to people using **your software**. They are separate from your
-Orbit dashboard account. Key-only integrations can skip this section.
-
-After a buyer registers and confirms their email, use the same client:
-
-```rust,ignore
-orbit.login(&username, &password, &cancel).await?;
-let page = orbit.owned_licences(None, &cancel).await?;
-// Let the user select a licence ID from page.items.
-// Any unique 16–128 character string, e.g. a UUID. Create it once per selection
-// and reuse it if you retry this activation.
-let operation_id = new_operation_id();
-orbit.activate_account(&selected_id, &operation_id, &cancel).await?;
-orbit.require_access("export", &cancel).await?;
-```
-
-Login and licence listing do not authorize protected work. Sessions stay in memory;
-ordinary session expiry does not expire a separate installation credential. Explicit
-session revocation, recovery and security changes can revoke it.
-
-See [advanced APIs](advanced.md) for registration, account management, custom storage,
-binding and explicit operation IDs. Run the [console example](../../examples/rust/licensed-export/README.md)
-for activation and restart behavior. The [backend example](../../examples/rust/licensed-backend/README.md)
-shows separate server-side customer authentication and licence enforcement.
+See the [console example](../../examples/rust/licensed-export/README.md) for an end-to-end
+flow and the [backend example](../../examples/rust/licensed-backend/README.md) for
+server-side customer authentication. Storage and clock behavior is described in the
+[advanced guide](advanced.md#storage-and-clock-guarantees).

@@ -160,7 +160,7 @@ fn grant_mutations_reject_signed_invalid_json_and_duplicate_security_fields() {
     let parts: Vec<_> = token.split('.').collect();
     let header = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
     let mut all_claims = claims();
-    for name in ["fingerprint", "fingerprint_provider", "licence_expires_at"] {
+    for name in ["licence_expires_at"] {
         all_claims[name] = serde_json::Value::Null;
     }
     let payload = serde_json::to_vec(&all_claims).unwrap();

@@ -30,7 +30,7 @@ fn shared_grant_vectors() {
         });
     let corpus: Corpus = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(corpus.format_version, 1);
-    assert_eq!(corpus.cases.len(), 101);
+    assert_eq!(corpus.cases.len(), 104);
     assert_eq!(corpus.cases.iter().filter(|case| case.valid).count(), 12);
     for case in corpus.cases {
         let mut expected = corpus.expected.clone();
@@ -51,6 +51,7 @@ fn shared_grant_vectors() {
             installation: text("installation"),
             fingerprint: expected["fingerprint"].as_str(),
             fingerprint_provider: expected["fingerprint_provider"].as_str(),
+            allow_unbound_fingerprint: false,
             credential_expires_at: expected["credential_expires_at"].as_i64(),
             licence_expires_at: expected["licence_expires_at"].as_i64(),
             now: number("now"),

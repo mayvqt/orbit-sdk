@@ -7,6 +7,6 @@ import (
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
 )
 
-func openClient(ctx context.Context, config orbit.AppConfig) (*orbit.Client, error) {
-	return orbit.Open(ctx, config)
+func openClient(ctx context.Context, appKey string, options orbit.Options) (*orbit.Client, error) {
+	return orbit.Open(ctx, appKey, options)
 }

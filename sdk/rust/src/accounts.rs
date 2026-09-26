@@ -4,7 +4,10 @@ use crate::{
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Customer {
@@ -12,14 +15,15 @@ pub struct Customer {
     pub username: String,
     pub email: String,
     pub suspended: bool,
-    pub created_at: String,
+    #[serde(deserialize_with = "deserialize_time")]
+    pub created_at: SystemTime,
 }
 
 /// Safe account metadata. Successful login does not authorize protected work.
 #[derive(Clone, Debug)]
 pub struct Account {
     pub customer: Customer,
-    pub expires_at: String,
+    pub expires_at: SystemTime,
 }
 
 /// Sensitive, opaque login proof held only in memory, with redacted debugging.
@@ -51,12 +55,18 @@ pub(crate) struct Session {
     pub(crate) token: String,
     account: Account,
 }
+impl Session {
+    pub(crate) fn customer_id(&self) -> &str {
+        &self.account.customer.id
+    }
+}
 
 #[derive(Deserialize)]
 struct LoginReply {
     customer: Customer,
     session: String,
-    expires_at: String,
+    #[serde(deserialize_with = "deserialize_time")]
+    expires_at: SystemTime,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -65,13 +75,21 @@ pub struct OwnedLicence {
     pub policy_name: String,
     pub state: String,
     pub expiry_mode: String,
-    pub first_used_at: Option<String>,
-    pub expires_at: Option<String>,
-    pub duration_seconds: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_time")]
+    pub first_used_at: Option<SystemTime>,
+    #[serde(default, deserialize_with = "deserialize_optional_time")]
+    pub expires_at: Option<SystemTime>,
+    #[serde(
+        rename = "duration_seconds",
+        default,
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub duration: Option<Duration>,
     pub device_limit: i32,
     pub hwid_locked: bool,
     pub offline_allowed: bool,
-    pub offline_seconds: i32,
+    #[serde(rename = "offline_seconds", deserialize_with = "deserialize_duration")]
+    pub offline_duration: Duration,
     pub entitlements: BTreeMap<String, bool>,
 }
 
@@ -92,7 +110,7 @@ pub struct Registration<'a> {
 /// Narrow resend proof retained in memory; deliberately not Debug or Serialize.
 pub struct PendingRegistration {
     pub accepted: bool,
-    pub expires_at: String,
+    pub expires_at: SystemTime,
     resend_credential: String,
     application_id: String,
     environment_id: String,
@@ -102,7 +120,8 @@ pub struct PendingRegistration {
 struct RegistrationReply {
     accepted: bool,
     resend_credential: String,
-    expires_at: String,
+    #[serde(deserialize_with = "deserialize_time")]
+    expires_at: SystemTime,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +130,100 @@ struct Accepted {
 }
 
 impl Client {
+    pub async fn login(&self, username: &str, password: &str) -> Result<Account> {
+        self.login_with_cancel(username, password, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn activate_account(&self, licence_id: &str) -> Result<Snapshot> {
+        self.activate_account_with_cancel(licence_id, "", &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn activate_account_with_id(
+        &self,
+        licence_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Snapshot> {
+        if !access::valid_operation_id(idempotency_key) {
+            return Err(Error::Configuration);
+        }
+        self.activate_account_with_cancel(
+            licence_id,
+            idempotency_key,
+            &self.0.transport.owner_cancel.clone(),
+        )
+        .await
+    }
+
+    pub async fn activate_account_with_previous(
+        &self,
+        licence_id: &str,
+        previous_credential: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Snapshot> {
+        if idempotency_key.is_some_and(|id| !access::valid_operation_id(id)) {
+            return Err(Error::Configuration);
+        }
+        self.activate_as(
+            ActivationPrincipal::Account(licence_id),
+            previous_credential,
+            idempotency_key.unwrap_or(""),
+            &self.0.transport.owner_cancel.clone(),
+        )
+        .await
+    }
+
+    pub async fn owned_licences(&self, after: Option<&str>) -> Result<OwnedLicences> {
+        self.owned_licences_with_cancel(after, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn claim_licence(&self, licence_key: &str) -> Result<OwnedLicence> {
+        self.claim_licence_with_cancel(licence_key, "", &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn claim_licence_with_id(
+        &self,
+        licence_key: &str,
+        idempotency_key: &str,
+    ) -> Result<OwnedLicence> {
+        if !access::valid_operation_id(idempotency_key) {
+            return Err(Error::Configuration);
+        }
+        self.claim_licence_with_cancel(
+            licence_key,
+            idempotency_key,
+            &self.0.transport.owner_cancel.clone(),
+        )
+        .await
+    }
+
+    pub async fn request_email_change(&self, password: &str, email: &str) -> Result<()> {
+        self.request_email_change_with_cancel(
+            password,
+            email,
+            &self.0.transport.owner_cancel.clone(),
+        )
+        .await
+    }
+
+    pub async fn register(&self, input: Registration<'_>) -> Result<PendingRegistration> {
+        self.register_with_cancel(input, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn resend_registration(&self, pending: &PendingRegistration) -> Result<()> {
+        self.resend_registration_with_cancel(pending, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
+    pub async fn request_password_recovery(&self, email: &str) -> Result<()> {
+        self.request_password_recovery_with_cancel(email, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+
     pub fn account(&self) -> Result<Option<Account>> {
         let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
         self.sync_storage(&mut state)?;
@@ -135,7 +248,7 @@ impl Client {
         })
     }
 
-    pub async fn login(
+    pub(crate) async fn login_with_cancel(
         &self,
         username: &str,
         password: &str,
@@ -163,7 +276,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .post(
+            .post_with_cancel(
                 "/api/client/v1/sessions",
                 &self.account_body(json!({"username": username, "password": password})),
                 false,
@@ -181,9 +294,7 @@ impl Client {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
             && !reply.customer.email.is_empty()
             && reply.customer.email.len() <= 254
-            && bearer(&reply.session)
-            && access::timestamp(&reply.customer.created_at).is_ok()
-            && access::timestamp(&reply.expires_at).is_ok();
+            && bearer(&reply.session);
         if !valid {
             return self.finish_account(Err(Error::InvalidResponse), generation, cancel);
         }
@@ -206,26 +317,15 @@ impl Client {
         Ok(account)
     }
 
-    pub async fn activate_account(
+    pub(crate) async fn activate_account_with_cancel(
         &self,
         licence_id: &str,
-        idempotency_key: &str,
-        cancel: &Cancellation,
-    ) -> Result<Snapshot> {
-        self.activate_account_with_previous(licence_id, None, idempotency_key, cancel)
-            .await
-    }
-
-    pub async fn activate_account_with_previous(
-        &self,
-        licence_id: &str,
-        previous_credential: Option<&str>,
         idempotency_key: &str,
         cancel: &Cancellation,
     ) -> Result<Snapshot> {
         self.activate_as(
             ActivationPrincipal::Account(licence_id),
-            previous_credential,
+            None,
             idempotency_key,
             cancel,
         )
@@ -234,10 +334,8 @@ impl Client {
 
     /// Local state is cleared when this method is called, even if its returned
     /// future is dropped. Only a successful await confirms remote revocation.
-    pub fn logout_account<'a>(
-        &'a self,
-        cancel: &'a Cancellation,
-    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+    pub fn logout_account(&self) -> impl std::future::Future<Output = Result<()>> + '_ {
+        let cancel = self.0.transport.owner_cancel.clone();
         let prepared = (|| -> Result<Option<Session>> {
             let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
             let session = state.account.take();
@@ -252,10 +350,10 @@ impl Client {
             let response = self
                 .0
                 .transport
-                .delete_bearer(
+                .delete_bearer_with_cancel(
                     &self.account_path("/api/client/v1/sessions/current", None),
                     &session.token,
-                    cancel,
+                    &cancel,
                 )
                 .await?;
             if response.is_some() {
@@ -265,7 +363,7 @@ impl Client {
         }
     }
 
-    pub async fn owned_licences(
+    pub(crate) async fn owned_licences_with_cancel(
         &self,
         after: Option<&str>,
         cancel: &Cancellation,
@@ -283,7 +381,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .get_bearer(
+            .get_bearer_with_cancel(
                 &self.account_path("/api/client/v1/licences", after),
                 &session.token,
                 cancel,
@@ -306,7 +404,7 @@ impl Client {
         self.finish_account(result, generation, cancel)
     }
 
-    pub async fn claim_licence(
+    pub(crate) async fn claim_licence_with_cancel(
         &self,
         licence_key: &str,
         idempotency_key: &str,
@@ -314,10 +412,19 @@ impl Client {
     ) -> Result<OwnedLicence> {
         if licence_key.is_empty()
             || licence_key.len() > 256
-            || !(16..=128).contains(&idempotency_key.len())
+            || (!idempotency_key.is_empty() && !access::valid_operation_id(idempotency_key))
+            || (!(16..=128).contains(&idempotency_key.len()) && self.0.installed.is_none())
         {
             return Err(Error::Configuration);
         }
+        let generated;
+        let idempotency_key = if idempotency_key.is_empty() {
+            let device = crate::Device::new_installation()?;
+            generated = device.installation_id;
+            generated.as_str()
+        } else {
+            idempotency_key
+        };
         self.account_post(
             "/api/client/v1/licence-claims",
             json!({"licence_key": licence_key, "idempotency_key": idempotency_key}),
@@ -331,7 +438,7 @@ impl Client {
         .await
     }
 
-    pub async fn request_email_change(
+    pub(crate) async fn request_email_change_with_cancel(
         &self,
         password: &str,
         email: &str,
@@ -351,7 +458,7 @@ impl Client {
         .map(|_| ())
     }
 
-    pub async fn register(
+    pub(crate) async fn register_with_cancel(
         &self,
         input: Registration<'_>,
         cancel: &Cancellation,
@@ -368,7 +475,7 @@ impl Client {
         let reply: RegistrationReply = decode(
             self.0
                 .transport
-                .post(
+                .post_with_cancel(
                     "/api/client/v1/registrations",
                     &self.account_body(
                         json!({"licence_key": input.licence_key, "username": input.username,
@@ -382,7 +489,6 @@ impl Client {
         if !reply.accepted || !bearer(&reply.resend_credential) {
             return Err(Error::InvalidResponse);
         }
-        access::timestamp(&reply.expires_at)?;
         Ok(PendingRegistration {
             accepted: reply.accepted,
             expires_at: reply.expires_at,
@@ -392,7 +498,7 @@ impl Client {
         })
     }
 
-    pub async fn resend_registration(
+    pub(crate) async fn resend_registration_with_cancel(
         &self,
         pending: &PendingRegistration,
         cancel: &Cancellation,
@@ -405,7 +511,7 @@ impl Client {
         accepted(decode(
             self.0
                 .transport
-                .post(
+                .post_with_cancel(
                     "/api/client/v1/registrations/resend",
                     &self.account_body(json!({"resend_credential": pending.resend_credential})),
                     false,
@@ -416,7 +522,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn request_password_recovery(
+    pub(crate) async fn request_password_recovery_with_cancel(
         &self,
         email: &str,
         cancel: &Cancellation,
@@ -427,7 +533,7 @@ impl Client {
         accepted(decode(
             self.0
                 .transport
-                .post(
+                .post_with_cancel(
                     "/api/client/v1/password-recovery",
                     &self.account_body(json!({"email": email})),
                     false,
@@ -483,7 +589,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .post(path, &self.account_body(body), retry_safe, cancel)
+            .post_with_cancel(path, &self.account_body(body), retry_safe, cancel)
             .await;
         self.finish_account(decode(response).and_then(validate), generation, cancel)
     }
@@ -537,13 +643,64 @@ fn check_licence(licence: &OwnedLicence) -> Result<()> {
     {
         return Err(Error::InvalidResponse);
     }
-    for date in [&licence.first_used_at, &licence.expires_at]
-        .into_iter()
-        .flatten()
-    {
-        access::timestamp(date)?;
-    }
     Ok(())
+}
+
+fn deserialize_time<'de, D>(deserializer: D) -> std::result::Result<SystemTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let timestamp = access::timestamp(&value).map_err(serde::de::Error::custom)?;
+    from_unix_seconds(timestamp).ok_or_else(|| serde::de::Error::custom("invalid timestamp"))
+}
+
+fn deserialize_optional_time<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<SystemTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            let timestamp = access::timestamp(&value).map_err(serde::de::Error::custom)?;
+            from_unix_seconds(timestamp)
+                .ok_or_else(|| serde::de::Error::custom("invalid timestamp"))
+        })
+        .transpose()
+}
+
+fn deserialize_optional_duration<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer)?
+        .map(|seconds| {
+            u64::try_from(seconds)
+                .map(Duration::from_secs)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let seconds = i64::deserialize(deserializer)?;
+    u64::try_from(seconds)
+        .map(Duration::from_secs)
+        .map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn from_unix_seconds(seconds: i64) -> Option<SystemTime> {
+    if seconds >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +710,67 @@ mod tests {
     use crate::transport::tests::{Fixture, TRANSIENT};
     use crate::{Access, Config, Device, MemoryStorage, Storage, StoredCredential, Transport};
     use std::sync::Arc;
+
+    fn system_time(value: &str) -> SystemTime {
+        from_unix_seconds(access::timestamp(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn account_and_licence_times_use_system_time_and_duration() {
+        let licence: OwnedLicence = serde_json::from_value(json!({
+            "id":"licence", "policy_name":"Export", "state":"active",
+            "expiry_mode":"duration", "first_used_at":"2026-01-01T00:00:00Z",
+            "expires_at":"2026-01-02T00:00:00Z", "duration_seconds":3600,
+            "device_limit":1, "hwid_locked":false, "offline_allowed":true,
+            "offline_seconds":900, "entitlements":{"export":true}
+        }))
+        .unwrap();
+        assert_eq!(
+            licence.first_used_at,
+            Some(system_time("2026-01-01T00:00:00Z"))
+        );
+        assert_eq!(licence.duration, Some(Duration::from_secs(3600)));
+        assert_eq!(licence.offline_duration, Duration::from_secs(900));
+        let boundary: OwnedLicence = serde_json::from_value(json!({
+            "id":"licence", "policy_name":"Export", "state":"active",
+            "expiry_mode":"duration", "first_used_at":"1969-12-31T23:59:59Z",
+            "expires_at":"9999-12-31T23:59:59Z", "duration_seconds":i64::MAX,
+            "device_limit":1, "hwid_locked":false, "offline_allowed":true,
+            "offline_seconds":i64::MAX, "entitlements":{"export":true}
+        }))
+        .unwrap();
+        assert_eq!(
+            boundary.first_used_at,
+            Some(UNIX_EPOCH - Duration::from_secs(1))
+        );
+        assert_eq!(
+            boundary.duration,
+            Some(Duration::from_secs(i64::MAX as u64))
+        );
+        assert_eq!(
+            boundary.offline_duration,
+            Duration::from_secs(i64::MAX as u64)
+        );
+        assert!(boundary.expires_at.is_some());
+        assert!(
+            serde_json::from_value::<OwnedLicence>(json!({
+                "id":"licence", "policy_name":"Export", "state":"active",
+                "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
+                "duration_seconds":-1, "device_limit":1, "hwid_locked":false,
+                "offline_allowed":false, "offline_seconds":0, "entitlements":{}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<OwnedLicence>(json!({
+                "id":"licence", "policy_name":"Export", "state":"active",
+                "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
+                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "offline_allowed":false, "offline_seconds":-1, "entitlements":{}
+            }))
+            .is_err()
+        );
+    }
 
     fn client() -> Client {
         let storage = Arc::new(MemoryStorage::default());
@@ -595,9 +813,9 @@ mod tests {
                     username: "alice".into(),
                     email: "alice@example.test".into(),
                     suspended: false,
-                    created_at: "2026-01-01T00:00:00Z".into(),
+                    created_at: system_time("2026-01-01T00:00:00Z"),
                 },
-                expires_at: "2026-01-02T00:00:00Z".into(),
+                expires_at: system_time("2026-01-02T00:00:00Z"),
             },
         });
         client
@@ -607,7 +825,7 @@ mod tests {
         let client = client();
         let generation = client.generation().unwrap();
         let cancel = Cancellation::new();
-        let logout = client.logout_account(&cancel);
+        let logout = client.logout_account();
         assert!(client.account().unwrap().is_none());
         assert_eq!(client.snapshot().unwrap().access, Access::Denied);
         drop(logout);
@@ -687,11 +905,7 @@ mod tests {
             fixture.assert_idle();
 
             let login_client = client.clone();
-            let login = tokio::spawn(async move {
-                login_client
-                    .login("alice", "password", &Cancellation::new())
-                    .await
-            });
+            let login = tokio::spawn(async move { login_client.login("alice", "password").await });
             fixture.next().await.respond(200, &login_reply("alice"));
             login.await.unwrap().unwrap();
             let writes = storage.writes.load(Ordering::SeqCst);
@@ -732,11 +946,8 @@ mod tests {
                 let mut client = client();
                 Arc::get_mut(&mut client.0).unwrap().transport = fixture.transport.clone();
                 let old_client = client.clone();
-                let old_login = tokio::spawn(async move {
-                    old_client
-                        .login("alice", "password", &Cancellation::new())
-                        .await
-                });
+                let old_login =
+                    tokio::spawn(async move { old_client.login("alice", "password").await });
                 let late = fixture.next().await;
                 let newer = if newer_identity {
                     let next = Client::with_storage(
@@ -751,11 +962,8 @@ mod tests {
                     )
                     .unwrap();
                     let next_client = next.clone();
-                    let next_login = tokio::spawn(async move {
-                        next_client
-                            .login("bob", "password", &Cancellation::new())
-                            .await
-                    });
+                    let next_login =
+                        tokio::spawn(async move { next_client.login("bob", "password").await });
                     fixture.next().await.respond(200, &login_reply("bob"));
                     assert_eq!(next_login.await.unwrap().unwrap().customer.username, "bob");
                     Some(next)
@@ -795,7 +1003,7 @@ mod tests {
         Arc::get_mut(&mut client.0).unwrap().transport = fixture.transport.clone();
         let guard = client.0.serial.lock().await;
         let cancel = Cancellation::new();
-        let mut login = Box::pin(client.login("bob", "password", &cancel));
+        let mut login = Box::pin(client.login_with_cancel("bob", "password", &cancel));
         assert!(matches!(
             login.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Pending
@@ -819,7 +1027,9 @@ mod tests {
         client.0.storage.invalidate().unwrap();
         let cancel = Cancellation::new();
         cancel.cancel();
-        let _ = client.deactivate("deactivate_operation_123", &cancel).await;
+        let _ = client
+            .deactivate_with_cancel("deactivate_operation_123", &cancel)
+            .await;
         assert!(client.account().unwrap().is_none());
         assert_eq!(client.snapshot().unwrap().access, Access::Denied);
         assert!(client.0.storage.load().unwrap().1.is_none());
@@ -842,9 +1052,12 @@ mod tests {
             let operation = tokio::spawn(async move {
                 let cancel = Cancellation::new();
                 match route {
-                    "sessions" => client.login("alice", "password", &cancel).await.map(|_| ()),
+                    "sessions" => client
+                        .login_with_cancel("alice", "password", &cancel)
+                        .await
+                        .map(|_| ()),
                     "registrations" => client
-                        .register(
+                        .register_with_cancel(
                             Registration {
                                 licence_key: "key",
                                 username: "alice",
@@ -857,10 +1070,10 @@ mod tests {
                         .map(|_| ()),
                     "registrations/resend" => {
                         client
-                            .resend_registration(
+                            .resend_registration_with_cancel(
                                 &PendingRegistration {
                                     accepted: true,
-                                    expires_at: "2026-01-02T00:00:00Z".into(),
+                                    expires_at: system_time("2026-01-02T00:00:00Z"),
                                     resend_credential: "c".repeat(43),
                                     application_id: "app".into(),
                                     environment_id: "test".into(),
@@ -871,15 +1084,19 @@ mod tests {
                     }
                     "password-recovery" => {
                         client
-                            .request_password_recovery("alice@example.test", &cancel)
+                            .request_password_recovery_with_cancel("alice@example.test", &cancel)
                             .await
                     }
                     "email-changes" => {
                         client
-                            .request_email_change("password", "new@example.test", &cancel)
+                            .request_email_change_with_cancel(
+                                "password",
+                                "new@example.test",
+                                &cancel,
+                            )
                             .await
                     }
-                    "sessions/current" => client.logout_account(&cancel).await,
+                    "sessions/current" => client.logout_account().await,
                     _ => unreachable!(),
                 }
             });

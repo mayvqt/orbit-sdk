@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
 )
@@ -51,17 +52,14 @@ func main() {
 	}
 }
 func run() error {
-	args := os.Args[1:]
-	if len(args) != 4 && len(args) != 5 {
-		return errors.New("Usage: orbit-licensed-export URL APP_ID ENVIRONMENT_ID ISSUER [ABSOLUTE_STATE_DIRECTORY]")
+	appKey := strings.TrimSpace(os.Getenv("ORBIT_APP_KEY"))
+	if appKey == "" {
+		return errors.New("Set ORBIT_APP_KEY from the Integration page")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	config := orbit.AppConfig{APIOrigin: args[0], ApplicationID: args[1], EnvironmentID: args[2], Issuer: args[3]}
-	if len(args) == 5 {
-		config.StatePath = args[4]
-	}
-	client, err := openClient(ctx, config)
+	options := orbit.Options{StatePath: os.Getenv("ORBIT_STATE_PATH")}
+	client, err := openClient(ctx, appKey, options)
 	if err != nil {
 		return err
 	}
@@ -69,25 +67,16 @@ func run() error {
 	input := bufio.NewScanner(os.Stdin)
 	input.Buffer(make([]byte, 1024), 64*1024)
 	c := console{input: input, client: client}
-	if _, err := client.RequireAccess(ctx, "export"); err != nil {
-		var failure *orbit.Error
-		if errors.As(err, &failure) && failure.Kind == orbit.Denied && failure.Code == "access_unavailable" {
-			fmt.Println("Activate with a licence key, or leave it empty to use the account commands.")
-			key, promptErr := c.prompt("Licence key: ", false)
-			if promptErr != nil {
-				if errors.Is(promptErr, io.EOF) {
-					return nil
-				}
-				return promptErr
-			}
-			if key != "" {
-				if _, err = client.Activate(ctx, key); err != nil {
-					c.reportError(err)
-				}
-			}
-		} else {
-			c.reportError(err)
+	_, err = client.EnsureAccess(ctx, "export", func(context.Context) (string, error) {
+		fmt.Println("Activate with a licence key, or leave it empty to use the account commands.")
+		key, promptErr := c.prompt("Licence key: ", false)
+		if errors.Is(promptErr, io.EOF) {
+			return "", nil
 		}
+		return key, promptErr
+	})
+	if err != nil && !errors.Is(err, orbit.ErrNotActivated) {
+		c.reportError(err)
 	}
 	fmt.Println(commands)
 	for {
@@ -154,7 +143,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		for _, licence := range page.Items {
 			expiry := "not started or perpetual"
 			if licence.ExpiresAt != nil {
-				expiry = *licence.ExpiresAt
+				expiry = licence.ExpiresAt.Format(time.RFC3339)
 			}
 			fmt.Printf("%s | %s | %s | expires %s\n", licence.ID, licence.PolicyName, licence.State, expiry)
 		}

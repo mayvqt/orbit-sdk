@@ -13,21 +13,60 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 	"weak"
 )
 
-// AppConfig contains only public application configuration. StatePath optionally
-// names an absolute dedicated directory for this installation's private state.
-// Share the returned *Client; close it when the application stops.
-type AppConfig struct {
-	APIOrigin           string
-	Issuer              string
-	ApplicationID       string
-	EnvironmentID       string
+// BindingMode selects how an installed client identifies this machine.
+type BindingMode uint8
+
+const (
+	BindingAutomatic BindingMode = iota
+	BindingDisabled
+	BindingCustom
+)
+
+// Options contains optional installed-client settings. The zero value uses
+// native machine_v1 identity when available and the platform's default state path.
+type Options struct {
 	StatePath           string
-	Fingerprint         *string
-	FingerprintProvider *string
+	BindingMode         BindingMode
+	Fingerprint         string
+	FingerprintProvider string
+}
+
+func resolveBinding(key AppKey, options Options) (*string, *string, error) {
+	if options.BindingMode > BindingCustom {
+		return nil, nil, ErrConfiguration
+	}
+	switch options.BindingMode {
+	case BindingAutomatic:
+		if options.Fingerprint != "" || options.FingerprintProvider != "" {
+			return nil, nil, ErrConfiguration
+		}
+		fingerprint, err := NativeFingerprint(key.applicationID, key.environmentID)
+		if err != nil {
+			var failure *Error
+			if errors.As(err, &failure) && failure.Kind == Denied && failure.Code == "device_identity_unavailable" {
+				return nil, nil, nil
+			}
+			return nil, nil, err
+		}
+		provider := "machine_v1"
+		return &fingerprint, &provider, nil
+	case BindingDisabled:
+		if options.Fingerprint != "" || options.FingerprintProvider != "" {
+			return nil, nil, ErrConfiguration
+		}
+		return nil, nil, nil
+	case BindingCustom:
+		if !lowerHex(options.Fingerprint, 64) || !strings.HasPrefix(options.FingerprintProvider, "custom:") || !validProvider(options.FingerprintProvider) {
+			return nil, nil, ErrConfiguration
+		}
+		fingerprint, provider := options.Fingerprint, options.FingerprintProvider
+		return &fingerprint, &provider, nil
+	default:
+		return nil, nil, ErrConfiguration
+	}
 }
 
 type installedLifecycle struct {
@@ -45,24 +84,36 @@ type installedLifecycle struct {
 // Open restores a stable installation, checks its credential online when present,
 // and starts automatic refresh. Only a recognized outage allows verified cached
 // offline access. New installations do not contact Orbit until activation.
-func Open(ctx context.Context, config AppConfig) (*Client, error) {
-	transport, err := NewTransport(config.APIOrigin)
+func Open(ctx context.Context, rawAppKey string, options ...Options) (*Client, error) {
+	if len(options) > 1 {
+		return nil, ErrConfiguration
+	}
+	var config Options
+	if len(options) == 1 {
+		config = options[0]
+	}
+	key, err := ParseAppKey(rawAppKey)
 	if err != nil {
 		return nil, err
 	}
-	client, err := openInstalled(ctx, config, transport)
+	transport, err := NewTransport(key.apiOrigin)
+	if err != nil {
+		return nil, err
+	}
+	client, err := openInstalled(ctx, key, config, transport)
 	if err != nil {
 		transport.CloseIdleConnections()
 	}
 	return client, err
 }
 
-func openInstalled(ctx context.Context, config AppConfig, transport *Transport) (*Client, error) {
+func openInstalled(ctx context.Context, key AppKey, options Options, transport *Transport) (*Client, error) {
 	if ctx.Err() != nil {
 		return nil, ErrCancelled
 	}
-	if !opaque(config.ApplicationID) || !opaque(config.EnvironmentID) || config.Issuer == "" || len(config.Issuer) > 4096 || !utf8.ValidString(config.Issuer) || (config.Fingerprint == nil) != (config.FingerprintProvider == nil) || config.Fingerprint != nil && !lowerHex(*config.Fingerprint, 64) || config.FingerprintProvider != nil && !validProvider(*config.FingerprintProvider) {
-		return nil, ErrConfiguration
+	fingerprint, fingerprintProvider, err := resolveBinding(key, options)
+	if err != nil {
+		return nil, err
 	}
 	// The transport has already rejected paths, queries, credentials and insecure
 	// origins. Normalize equivalent DNS case, default port and trailing slash.
@@ -77,10 +128,10 @@ func openInstalled(ctx context.Context, config AppConfig, transport *Transport) 
 		host = "[" + host + "]"
 	}
 	origin := transport.base.Scheme + "://" + host
-	scope := installedScope{APIOrigin: origin, Issuer: config.Issuer, ApplicationID: config.ApplicationID, EnvironmentID: config.EnvironmentID}
+	scope := installedScope{APIOrigin: origin, Issuer: key.issuer, ApplicationID: key.applicationID, EnvironmentID: key.environmentID}
 	scopeBytes, _ := json.Marshal(scope)
 	digest := sha256.Sum256(scopeBytes)
-	path := config.StatePath
+	path := options.StatePath
 	if path == "" {
 		base := ""
 		switch runtime.GOOS {
@@ -119,18 +170,25 @@ func openInstalled(ctx context.Context, config AppConfig, transport *Transport) 
 			files.close()
 			return nil, e
 		}
-		record := installedRecord{SDK: installedSDK, Format: 2, Provider: provider, Scope: scope, Installation: installedIdentity{ID: device.InstallationID, Fingerprint: cloneString(config.Fingerprint), FingerprintProvider: cloneString(config.FingerprintProvider)}}
+		record := installedRecord{SDK: installedSDK, Format: 2, Provider: provider, Scope: scope, Installation: installedIdentity{ID: device.InstallationID, Fingerprint: cloneString(fingerprint), FingerprintProvider: cloneString(fingerprintProvider)}}
 		err = storage.writeLocked(record)
 	} else if err == nil {
-		storage.record, err = decodeInstalled(data, scope, provider, config.Fingerprint, config.FingerprintProvider)
+		storage.record, err = decodeInstalled(data, scope, provider)
 	}
 	clear(data)
 	if err != nil {
 		files.close()
 		return nil, ErrStorage
 	}
+	if !created {
+		if _, err = storage.rebindIfChanged(fingerprint, fingerprintProvider); err != nil {
+			files.close()
+			return nil, err
+		}
+	}
 	record := storage.record
-	client, err := NewClientWithStorage(Config{ApplicationID: config.ApplicationID, EnvironmentID: config.EnvironmentID, Issuer: config.Issuer}, Device{InstallationID: record.Installation.ID, Fingerprint: config.Fingerprint, FingerprintProvider: config.FingerprintProvider}, transport, storage)
+	device := Device{InstallationID: record.Installation.ID, Fingerprint: fingerprint, FingerprintProvider: fingerprintProvider}
+	client, err := newClientWithStorage(key, device, transport, storage, true)
 	if err != nil {
 		storage.close()
 		return nil, err
@@ -175,6 +233,11 @@ func (c *Client) restoreInstalled(record installedRecord) (err error) {
 	if a == nil || credential == nil {
 		return nil
 	}
+	if !equalString(record.Installation.Fingerprint, c.device.Fingerprint) || !equalString(record.Installation.FingerprintProvider, c.device.FingerprintProvider) {
+		// A cache belongs to the exact machine identity saved with it. Keep the
+		// encrypted record intact for recovery, but force online validation.
+		return nil
+	}
 	restored := false
 	defer func() {
 		if !restored {
@@ -185,7 +248,7 @@ func (c *Client) restoreInstalled(record installedRecord) (err error) {
 	if err != nil {
 		return nil
 	}
-	expected := expectedGrant{issuer: c.config.Issuer, application: c.config.ApplicationID, environment: c.config.EnvironmentID, licence: credential.LicenceID, activation: credential.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, credentialExpiresAt: credential.CredentialExpiresAt, credentialPersistent: credential.CredentialExpiresAt == 0, licenceExpiresAt: a.LicenceExpiresAt, now: a.ReceivedServerTime}
+	expected := expectedGrant{issuer: c.key.issuer, application: c.key.applicationID, environment: c.key.environmentID, licence: credential.LicenceID, activation: credential.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, allowUnboundFingerprint: true, credentialExpiresAt: credential.CredentialExpiresAt, credentialPersistent: credential.CredentialExpiresAt == 0, licenceExpiresAt: a.LicenceExpiresAt, now: a.ReceivedServerTime}
 	claims, err := verifyGrant(a.JWS, keys, expected)
 	if err != nil {
 		return nil

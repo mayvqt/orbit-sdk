@@ -1,5 +1,7 @@
+#[cfg(test)]
+use crate::MemoryStorage;
 use crate::{
-    Cancellation, Error, MemoryStorage, Result, Storage, StoredCredential, Transport,
+    Cancellation, Error, Result, Storage, StoredCredential, Transport,
     accounts::Session,
     clock::{self, Anchor},
     grants::{self, Claims, Expected, Keys},
@@ -14,7 +16,7 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Clone)]
-pub struct Config {
+pub(crate) struct Config {
     pub application_id: String,
     pub environment_id: String,
     pub issuer: String,
@@ -49,12 +51,17 @@ pub enum Access {
 pub struct Snapshot {
     pub access: Access,
     pub entitlements: BTreeMap<String, bool>,
-    pub expires_at: Option<i64>,
-    pub next_check_at: Option<i64>,
-    pub credential_expires_at: Option<i64>,
+    pub expires_at: Option<std::time::SystemTime>,
+    pub next_check_at: Option<std::time::SystemTime>,
+    pub credential_expires_at: Option<std::time::SystemTime>,
     pub reauthentication_required: bool,
     pub offline_allowed: bool,
-    pub remaining_offline_seconds: u64,
+    pub remaining_offline: Duration,
+}
+impl Snapshot {
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.entitlements.get(feature).copied().unwrap_or(false)
+    }
 }
 pub(crate) struct State {
     pub(crate) generation: u64,
@@ -126,10 +133,13 @@ pub(crate) fn opaque(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
+pub(crate) fn valid_operation_id(value: &str) -> bool {
+    (16..=128).contains(&value.len()) && !value.chars().any(char::is_control)
+}
 fn bearer(value: &str) -> bool {
     value.len() == 43 && opaque(value)
 }
-fn valid_provider(value: &str) -> bool {
+pub(crate) fn valid_provider(value: &str) -> bool {
     value == "machine_v1"
         || value.strip_prefix("custom:").is_some_and(|suffix| {
             (1..=48).contains(&suffix.len())
@@ -171,8 +181,21 @@ pub(crate) fn valid_stored_credential(
         && opaque(&saved.licence_id)
         && bearer(&saved.credential)
 }
+fn valid_stored_credential_identity(
+    saved: &StoredCredential,
+    config: &Config,
+    device: &Device,
+) -> bool {
+    saved.application_id == config.application_id
+        && saved.environment_id == config.environment_id
+        && saved.installation_id == device.installation_id
+        && opaque(&saved.activation_id)
+        && opaque(&saved.licence_id)
+        && bearer(&saved.credential)
+}
 impl Client {
-    pub fn new(config: Config, device: Device, transport: Transport) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn new(config: Config, device: Device, transport: Transport) -> Result<Self> {
         Self::with_storage(
             config,
             device,
@@ -180,11 +203,29 @@ impl Client {
             Arc::new(MemoryStorage::default()),
         )
     }
-    pub fn with_storage(
+    #[cfg(test)]
+    pub(crate) fn with_storage(
+        config: Config,
+        device: Device,
+        transport: Transport,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Self> {
+        Self::with_storage_inner(config, device, transport, storage, false)
+    }
+    pub(crate) fn with_installed_storage(
+        config: Config,
+        device: Device,
+        transport: Transport,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Self> {
+        Self::with_storage_inner(config, device, transport, storage, true)
+    }
+    fn with_storage_inner(
         config: Config,
         device: Device,
         mut transport: Transport,
         storage: Arc<dyn Storage>,
+        allow_binding_change: bool,
     ) -> Result<Self> {
         if !valid_configuration(&config, &device) {
             return Err(Error::Configuration);
@@ -195,7 +236,11 @@ impl Client {
         transport.owner_cancel = Cancellation::new();
         let (version, credential) = storage.load()?;
         if let Some(saved) = &credential
-            && !valid_stored_credential(saved, &config, &device)
+            && !(if allow_binding_change {
+                valid_stored_credential_identity(saved, &config, &device)
+            } else {
+                valid_stored_credential(saved, &config, &device)
+            })
         {
             return Err(Error::Storage);
         }
@@ -255,18 +300,26 @@ impl Client {
             entitlements: BTreeMap::new(),
             expires_at: None,
             next_check_at: None,
-            credential_expires_at: credential_expiry,
+            credential_expires_at: credential_expiry
+                .map(|value| {
+                    crate::accounts::from_unix_seconds(value).ok_or(Error::InvalidResponse)
+                })
+                .transpose()?,
             reauthentication_required: state.credential.is_none(),
             offline_allowed: false,
-            remaining_offline_seconds: 0,
+            remaining_offline: Duration::ZERO,
         };
         if let (Some(claims), Some(anchor)) = (&state.claims, &state.anchor) {
             let now = match anchor.now() {
                 Ok(now) => now,
                 Err(_) => return Ok(snapshot),
             };
-            snapshot.expires_at = Some(claims.exp);
-            snapshot.next_check_at = Some(claims.refresh_after);
+            snapshot.expires_at =
+                Some(crate::accounts::from_unix_seconds(claims.exp).ok_or(Error::InvalidResponse)?);
+            snapshot.next_check_at = Some(
+                crate::accounts::from_unix_seconds(claims.refresh_after)
+                    .ok_or(Error::InvalidResponse)?,
+            );
             snapshot.reauthentication_required =
                 credential_expiry.is_some_and(|expiry| expiry <= now + 86400);
             snapshot.offline_allowed = claims.offline_allowed;
@@ -288,7 +341,7 @@ impl Client {
             if matches!(snapshot.access, Access::Online | Access::Offline) {
                 snapshot.entitlements = claims.entitlements.clone();
                 if claims.offline_allowed {
-                    snapshot.remaining_offline_seconds = (claims.exp - now) as u64;
+                    snapshot.remaining_offline = Duration::from_secs((claims.exp - now) as u64);
                 }
             }
         }
@@ -322,29 +375,42 @@ impl Client {
         state.storage_version = self.0.storage.invalidate()?;
         Ok(())
     }
-    pub async fn activate(
-        &self,
-        key: &str,
-        idempotency_key: &str,
-        cancel: &Cancellation,
-    ) -> Result<Snapshot> {
-        self.activate_with_previous(key, None, idempotency_key, cancel)
+    pub async fn activate(&self, key: &str) -> Result<Snapshot> {
+        self.activate_with_cancel(key, "", &self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub async fn activate_with_id(&self, key: &str, idempotency_key: &str) -> Result<Snapshot> {
+        if !valid_operation_id(idempotency_key) {
+            return Err(Error::Configuration);
+        }
+        self.activate_with_cancel(key, idempotency_key, &self.0.transport.owner_cancel.clone())
             .await
     }
     pub async fn activate_with_previous(
         &self,
         key: &str,
         previous_credential: Option<&str>,
-        idempotency_key: &str,
-        cancel: &Cancellation,
+        idempotency_key: Option<&str>,
     ) -> Result<Snapshot> {
+        if idempotency_key.is_some_and(|id| !valid_operation_id(id)) {
+            return Err(Error::Configuration);
+        }
         self.activate_as(
             ActivationPrincipal::Key(key),
             previous_credential,
-            idempotency_key,
-            cancel,
+            idempotency_key.unwrap_or(""),
+            &self.0.transport.owner_cancel.clone(),
         )
         .await
+    }
+    pub(crate) async fn activate_with_cancel(
+        &self,
+        key: &str,
+        idempotency_key: &str,
+        cancel: &Cancellation,
+    ) -> Result<Snapshot> {
+        self.activate_as(ActivationPrincipal::Key(key), None, idempotency_key, cancel)
+            .await
     }
     pub(crate) async fn activate_as(
         &self,
@@ -358,6 +424,7 @@ impl Client {
             ActivationPrincipal::Account(licence) => opaque(licence),
         };
         if !valid_principal
+            || (!idempotency_key.is_empty() && !valid_operation_id(idempotency_key))
             || (!(16..=128).contains(&idempotency_key.len())
                 && !(self.0.installed.is_some() && idempotency_key.is_empty()))
         {
@@ -371,20 +438,26 @@ impl Client {
             if state.generation != generation {
                 return Err(Error::StaleResponse);
             }
-            let session = match principal {
-                ActivationPrincipal::Key(_) => None,
-                ActivationPrincipal::Account(_) => Some(
-                    state
+            let (session, customer_id) = match principal {
+                ActivationPrincipal::Key(_) => (None, None),
+                ActivationPrincipal::Account(_) => {
+                    let account = state
                         .account
                         .as_ref()
-                        .ok_or(Error::ReauthenticationRequired)?
-                        .token
-                        .clone(),
-                ),
+                        .ok_or(Error::ReauthenticationRequired)?;
+                    (
+                        Some(account.token.clone()),
+                        Some(account.customer_id().to_owned()),
+                    )
+                }
             };
             let operation = if let Some(storage) = &self.0.installed {
-                let (operation, version) =
-                    storage.prepare_activation(principal, previous_credential, idempotency_key)?;
+                let (operation, version) = storage.prepare_activation(
+                    principal,
+                    customer_id.as_deref(),
+                    previous_credential,
+                    idempotency_key,
+                )?;
                 state.storage_version = version;
                 state.generation = state.generation.wrapping_add(1);
                 state.claims = None;
@@ -429,7 +502,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .post("/api/client/v1/activations", &input, true, cancel)
+            .post_with_cancel("/api/client/v1/activations", &input, true, cancel)
             .await;
         self.accept_for_licence(
             response,
@@ -441,7 +514,11 @@ impl Client {
         )
         .await
     }
-    pub async fn refresh(&self, cancel: &Cancellation) -> Result<Snapshot> {
+    pub async fn refresh(&self) -> Result<Snapshot> {
+        self.refresh_with_cancel(&self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn refresh_with_cancel(&self, cancel: &Cancellation) -> Result<Snapshot> {
         self.refresh_inner(cancel, false).await
     }
     pub(crate) async fn refresh_if_needed(&self, cancel: &Cancellation) -> Result<Snapshot> {
@@ -476,8 +553,7 @@ impl Client {
                 Access::RefreshRequired | Access::Expired | Access::Offline
             ) || !retry_due
             {
-                if self.0.installed.is_some()
-                    && snapshot.access != Access::Offline
+                if snapshot.access != Access::Offline
                     && let Some(error) = &state.last_failure
                 {
                     return Err(error.clone());
@@ -498,7 +574,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .post(
+            .post_with_cancel(
                 &format!(
                     "/api/client/v1/activations/{}/validate",
                     saved.activation_id
@@ -515,7 +591,30 @@ impl Client {
         json!({"application_id":self.0.config.application_id,"environment_id":self.0.config.environment_id,"credential":saved.credential,
             "installation_id":self.0.device.installation_id,"fingerprint":self.0.device.fingerprint,"fingerprint_provider":self.0.device.fingerprint_provider})
     }
-    pub async fn deactivate(&self, idempotency_key: &str, cancel: &Cancellation) -> Result<()> {
+    pub async fn deactivate(&self) -> Result<()> {
+        self.deactivate_with_cancel("", &self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub async fn deactivate_with_id(&self, idempotency_key: &str) -> Result<()> {
+        if !valid_operation_id(idempotency_key) {
+            return Err(Error::Configuration);
+        }
+        self.deactivate_with_cancel(idempotency_key, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn deactivate_with_cancel(
+        &self,
+        requested_id: &str,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let generated;
+        let idempotency_key = if requested_id.is_empty() {
+            let device = Device::new_installation()?;
+            generated = device.installation_id;
+            generated.as_str()
+        } else {
+            requested_id
+        };
         if !(16..=128).contains(&idempotency_key.len()) {
             return Err(Error::Configuration);
         }
@@ -537,7 +636,7 @@ impl Client {
         let response = self
             .0
             .transport
-            .post(
+            .post_with_cancel(
                 &format!(
                     "/api/client/v1/activations/{}/deactivate",
                     saved.activation_id
@@ -552,7 +651,15 @@ impl Client {
         }
         Ok(())
     }
-    pub async fn require_access(&self, feature: &str, cancel: &Cancellation) -> Result<Snapshot> {
+    pub async fn require_access(&self, feature: &str) -> Result<Snapshot> {
+        self.require_access_with_cancel(feature, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn require_access_with_cancel(
+        &self,
+        feature: &str,
+        cancel: &Cancellation,
+    ) -> Result<Snapshot> {
         let snapshot = self.snapshot()?;
         let snapshot = if matches!(
             snapshot.access,
@@ -562,7 +669,7 @@ impl Client {
                 Ok(value) => value,
                 Err(error @ Error::Transient { .. }) => {
                     let snapshot = self.snapshot()?;
-                    if self.0.installed.is_some() && snapshot.access != Access::Offline {
+                    if snapshot.access != Access::Offline {
                         return Err(error);
                     }
                     snapshot
@@ -573,18 +680,28 @@ impl Client {
             snapshot
         };
         if !matches!(snapshot.access, Access::Online | Access::Offline) {
-            return Err(Error::Denied {
-                code: "access_unavailable".into(),
-                request_id: None,
-            });
+            return Err(Error::NotActivated);
         }
         if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
-            return Err(Error::Denied {
-                code: "feature_unavailable".into(),
-                request_id: None,
-            });
+            return Err(Error::FeatureUnavailable);
         }
         Ok(snapshot)
+    }
+    pub async fn ensure_access<F>(&self, feature: &str, ask_for_key: F) -> Result<Snapshot>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        match self.require_access(feature).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(Error::NotActivated) => {
+                let Some(key) = ask_for_key().filter(|key| !key.trim().is_empty()) else {
+                    return Err(Error::NotActivated);
+                };
+                self.activate(&key).await?;
+                self.require_access(feature).await
+            }
+            Err(error) => Err(error),
+        }
     }
     async fn accept(
         &self,
@@ -717,12 +834,8 @@ impl Client {
         if !opaque(&reply.activation_id)
             || reply.installation_id != self.0.device.installation_id
             || reply.fingerprint_provider != self.0.device.fingerprint_provider
-            || reply.binding_mode
-                != if self.0.device.fingerprint.is_some() {
-                    "hwid"
-                } else {
-                    "none"
-                }
+            || !matches!(reply.binding_mode.as_str(), "none" | "hwid")
+            || (reply.binding_mode == "hwid" && self.0.device.fingerprint.is_none())
         {
             return Err(Error::InvalidResponse);
         }
@@ -756,7 +869,7 @@ impl Client {
             let value = self
                 .0
                 .transport
-                .get(
+                .get_with_cancel(
                     &format!(
                         "/.well-known/orbit-jwks.json?application_id={}&environment_id={}",
                         self.0.config.application_id, self.0.config.environment_id
@@ -782,6 +895,7 @@ impl Client {
             installation: &self.0.device.installation_id,
             fingerprint: self.0.device.fingerprint.as_deref(),
             fingerprint_provider: self.0.device.fingerprint_provider.as_deref(),
+            allow_unbound_fingerprint: true,
             credential_expires_at: expiry,
             licence_expires_at: licence_expiry,
             now,
@@ -791,6 +905,9 @@ impl Client {
             &*self.0.keys.lock().map_err(|_| Error::Storage)?,
             &expected,
         )?;
+        if claims.binding_mode != reply.binding_mode {
+            return Err(Error::InvalidResponse);
+        }
         let credential = reply
             .credential
             .or_else(|| previous.map(|saved| saved.credential.clone()))
@@ -1088,10 +1205,10 @@ mod tests {
                     let previous_client = client.clone();
                     let previous = tokio::spawn(async move {
                         if refresh {
-                            previous_client.refresh(&Cancellation::new()).await
+                            previous_client.refresh().await
                         } else {
                             previous_client
-                                .activate("old-key", "old_operation_123", &Cancellation::new())
+                                .activate_with_id("old-key", "old_operation_123")
                                 .await
                         }
                     });
@@ -1113,7 +1230,7 @@ mod tests {
                         let next_client = next.clone();
                         let activation = tokio::spawn(async move {
                             next_client
-                                .activate("new-key", "new_operation_123", &Cancellation::new())
+                                .activate_with_id("new-key", "new_operation_123")
                                 .await
                         });
                         fixture
@@ -1158,12 +1275,7 @@ mod tests {
         let activating_client = client.clone();
         let operation = tokio::spawn(async move {
             activating_client
-                .activate_with_previous(
-                    "key",
-                    Some("previous-proof"),
-                    "retry_operation_123",
-                    &Cancellation::new(),
-                )
+                .activate_with_previous("key", Some("previous-proof"), Some("retry_operation_123"))
                 .await
         });
         let first = fixture.next().await;
@@ -1194,7 +1306,7 @@ mod tests {
             let activating_client = client.clone();
             let operation = tokio::spawn(async move {
                 activating_client
-                    .activate("key", "cancel_operation_123", &operation_cancel)
+                    .activate_with_cancel("key", "cancel_operation_123", &operation_cancel)
                     .await
             });
             fixture
@@ -1226,7 +1338,7 @@ mod tests {
         let activating_client = client.clone();
         let operation = tokio::spawn(async move {
             activating_client
-                .activate("key", "logout_operation_123", &Cancellation::new())
+                .activate_with_id("key", "logout_operation_123")
                 .await
         });
         fixture
@@ -1255,7 +1367,9 @@ mod tests {
             let operation_cancel = cancel.clone();
             let refreshing = client.clone();
             let operation =
-                tokio::spawn(async move { refreshing.refresh(&operation_cancel).await });
+                tokio::spawn(
+                    async move { refreshing.refresh_with_cancel(&operation_cancel).await },
+                );
             fixture
                 .next()
                 .await
@@ -1303,13 +1417,63 @@ mod tests {
 
     #[cfg(feature = "local-development")]
     #[tokio::test]
+    async fn explicit_empty_or_out_of_range_mutation_ids_do_not_change_state_or_send() {
+        let mut fixture = Fixture::new().await;
+        let mut client = client(false);
+        Arc::get_mut(&mut client.0).unwrap().transport = fixture.transport.clone();
+        let before = {
+            let state = client.0.state.lock().unwrap();
+            (
+                state.generation,
+                state.credential.as_ref().unwrap().credential.clone(),
+            )
+        };
+        let result = client.activate_with_id("key", "").await;
+        assert!(matches!(result, Err(Error::Configuration)));
+        assert!(matches!(
+            client.activate_with_previous("key", None, Some("")).await,
+            Err(Error::Configuration)
+        ));
+        assert!(matches!(
+            client.activate_account_with_id("licence", "").await,
+            Err(Error::Configuration)
+        ));
+        assert!(matches!(
+            client
+                .activate_account_with_previous("licence", None, Some(""))
+                .await,
+            Err(Error::Configuration)
+        ));
+        assert!(matches!(
+            client.claim_licence_with_id("purchase-key", "").await,
+            Err(Error::Configuration)
+        ));
+        assert!(matches!(
+            client.deactivate_with_id("").await,
+            Err(Error::Configuration)
+        ));
+        let state = client.0.state.lock().unwrap();
+        assert_eq!(state.generation, before.0);
+        assert_eq!(
+            state
+                .credential
+                .as_ref()
+                .map(|value| value.credential.as_str()),
+            Some(before.1.as_str())
+        );
+        drop(state);
+        fixture.assert_idle();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
     async fn transient_jwks_failure_preserves_saved_credential_and_successful_retry_recovers() {
         let mut fixture = Fixture::new().await;
         let mut client = constructor(None, Some(stored_credential())).unwrap();
         Arc::get_mut(&mut client.0).unwrap().transport = fixture.transport.clone();
         let prior = client.0.storage.load().unwrap();
         let refreshing = client.clone();
-        let operation = tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+        let operation = tokio::spawn(async move { refreshing.refresh().await });
         fixture
             .next()
             .await
@@ -1335,7 +1499,7 @@ mod tests {
         );
 
         let refreshing = client.clone();
-        let retry = tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+        let retry = tokio::spawn(async move { refreshing.refresh().await });
         fixture
             .next()
             .await
@@ -1358,18 +1522,10 @@ mod tests {
 
         let serial = client.0.serial.lock().await;
         let requiring = client.clone();
-        let first = tokio::spawn(async move {
-            requiring
-                .require_access("export", &Cancellation::new())
-                .await
-        });
+        let first = tokio::spawn(async move { requiring.require_access("export").await });
         tokio::task::yield_now().await;
         let requiring = client.clone();
-        let queued = tokio::spawn(async move {
-            requiring
-                .require_access("export", &Cancellation::new())
-                .await
-        });
+        let queued = tokio::spawn(async move { requiring.require_access("export").await });
         tokio::task::yield_now().await;
         drop(serial);
 
@@ -1382,18 +1538,12 @@ mod tests {
             assert!(retry.head.contains("/activations/activation/validate"));
             retry.respond(503, crate::transport::tests::TRANSIENT);
         }
-        assert!(matches!(
-            first.await.unwrap(),
-            Err(Error::Denied { ref code, .. }) if code == "access_unavailable"
-        ));
+        assert!(matches!(first.await.unwrap(), Err(Error::Transient { .. })));
         let queued = tokio::time::timeout(Duration::from_secs(1), queued)
             .await
             .expect("queued protected access should finish without another refresh")
             .unwrap();
-        assert!(matches!(
-            queued,
-            Err(Error::Denied { ref code, .. }) if code == "access_unavailable"
-        ));
+        assert!(matches!(queued, Err(Error::Transient { .. })));
         let retry_deadline = client.0.state.lock().unwrap().retry_deadline.unwrap();
         assert!(retry_deadline >= pacing_started + Duration::from_secs(15));
         assert_eq!(
@@ -1401,18 +1551,16 @@ mod tests {
             stored_credential().credential
         );
 
-        let repeated = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.require_access("export", &Cancellation::new()),
-        )
-        .await
-        .expect("access check should return without another refresh");
-        assert!(matches!(repeated, Err(Error::Denied { .. })));
+        let repeated =
+            tokio::time::timeout(Duration::from_secs(1), client.require_access("export"))
+                .await
+                .expect("access check should return without another refresh");
+        assert!(matches!(repeated, Err(Error::Transient { .. })));
         fixture.assert_idle();
 
         // Explicit refresh bypasses the protected-call retry deadline.
         let refreshing = client.clone();
-        let explicit = tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+        let explicit = tokio::spawn(async move { refreshing.refresh().await });
         let validation = fixture.next().await;
         assert!(validation.head.contains("/activations/activation/validate"));
         validation.respond(200, &signed_reply(true, "licence"));
@@ -1426,23 +1574,17 @@ mod tests {
             Err(Error::Transient { .. })
         ));
 
-        let repeated = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.require_access("export", &Cancellation::new()),
-        )
-        .await
-        .expect("access check should remain paced after the explicit refresh");
-        assert!(matches!(repeated, Err(Error::Denied { .. })));
+        let repeated =
+            tokio::time::timeout(Duration::from_secs(1), client.require_access("export"))
+                .await
+                .expect("access check should remain paced after the explicit refresh");
+        assert!(matches!(repeated, Err(Error::Transient { .. })));
         fixture.assert_idle();
 
         client.0.state.lock().unwrap().retry_deadline =
             Some(Instant::now() - Duration::from_secs(1));
         let requiring = client.clone();
-        let retry = tokio::spawn(async move {
-            requiring
-                .require_access("export", &Cancellation::new())
-                .await
-        });
+        let retry = tokio::spawn(async move { requiring.require_access("export").await });
         fixture
             .next()
             .await
@@ -1469,7 +1611,7 @@ mod tests {
         client.0.state.lock().unwrap().anchor = Some(anchor);
 
         let refreshing = client.clone();
-        let explicit = tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+        let explicit = tokio::spawn(async move { refreshing.refresh().await });
         let validation = fixture.next().await;
         assert!(validation.head.contains("/activations/activation/validate"));
         let pacing_started = Instant::now();
@@ -1488,21 +1630,20 @@ mod tests {
         assert!(retry_deadline >= pacing_started + Duration::from_secs(15));
 
         for _ in 0..2 {
-            let snapshot = tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 Duration::from_secs(1),
                 client.refresh_if_needed(&Cancellation::new()),
             )
             .await
-            .expect("invalid anchor fallback should suppress another refresh")
-            .unwrap();
-            assert_eq!(snapshot.access, Access::RefreshRequired);
+            .expect("invalid anchor fallback should suppress another refresh");
+            assert!(matches!(outcome, Err(Error::Transient { .. })));
         }
         fixture.assert_idle();
 
         for _ in 0..2 {
             assert!(matches!(
-                client.require_access("export", &Cancellation::new()).await,
-                Err(Error::Denied { .. })
+                client.require_access("export").await,
+                Err(Error::Transient { .. })
             ));
         }
         fixture.assert_idle();
@@ -1517,7 +1658,7 @@ mod tests {
         let prior = client.0.storage.load().unwrap();
         let pacing_started = Instant::now();
         let refreshing = client.clone();
-        let operation = tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+        let operation = tokio::spawn(async move { refreshing.refresh().await });
         fixture
             .next()
             .await
@@ -1555,7 +1696,7 @@ mod tests {
         let activating = client.clone();
         let operation = tokio::spawn(async move {
             activating
-                .activate("key", "initial_operation_123", &Cancellation::new())
+                .activate_with_id("key", "initial_operation_123")
                 .await
         });
         fixture
@@ -1586,8 +1727,7 @@ mod tests {
                 *client.0.keys.lock().unwrap() = Keys::parse(jwks()).unwrap();
             }
             let refreshing = client.clone();
-            let operation =
-                tokio::spawn(async move { refreshing.refresh(&Cancellation::new()).await });
+            let operation = tokio::spawn(async move { refreshing.refresh().await });
             let reply = signed_reply(true, "licence");
             let reply = if kind == "unknown_key" {
                 reply_with_kid(&reply, "unknown-key")
@@ -1656,9 +1796,14 @@ mod tests {
     #[test]
     fn shared_storage_invalidation_clears_cached_access() {
         let client = client(true);
-        assert_eq!(client.snapshot().unwrap().access, Access::Online);
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.access, Access::Online);
+        assert!(snapshot.has_feature("export"));
+        assert!(!snapshot.has_feature("missing"));
         client.0.storage.invalidate().unwrap();
-        assert_eq!(client.snapshot().unwrap().access, Access::Denied);
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.access, Access::Denied);
+        assert!(!snapshot.has_feature("export"));
     }
     #[tokio::test]
     async fn explicit_denial_tls_failure_and_logout_invalidate_generations() {

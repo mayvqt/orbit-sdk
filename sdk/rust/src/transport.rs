@@ -16,25 +16,25 @@ const CLIENT_PREFIX: &str = "/api/client/v1/";
 const JWKS_PATH: &str = "/.well-known/orbit-jwks.json";
 
 #[derive(Clone)]
-pub struct Cancellation {
+pub(crate) struct Cancellation {
     state: watch::Sender<bool>,
 }
 
 impl Cancellation {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (state, _) = watch::channel(false);
         Self { state }
     }
 
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.state.send_replace(true);
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         *self.state.borrow()
     }
 
-    pub async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         let mut receiver = self.state.subscribe();
         loop {
             if *receiver.borrow_and_update() {
@@ -76,25 +76,7 @@ impl Transport {
 
     #[cfg(feature = "local-development")]
     pub fn local_loopback(base: &str) -> Result<Self> {
-        let parsed = origin(base, "http")?;
-        let authority = origin_authority(base)?;
-        let host = if let Some(ipv6) = authority.strip_prefix('[') {
-            ipv6.split_once(']')
-                .map(|(host, _)| host)
-                .ok_or(Error::Configuration)?
-        } else {
-            authority
-                .split_once(':')
-                .map_or(authority, |(host, _)| host)
-        };
-        // Parse the supplied literal, not a DNS name or a URL-normalized numeric
-        // hostname. This also excludes shorthand and integer IPv4 spellings.
-        if !host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-        {
-            return Err(Error::Configuration);
-        }
+        let parsed = validate_local_origin(base)?;
         let client = client_builder()
             .no_proxy()
             .build()
@@ -110,12 +92,23 @@ impl Transport {
         self.base.origin().ascii_serialization()
     }
 
-    pub async fn get(&self, path: &str, cancel: &Cancellation) -> Result<Option<Value>> {
+    pub async fn get(&self, path: &str) -> Result<Option<Value>> {
+        self.get_with_cancel(path, &self.owner_cancel.clone()).await
+    }
+    pub(crate) async fn get_with_cancel(
+        &self,
+        path: &str,
+        cancel: &Cancellation,
+    ) -> Result<Option<Value>> {
         self.request(Method::GET, path, None, None, true, cancel)
             .await
     }
 
-    pub async fn get_bearer(
+    pub async fn get_bearer(&self, path: &str, bearer: &str) -> Result<Option<Value>> {
+        self.get_bearer_with_cancel(path, bearer, &self.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn get_bearer_with_cancel(
         &self,
         path: &str,
         bearer: &str,
@@ -131,7 +124,11 @@ impl Transport {
             .await
     }
 
-    pub async fn delete_bearer(
+    pub async fn delete_bearer(&self, path: &str, bearer: &str) -> Result<Option<Value>> {
+        self.delete_bearer_with_cancel(path, bearer, &self.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn delete_bearer_with_cancel(
         &self,
         path: &str,
         bearer: &str,
@@ -144,7 +141,11 @@ impl Transport {
             .await
     }
 
-    pub async fn post(
+    pub async fn post(&self, path: &str, body: &Value, retry_safe: bool) -> Result<Option<Value>> {
+        self.post_with_cancel(path, body, retry_safe, &self.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn post_with_cancel(
         &self,
         path: &str,
         body: &Value,
@@ -382,6 +383,29 @@ impl Transport {
     }
 }
 
+pub(crate) fn validate_local_origin(base: &str) -> Result<Url> {
+    let parsed = origin(base, "http")?;
+    let authority = origin_authority(base)?;
+    let host = if let Some(ipv6) = authority.strip_prefix('[') {
+        ipv6.split_once(']')
+            .map(|(host, _)| host)
+            .ok_or(Error::Configuration)?
+    } else {
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    // Parse the supplied literal, not a DNS name or a URL-normalized numeric
+    // hostname. This also excludes shorthand and integer IPv4 spellings.
+    if !host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+    {
+        return Err(Error::Configuration);
+    }
+    Ok(parsed)
+}
+
 fn client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -402,7 +426,7 @@ fn origin_authority(base: &str) -> Result<&str> {
     Ok(authority)
 }
 
-fn origin(base: &str, scheme: &str) -> Result<Url> {
+pub(crate) fn origin(base: &str, scheme: &str) -> Result<Url> {
     origin_authority(base)?;
     let parsed = Url::parse(base).map_err(|_| Error::Configuration)?;
     if parsed.scheme() != scheme
@@ -619,6 +643,14 @@ pub(crate) mod tests {
                 .unwrap()
         }
 
+        pub(crate) fn fresh_transport(&self) -> Transport {
+            Transport {
+                client: self.transport.client.clone(),
+                base: self.transport.base.clone(),
+                owner_cancel: Cancellation::new(),
+            }
+        }
+
         pub(crate) fn assert_idle(&mut self) {
             assert!(self.requests.try_recv().is_err());
         }
@@ -694,7 +726,7 @@ pub(crate) mod tests {
             let transport = fixture.transport.clone();
             let operation = tokio::spawn(async move {
                 transport
-                    .get("/.well-known/orbit-jwks.json", &Cancellation::new())
+                    .get_with_cancel("/.well-known/orbit-jwks.json", &Cancellation::new())
                     .await
             });
             for _ in 0..attempts {
@@ -736,7 +768,7 @@ pub(crate) mod tests {
         let transport = fixture.transport.clone();
         let operation = tokio::spawn(async move {
             transport
-                .post(
+                .post_with_cancel(
                     "/api/client/v1/sessions",
                     &serde_json::json!({}),
                     false,
@@ -776,7 +808,7 @@ pub(crate) mod tests {
                 let transport = fixture.transport.clone();
                 let operation = tokio::spawn(async move {
                     transport
-                        .post(
+                        .post_with_cancel(
                             "/api/client/v1/sessions",
                             &serde_json::json!({}),
                             false,
@@ -822,7 +854,7 @@ pub(crate) mod tests {
         let started = Instant::now();
         let operation = tokio::spawn(async move {
             transport
-                .post(
+                .post_with_cancel(
                     "/api/client/v1/activations",
                     &body,
                     true,
@@ -864,7 +896,7 @@ pub(crate) mod tests {
         let operation_cancel = cancel.clone();
         let operation = tokio::spawn(async move {
             transport
-                .get("/.well-known/orbit-jwks.json", &operation_cancel)
+                .get_with_cancel("/.well-known/orbit-jwks.json", &operation_cancel)
                 .await
         });
         fixture.next().await.respond_after(503, TRANSIENT, Some(20));
@@ -894,7 +926,7 @@ pub(crate) mod tests {
         };
         let operation = tokio::spawn(async move {
             transport
-                .get("/.well-known/orbit-jwks.json", &Cancellation::new())
+                .get_with_cancel("/.well-known/orbit-jwks.json", &Cancellation::new())
                 .await
         });
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -962,7 +994,9 @@ pub(crate) mod tests {
         cancel.cancelled().await;
         let client = Transport::new("https://orbit.example.test").unwrap();
         assert!(matches!(
-            client.get("/.well-known/orbit-jwks.json", &cancel).await,
+            client
+                .get_with_cancel("/.well-known/orbit-jwks.json", &cancel)
+                .await,
             Err(Error::Cancelled)
         ));
     }

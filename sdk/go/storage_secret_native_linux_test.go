@@ -63,7 +63,7 @@ func openNativeSecretStorage(t *testing.T, directory string) *SecretServiceStora
 	return storage
 }
 
-func denyNativeSecretStorage(t *testing.T, directory string, config Config, device Device) {
+func denyNativeSecretStorage(t *testing.T, directory string, config AppKey, device Device) {
 	t.Helper()
 	storage, err := OpenSecretServiceStorage(directory, config, device)
 	if storage != nil {
@@ -252,11 +252,11 @@ func TestNativeSecretServiceRejectsScopeCorruptAndMissingItems(t *testing.T) {
 			config, device, _ := storageFixture()
 			switch change {
 			case "issuer":
-				config.Issuer += "other"
+				config.issuer += "other"
 			case "application":
-				config.ApplicationID += "other"
+				config.applicationID += "other"
 			case "environment":
-				config.EnvironmentID += "other"
+				config.environmentID += "other"
 			case "installation":
 				device.InstallationID += "other"
 			case "fingerprint":
@@ -283,7 +283,7 @@ func TestNativeSecretServiceRejectsScopeCorruptAndMissingItems(t *testing.T) {
 			case "truncated":
 				record = record[:len(record)-1]
 			case "wrong-record-scope":
-				scope.config.Issuer += "other"
+				scope.key.issuer += "other"
 				record, _ = encodeStorageRecord(scope, 0, nil)
 			}
 			encoded := []byte(base64.StdEncoding.EncodeToString(record))

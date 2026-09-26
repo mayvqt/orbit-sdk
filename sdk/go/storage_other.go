@@ -3,6 +3,6 @@
 package orbit
 
 // OpenWindowsStorage fails closed on platforms without current-user Windows DPAPI.
-func OpenWindowsStorage(directory string, config Config, device Device) (*WindowsStorage, error) {
+func OpenWindowsStorage(directory string, key AppKey, device Device) (*WindowsStorage, error) {
 	return nil, ErrStorage
 }

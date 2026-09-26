@@ -12,6 +12,8 @@ const (
 	Cancelled                ErrorKind = "cancelled"
 	Transient                ErrorKind = "transient"
 	Denied                   ErrorKind = "denied"
+	NotActivated             ErrorKind = "not_activated"
+	FeatureUnavailable       ErrorKind = "feature_unavailable"
 	InvalidResponse          ErrorKind = "invalid_response"
 	TransportSecurity        ErrorKind = "transport_security"
 	ReauthenticationRequired ErrorKind = "reauthentication_required"
@@ -46,6 +48,10 @@ func (e *Error) Error() string {
 		return "Orbit is temporarily unreachable. Try again later."
 	case Denied:
 		return "Orbit denied access. Contact application support."
+	case NotActivated:
+		return "Activate a licence to continue."
+	case FeatureUnavailable:
+		return "This licence does not include the requested feature."
 	case InvalidResponse:
 		return "Orbit response verification failed"
 	case TransportSecurity:
@@ -113,6 +119,8 @@ var (
 	ErrCancelled                = &Error{Kind: Cancelled}
 	ErrTransient                = &Error{Kind: Transient}
 	ErrDenied                   = &Error{Kind: Denied}
+	ErrNotActivated             = &Error{Kind: NotActivated, Code: "access_unavailable"}
+	ErrFeatureUnavailable       = &Error{Kind: FeatureUnavailable, Code: "feature_unavailable"}
 	ErrInvalidResponse          = &Error{Kind: InvalidResponse}
 	ErrTransportSecurity        = &Error{Kind: TransportSecurity}
 	ErrReauthenticationRequired = &Error{Kind: ReauthenticationRequired}

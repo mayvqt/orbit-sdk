@@ -1,12 +1,15 @@
-use crate::{Error, Result};
+#[cfg(test)]
+use crate::Error;
+use crate::Result;
+#[cfg(test)]
 use std::sync::Mutex;
 
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[cfg(test)]
 mod codec;
+#[cfg(test)]
 mod secret_service;
+#[cfg(test)]
 mod windows;
-pub use secret_service::SecretServiceStorage;
-pub use windows::WindowsStorage;
 
 /// Sensitive bearer material: deliberately has no Debug or Serialize implementation.
 /// Adapters must use OS-protected storage, isolate each access context, and perform
@@ -32,7 +35,9 @@ pub trait Storage: Send + Sync {
     fn invalidate(&self) -> Result<u64>;
 }
 #[derive(Default)]
+#[cfg(test)]
 pub struct MemoryStorage(Mutex<(u64, Option<StoredCredential>)>);
+#[cfg(test)]
 impl Storage for MemoryStorage {
     fn version(&self) -> Result<u64> {
         self.0

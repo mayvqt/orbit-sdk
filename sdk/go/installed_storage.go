@@ -79,7 +79,8 @@ func installedCredentialFrom(c *StoredCredential) *installedCredential {
 	}
 	return r
 }
-func (s *installedStorage) Invalidate() (uint64, error) { return s.invalidate(true) }
+func (s *installedStorage) Invalidate() (uint64, error)                  { return s.invalidate(true) }
+func (s *installedStorage) invalidatePreservingPending() (uint64, error) { return s.invalidate(false) }
 func (s *installedStorage) invalidate(clearPending bool) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -104,16 +105,43 @@ func (s *installedStorage) dropCache() error {
 	r.Access = nil
 	return s.writeLocked(r)
 }
-func (s *installedStorage) begin(key, licence, previous, operation string) (string, uint64, error) {
+func (s *installedStorage) rebindIfChanged(fingerprint, provider *string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkLocked(); err != nil {
+		return false, err
+	}
+	if equalString(s.record.Installation.Fingerprint, fingerprint) && equalString(s.record.Installation.FingerprintProvider, provider) {
+		return false, nil
+	}
+	if s.record.Generation == math.MaxInt64 {
+		return false, ErrStorage
+	}
+	device, err := NewInstallation()
+	if err != nil {
+		return false, err
+	}
+	record := s.record
+	record.Generation++
+	record.Installation = installedIdentity{ID: device.InstallationID, Fingerprint: cloneString(fingerprint), FingerprintProvider: cloneString(provider)}
+	record.Credential, record.Access, record.Pending = nil, nil, nil
+	return true, s.writeLocked(record)
+}
+func (s *installedStorage) begin(key, licence, customerID, previous, operation string, fingerprint, fingerprintProvider *string) (string, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.record
 	kind, input := "key", key
 	if licence != "" {
 		kind, input = "account", licence
+		if !opaque(customerID) {
+			return "", 0, ErrConfiguration
+		}
+	} else if customerID != "" {
+		return "", 0, ErrConfiguration
 	}
 	// Marshaling maps recursively sorts keys; retain only this scoped digest.
-	encoded, err := json.Marshal(map[string]any{"scope": map[string]any{"api_origin": r.Scope.APIOrigin, "issuer": r.Scope.Issuer, "application_id": r.Scope.ApplicationID, "environment_id": r.Scope.EnvironmentID}, "installation": map[string]any{"id": r.Installation.ID, "fingerprint": r.Installation.Fingerprint, "fingerprint_provider": r.Installation.FingerprintProvider}, "principal_kind": kind, "licence_input": input, "previous_credential": optionalString(previous), "credential_mode": "persistent"})
+	encoded, err := json.Marshal(map[string]any{"scope": map[string]any{"api_origin": r.Scope.APIOrigin, "issuer": r.Scope.Issuer, "application_id": r.Scope.ApplicationID, "environment_id": r.Scope.EnvironmentID}, "installation": map[string]any{"id": r.Installation.ID, "fingerprint": fingerprint, "fingerprint_provider": fingerprintProvider}, "principal_kind": kind, "licence_input": input, "customer_id": optionalString(customerID), "previous_credential": optionalString(previous), "credential_mode": "persistent"})
 	if err != nil {
 		return "", 0, ErrConfiguration
 	}
@@ -185,6 +213,8 @@ func (s *installedStorage) commit(version uint64, credential *StoredCredential, 
 	}
 	r := s.record
 	r.Credential, r.Pending = installedCredentialFrom(credential), nil
+	r.Installation.Fingerprint = cloneString(credential.Fingerprint)
+	r.Installation.FingerprintProvider = cloneString(credential.FingerprintProvider)
 	r.Access = &installedAccess{JWS: *reply.Grant, JWKS: set, LicenceExpiresAt: licenceExpiry, ReceivedServerTime: anchor.server, ReceivedWallTime: anchor.wall, ServerHighWater: now, WallHighWater: time.Now().Unix()}
 	return s.writeLocked(r)
 }

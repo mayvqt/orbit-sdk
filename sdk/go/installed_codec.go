@@ -82,14 +82,14 @@ func exactInstalledShape(value any, kind reflect.Type) bool {
 	return true
 }
 
-func decodeInstalled(data []byte, scope installedScope, provider string, fingerprint, fingerprintProvider *string) (installedRecord, error) {
+func decodeInstalled(data []byte, scope installedScope, provider string) (installedRecord, error) {
 	var record installedRecord
 	value, err := uniqueJSON(data)
 	if err != nil || !exactInstalledShape(value, reflect.TypeOf(record)) || json.Unmarshal(data, &record) != nil {
 		return record, ErrStorage
 	}
 	identity := record.Installation
-	if record.SDK != installedSDK || record.Format != 2 || record.Provider != provider || record.Scope != scope || record.Generation > math.MaxInt64 || !opaque(identity.ID) || len(identity.ID) < 16 || !equalString(identity.Fingerprint, fingerprint) || !equalString(identity.FingerprintProvider, fingerprintProvider) {
+	if record.SDK != installedSDK || record.Format != 2 || record.Provider != provider || record.Scope != scope || record.Generation > math.MaxInt64 || !opaque(identity.ID) || len(identity.ID) < 16 || (identity.Fingerprint == nil) != (identity.FingerprintProvider == nil) || identity.Fingerprint != nil && !lowerHex(*identity.Fingerprint, 64) || identity.FingerprintProvider != nil && !validProvider(*identity.FingerprintProvider) {
 		return record, ErrStorage
 	}
 	if c := record.Credential; c != nil {
