@@ -68,6 +68,50 @@ enforced concurrent seats.
 Record issuance/renewal, actor, scope, installation, sequence and expiry in audit
 history. Do not log the file, raw request fingerprint or authentication secrets.
 
+### HTTP issuance profile
+
+The following routes are the implementation target; this contract alone does not
+make them available. The normal body limits, admission limits and strict JSON
+rules apply. Nested request objects reject unknown and duplicate fields too.
+
+- `GET /.well-known/orbit-offline-jwks.json?application_id=...&environment_id=...`
+  returns only that environment's configured offline-purpose public keys. It uses
+  the same pre-database admission boundary as connected key discovery.
+- `POST /api/client/v1/offline-files` accepts `request` (the exported object),
+  `duration_seconds`, `idempotency_key`, and either `licence_key`, or
+  `customer_session` plus `licence_id`. An optional `previous_credential` supports
+  the existing authenticated machine-rebinding rules; it is never included in
+  the exported public request. Each new customer issuance requires a login within
+  five minutes. An identical acknowledgement retry still requires current
+  authentication/ownership, without resetting its original issuance time.
+- Seller issuance uses `POST /api/management/v1/licences/{id}/offline-files` with
+  the normal scoped query and management bearer, or the dashboard licence's
+  `offline-files` action with its existing cookie/CSRF rules. The body contains
+  `request`, `duration_seconds` and `idempotency_key`. Management callers need
+  both `licences:write` and `devices:write`. A seller must use the existing audited
+  reset flow before replacing a machine-locked installation without its previous
+  credential; knowing a fingerprint is insufficient.
+
+The request's app key must identify the exact API origin, application and
+environment being authorized. Duration is an integer from 86,400 through
+31,622,400 seconds. Policy and purchased-expiry caps may make the resulting file
+shorter than the requested minimum. Disabled file policy or unavailable offline
+signing keys must fail before changing installation state.
+
+Successful issuance returns a typed JSON result containing `file` (the compact
+JWS), `issuance_id`, `licence_id`, `activation_id`, `installation_id`, `sequence`,
+`issued_at` and `expires_at`. Response timestamps use the ordinary RFC 3339 UTC
+API profile; signed claims retain integer epoch seconds. The caller saves `file`
+as a `.orbit` file. Responses containing it must not be cached or logged.
+
+Operation replay retains the original file for the normal 24-hour retry window;
+an identical successful retry returns the same bytes and metadata. A retry cannot
+create a new activation, move first use, increment the sequence or extend expiry.
+After that window, a new deliberate renewal uses a new operation ID. Current
+revocation, suspension, ownership, recovery holds and workspace admission remain
+authoritative when retrieving an issuance online, even though they cannot recall
+a file already on a disconnected machine.
+
 ## Signed file
 
 The file is a UTF-8 compact JWS, at most 16 KiB, with no surrounding JSON envelope.
