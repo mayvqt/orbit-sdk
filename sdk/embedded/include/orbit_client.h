@@ -5,12 +5,16 @@
 extern "C" {
 #endif
 
-/* Compile the client and its callers with the same bounded arena profile.
- * Smaller profiles reject oversized responses without weakening validation. */
+/* Default allocation for callers; orbit_client_init accepts an actual runtime
+ * capacity from ORBIT_CLIENT_ARENA_MIN_BYTES through
+ * ORBIT_CLIENT_ARENA_MAX_BYTES. */
 #ifndef ORBIT_CLIENT_ARENA_BYTES
 #define ORBIT_CLIENT_ARENA_BYTES 32768u
 #endif
-#if ORBIT_CLIENT_ARENA_BYTES < 8192u || ORBIT_CLIENT_ARENA_BYTES > 32768u
+#define ORBIT_CLIENT_ARENA_MIN_BYTES 8192u
+#define ORBIT_CLIENT_ARENA_MAX_BYTES 32768u
+#if ORBIT_CLIENT_ARENA_BYTES < ORBIT_CLIENT_ARENA_MIN_BYTES || \
+    ORBIT_CLIENT_ARENA_BYTES > ORBIT_CLIENT_ARENA_MAX_BYTES
 #error "ORBIT_CLIENT_ARENA_BYTES must be between 8192 and 32768"
 #endif
 #define ORBIT_CLIENT_STORAGE_BYTES 6960u
@@ -97,9 +101,11 @@ typedef struct orbit_access_snapshot {
 /* No heap, threads or implicit timers. Init loads/creates stable installation
  * identity, but never restores access. The first tick validates a stored
  * bearer. All calls are serialized by the host; network callbacks must not
- * reenter. arena is at least ORBIT_CLIENT_ARENA_BYTES and scratch at least
- * ORBIT_GRANT_WORKSPACE_BYTES; all objects and borrowed config bytes must be
- * disjoint. */
+ * reenter. arena_length is the actual caller-owned capacity and must be in
+ * [ORBIT_CLIENT_ARENA_MIN_BYTES, ORBIT_CLIENT_ARENA_MAX_BYTES], independent
+ * of the compile-time default ORBIT_CLIENT_ARENA_BYTES. Scratch must be at
+ * least ORBIT_GRANT_WORKSPACE_BYTES; all objects and borrowed config bytes
+ * must be disjoint. */
 int32_t orbit_client_init(orbit_client_t *client,
                           const orbit_client_config_t *config,
                           const orbit_client_services_t *services,

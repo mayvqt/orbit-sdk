@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(orbit_embedded_core VERSION 0.3.1 LANGUAGES C)
+project(orbit_embedded_core VERSION 0.4.0 LANGUAGES C)
 
 include(CTest)
 
@@ -11,10 +11,15 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(orbit_embedded_core PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 
-add_library(orbit_embedded_client STATIC src/orbit_client.c src/orbit_wire.c src/orbit_storage.c)
+add_library(orbit_embedded_client STATIC src/orbit_client.c src/orbit_wire.c src/orbit_storage.c src/orbit_app_key.c)
 add_library(Orbit::EmbeddedClient ALIAS orbit_embedded_client)
 target_link_libraries(orbit_embedded_client PUBLIC orbit_embedded_core)
 target_compile_features(orbit_embedded_client PUBLIC c_std_11)
+set(ORBIT_CLIENT_ARENA_BYTES 32768 CACHE STRING "Default caller-owned embedded client arena size")
+if(ORBIT_CLIENT_ARENA_BYTES LESS 8192 OR ORBIT_CLIENT_ARENA_BYTES GREATER 32768)
+    message(FATAL_ERROR "ORBIT_CLIENT_ARENA_BYTES must be between 8192 and 32768")
+endif()
+target_compile_definitions(orbit_embedded_client PUBLIC ORBIT_CLIENT_ARENA_BYTES=${ORBIT_CLIENT_ARENA_BYTES})
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(orbit_embedded_client PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
@@ -53,6 +58,27 @@ if(BUILD_TESTING)
         VERBATIM
     )
     add_custom_target(orbit_embedded_generate_vectors DEPENDS ${ORBIT_GENERATED_VECTORS})
+    set(ORBIT_GENERATED_APP_KEY_VECTORS ${CMAKE_CURRENT_BINARY_DIR}/orbit_generated_app_key_vectors.h)
+    set(ORBIT_APP_KEY_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json CACHE FILEPATH "Shared app-key vectors")
+    add_custom_command(
+        OUTPUT ${ORBIT_GENERATED_APP_KEY_VECTORS}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_key_vectors.py
+            --source ${ORBIT_APP_KEY_VECTORS}
+            --output ${ORBIT_GENERATED_APP_KEY_VECTORS}
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_key_vectors.py
+            ${ORBIT_APP_KEY_VECTORS}
+        VERBATIM
+    )
+    add_custom_target(orbit_embedded_generate_app_key_vectors DEPENDS ${ORBIT_GENERATED_APP_KEY_VECTORS})
+    add_executable(orbit_embedded_app_key_tests tests/test_app_key.c)
+    add_dependencies(orbit_embedded_app_key_tests orbit_embedded_generate_app_key_vectors)
+    target_include_directories(orbit_embedded_app_key_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(orbit_embedded_app_key_tests PRIVATE orbit_embedded_client)
+    target_compile_features(orbit_embedded_app_key_tests PRIVATE c_std_11)
+    add_test(NAME orbit_embedded_shared_app_key_vectors COMMAND orbit_embedded_app_key_tests)
+
     add_executable(orbit_embedded_vector_tests
         tests/test_vectors.c tests/openssl_adapter.c adapters/openssl.c)
     add_dependencies(orbit_embedded_vector_tests orbit_embedded_generate_vectors)

@@ -1,5 +1,8 @@
 # Orbit for embedded devices
 
+This checkout contains candidate `0.4.0` embedded code. It is unreleased: no
+tag, firmware package or published Rust package is implied.
+
 Activate a licence key once, then check access before each protected operation.
 The C11 client owns no heap or threads. A `no_std` Rust wrapper provides the same
 client with exclusive buffer and platform borrows.
@@ -14,34 +17,47 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-The Wi-Fi examples and STM32 integration harness have passed cross-builds;
-physical-board testing is still required. The Linux adapter and portable client
-have host test coverage. See the [board requirements and build commands](docs/boards.md)
-before integrating a port.
+Earlier Wi-Fi and STM32 integration cross-builds are documented in the board
+guide. This v0.4.0 local candidate has host C/Rust validation and portable ARM
+object measurements only; no new firmware cross-build or physical-board run is
+claimed. See the [board requirements and build commands](docs/boards.md) before
+integrating a port.
 
 ## Configure and activate
 
-Choose your API origin, issuer, application ID and environment ID. Use the
-matching board adapter to fill `orbit_client_services_t`, then initialize one
-client with caller-owned storage:
+Copy the public app key from the Orbit Integration page into your build as
+`ORBIT_APP_KEY`. The heapless parser validates its HTTPS origin and scope, then
+returns config slices borrowing the caller-owned origin buffer and app-key text.
+The common examples parse this value before initializing the client:
 
 ```c
 #include "orbit_client.h"
+#include "orbit_app_key.h"
+#include <string.h>
 
 static orbit_client_t client;
+static uint8_t decoded_origin[ORBIT_APP_KEY_ORIGIN_MAX_BYTES];
+static orbit_client_config_t config;
 static uint8_t arena[ORBIT_CLIENT_ARENA_BYTES];
 static uint8_t scratch[ORBIT_GRANT_WORKSPACE_BYTES];
 
-/* config and services come from your application's setup. */
-int32_t start(const orbit_client_config_t *config,
+int32_t start(const char *app_key,
               const orbit_client_services_t *services) {
-    return orbit_client_init(&client, config, services,
+    orbit_embedded_slice_t key = {
+        (const uint8_t *)app_key, (uint32_t)strlen(app_key)
+    };
+    int32_t result = orbit_app_key_parse(key, decoded_origin,
+                                         sizeof(decoded_origin), &config);
+    if (result != ORBIT_CLIENT_OK) return result;
+    return orbit_client_init(&client, &config, services,
                               arena, sizeof(arena), scratch, sizeof(scratch));
 }
 ```
 
-For a hardware-bound licence policy, also supply your stable fingerprint and
-matching fingerprint provider in the client configuration.
+Keep the origin buffer and app-key text alive as long as the client. For a
+hardware-bound policy, add its stable fingerprint and provider to parsed config
+before initialization. An unbound policy can still send an optional pair; the
+signed grant remains strictly unbound and the reply provider must match it.
 
 Call `orbit_client_tick` from your loop. On first use it returns
 `ORBIT_CLIENT_ACTIVATION_REQUIRED`; supply the user's key with
@@ -67,8 +83,9 @@ the [native HTTP API](../../examples/http/README.md).
 ## Rust
 
 Add a path dependency on `sdk/embedded/rust` and implement its `Platform` trait
-with your maintained platform libraries. Create `Buffers`, `Config` and
-`Client`, then use `activate`, `tick` and `require_access`. The wrapper adds no
+with your maintained platform libraries. Parse one key into `AppKey`, then
+create `Buffers::<32768>` (or `Buffers::<8192>`), `Config` and `Client`, then
+use `activate`, `tick` and `require_access`. The wrapper adds no
 dependencies or allocator and prevents reuse of its platform or arena while the
 client is alive. See [Rust setup](rust/README.md).
 
@@ -80,12 +97,17 @@ outlive the client. Calls are synchronous and serialized; callbacks cannot
 reenter. Call `orbit_client_clock_lost` if sleep/resume makes elapsed time
 uncertain. Keep credentials out of logs and protect their storage on the device.
 
-The full client reserves **41,776 bytes** for state, transaction arena and parser
-scratch. Measured portable Cortex-M0+ stack is conservatively **3,700 bytes**;
+The default client reserves **41,776 bytes** for state, 32 KiB transaction arena
+and parser scratch. Set `ORBIT_CLIENT_ARENA_BYTES=8192` for a **17,200-byte**
+compact caller buffer, or choose a runtime C arena from 8 to 32 KiB. A compact
+arena rejects any request or response that does not fit. Measured portable
+Cortex-M0+ client stack is conservatively **3,716 bytes** (app-key parsing adds
+at most **240 bytes**);
 crypto, TLS, board libraries, runtime helpers and interrupts are additional.
 The STM32G0B1RE's 144 KiB RAM can accommodate these portable buffers with room for
-its bridge and crypto. The integration harness links successfully; measure actual
-stack and heap after adding your board initialization and application.
+its bridge and crypto. An earlier integration harness linked successfully; this
+candidate has not been rebuilt for STM32. Measure actual stack and heap after
+adding your board initialization and application.
 
 The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
 use. The [security and storage reference](docs/security.md) covers lifecycle and

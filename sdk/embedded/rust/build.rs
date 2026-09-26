@@ -25,7 +25,7 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let mut objects = Vec::new();
     for name in [
-        "grant", "json", "prepare", "jwks", "client", "wire", "storage",
+        "grant", "json", "prepare", "jwks", "client", "wire", "storage", "app_key",
     ] {
         let src = format!("../src/orbit_{name}.c");
         println!("cargo:rerun-if-changed={src}");

@@ -118,7 +118,7 @@ static size_t receive_bytes(char *bytes, size_t size, size_t count, void *p) {
     r->error = ORBIT_CLIENT_UNTRUSTED;
     return 0;
   }
-  if (n > ORBIT_CLIENT_ARENA_BYTES - r->total) {
+  if (n > ORBIT_CLIENT_ARENA_MAX_BYTES - r->total) {
     r->error = ORBIT_CLIENT_RESOURCE_LIMIT;
     return 0u;
   }
@@ -147,7 +147,7 @@ int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
   if (!request || !http || !receive || !request->origin.data ||
       !request->path.data || (!request->body.data && request->body.length) ||
       request->origin.length > 512u || request->path.length > 512u ||
-      request->body.length > ORBIT_CLIENT_ARENA_BYTES || request->post > 1u ||
+      request->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES || request->post > 1u ||
       request->origin.length < 8u ||
       memcmp(request->origin.data, "https://", 8u) != 0 ||
       request->path.length == 0u || request->path.data[0] != '/')

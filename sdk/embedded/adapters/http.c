@@ -107,7 +107,7 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
       memcmp(request->origin.data, "https://", 8) || !request->path.data ||
       !request->path.length || request->path.length > 512 ||
       request->path.data[0] != '/' ||
-      request->body.length > ORBIT_CLIENT_ARENA_BYTES ||
+      request->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES ||
       (!request->body.data && request->body.length) || request->post > 1)
     return ORBIT_CLIENT_ARGUMENT;
   *status = 0;
@@ -237,7 +237,7 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
     rc = 0;
     goto done;
   }
-  if (has_length && content_length > ORBIT_CLIENT_ARENA_BYTES) {
+  if (has_length && content_length > ORBIT_CLIENT_ARENA_MAX_BYTES) {
     rc = ORBIT_CLIENT_RESOURCE_LIMIT;
     goto done;
   }
@@ -247,7 +247,7 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
       rc = line(&r, text, sizeof(text));
       if (rc)
         goto done;
-      if (!number(text, 16, &n) || n > ORBIT_CLIENT_ARENA_BYTES - total) {
+      if (!number(text, 16, &n) || n > ORBIT_CLIENT_ARENA_MAX_BYTES - total) {
         rc = ORBIT_CLIENT_RESOURCE_LIMIT;
         goto done;
       }
@@ -279,7 +279,7 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
     }
     --r.at;
     uint32_t n = r.length - r.at;
-    if (n > ORBIT_CLIENT_ARENA_BYTES - total) {
+    if (n > ORBIT_CLIENT_ARENA_MAX_BYTES - total) {
       rc = ORBIT_CLIENT_RESOURCE_LIMIT;
       goto done;
     }

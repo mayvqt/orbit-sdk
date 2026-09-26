@@ -21,19 +21,36 @@
   } while (0)
 #define S(s)                                                                   \
   ((orbit_embedded_slice_t){(const uint8_t *)(s), (uint32_t)(sizeof(s) - 1u)})
+#define TEST_FINGERPRINT                                                       \
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 typedef struct mock {
   int64_t now;
   uint64_t ticks;
   uint8_t record[1024];
-  uint32_t record_length, commits, posts, gets;
+  uint32_t record_length, commits, posts, gets, large_response_length;
   int post_transient, key_transient, denial, bad_signature, storage_failure,
-      oversized, offline, reenter, reenter_clock, reenter_commit;
+      oversized, oversized_response, offline, reenter, reenter_clock,
+      reenter_commit, grant_hwid_claims, sent_fingerprint, sent_provider;
   char installation[129], operation_id[129], previous_operation[129], kid[129];
+  char grant_binding_mode[16], reply_binding_mode[16], grant_provider[64],
+      reply_provider[64];
   orbit_client_t *client;
 } mock_t;
 static orbit_client_t client;
-static uint8_t arena[ORBIT_CLIENT_ARENA_BYTES],
+static uint8_t arena[ORBIT_CLIENT_ARENA_MAX_BYTES],
+    compact_arena[ORBIT_CLIENT_ARENA_MIN_BYTES],
     scratch[ORBIT_GRANT_WORKSPACE_BYTES];
+typedef struct guarded_arena {
+  uint8_t before;
+  uint8_t bytes[ORBIT_CLIENT_ARENA_MAX_BYTES];
+  uint8_t after;
+} guarded_arena_t;
+static guarded_arena_t guarded_arena;
+static struct {
+  uint8_t before;
+  uint8_t bytes[ORBIT_CLIENT_ARENA_MIN_BYTES];
+  uint8_t after;
+} guarded_compact_arena;
 static EVP_PKEY *private_key;
 static const orbit_client_config_t config = {S("https://orbit.test"),
                                              S("https://orbit.test"),
@@ -41,6 +58,9 @@ static const orbit_client_config_t config = {S("https://orbit.test"),
                                              S("env"),
                                              {NULL, 0},
                                              {NULL, 0}};
+static const orbit_client_config_t bound_config = {
+    S("https://orbit.test"), S("https://orbit.test"), S("app"), S("env"),
+    S(TEST_FINGERPRINT), S("machine_v1")};
 
 static int b64(const uint8_t *in, size_t length, char *out) {
   int n = EVP_EncodeBlock((unsigned char *)out, in, (int)length), i;
@@ -128,8 +148,10 @@ static int32_t reject_reentry(mock_t *m) {
 static int32_t exchange(void *context, const orbit_http_request_t *request,
                         uint16_t *http, orbit_receive_fn receive, void *sink) {
   mock_t *m = context;
-  char path[512], body[4096], payload[2048], token[4096], reply[6144],
-      timestamp[32], jwks[1024], x[64], y[64];
+  char path[512], body[4096], payload[2048], token[4096],
+      reply[ORBIT_CLIENT_ARENA_MAX_BYTES + 1u],
+      timestamp[32], jwks[1024], x[64], y[64], binding_claims[256],
+      provider_json[128];
   time_t seconds = (time_t)m->now;
   struct tm utc;
   uint32_t i;
@@ -142,6 +164,12 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   if (request->body.length)
     memcpy(body, request->body.data, request->body.length);
   body[request->body.length] = 0;
+  if (request->post) {
+    m->sent_fingerprint =
+        strstr(body, "\"fingerprint\":\"" TEST_FINGERPRINT "\"") != NULL;
+    m->sent_provider =
+        strstr(body, "\"fingerprint_provider\":\"machine_v1\"") != NULL;
+  }
   if (m->reenter && reject_reentry(m) != 0)
     return ORBIT_CLIENT_UNTRUSTED;
   if (!request->post) {
@@ -186,6 +214,16 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
       strcmp(path, "/api/client/v1/activations/activation_1/validate") != 0)
     return ORBIT_CLIENT_UNTRUSTED;
   *http = 200u;
+  if (m->oversized_response) {
+    static const uint8_t response[ORBIT_CLIENT_ARENA_MAX_BYTES + 1u] = {0};
+    return receive(sink, response, sizeof(response));
+  }
+  if (m->grant_hwid_claims)
+    snprintf(binding_claims, sizeof(binding_claims),
+             ",\"fingerprint\":\"%s\",\"fingerprint_provider\":\"%s\"",
+             TEST_FINGERPRINT, m->grant_provider);
+  else
+    binding_claims[0] = 0;
   snprintf(payload, sizeof(payload),
            "{\"iss\":\"https://"
            "orbit.test\",\"aud\":\"orbit:app:env\",\"sub\":\"licence_1\","
@@ -193,12 +231,12 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
            "\"iat\":%lld,\"nbf\":%lld,\"exp\":%lld,\"application_id\":\"app\","
            "\"environment_id\":"
            "\"env\",\"activation_id\":\"activation_1\",\"installation_id\":\"%"
-           "s\",\"binding_"
-           "mode\": \"none\",\"policy_version\":1,\"entitlements\":{\"export\":"
+           "s\",\"binding_mode\":\"%s\"%s,\"policy_version\":1,\"entitlements\":{\"export\":"
            "true,\"disabled\":"
            "false},\"refresh_after\":%lld,\"offline_allowed\":%s}",
            (long long)m->now, (long long)m->now,
            (long long)(m->now + (m->offline ? 86400 : 300)), m->installation,
+           m->grant_binding_mode, binding_claims,
            (long long)(m->now + (m->offline ? 900 : 60)),
            m->offline ? "true" : "false");
   if (!sign_token(payload, m->kid, token, sizeof(token)))
@@ -209,16 +247,29 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   }
   gmtime_r(&seconds, &utc);
   strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  if (m->reply_provider[0])
+    snprintf(provider_json, sizeof(provider_json),
+             "\"fingerprint_provider\":\"%s\"", m->reply_provider);
+  else
+    strcpy(provider_json, "\"fingerprint_provider\":null");
   snprintf(reply, sizeof(reply),
            "{\"activation_id\":\"activation_1\",\"installation_id\":\"%s\",%"
            "s\"credential_expires_"
            "at\":null,\"grant\":\"%s\",\"server_time\":\"%s\",\"binding_mode\":"
-           "\"none\",\"fingerprint_"
-           "provider\":null,\"licence_expires_at\":null,\"secret_replay_"
+           "\"%s\",%s,\"licence_expires_at\":null,\"secret_replay_"
            "expired\":false}",
            m->installation,
            strstr(path, "/validate") ? "" : "\"credential\":\"credential_1\",",
-           token, timestamp);
+           token, timestamp, m->reply_binding_mode, provider_json);
+  if (m->large_response_length != 0u) {
+    uint32_t response_length = (uint32_t)strlen(reply);
+    if (m->large_response_length < response_length ||
+        m->large_response_length > sizeof(reply) - 1u)
+      return ORBIT_CLIENT_UNTRUSTED;
+    memset(reply + response_length, ' ',
+           m->large_response_length - response_length);
+    return receive(sink, (const uint8_t *)reply, m->large_response_length);
+  }
   return receive(sink, (const uint8_t *)reply, (uint32_t)strlen(reply));
 }
 static int32_t clock_read(void *context, int64_t *unix_seconds,
@@ -275,13 +326,22 @@ static int32_t commit(void *context, uint64_t expected, const uint8_t *record,
   ++m->commits;
   return 0;
 }
-static int init(mock_t *m) {
+static int init_with_config_arena(mock_t *m,
+                                  const orbit_client_config_t *client_config,
+                                  uint8_t *arena_bytes, uint32_t arena_length) {
   orbit_client_services_t services = {m,    exchange, clock_read, entropy,
                                       load, commit,   {0}};
   services.crypto = *orbit_test_openssl_crypto();
   m->client = &client;
-  return orbit_client_init(&client, &config, &services, arena, sizeof(arena),
-                           scratch, sizeof(scratch));
+  return orbit_client_init(&client, client_config, &services, arena_bytes,
+                           arena_length, scratch, sizeof(scratch));
+}
+static int init_with_arena(mock_t *m, uint8_t *arena_bytes,
+                           uint32_t arena_length) {
+  return init_with_config_arena(m, &config, arena_bytes, arena_length);
+}
+static int init(mock_t *m) {
+  return init_with_arena(m, arena, sizeof(arena));
 }
 static void reset(mock_t *m) {
   memset(m, 0, sizeof(*m));
@@ -289,10 +349,119 @@ static void reset(mock_t *m) {
   m->ticks = 1000;
   m->offline = 1;
   strcpy(m->kid, "test-key");
+  strcpy(m->grant_binding_mode, "none");
+  strcpy(m->reply_binding_mode, "none");
 }
 static void elapse(mock_t *m, int64_t seconds) {
   m->now += seconds;
   m->ticks += (uint64_t)seconds * 1000u;
+}
+static int runtime_arena_bounds(void) {
+  mock_t m;
+  orbit_access_snapshot_t snapshot;
+  reset(&m);
+  CHECK(init_with_arena(&m, compact_arena, sizeof(compact_arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && snapshot.allowed);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  CHECK(init_with_arena(&m, arena, ORBIT_CLIENT_ARENA_MIN_BYTES - 1u) ==
+        ORBIT_CLIENT_ARGUMENT);
+  CHECK(init_with_arena(&m, arena, ORBIT_CLIENT_ARENA_MAX_BYTES + 1u) ==
+        ORBIT_CLIENT_ARGUMENT);
+
+  reset(&m);
+  guarded_compact_arena.before = 0xa5u;
+  guarded_compact_arena.after = 0x5au;
+  memset(guarded_compact_arena.bytes, 0xcc, sizeof(guarded_compact_arena.bytes));
+  CHECK(init_with_arena(&m, guarded_compact_arena.bytes,
+                        ORBIT_CLIENT_ARENA_MIN_BYTES) == 0);
+  m.large_response_length = ORBIT_CLIENT_ARENA_MIN_BYTES + 1u;
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_RESOURCE_LIMIT);
+  CHECK(guarded_compact_arena.before == 0xa5u && guarded_compact_arena.after == 0x5au);
+  orbit_client_destroy(&client);
+  CHECK(guarded_compact_arena.before == 0xa5u && guarded_compact_arena.after == 0x5au);
+  CHECK(memcmp(guarded_compact_arena.bytes,
+               (uint8_t[ORBIT_CLIENT_ARENA_MIN_BYTES]){0},
+               ORBIT_CLIENT_ARENA_MIN_BYTES) == 0);
+
+  reset(&m);
+  guarded_arena.before = 0x3cu;
+  guarded_arena.after = 0xc3u;
+  memset(guarded_arena.bytes, 0xcc, sizeof(guarded_arena.bytes));
+  CHECK(init_with_arena(&m, guarded_arena.bytes,
+                        ORBIT_CLIENT_ARENA_MAX_BYTES) == 0);
+  m.large_response_length = ORBIT_CLIENT_ARENA_MIN_BYTES + 1u;
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  CHECK(guarded_arena.before == 0x3cu && guarded_arena.after == 0xc3u);
+  orbit_client_destroy(&client);
+  CHECK(guarded_arena.before == 0x3cu && guarded_arena.after == 0xc3u);
+  CHECK(memcmp(guarded_arena.bytes,
+               (uint8_t[ORBIT_CLIENT_ARENA_MAX_BYTES]){0},
+               ORBIT_CLIENT_ARENA_MAX_BYTES) == 0);
+  return 0;
+}
+static int optional_machine_binding(void) {
+  mock_t m;
+  reset(&m);
+  strcpy(m.reply_provider, "machine_v1");
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  CHECK(m.sent_fingerprint && m.sent_provider);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_provider, "custom:test_device");
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_UNTRUSTED);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_provider, "machine_v1");
+  strcpy(m.grant_binding_mode, "hwid");
+  strcpy(m.grant_provider, "machine_v1");
+  m.grant_hwid_claims = 1;
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_UNTRUSTED);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_binding_mode, "hwid");
+  strcpy(m.reply_provider, "machine_v1");
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_UNTRUSTED);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_binding_mode, "hwid");
+  strcpy(m.reply_provider, "machine_v1");
+  strcpy(m.grant_binding_mode, "hwid");
+  strcpy(m.grant_provider, "machine_v1");
+  m.grant_hwid_claims = 1;
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_binding_mode, "hwid");
+  strcpy(m.reply_provider, "machine_v1");
+  CHECK(init(&m) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_UNTRUSTED);
+  orbit_client_destroy(&client);
+
+  reset(&m);
+  strcpy(m.reply_binding_mode, "future_mode");
+  CHECK(init_with_config_arena(&m, &bound_config, arena, sizeof(arena)) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_UNTRUSTED);
+  orbit_client_destroy(&client);
+  return 0;
 }
 static int lifecycle(void) {
   mock_t m;
@@ -543,6 +712,8 @@ int main(void) {
   private_key = PEM_read_PrivateKey(file, NULL, NULL, NULL);
   fclose(file);
   CHECK(private_key != NULL);
+  CHECK(runtime_arena_bounds() == 0);
+  CHECK(optional_machine_binding() == 0);
   CHECK(lifecycle() == 0);
   CHECK(retry_and_storage() == 0);
   CHECK(journal_faults() == 0);

@@ -70,13 +70,13 @@ static int32_t count_receive(void *p, const uint8_t *b, uint32_t n) {
   mock_t *m = p;
   (void)b;
   m->got += n;
-  return m->got <= ORBIT_CLIENT_ARENA_BYTES ? 0 : ORBIT_CLIENT_RESOURCE_LIMIT;
+  return m->got <= ORBIT_CLIENT_ARENA_MAX_BYTES ? 0 : ORBIT_CLIENT_RESOURCE_LIMIT;
 }
 static int check_content_length_limit(void) {
-  static char response[ORBIT_CLIENT_ARENA_BYTES + 128];
+  static char response[ORBIT_CLIENT_ARENA_MAX_BYTES + 128];
   const uint32_t chunks[] = {1, 31, 512};
   for (uint32_t extra = 0; extra <= 1; ++extra) {
-    uint32_t length = ORBIT_CLIENT_ARENA_BYTES + extra;
+    uint32_t length = ORBIT_CLIENT_ARENA_MAX_BYTES + extra;
     int header = snprintf(response, sizeof(response),
                           "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", length);
     CHECK(header > 0 && (uint32_t)header + length < sizeof(response));

@@ -1,10 +1,17 @@
 # Board setup and build checks
 
-Set your API origin, issuer, application and environment in the
-[common example](../../../examples/embedded/common/client.c). Each firmware
-provisions networking and trusted time before starting Orbit, supplies a licence
-key through its own provisioning UI, and gates actions with the access helper.
-The example board hooks default to unavailable access until configured.
+Set the public app-key build definition `ORBIT_APP_KEY` from the Orbit
+Integration page. The [common example](../../../examples/embedded/common/client.c)
+parses it into caller-owned origin storage before client initialization. Each
+firmware provisions networking and trusted time, supplies a separate licence key
+through its own UI, and gates actions with the access helper. The examples do
+not embed or persist licence keys. Board hooks default to unavailable access
+until configured.
+
+The v0.4.0 candidate work has not been cross-built or run on physical boards.
+Build history below records earlier target evidence and platform prerequisites;
+host tests and portable ARM object measurements do not establish firmware or
+board validation.
 
 ## Linux and Pi Zero 2 W
 
@@ -13,7 +20,9 @@ headers/libraries, and trusted system UTC/CA roots. The adapter uses Linux
 `getrandom`, `CLOCK_BOOTTIME`, file locking and fsync. Run from the SDK root:
 
 ```sh
-cmake -S examples/embedded/linux -B build/orbit-pi -DCMAKE_BUILD_TYPE=Release
+export ORBIT_APP_KEY='orbit_app_test_...'
+cmake -S examples/embedded/linux -B build/orbit-pi -DCMAKE_BUILD_TYPE=Release \
+  -DORBIT_APP_KEY="$ORBIT_APP_KEY"
 cmake --build build/orbit-pi
 mkdir -m 700 "$HOME/.orbit-device"
 build/orbit-pi/orbit_pi "$HOME/.orbit-device"
@@ -23,11 +32,12 @@ The example reads a key from its private terminal when needed; it never writes
 the key to disk. Provisioning UIs should hide input. The same build creates
 `orbit/orbit_bridge_host`, which can serve a trusted raw USB/UART stream for an
 MCU. Pass the one allowed HTTPS origin as its argument. Do not mix log output or
-terminal echo into that binary stream. Linux x86-64 builds/tests pass. The example
-and bridge host also cross-link for
-64-bit Pi Linux with Clang 22.1.8, Cortex-A53 and a Debian trixie arm64 sysroot
-(glibc 2.41, libcurl 8.14.1, OpenSSL 3.5.7). All six host suites also pass under
-QEMU AArch64. Physical Pi testing remains outstanding.
+terminal echo into that binary stream. Linux x86-64 host builds and tests pass.
+Historical cross-link evidence: the example and bridge host linked for 64-bit Pi
+Linux with Clang 22.1.8, Cortex-A53 and a Debian trixie arm64 sysroot (glibc 2.41,
+libcurl 8.14.1, OpenSSL 3.5.7). The six pre-candidate host suites also passed
+under QEMU AArch64. The current candidate has not been rebuilt for Pi Linux;
+physical Pi testing remains outstanding.
 
 ## ESP32
 
@@ -35,6 +45,7 @@ Requires the maintained ESP-IDF SDK, its matching target GCC toolchain, Python
 environment and CMake/Ninja. Use `examples/embedded/esp32` as the IDF project:
 
 ```sh
+export ORBIT_APP_KEY='orbit_app_test_...'
 idf.py -C examples/embedded/esp32 set-target esp32
 idf.py -C examples/embedded/esp32 build
 ```
@@ -47,7 +58,8 @@ and update/debug controls for deployment. The port uses esp-tls and Mbed TLS,
 requires Wi-Fi entropy to be active, and performs no automatic storage erasure.
 Deep sleep resumes through client initialization and online validation.
 
-The ESP32 example builds with ESP-IDF 5.5.2 and its GCC 14.2 toolchain.
+Historical baseline evidence: the ESP32 example built with ESP-IDF 5.5.2 and its
+GCC 14.2 toolchain. The current candidate has not been rebuilt for this target.
 Physical-board testing remains outstanding.
 
 ## ESP8266 / NodeMCU
@@ -57,6 +69,7 @@ and its matching Xtensa toolchain. The example includes the portable C sources,
 BearSSL adapter, LittleFS journal and native Wi-Fi stream:
 
 ```sh
+export ORBIT_APP_KEY='orbit_app_test_...'
 pio run --project-dir examples/embedded/esp8266 --environment nodemcuv2
 ```
 
@@ -67,10 +80,11 @@ locally is not negotiation. The port uses trusted wall time for conservative
 elapsed tracking and denies access after rollback. Measure free heap during TLS
 handshake as well as Orbit's static buffers; ESP8266 is the tightest RAM target.
 
-The NodeMCU example builds with PlatformIO 6.1.19, ESP8266 Arduino 3.1.2 and
-GCC 10.3. Its 8 KiB Orbit arena leaves 34,124 bytes of static RAM headroom while
-retaining the full TLS receive buffer. Peak TLS heap and hardware operation
-remain unverified.
+The NodeMCU baseline built with PlatformIO 6.1.19, ESP8266 Arduino 3.1.2 and GCC
+10.3. The 8 KiB Orbit arena retains the full TLS receive buffer; the app-key
+parser adds 384 bytes of static origin storage plus its setup-time stack frame.
+Measure candidate static RAM and peak TLS heap on the target. Hardware operation
+remains unverified.
 
 ## Pico W and Pico 2 W: native Wi-Fi
 
@@ -79,6 +93,7 @@ Ninja or Make, Python, and a Pico SDK checkout containing cyw43, lwIP and Mbed T
 submodules. Both targets use the Cortex-M build:
 
 ```sh
+export ORBIT_APP_KEY='orbit_app_test_...'
 cmake -S examples/embedded/pico_wifi -B build/pico-w -DPICO_BOARD=pico_w
 cmake --build build/pico-w
 cmake -S examples/embedded/pico_wifi -B build/pico2-w -DPICO_BOARD=pico2_w
@@ -90,8 +105,8 @@ clock and CSPRNG hooks in `main.c`. The native port uses the polling cyw43/lwIP
 architecture with required certificate verification and certificate date checks.
 It links the SDK's Mbed TLS component libraries and supplies the entropy callback
 from your trusted source; it does not use an insecure TLS mode or treat weak
-oscillator output as a sufficient CSPRNG seed. The same source builds for both
-boards. [Pico SDK networking documentation](https://www.raspberrypi.com/documentation/pico-sdk/networking.html)
+oscillator output as a sufficient CSPRNG seed. The same source is used for both
+board targets. [Pico SDK networking documentation](https://www.raspberrypi.com/documentation/pico-sdk/networking.html)
 describes the underlying libraries.
 
 Reserve the final two 4 KiB flash sectors for the journal in the product's linker
@@ -101,8 +116,10 @@ execution for other-core/interrupt coordination. Reinitialize after uncertain
 sleep elapsed time. A trusted host bridge is an optional alternative transport;
 the native example does not require one.
 
-Both native Wi-Fi examples build with Pico SDK 2.3.1 and Arm GCC 14.3.1,
-producing ELF, BIN and UF2 files. Physical-board testing remains outstanding.
+Historical baseline evidence: both native Wi-Fi examples built with Pico SDK
+2.3.1 and Arm GCC 14.3.1, producing ELF, BIN and UF2 files. The current v0.4.0
+candidate has not been rebuilt for these targets. Physical-board testing remains
+outstanding.
 
 ## STM32G0B1RE
 
@@ -128,8 +145,10 @@ standalone networking needs an external network module and a separately
 integrated authenticated TLS transport.
 
 The [STM32G0B1RE](https://www.st.com/en/microcontrollers-microprocessors/stm32g0b1re.html)
-has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. The integration harness
-links with CubeG0 1.6.3, Arm GCC 14.3.1 and Mbed TLS
-3.6.6, using 44,876 bytes of flash and 44,064 bytes of reserved RAM. It includes
-HAL/CMSIS startup but is not a complete runnable board application: supply UART
-initialization and verify runtime stack, heap and power-loss behaviour on hardware.
+has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. Historical baseline
+evidence: an integration harness linked with CubeG0 1.6.3, Arm GCC 14.3.1 and
+Mbed TLS 3.6.6, using 44,876 bytes of flash and 44,064 bytes of reserved RAM.
+The current candidate has not been rebuilt for this target. That earlier harness
+included HAL/CMSIS startup but was not a complete runnable board application:
+supply UART initialization and verify runtime stack, heap and power-loss
+behaviour on hardware.

@@ -206,7 +206,8 @@ int32_t orbit_client_init(orbit_client_t *client,
   uint8_t scope[32];
   orbit_client_state_t *c;
   if (client == NULL || cfg == NULL || services == NULL || arena == NULL ||
-      scratch == NULL || arena_length < ORBIT_CLIENT_ARENA_BYTES ||
+      scratch == NULL || arena_length < ORBIT_CLIENT_ARENA_MIN_BYTES ||
+      arena_length > ORBIT_CLIENT_ARENA_MAX_BYTES ||
       scratch_length < ORBIT_GRANT_WORKSPACE_BYTES)
     return ORBIT_CLIENT_ARGUMENT;
   /* A live or initializing owner cannot be replaced from inside a callback. */
@@ -239,6 +240,7 @@ int32_t orbit_client_init(orbit_client_t *client,
   c->config = *cfg;
   c->services = *services;
   c->arena = arena;
+  c->arena_capacity = arena_length;
   c->scratch = (uint8_t *)scratch;
   c->last_wall = -1;
   c->magic = CLIENT_MAGIC;
@@ -324,7 +326,8 @@ static int32_t receive_response(void *context, const uint8_t *bytes,
   response_sink_t *sink = (response_sink_t *)context;
   if (bytes == NULL && length)
     return sink->error = ORBIT_CLIENT_UNTRUSTED;
-  if (length > ORBIT_CLIENT_ARENA_BYTES - sink->length)
+  if (sink->length > sink->c->arena_capacity ||
+      length > sink->c->arena_capacity - sink->length)
     return sink->error = ORBIT_CLIENT_RESOURCE_LIMIT;
   orbit_copy(sink->c->arena + sink->length, bytes, length);
   sink->length += length;
@@ -427,6 +430,7 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   uint64_t ticks;
   int64_t now;
   int32_t result;
+  int is_hwid;
   result = orbit_reply_parse(c->arena, response_length, c->scratch, &reply);
   if (result != 0)
     goto done;
@@ -434,18 +438,26 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     result = ORBIT_CLIENT_PENDING;
     goto done;
   }
+  {
+    static const uint8_t hwid_mode[] = "hwid";
+    static const uint8_t none_mode[] = "none";
+    is_hwid = decode_equal(c->arena, reply.binding, slice(hwid_mode, 4u));
+    const int is_none = decode_equal(c->arena, reply.binding,
+                                    slice(none_mode, 4u));
+    if ((!is_hwid && !is_none) ||
+        (is_hwid && c->config.fingerprint.length == 0u) ||
+        reply.has_provider != (c->config.fingerprint_provider.length != 0u) ||
+        (reply.has_provider && !decode_equal(c->arena, reply.provider,
+                                             c->config.fingerprint_provider))) {
+      result = ORBIT_CLIENT_UNTRUSTED;
+      goto done;
+    }
+  }
   if (reply.grant.length == 0u ||
       !decode_equal(
           c->arena, reply.installation,
           slice(c->record.installation, c->record.installation_length)) ||
-      !decode_equal(
-          c->arena, reply.binding,
-          slice(
-              (const uint8_t *)(c->config.fingerprint.length ? "hwid" : "none"),
-              4u)) ||
-      reply.has_provider != (c->config.fingerprint_provider.length != 0u) ||
-      (reply.has_provider && !decode_equal(c->arena, reply.provider,
-                                           c->config.fingerprint_provider))) {
+      reply.binding.length == 0u) {
     result = ORBIT_CLIENT_UNTRUSTED;
     goto done;
   }
@@ -484,14 +496,11 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   expected.environment_id = c->config.environment_id;
   expected.activation_id = slice(next.activation, next.activation_length);
   expected.installation_id = slice(next.installation, next.installation_length);
-  expected.fingerprint = c->config.fingerprint;
-  if (!c->config.fingerprint.length)
-    expected.fingerprint = slice(NULL, 0u);
-  expected.fingerprint_provider = c->config.fingerprint_provider;
-  if (!c->config.fingerprint_provider.length)
-    expected.fingerprint_provider = slice(NULL, 0u);
-  expected.has_fingerprint = (uint8_t)(c->config.fingerprint.length != 0u);
-  expected.has_fingerprint_provider = expected.has_fingerprint;
+  expected.has_fingerprint = (uint8_t)is_hwid;
+  expected.has_fingerprint_provider = (uint8_t)is_hwid;
+  expected.fingerprint = is_hwid ? c->config.fingerprint : slice(NULL, 0u);
+  expected.fingerprint_provider = is_hwid ? c->config.fingerprint_provider
+                                          : slice(NULL, 0u);
   expected.has_credential_expiry = next.has_expiry;
   expected.credential_expires_at = next.credential_expiry;
   expected.has_licence_expiry = reply.has_licence_expiry;
@@ -598,7 +607,7 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
                        orbit_embedded_slice_t key) {
   uint8_t path[256];
   orbit_writer_t route = {path, 0u, sizeof(path), 0};
-  orbit_writer_t request_body = {c->arena, 0u, ORBIT_CLIENT_ARENA_BYTES, 0};
+  orbit_writer_t request_body = {c->arena, 0u, c->arena_capacity, 0};
   orbit_http_request_t request;
   response_sink_t sink = {c, 0u, 0};
   uint16_t http = 0u;
@@ -681,7 +690,7 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
 }
 static int32_t finish_operation(orbit_client_state_t *c, int32_t result) {
   c->busy = 0u;
-  wipe(c->arena, ORBIT_CLIENT_ARENA_BYTES);
+  wipe(c->arena, c->arena_capacity);
   wipe(c->scratch, ORBIT_GRANT_WORKSPACE_BYTES);
   return result;
 }
@@ -709,7 +718,7 @@ static ORBIT_NOINLINE int32_t prepare_activation(orbit_client_state_t *c,
     result = ORBIT_CLIENT_PENDING;
     goto done;
   }
-  w = (orbit_writer_t){c->arena, 0u, ORBIT_CLIENT_ARENA_BYTES, 0};
+  w = (orbit_writer_t){c->arena, 0u, c->arena_capacity, 0};
   body(c, &w, key, 1u, &next);
   length = w.length;
   if (w.status || c->services.crypto.sha256(c->services.crypto.context,
@@ -746,7 +755,7 @@ int32_t orbit_client_activate(orbit_client_t *client,
       !orbit_json_valid_utf8_no_nul(key.data, key.length))
     return ORBIT_CLIENT_ARGUMENT;
   if (orbit_overlap(key.data, key.length, client, sizeof(*client)) ||
-      orbit_overlap(key.data, key.length, c->arena, ORBIT_CLIENT_ARENA_BYTES) ||
+      orbit_overlap(key.data, key.length, c->arena, c->arena_capacity) ||
       orbit_overlap(key.data, key.length, c->scratch,
                     ORBIT_GRANT_WORKSPACE_BYTES))
     return ORBIT_CLIENT_ARGUMENT;
@@ -805,7 +814,7 @@ int32_t orbit_client_snapshot(orbit_client_t *client,
   int32_t result;
   if (out == NULL || c == NULL ||
       orbit_overlap(out, sizeof(*out), client, sizeof(*client)) ||
-      orbit_overlap(out, sizeof(*out), c->arena, ORBIT_CLIENT_ARENA_BYTES) ||
+      orbit_overlap(out, sizeof(*out), c->arena, c->arena_capacity) ||
       orbit_overlap(out, sizeof(*out), c->scratch, ORBIT_GRANT_WORKSPACE_BYTES))
     return ORBIT_CLIENT_ARGUMENT;
   if (c->busy)
@@ -841,7 +850,7 @@ int32_t orbit_client_require_access(orbit_client_t *client,
       name.length > 64u ||
       orbit_overlap(name.data, name.length, client, sizeof(*client)) ||
       orbit_overlap(name.data, name.length, c->arena,
-                    ORBIT_CLIENT_ARENA_BYTES) ||
+                    c->arena_capacity) ||
       orbit_overlap(name.data, name.length, c->scratch,
                     ORBIT_GRANT_WORKSPACE_BYTES))
     return ORBIT_CLIENT_ARGUMENT;
@@ -938,7 +947,7 @@ void orbit_client_destroy(orbit_client_t *client) {
     return;
   if (c->busy)
     return;
-  wipe(c->arena, ORBIT_CLIENT_ARENA_BYTES);
+  wipe(c->arena, c->arena_capacity);
   wipe(c->scratch, ORBIT_GRANT_WORKSPACE_BYTES);
   wipe(client, sizeof(*client));
 }

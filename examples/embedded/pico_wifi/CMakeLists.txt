@@ -13,4 +13,7 @@ target_link_libraries(orbit_pico_wifi PRIVATE orbit_embedded_transport
     pico_stdlib pico_flash pico_cyw43_arch_lwip_poll pico_lwip_mbedtls
     pico_mbedtls_headers pico_mbedtls_crypto pico_mbedtls_x509 pico_mbedtls_tls)
 target_compile_definitions(orbit_pico_wifi PRIVATE ALTCP_MBEDTLS_AUTHMODE=MBEDTLS_SSL_VERIFY_REQUIRED)
+if(DEFINED ENV{ORBIT_APP_KEY})
+    target_compile_definitions(orbit_pico_wifi PRIVATE ORBIT_APP_KEY=\"$ENV{ORBIT_APP_KEY}\")
+endif()
 pico_add_extra_outputs(orbit_pico_wifi)

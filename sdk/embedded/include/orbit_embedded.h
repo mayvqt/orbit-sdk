@@ -79,6 +79,8 @@ typedef struct orbit_grant_claims {
   uint16_t arena_length;
   uint8_t has_fingerprint;
   uint8_t has_fingerprint_provider;
+  uint8_t fingerprint_present;
+  uint8_t fingerprint_provider_present;
   uint8_t has_licence_expiry;
   uint8_t offline_allowed;
   uint8_t entitlement_count;

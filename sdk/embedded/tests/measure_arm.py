@@ -16,7 +16,7 @@ args.output.mkdir(parents=True, exist_ok=True)
 objects = []
 frames = {}
 edges = {}
-for name in ("grant", "json", "prepare", "jwks", "client", "wire", "storage"):
+for name in ("grant", "json", "prepare", "jwks", "client", "wire", "storage", "app_key"):
     obj = args.output / f"orbit_{name}.o"
     subprocess.run(["clang", "--target=arm-none-eabi", "-mcpu=cortex-m0plus", "-mthumb",
                     "-std=c11", "-Os", "-ffreestanding", "-fno-builtin", "-fstack-usage",
@@ -58,8 +58,9 @@ def peak(name, path=()):
                     default=(0, ()))
     return (frames[name] + following[0], (name,) + following[1])
 
-for name in ("orbit_grant_verify", "orbit_jwks_import", "orbit_client_activate",
-             "orbit_client_require_access", "orbit_client_deactivate"):
+for name in ("orbit_grant_verify", "orbit_jwks_import", "orbit_app_key_parse",
+             "orbit_client_activate", "orbit_client_require_access",
+             "orbit_client_deactivate"):
     size, path = peak(name)
     print(f"Conservative portable stack {name}: {size} bytes; {' -> '.join(path)}")
 print("Unresolved target runtime (must be supplied by the actual board toolchain):")

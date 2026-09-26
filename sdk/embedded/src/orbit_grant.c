@@ -216,9 +216,11 @@ static int32_t parse_claims_json(parser_t *parser, orbit_grant_claims_t *claims,
         } else if (span_equals_ascii(parser->data, key, "fingerprint", 11u)) {
             bit = SEEN_FP;
             if (parse_optional_string(parser, claims, &claims->fingerprint, &claims->has_fingerprint) != ORBIT_GRANT_STATUS_OK) return parser->status;
+            claims->fingerprint_present = 1u;
         } else if (span_equals_ascii(parser->data, key, "fingerprint_provider", 20u)) {
             bit = SEEN_FP_PROVIDER;
             if (parse_optional_string(parser, claims, &claims->fingerprint_provider, &claims->has_fingerprint_provider) != ORBIT_GRANT_STATUS_OK) return parser->status;
+            claims->fingerprint_provider_present = 1u;
         } else if (span_equals_ascii(parser->data, key, "policy_version", 14u)) {
             int64_t value;
             bit = SEEN_POLICY;
@@ -328,10 +330,12 @@ static int claims_match_context(const uint8_t *arena, const orbit_grant_claims_t
     if (expected->has_licence_id && !text_equals_bytes(arena, claims, claims->subject, expected->licence_id.data, expected->licence_id.length)) return 0;
     if (expected->has_fingerprint) {
         if (binding_length != 4u || !bytes_equal((const uint8_t *)binding, (const uint8_t *)"hwid", 4u) ||
+            !claims->fingerprint_present || !claims->fingerprint_provider_present ||
             !claims->has_fingerprint || !claims->has_fingerprint_provider ||
             !text_equals_bytes(arena, claims, claims->fingerprint, expected->fingerprint.data, expected->fingerprint.length) ||
             !text_equals_bytes(arena, claims, claims->fingerprint_provider, expected->fingerprint_provider.data, expected->fingerprint_provider.length)) return 0;
     } else if (binding_length != 4u || !bytes_equal((const uint8_t *)binding, (const uint8_t *)"none", 4u) ||
+               claims->fingerprint_present || claims->fingerprint_provider_present ||
                claims->has_fingerprint || claims->has_fingerprint_provider) return 0;
     if (claims->has_licence_expiry != expected->has_licence_expiry ||
         (claims->has_licence_expiry && claims->licence_expires_at != expected->licence_expires_at)) return 0;
