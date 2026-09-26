@@ -26,8 +26,8 @@ MCU. Pass the one allowed HTTPS origin as its argument. Do not mix log output or
 terminal echo into that binary stream. Linux x86-64 builds/tests pass. The example
 and bridge host also cross-link for
 64-bit Pi Linux with Clang 22.1.8, Cortex-A53 and a Debian trixie arm64 sysroot
-(glibc 2.41, libcurl 8.14.1, OpenSSL 3.5.7). Pi hardware and ARM Linux runtime
-checks remain outstanding.
+(glibc 2.41, libcurl 8.14.1, OpenSSL 3.5.7). All six host suites also pass under
+QEMU AArch64. Physical Pi testing remains outstanding.
 
 ## ESP32
 

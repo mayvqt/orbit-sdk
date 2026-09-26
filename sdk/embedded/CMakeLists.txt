@@ -87,6 +87,7 @@ if(BUILD_TESTING)
         target_link_libraries(orbit_embedded_posix_tests PRIVATE orbit_embedded_posix)
         add_test(NAME orbit_embedded_posix_storage COMMAND orbit_embedded_posix_tests)
         add_test(NAME orbit_embedded_bridge_host COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bridge_host.py $<TARGET_FILE:orbit_bridge_host>)
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bridge_host.py
+            ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:orbit_bridge_host>)
     endif()
 endif()
