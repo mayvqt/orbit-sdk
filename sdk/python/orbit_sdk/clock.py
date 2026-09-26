@@ -40,6 +40,12 @@ def elapsed_ns() -> int:
             return value.value * 100
         except (AttributeError, OSError, ValueError) as exc:
             raise error(CLOCK_UNCERTAIN, "clock_uncertain") from exc
+    if sys.platform == "darwin":
+        from ._macos import continuous_ns
+        try:
+            return continuous_ns()
+        except (AttributeError, OSError, ValueError) as exc:
+            raise error(CLOCK_UNCERTAIN, "clock_uncertain") from exc
     raise error(CLOCK_UNCERTAIN, "clock_uncertain")
 
 

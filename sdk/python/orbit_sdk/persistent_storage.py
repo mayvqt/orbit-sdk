@@ -14,7 +14,7 @@ from typing import Any
 from .device import installation_id_new, lower_hex, opaque, valid_provider
 from .errors import STALE_RESPONSE, STORAGE, OrbitError, error
 from .jsonutil import strict_int, unique_json
-from .storage import MAX_GENERATION, _LinuxLease
+from .storage import MAX_GENERATION, _LinuxLease, _sync_posix
 from .transport import _safe_origin
 
 MAX_ENVELOPE = 64 * 1024
@@ -94,6 +94,11 @@ def default_state_directory(config: Any) -> str:
         if not base or not os.path.isabs(base):
             raise error(STORAGE, "storage_unavailable")
         return os.path.join(base, "Orbit", digest)
+    if sys.platform == "darwin":
+        home = os.path.expanduser("~")
+        if not home or home == "~" or not os.path.isabs(home):
+            raise error(STORAGE, "storage_unavailable")
+        return os.path.join(home, "Library", "Application Support", "Orbit", digest)
     if not sys.platform.startswith("linux"):
         raise error(STORAGE, "storage_unavailable")
     base = os.environ.get("XDG_STATE_HOME")
@@ -111,7 +116,7 @@ def _ensure_directory(path: str) -> str:
     if not os.path.isabs(path) or "\0" in path or ".." in Path(path).parts:
         raise error(STORAGE, "storage_failed")
     try:
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") or sys.platform == "darwin":
             _ensure_linux_directory(path)
         elif sys.platform == "win32":
             _ensure_windows_directory(path)
@@ -144,7 +149,7 @@ def _ensure_linux_directory(path: str) -> None:
                 except FileExistsError:
                     pass
                 if created:
-                    os.fsync(fd)
+                    _sync_posix(fd)
                 next_fd = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
             os.close(fd)
             fd = next_fd
@@ -442,7 +447,7 @@ class InstallationStorage:
         target = os.fspath(directory) if directory is not None else default_state_directory(config)
         if not isinstance(target, str) or not os.path.isabs(target):
             raise error(STORAGE, "storage_failed")
-        provider = "windows_dpapi" if sys.platform == "win32" else "private_file" if sys.platform.startswith("linux") else "unsupported"
+        provider = "windows_dpapi" if sys.platform == "win32" else "private_file" if (sys.platform.startswith("linux") or sys.platform == "darwin") else "unsupported"
         if provider == "unsupported":
             raise error(STORAGE, "storage_unavailable")
         parent = _ensure_directory(target)
@@ -741,7 +746,7 @@ def _write_linux_record(lease: _LinuxLease, raw: bytes) -> None:
         offset = 0
         while offset < len(raw):
             offset += os.write(fd, raw[offset:])
-        os.fsync(fd)
+        _sync_posix(fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise error(STORAGE, "storage_failed")
@@ -749,7 +754,7 @@ def _write_linux_record(lease: _LinuxLease, raw: bytes) -> None:
         replaced = True
         dir_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=directory_fd)
         try:
-            os.fsync(dir_fd)
+            _sync_posix(dir_fd)
         finally:
             os.close(dir_fd)
         lease.complete_write()

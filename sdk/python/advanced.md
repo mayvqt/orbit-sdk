@@ -42,6 +42,8 @@ registration handles. Finalizers are only a fallback for forgotten closes.
 
 On Linux, `open()` stores a private record under
 `$XDG_STATE_HOME/orbit/<scope-hash>/` (or `~/.local/state/orbit/<scope-hash>/`).
+On macOS, it uses private files under
+`~/Library/Application Support/Orbit/<scope-hash>/`; this is not Keychain storage.
 On Windows, it uses the current user's `LOCALAPPDATA/Orbit/<scope-hash>/` with
 DPAPI and an explicit private ACL. New directories and files grant access only
 to the current user, SYSTEM and Administrators; an existing directory with
@@ -49,7 +51,7 @@ foreign ownership or broader access is rejected without changing its ACL.
 Impersonating threads are unsupported; use a client under the service account.
 Set `state_path` to an absolute, dedicated private directory for a
 service or container, and mount that directory on persistent storage across
-restarts. Keep it owned by the service user and mode `0700` on Linux. A lease
+restarts. Keep it owned by the service user and mode `0700` on Linux/macOS. A lease
 allows only one process to own an installation at a time; give concurrent
 workers separate installation state. `installation_in_use` means another client
 holds the lease; reuse that client or close it before opening the same directory.
@@ -58,7 +60,7 @@ Do not delete lock files to bypass an active lease.
 The record can cache the original signed access grant and its verified public
 key. A restart rechecks those signatures, scope, expiry, and trusted-clock
 evidence; offline access ends at the grant's original deadline. It never turns
-the grant into a new or longer-lived one. Linux file permissions protect the
+the grant into a new or longer-lived one. Linux/macOS file permissions protect the
 record from other users, while Windows DPAPI protects its contents for the
 current user. Neither protects against someone who can control that user or
 modify the running process. Credentials and grants are not tamper-proof. Raw
@@ -95,11 +97,39 @@ containers or virtual machine images with shared IDs. To supply a stable host
 identity, construct `DeviceBinding(fingerprint, provider)`; the fingerprint
 must be a 64-character lowercase hex value and the provider must be
 `machine_v1` or `custom:<name>`. `machine_fingerprint(...)` can hash a
-host-provided Linux or Windows identity. Never send the raw machine identifier
+host-provided Linux, Windows or macOS identity. Never send the raw machine identifier
 to Orbit. If the current identity differs from the one saved with the
 installation, the SDK discards its saved credential and signed grant and
 creates a fresh installation ID. The new machine must activate within the
 licence's device limit before it can restore access.
+
+## macOS platform checks
+
+The candidate's macOS bindings read `IOPlatformUUID` through IOKit and use
+`mach_continuous_time`, including sleep, for elapsed-time checks. Timebase
+resolution is cached; time is sampled for every decision. The SDK synchronizes
+regular state and lease files with `F_FULLFSYNC` and synchronizes the containing
+directory after replacement. A filesystem that rejects the required durability
+operation returns a storage error. Other platforms retain their existing paths.
+
+The platform contract and OS references are in
+[installed platforms](../../contracts/sdk/platforms.md). Linux checks exercise
+the injected framework boundary, overflow, invalid identity and object cleanup,
+plus POSIX restart, exclusive leases and replacement rejection. These simulations
+are not native macOS validation. Neither macOS x64 nor arm64 has been exercised
+on native hardware in this work; both still need native TLS, restart, sleep across
+expiry and filesystem-failure checks before a release claims full support.
+
+From the repository root on a Mac with the SDK installed, run:
+
+```sh
+python -m unittest discover -s sdk/python/tests -p 'test_macos.py' -v
+```
+
+The native test requires a readable platform UUID and a local private filesystem.
+It checks framework access, continuous time and durable state reopen. The broader
+suite remains `python -m unittest discover -s sdk/python/tests`; platform-specific
+skips are reported separately.
 
 ## Access-check performance
 

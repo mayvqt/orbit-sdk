@@ -1,7 +1,9 @@
 # Orbit Python SDK
 
 Add licence activation and feature checks to Python applications on Windows
-and Linux. Requires Python 3.12 or newer.
+and Linux. Requires Python 3.12 or newer. The candidate also includes macOS
+bindings; native macOS validation is still pending. See the
+[platform checks](advanced.md#macos-platform-checks) before adopting that target.
 
 ## Install
 

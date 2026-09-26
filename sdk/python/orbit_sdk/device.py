@@ -37,7 +37,7 @@ def installation_id_new() -> str:
 
 
 def machine_fingerprint(application_id: str, environment_id: str, family: str, identity: str) -> str:
-    if not opaque(application_id) or not opaque(environment_id) or family not in ("linux", "windows"):
+    if not opaque(application_id) or not opaque(environment_id) or family not in ("linux", "windows", "macos"):
         raise error(CONFIGURATION, "invalid_configuration")
     normalized = identity.strip(" \t\n\r\v\f").replace("-", "").lower()
     if not lower_hex(normalized, 32) or normalized in ("0" * 32, "f" * 32):
@@ -86,6 +86,9 @@ def native_fingerprint(application_id: str, environment_id: str) -> str:
     if not opaque(application_id) or not opaque(environment_id):
         raise error(CONFIGURATION, "invalid_configuration")
     try:
+        if sys.platform == "darwin":
+            from ._macos import platform_uuid
+            return machine_fingerprint(application_id, environment_id, "macos", platform_uuid())
         if sys.platform.startswith("linux"):
             fd = os.open("/etc/machine-id", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
