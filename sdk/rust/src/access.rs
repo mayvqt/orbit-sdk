@@ -56,6 +56,7 @@ pub struct Snapshot {
     pub credential_expires_at: Option<std::time::SystemTime>,
     pub reauthentication_required: bool,
     pub offline_allowed: bool,
+    pub offline_file_mode: bool,
     pub remaining_offline: Duration,
 }
 impl Snapshot {
@@ -70,6 +71,7 @@ pub(crate) struct State {
     pub(crate) credential: Option<StoredCredential>,
     pub(crate) claims: Option<Claims>,
     pub(crate) anchor: Option<Anchor>,
+    pub(crate) offline: Option<crate::offline::Runtime>,
     pub(crate) restored: bool,
     transient: bool,
     retry_deadline: Option<Instant>,
@@ -77,12 +79,14 @@ pub(crate) struct State {
 }
 pub(crate) struct Inner {
     pub(crate) config: Config,
-    device: Device,
+    pub(crate) app_key: Option<crate::AppKey>,
+    pub(crate) device: Device,
     pub(crate) transport: Transport,
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) state: Mutex<State>,
     pub(crate) serial: tokio::sync::Mutex<()>,
     pub(crate) keys: Mutex<Keys>,
+    pub(crate) offline_keys: Option<Keys>,
     pub(crate) installed: Option<Arc<crate::installed::InstalledStorage>>,
     pub(crate) worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) close_serial: tokio::sync::Mutex<()>,
@@ -93,7 +97,11 @@ impl Drop for Inner {
         self.transport.owner_cancel.cancel();
         if let Some(storage) = &self.installed {
             if let Ok(state) = self.state.get_mut() {
-                let _ = storage.checkpoint(state.anchor.as_ref(), true);
+                if let Some(offline) = state.offline.as_mut().filter(|item| item.authorized) {
+                    let _ = storage.checkpoint_offline(offline, true);
+                } else {
+                    let _ = storage.checkpoint(state.anchor.as_ref(), true);
+                }
             }
             storage.close();
         }
@@ -246,6 +254,7 @@ impl Client {
         }
         Ok(Self(Arc::new(Inner {
             config,
+            app_key: None,
             device,
             transport,
             storage,
@@ -256,6 +265,7 @@ impl Client {
                 credential,
                 claims: None,
                 anchor: None,
+                offline: None,
                 restored: false,
                 transient: false,
                 retry_deadline: None,
@@ -263,6 +273,7 @@ impl Client {
             }),
             serial: tokio::sync::Mutex::new(()),
             keys: Mutex::new(Keys::default()),
+            offline_keys: None,
             installed: None,
             worker: Mutex::new(None),
             close_serial: tokio::sync::Mutex::new(()),
@@ -275,6 +286,21 @@ impl Client {
         self.checked_snapshot_locked(&mut state)
     }
     fn checked_snapshot_locked(&self, state: &mut State) -> Result<Snapshot> {
+        if let Some(offline) = state.offline.as_mut().filter(|offline| offline.authorized) {
+            let Some(anchor) = &offline.anchor else {
+                return Self::offline_snapshot(offline, None);
+            };
+            match anchor.now_with_wall() {
+                Ok((now, wall)) if wall.saturating_add(30) >= offline.saved.wall_high_water => {
+                    offline.uncertain = false;
+                    return Self::offline_snapshot(offline, Some(now));
+                }
+                _ => {
+                    offline.uncertain = true;
+                    return Self::offline_snapshot(offline, None);
+                }
+            }
+        }
         let now = if let Some(anchor) = &state.anchor {
             match anchor.now() {
                 Ok(now) => Some(now),
@@ -294,8 +320,49 @@ impl Client {
         Self::snapshot_state_at(state, now)
     }
     fn snapshot_state(state: &State) -> Result<Snapshot> {
+        if let Some(offline) = state.offline.as_ref().filter(|offline| offline.authorized) {
+            let now = offline
+                .anchor
+                .as_ref()
+                .and_then(|anchor| anchor.now_with_wall().ok())
+                .and_then(|(now, wall)| {
+                    (wall.saturating_add(30) >= offline.saved.wall_high_water).then_some(now)
+                });
+            return Self::offline_snapshot(offline, now);
+        }
         let now = state.anchor.as_ref().and_then(|anchor| anchor.now().ok());
         Self::snapshot_state_at(state, now)
+    }
+    pub(crate) fn offline_snapshot(
+        offline: &crate::offline::Runtime,
+        now: Option<i64>,
+    ) -> Result<Snapshot> {
+        let mut snapshot = Snapshot {
+            access: Access::Denied,
+            entitlements: BTreeMap::new(),
+            expires_at: offline
+                .verified
+                .as_ref()
+                .and_then(|claims| crate::accounts::from_unix_seconds(claims.expires_at)),
+            next_check_at: None,
+            credential_expires_at: None,
+            reauthentication_required: false,
+            offline_allowed: true,
+            offline_file_mode: true,
+            remaining_offline: Duration::ZERO,
+        };
+        let (Some(claims), Some(now)) = (&offline.verified, now.filter(|_| !offline.uncertain))
+        else {
+            return Ok(snapshot);
+        };
+        if claims.expires_at <= now {
+            snapshot.access = Access::Expired;
+            return Ok(snapshot);
+        }
+        snapshot.access = Access::Offline;
+        snapshot.entitlements = claims.entitlements.clone();
+        snapshot.remaining_offline = Duration::from_secs((claims.expires_at - now) as u64);
+        Ok(snapshot)
     }
     fn snapshot_state_at(state: &State, now: Option<i64>) -> Result<Snapshot> {
         let credential_expiry = state
@@ -318,6 +385,7 @@ impl Client {
                 .transpose()?,
             reauthentication_required: state.credential.is_none(),
             offline_allowed: false,
+            offline_file_mode: false,
             remaining_offline: Duration::ZERO,
         };
         if let Some(claims) = &state.claims {
@@ -387,8 +455,19 @@ impl Client {
     }
     pub fn logout(&self) -> Result<()> {
         let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+        let checkpoint_error = if let (Some(storage), Some(offline)) = (
+            &self.0.installed,
+            state.offline.as_mut().filter(|item| item.authorized),
+        ) {
+            storage.checkpoint_offline(offline, true).err()
+        } else {
+            None
+        };
         clear(&mut state);
         state.storage_version = self.0.storage.invalidate()?;
+        if let Some(error) = checkpoint_error {
+            return Err(error);
+        }
         Ok(())
     }
     pub async fn activate(&self, key: &str) -> Result<Snapshot> {
@@ -468,6 +547,9 @@ impl Client {
                 }
             };
             let operation = if let Some(storage) = &self.0.installed {
+                if let Some(offline) = state.offline.as_mut().filter(|item| item.authorized) {
+                    storage.checkpoint_offline(offline, true)?;
+                }
                 let (operation, version) = storage.prepare_activation(
                     principal,
                     customer_id.as_deref(),
@@ -478,6 +560,9 @@ impl Client {
                 state.generation = state.generation.wrapping_add(1);
                 state.claims = None;
                 state.anchor = None;
+                if let Some(offline) = state.offline.as_mut() {
+                    offline.authorized = false;
+                }
                 state.restored = false;
                 state.transient = false;
                 state.retry_deadline = None;
@@ -685,6 +770,18 @@ impl Client {
             let snapshot = self.checked_snapshot_locked(&mut state)?;
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
+            }
+            if snapshot.offline_file_mode {
+                if snapshot.access == Access::Expired {
+                    return Err(crate::offline::expired());
+                }
+                if snapshot.access != Access::Offline {
+                    return Err(Error::ClockUncertain);
+                }
+                if !snapshot.has_feature(feature) {
+                    return Err(Error::FeatureUnavailable);
+                }
+                return Ok(snapshot);
             }
             if snapshot.access == Access::Online {
                 if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
@@ -997,6 +1094,9 @@ fn clear_access(state: &mut State) {
     state.retry_deadline = None;
     state.restored = false;
     state.last_failure = None;
+    if let Some(offline) = state.offline.as_mut() {
+        offline.authorized = false;
+    }
 }
 
 fn transient_retry_delay() -> Duration {

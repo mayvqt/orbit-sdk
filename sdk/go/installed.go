@@ -32,6 +32,7 @@ type Options struct {
 	BindingMode         BindingMode
 	Fingerprint         string
 	FingerprintProvider string
+	OfflineKeys         []byte
 }
 
 func resolveBinding(key AppKey, options Options) (*string, *string, error) {
@@ -111,6 +112,14 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 	if ctx.Err() != nil {
 		return nil, ErrCancelled
 	}
+	var offlineKeys grantKeys
+	if len(options.OfflineKeys) != 0 {
+		var err error
+		offlineKeys, err = parseOfflineKeys(append([]byte(nil), options.OfflineKeys...), key.environment)
+		if err != nil {
+			return nil, err
+		}
+	}
 	fingerprint, fingerprintProvider, err := resolveBinding(key, options)
 	if err != nil {
 		return nil, err
@@ -186,6 +195,10 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 		files.close()
 		return nil, ErrStorage
 	}
+	if storage.record.Offline != nil && storage.record.Offline.JWS != nil && len(offlineKeys) == 0 {
+		files.close()
+		return nil, ErrConfiguration
+	}
 	if !created {
 		if _, err = storage.rebindIfChanged(fingerprint, fingerprintProvider); err != nil {
 			files.close()
@@ -199,6 +212,7 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 		storage.close()
 		return nil, err
 	}
+	client.offlineKeys = offlineKeys
 	lifetime, cancel := context.WithCancel(context.Background())
 	transport.installationLifetime = lifetime
 	client.installed = storage
@@ -235,6 +249,34 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 }
 
 func (c *Client) restoreInstalled(record installedRecord) (err error) {
+	if record.Offline != nil {
+		stored := record.Offline
+		runtime := &offlineRuntime{wallHighWater: stored.WallHighWater, saved: *stored}
+		if stored.JWS != nil {
+			if len(c.offlineKeys) == 0 {
+				return ErrConfiguration
+			}
+			start, startErr := captureStart()
+			if startErr != nil {
+				return startErr
+			}
+			claims, verifyErr := verifyOfflineFile([]byte(*stored.JWS), c.offlineKeys, c.key, c.device.InstallationID, c.device.Fingerprint, c.device.FingerprintProvider, stored.VerifiedAt, stored.Sequence)
+			if verifyErr != nil || claims.Sequence != stored.Sequence || claims.IssuanceID != stored.IssuanceID || claims.ContentDigest != stored.ContentDigest || stored.VerifiedAt < claims.IssuedAt-30 || stored.VerifiedAt >= claims.ExpiresAt {
+				return ErrStorage
+			}
+			runtime.claims = claims
+			trustedNow := start.wall
+			if stored.TimeHighWater > trustedNow {
+				trustedNow = stored.TimeHighWater
+			}
+			runtime.anchor = &timeAnchor{server: trustedNow, requestStart: start}
+			runtime.authorized = true
+			runtime.uncertain = start.wall+30 < stored.WallHighWater || stored.TimeHighWater < stored.VerifiedAt
+			c.state.offline = runtime
+			return nil
+		}
+		c.state.offline = runtime
+	}
 	a, credential := record.Access, record.storedCredential()
 	if a == nil || credential == nil {
 		return nil
@@ -299,6 +341,9 @@ func (c *Client) operationContext(ctx context.Context) (context.Context, func())
 	return child, func() { stop(); cancel() }
 }
 func (c *Client) checkpointLocked(force bool) error {
+	if c.installed != nil && c.state.offline != nil && c.state.offline.authorized {
+		return c.checkpointOfflineLocked(force)
+	}
 	if c.installed == nil || c.state.anchor == nil || c.state.claims == nil {
 		return nil
 	}
@@ -324,6 +369,201 @@ func (c *Client) checkpointLocked(force bool) error {
 	}
 	c.lifecycle.lastCheckpoint = time.Now()
 	return nil
+}
+
+func (c *Client) checkpointOfflineLocked(force bool) error {
+	if c.installed == nil || c.state.offline == nil || !c.state.offline.authorized || c.state.offline.anchor == nil {
+		return nil
+	}
+	if !force && time.Since(c.lifecycle.lastCheckpoint) < time.Minute {
+		return nil
+	}
+	offline := c.state.offline
+	now, wall, err := offline.anchor.nowWithWall()
+	if err != nil || wall < offline.wallHighWater-30 || wall < 0 || now < offline.saved.TimeHighWater {
+		offline.uncertain = true
+		if err != nil {
+			return err
+		}
+		return ErrClockUncertain
+	}
+	saved := offline.saved
+	if now > saved.TimeHighWater {
+		saved.TimeHighWater = now
+	}
+	if wall > saved.WallHighWater {
+		saved.WallHighWater = wall
+	}
+	if err := c.installed.checkpointOffline(saved); err != nil {
+		offline.authorized = false
+		return err
+	}
+	offline.saved, offline.wallHighWater = saved, saved.WallHighWater
+	if c.lifecycle != nil {
+		c.lifecycle.lastCheckpoint = time.Now()
+	}
+	c.wakeInstalled()
+	return nil
+}
+
+// OfflineRequest exports the current public installation identity for an
+// authenticated seller or customer to issue a signed file on a connected machine.
+func (c *Client) OfflineRequest() (OfflineRequest, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.syncStorageLocked(); err != nil {
+		return OfflineRequest{}, err
+	}
+	if c.installed == nil {
+		return OfflineRequest{}, ErrConfiguration
+	}
+	return OfflineRequest{Format: "orbit-offline-request", Version: 1, AppKey: publicAppKey(c.key), InstallationID: c.device.InstallationID, Fingerprint: cloneString(c.device.Fingerprint), FingerprintProvider: cloneString(c.device.FingerprintProvider)}, nil
+}
+
+// ImportOfflineFile verifies a seller-issued signed file using only the trusted
+// OfflineKeys supplied when opening this client, then durably selects offline mode.
+func (c *Client) ImportOfflineFile(ctx context.Context, file []byte) (Snapshot, error) {
+	ctx, stop := c.operationContext(ctx)
+	defer stop()
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	if c.installed == nil || len(c.offlineKeys) == 0 || len(file) == 0 || len(file) > offlineMaxFile {
+		return Snapshot{}, ErrConfiguration
+	}
+	generation, err := c.generation()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return c.importOfflineFileWithGeneration(ctx, file, generation)
+}
+
+func (c *Client) importOfflineFileWithGeneration(ctx context.Context, file []byte, generation uint64) (Snapshot, error) {
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	if c.installed == nil || len(c.offlineKeys) == 0 || len(file) == 0 || len(file) > offlineMaxFile {
+		return Snapshot{}, ErrConfiguration
+	}
+	if err := c.lockOperation(ctx, generation); err != nil {
+		return Snapshot{}, err
+	}
+	defer c.unlockOperation()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.syncStorageLocked(); err != nil {
+		return Snapshot{}, err
+	}
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	if c.state.generation != generation {
+		return Snapshot{}, ErrStaleResponse
+	}
+	previous, err := c.installed.offlineState()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	start, err := captureStart()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	minimum, highTime, highWall := int64(1), int64(0), int64(0)
+	if previous != nil {
+		minimum, highTime, highWall = previous.Sequence, previous.TimeHighWater, previous.WallHighWater
+	}
+	wallNow := start.wall
+	if wallNow+30 < highWall {
+		return Snapshot{}, ErrClockUncertain
+	}
+	now := wallNow
+	if now < highTime {
+		now = highTime
+	}
+	if c.state.offline != nil && c.state.offline.anchor != nil {
+		anchorNow, anchorWall, anchorErr := c.state.offline.anchor.nowWithWall()
+		if anchorErr != nil {
+			c.state.offline.uncertain = true
+			return Snapshot{}, ErrClockUncertain
+		}
+		if anchorWall+30 < highWall {
+			c.state.offline.uncertain = true
+			return Snapshot{}, ErrClockUncertain
+		}
+		if anchorNow < highTime {
+			c.state.offline.uncertain = true
+			return Snapshot{}, ErrClockUncertain
+		}
+		c.state.offline.uncertain = false
+		if anchorNow > now {
+			now = anchorNow
+		}
+	}
+	claims, err := verifyOfflineFile(file, c.offlineKeys, c.key, c.device.InstallationID, c.device.Fingerprint, c.device.FingerprintProvider, now, minimum)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if previous != nil && claims.Sequence == previous.Sequence && (claims.IssuanceID != previous.IssuanceID || claims.ContentDigest != previous.ContentDigest) {
+		return Snapshot{}, offlineError("offline_sequence")
+	}
+	trustedNow := now
+	if claims.IssuedAt > trustedNow {
+		trustedNow = claims.IssuedAt
+	}
+	token := strings.Trim(string(file), " \t\r\n\v\f")
+	saved := offlineRecord{JWS: &token, Sequence: claims.Sequence, IssuanceID: claims.IssuanceID, ContentDigest: claims.ContentDigest, VerifiedAt: now, TimeHighWater: trustedNow, WallHighWater: highWall}
+	if wallNow > saved.WallHighWater {
+		saved.WallHighWater = wallNow
+	}
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	version, err := c.installed.saveOffline(c.state.storageVersion, saved)
+	if err != nil {
+		clearState(&c.state)
+		c.keys = make(grantKeys)
+		return Snapshot{}, err
+	}
+	clearState(&c.state)
+	c.state.storageVersion = version
+	c.keys = make(grantKeys)
+	anchor := &timeAnchor{server: trustedNow, requestStart: start}
+	if ctx.Err() != nil {
+		version, clearErr := c.installed.Invalidate()
+		clearState(&c.state)
+		if clearErr == nil {
+			c.state.storageVersion = version
+		}
+		if clearErr != nil {
+			return Snapshot{}, ErrStorage
+		}
+		return Snapshot{}, ErrCancelled
+	}
+	runtime := &offlineRuntime{claims: claims, anchor: anchor, authorized: true, wallHighWater: saved.WallHighWater, saved: saved}
+	current, currentWall, clockErr := anchor.nowWithWall()
+	if clockErr != nil || currentWall+30 < saved.WallHighWater || current < saved.TimeHighWater {
+		version, clearErr := c.installed.Invalidate()
+		clearState(&c.state)
+		if clearErr == nil {
+			c.state.storageVersion = version
+		}
+		if clearErr != nil {
+			return Snapshot{}, ErrStorage
+		}
+		if clockErr != nil {
+			return Snapshot{}, clockErr
+		}
+		return Snapshot{}, ErrClockUncertain
+	}
+	if currentWall > runtime.saved.WallHighWater {
+		runtime.wallHighWater = currentWall
+	}
+	c.state.offline = runtime
+	if c.lifecycle != nil {
+		c.lifecycle.lastCheckpoint = time.Now()
+	}
+	c.wakeInstalled()
+	return c.offlineSnapshotLocked(runtime, current, true), nil
 }
 
 type installedCleanup struct {
@@ -394,7 +634,17 @@ func installedTick(reference weak.Pointer[Client]) (bool, time.Duration) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed || c.state.credential == nil {
+	if c.closed {
+		return true, -1
+	}
+	if c.state.offline != nil && c.state.offline.authorized {
+		delay := time.Until(c.lifecycle.lastCheckpoint.Add(time.Minute))
+		if delay <= 0 {
+			delay = time.Second
+		}
+		return true, delay
+	}
+	if c.state.credential == nil {
 		return true, -1
 	}
 	delay := time.Until(c.state.retryAt)

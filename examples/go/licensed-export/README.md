@@ -23,3 +23,6 @@ For Account or Both mode, leave the initial key prompt empty and use `register`.
 Other commands are `more`, `claim`, `resend`, `recover`, `email`, `account-logout` and `deactivate`. `logout` clears local access; `account-logout` also requests session revocation. Only acknowledged deactivation releases a device slot.
 
 The example module references the local SDK source. For your own project, follow the [SDK installation instructions](../../../sdk/go/README.md). Source and examples are [MIT licensed](../../../sdk/LICENSE).
+
+For long-disconnected installations, the SDK guide explains trusted offline JWKS setup,
+exporting an installation request and importing a seller-issued `.orbit` file.

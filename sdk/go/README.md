@@ -77,6 +77,51 @@ The state directory is private to the current user: owner-only files on Linux an
 
 `Options{StatePath: ...}` selects a dedicated absolute directory for a service account or persistent container volume. Share one `*Client` in the process; another process opening the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
 
+## Long-term offline files
+
+For an installation that will be disconnected longer than a connected grant allows,
+ship a trusted offline-purpose JWKS with the application or obtain it from the app-key
+origin over verified HTTPS. Configure it when opening the client; never take public
+keys from the imported file or from the person who hands you that file:
+
+```go
+func runOffline(ctx context.Context, appKey string) error {
+	trustedKeys, err := os.ReadFile("trusted-offline-jwks.json")
+	if err != nil { return err }
+	client, err := orbit.Open(ctx, appKey, orbit.Options{OfflineKeys: trustedKeys})
+	if err != nil { return err }
+	defer client.Close()
+
+	request, err := client.OfflineRequest()
+	if err != nil { return err }
+	requestJSON, err := json.MarshalIndent(request, "", "  ")
+	if err != nil { return err }
+	if err := os.WriteFile("offline-request.json", requestJSON, 0600); err != nil { return err }
+	// Transfer this public request to an authorized seller/customer issuance workflow.
+	file, err := os.ReadFile("licence.orbit")
+	if err != nil { return err }
+	if _, err := client.ImportOfflineFile(ctx, file); err != nil { return err }
+	if _, err := client.RequireAccess(ctx, "export"); err != nil { return err }
+	return nil
+}
+```
+
+This function uses the same standard-library and `orbit` imports as the Quick start,
+plus `encoding/json`.
+
+The request contains the app key and current installation/binding identity, but no
+licence key, account session or activation credential. Issuance and renewal happen
+through an authorized online workflow; this SDK verifies and imports the resulting
+`.orbit` file locally. Imports are signature-, scope-, binding-, expiry- and
+sequence-checked, and the signed file is saved before access is returned. Reimporting
+the same file does not extend its absolute expiry. `RequireAccess` never refreshes or
+prompts while a file is active; an expired file returns `offline_file_expired`.
+
+An already-issued file cannot be promptly revoked while disconnected. The local
+sequence and clock floors prevent ordinary replay and clock rollback, but restoring a
+complete old machine or VM snapshot cannot be detected reliably. Give this limit to
+users before issuing long-term access. See [offline storage details](ADVANCED.md#long-term-offline-files).
+
 ## Optional customer accounts
 
 Customer accounts belong to people using your software, separately from your Orbit dashboard account. After a buyer registers and confirms the email link, call `Login`, `OwnedLicences`, and `ActivateAccount`, then use `RequireAccess` before the first protected operation. `EnsureAccess` is for the purchase-key activation flow; it does not perform customer sign-in or licence selection.

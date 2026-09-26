@@ -26,3 +26,5 @@ For an isolated loopback Orbit fixture, enable `local-development`; that build u
 enabled for HTTPS.
 
 See the [SDK guide](../../../sdk/rust/README.md) and [advanced APIs](../../../sdk/rust/advanced.md).
+For long-disconnected installations, those guides also cover trusted offline keys,
+installation requests and importing seller-issued `.orbit` files.

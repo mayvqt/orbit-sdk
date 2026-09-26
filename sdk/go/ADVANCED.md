@@ -10,6 +10,29 @@ Set `Options.BindingMode` to `BindingDisabled` for shared VM/container images. T
 
 `Options.StatePath` selects a dedicated absolute state directory. Preserve the directory after a storage error; corrupt or missing initialized data is never silently reset. Linux and macOS use pinned private owner-only files and an exclusive lease; macOS requires `F_FULLFSYNC` and parent-directory synchronization. Windows uses current-user DPAPI with a protected DACL. The explicit `OpenWindowsStorage` and `OpenSecretServiceStorage` adapters remain available for advanced credential-only persistence and take `AppKey` and `Device` values.
 
+## Long-term offline files
+
+Set `Options.OfflineKeys` to the bounded trusted JWKS JSON for the app's Test or Live
+environment. The parser accepts only ES256 signing keys with matching `offline-test-`
+or `offline-live-` key IDs. Distribute keys with trusted software/configuration or fetch
+them from the parsed app-key origin over verified HTTPS; never import a key from the
+signed file itself.
+
+`OfflineRequest()` returns the current installation ID and optional binding pair in a
+serializable request. It makes no HTTP request and consumes no installation slot. An
+authorized online issuance workflow returns the compact `.orbit` file;
+`ImportOfflineFile(ctx, file)` verifies it and durably switches the installation to
+that file's authority. Imports reject lower sequence numbers and conflicting equal
+sequences. `Snapshot.OfflineFileMode` distinguishes file access from a cached connected
+grant; `RequireAccess` uses the local continuous clock and storage lease without
+refreshing or prompting. Expiry produces `offline_file_expired`.
+
+The file's signed expiry is absolute and never moves forward on reimport. Expiry,
+refunds and revocation cannot promptly recall a file on a disconnected machine. Saved
+sequence/time floors resist ordinary file replay and clock changes, while a person who
+restores a complete old disk or VM snapshot can roll local history back. Do not promise
+protection against whole-machine rollback.
+
 ## macOS build and validation
 
 Build installed clients on macOS 10.12 or newer with cgo enabled and the Xcode Command Line Tools installed. The macOS files link the system IOKit and CoreFoundation frameworks for platform identity and use `mach_continuous_time` for sleep-inclusive elapsed time. A filesystem that rejects `F_FULLFSYNC` fails closed; the SDK does not fall back to ordinary fsync for file contents. When cgo is disabled, Open returns `ErrNativeSupportRequired`.

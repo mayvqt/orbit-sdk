@@ -42,19 +42,24 @@ func captureStart() (requestStart, error) {
 	return requestStart{elapsed: elapsed, wall: wall}, nil
 }
 func (a timeAnchor) now() (int64, error) {
+	now, _, err := a.nowWithWall()
+	return now, err
+}
+func (a timeAnchor) nowWithWall() (int64, int64, error) {
 	elapsed, err := elapsedClock()
 	if err != nil || elapsed < a.elapsed {
-		return 0, ErrClockUncertain
+		return 0, 0, ErrClockUncertain
 	}
 	seconds := int64((elapsed - a.elapsed) / time.Second)
 	if a.wall > math.MaxInt64-seconds || a.server > math.MaxInt64-seconds {
-		return 0, ErrClockUncertain
+		return 0, 0, ErrClockUncertain
 	}
-	difference := time.Now().Unix() - (a.wall + seconds)
+	wall := time.Now().Unix()
+	difference := wall - (a.wall + seconds)
 	if difference < -30 || difference > 30 {
-		return 0, ErrClockUncertain
+		return 0, wall, ErrClockUncertain
 	}
-	return a.server + seconds, nil
+	return a.server + seconds, wall, nil
 }
 
 func timestamp(value string) (int64, error) {

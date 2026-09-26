@@ -41,6 +41,9 @@ impl Start {
             wall: wall()?,
         })
     }
+    pub(crate) fn wall(&self) -> i64 {
+        self.wall
+    }
 }
 #[derive(Clone)]
 pub struct Anchor {
@@ -67,6 +70,9 @@ impl Anchor {
         })
     }
     pub fn now(&self) -> Result<i64> {
+        self.now_with_wall().map(|value| value.0)
+    }
+    pub(crate) fn now_with_wall(&self) -> Result<(i64, i64)> {
         let elapsed = elapsed_clock()?
             .checked_sub(self.elapsed)
             .ok_or(Error::ClockUncertain)?;
@@ -75,12 +81,15 @@ impl Anchor {
             .wall
             .checked_add(seconds)
             .ok_or(Error::ClockUncertain)?;
-        if wall()?.abs_diff(expected) > 30 {
+        let wall_now = wall()?;
+        if wall_now.abs_diff(expected) > 30 {
             return Err(Error::ClockUncertain);
         }
-        self.server
+        let now = self
+            .server
             .checked_add(seconds)
-            .ok_or(Error::ClockUncertain)
+            .ok_or(Error::ClockUncertain)?;
+        Ok((now, wall_now))
     }
 }
 

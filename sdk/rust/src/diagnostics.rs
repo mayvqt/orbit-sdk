@@ -105,6 +105,9 @@ impl Error {
             "licence_expired" => {
                 "Your licence has expired. Contact application support to renew it."
             }
+            "offline_file_expired" => {
+                "Your offline licence file has expired. Request a renewed file from application support."
+            }
             "licence_suspended" => "Your licence is suspended. Contact application support.",
             "licence_revoked" => "Your licence was revoked. Contact application support.",
             "device_limit_reached" => {

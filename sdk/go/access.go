@@ -42,6 +42,7 @@ type Snapshot struct {
 	CredentialExpiresAt      *time.Time
 	ReauthenticationRequired bool
 	OfflineAllowed           bool
+	OfflineFileMode          bool
 	RemainingOffline         time.Duration
 	StorageCapability        StorageCapability
 }
@@ -59,6 +60,7 @@ type accessState struct {
 	transient      bool
 	nextRetry      int64
 	retryAt        time.Time // Monotonic pacing only; never grants access.
+	offline        *offlineRuntime
 }
 
 // Client is safe for concurrent use. Create a separate context for each selected
@@ -76,6 +78,7 @@ type Client struct {
 	lifecycle         *installedLifecycle
 	closed            bool
 	keys              grantKeys // Accessed only while holding the serial operation gate.
+	offlineKeys       grantKeys
 }
 
 func (*Client) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte("[Orbit client]")) }
@@ -139,6 +142,9 @@ func clearAccess(state *accessState) {
 	state.transient = false
 	state.nextRetry = 0
 	state.retryAt = time.Time{}
+	if state.offline != nil {
+		state.offline.authorized = false
+	}
 }
 func clearState(state *accessState) { clearAccess(state); state.account = nil }
 func (c *Client) syncStorageLocked() error {
@@ -211,6 +217,20 @@ func (c *Client) checkedSnapshotLocked() (Snapshot, error) {
 	if err := c.syncStorageLocked(); err != nil {
 		return Snapshot{}, err
 	}
+	if c.state.offline != nil && c.state.offline.authorized {
+		offline := c.state.offline
+		now, wall, err := offlineAnchorNow(offline.anchor)
+		if err != nil {
+			offline.uncertain = true
+			return c.offlineSnapshotLocked(offline, 0, false), nil
+		}
+		if wall+30 < offline.wallHighWater {
+			offline.uncertain = true
+			return c.offlineSnapshotLocked(offline, 0, false), nil
+		}
+		offline.uncertain = false
+		return c.offlineSnapshotLocked(offline, now, true), nil
+	}
 	if c.state.anchor != nil {
 		now, err := c.state.anchor.now()
 		if err != nil {
@@ -229,11 +249,44 @@ func (c *Client) checkedSnapshotLocked() (Snapshot, error) {
 	return c.snapshotLockedAt(0, false), nil
 }
 func (c *Client) snapshotLocked() Snapshot {
+	if c.state.offline != nil && c.state.offline.authorized {
+		offline := c.state.offline
+		now, wall, err := offlineAnchorNow(offline.anchor)
+		if err != nil {
+			offline.uncertain = true
+			return c.offlineSnapshotLocked(offline, 0, false)
+		}
+		if wall+30 < offline.wallHighWater {
+			offline.uncertain = true
+			return c.offlineSnapshotLocked(offline, 0, false)
+		}
+		offline.uncertain = false
+		return c.offlineSnapshotLocked(offline, now, true)
+	}
 	if c.state.anchor == nil {
 		return c.snapshotLockedAt(0, false)
 	}
 	now, err := c.state.anchor.now()
 	return c.snapshotLockedAt(now, err == nil)
+}
+func (c *Client) offlineSnapshotLocked(offline *offlineRuntime, now int64, clockValid bool) Snapshot {
+	snapshot := Snapshot{Access: AccessDenied, Entitlements: map[string]bool{}, OfflineAllowed: true, OfflineFileMode: true, StorageCapability: c.storageCapability}
+	expires := time.Unix(offline.claims.ExpiresAt, 0).UTC()
+	snapshot.ExpiresAt = &expires
+	if !clockValid {
+		return snapshot
+	}
+	if now >= offline.claims.ExpiresAt {
+		snapshot.Access = AccessExpired
+		return snapshot
+	}
+	snapshot.Access = AccessOffline
+	snapshot.Entitlements = make(map[string]bool, len(offline.claims.Entitlements))
+	for name, enabled := range offline.claims.Entitlements {
+		snapshot.Entitlements[name] = enabled
+	}
+	snapshot.RemainingOffline = time.Duration(offline.claims.ExpiresAt-now) * time.Second
+	return snapshot
 }
 func (c *Client) snapshotLockedAt(now int64, clockValid bool) Snapshot {
 	snapshot := Snapshot{Access: AccessDenied, Entitlements: make(map[string]bool), ReauthenticationRequired: true, StorageCapability: c.storageCapability}
@@ -288,8 +341,12 @@ func (c *Client) snapshotLockedAt(now int64, clockValid bool) Snapshot {
 func (c *Client) Logout() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	checkpointErr := c.checkpointOfflineLocked(true)
 	clearState(&c.state)
-	return c.invalidateLocked()
+	if err := c.invalidateLocked(); err != nil {
+		return err
+	}
+	return checkpointErr
 }
 
 func (c *Client) Activate(ctx context.Context, key string, operationID ...string) (Snapshot, error) {
@@ -339,6 +396,12 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 		return Snapshot{}, ErrStaleResponse
 	}
 	if c.installed != nil {
+		if c.state.offline != nil && c.state.offline.authorized {
+			if err := c.checkpointOfflineLocked(true); err != nil {
+				c.mu.Unlock()
+				return Snapshot{}, err
+			}
+		}
 		customerID := ""
 		if licence != "" && c.state.account == nil {
 			c.mu.Unlock()
@@ -475,6 +538,7 @@ func (c *Client) Deactivate(ctx context.Context, ids ...string) error {
 		return err
 	}
 	saved := cloneCredential(c.state.credential)
+	checkpointErr := c.checkpointOfflineLocked(true)
 	clearAccess(&c.state)
 	if err := c.invalidateLocked(); err != nil {
 		c.mu.Unlock()
@@ -482,6 +546,9 @@ func (c *Client) Deactivate(ctx context.Context, ids ...string) error {
 	}
 	generation := c.state.generation
 	c.mu.Unlock()
+	if checkpointErr != nil {
+		return checkpointErr
+	}
 	if saved == nil {
 		return ErrReauthenticationRequired
 	}
@@ -538,6 +605,22 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 	if ctx.Err() != nil {
 		c.mu.Unlock()
 		return Snapshot{}, ErrCancelled
+	}
+	if snapshot.OfflineFileMode {
+		if snapshot.Access == AccessExpired {
+			c.mu.Unlock()
+			return Snapshot{}, offlineError("offline_file_expired")
+		}
+		if snapshot.Access != AccessOffline {
+			c.mu.Unlock()
+			return Snapshot{}, ErrClockUncertain
+		}
+		if !snapshot.HasFeature(feature) {
+			c.mu.Unlock()
+			return Snapshot{}, ErrFeatureUnavailable
+		}
+		c.mu.Unlock()
+		return snapshot, nil
 	}
 	if snapshot.Access == AccessOnline {
 		if !snapshot.HasFeature(feature) {

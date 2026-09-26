@@ -212,6 +212,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (Account,
 		c.mu.Unlock()
 		return Account{}, ErrStaleResponse
 	}
+	checkpointErr := c.checkpointOfflineLocked(true)
 	clearState(&c.state)
 	if err := c.invalidateLockedPreservingPending(); err != nil {
 		c.mu.Unlock()
@@ -219,6 +220,9 @@ func (c *Client) Login(ctx context.Context, username, password string) (Account,
 	}
 	generation = c.state.generation
 	c.mu.Unlock()
+	if checkpointErr != nil {
+		return Account{}, checkpointErr
+	}
 	data, err := c.transport.Post(ctx, clientPrefix+"sessions", c.scopeBody(map[string]any{"username": username, "password": password}), false)
 	var reply loginReply
 	if err == nil {
@@ -278,6 +282,7 @@ func (c *Client) LogoutAccount(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
+	checkpointErr := c.checkpointOfflineLocked(true)
 	session := c.state.account
 	clearState(&c.state)
 	if err := c.invalidateLocked(); err != nil {
@@ -287,7 +292,7 @@ func (c *Client) LogoutAccount(ctx context.Context) error {
 	generation := c.state.generation
 	c.mu.Unlock()
 	if session == nil {
-		return nil
+		return checkpointErr
 	}
 	data, err := c.transport.DeleteBearer(ctx, c.accountPath(clientPrefix+"sessions/current", ""), session.token)
 	if generationErr := c.checkGeneration(generation); generationErr != nil {
@@ -299,7 +304,7 @@ func (c *Client) LogoutAccount(ctx context.Context) error {
 	if data != nil {
 		return ErrInvalidResponse
 	}
-	return nil
+	return checkpointErr
 }
 
 // OwnedLicences returns at most one page. Pass an empty cursor for the first.

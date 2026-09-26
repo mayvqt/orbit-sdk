@@ -133,7 +133,7 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/sdk/app-keys.json");
         let corpus: Corpus = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(corpus.format_version, 1);
-        assert!(!corpus.cases.is_empty());
+        assert_eq!(corpus.cases.len(), 27);
         for case in corpus.cases {
             let parsed = AppKey::parse(&case.key);
             assert_eq!(parsed.is_ok(), case.valid, "{}", case.name);

@@ -1,5 +1,5 @@
 //! Owned installed-client state. Secret inputs never enter the serialized envelope.
-use crate::access::{self, ActivationPrincipal};
+use crate::access::{self, ActivationPrincipal, clear};
 use crate::clock::{self, Anchor};
 use crate::grants::{self, Expected, Keys};
 use crate::{AppKey, Client, Config, Device, Error, Result, Storage, StoredCredential, Transport};
@@ -76,6 +76,7 @@ fn write_pending_marker(file: &std::fs::File) -> Result<()> {
 struct WriteFault {
     stage: std::sync::atomic::AtomicU8,
     crash: std::sync::atomic::AtomicBool,
+    delay_millis: std::sync::atomic::AtomicU64,
 }
 #[cfg(test)]
 impl WriteFault {
@@ -87,6 +88,12 @@ impl WriteFault {
             std::process::exit(42);
         }
         Err(Error::Storage)
+    }
+    fn delay_once(&self) {
+        let milliseconds = self.delay_millis.swap(0, Ordering::Relaxed);
+        if milliseconds != 0 {
+            std::thread::sleep(Duration::from_millis(milliseconds));
+        }
     }
 }
 
@@ -108,6 +115,8 @@ pub enum MachineBinding {
 pub struct Options {
     pub state_directory: Option<PathBuf>,
     pub machine_binding: MachineBinding,
+    /// Trusted offline-file JWKS. Keys embedded in imported files are never trusted.
+    pub offline_keys: Option<Vec<u8>>,
 }
 
 fn resolve_binding(
@@ -218,6 +227,8 @@ struct Record {
     pending_activation: Option<Pending>,
     #[serde(deserialize_with = "Option::deserialize")]
     access: Option<Cache>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offline: Option<crate::offline::Persisted>,
 }
 struct DiskState {
     record: Record,
@@ -297,7 +308,8 @@ impl Record {
     }
     fn validate(&self, scope: &Scope, key: &AppKey) -> Result<()> {
         if self.sdk != "orbit.installed-client"
-            || self.format != 2
+            || (self.format == 2) != self.offline.is_none()
+            || !(self.format == 2 || self.format == 3)
             || self.provider != provider()
             || &self.scope != scope
             || self.scope.issuer != key.issuer()
@@ -345,10 +357,36 @@ impl Record {
                     .iter()
                     .any(|t| !valid_time(*t))
             })
+            || self.offline.as_ref().is_some_and(|offline| {
+                offline.sequence == 0
+                    || offline.sequence > crate::offline::MAX_SEQUENCE
+                    || !access::opaque(&offline.issuance_id)
+                    || offline.content_digest.len() != 64
+                    || !offline
+                        .content_digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || !valid_time(offline.verified_at)
+                    || offline.time_high_water < offline.verified_at
+                    || !valid_time(offline.time_high_water)
+                    || !valid_time(offline.wall_high_water)
+                    || offline.jws.as_ref().is_some_and(|jws| {
+                        jws.is_empty()
+                            || jws.len() > 16 * 1024
+                            || self.credential.is_some()
+                            || self.pending_activation.is_some()
+                            || self.access.is_some()
+                    })
+            })
         {
             return Err(Error::CorruptState);
         }
         Ok(())
+    }
+}
+fn clear_offline_authority(record: &mut Record) {
+    if let Some(offline) = &mut record.offline {
+        offline.jws = None;
     }
 }
 impl DiskState {
@@ -372,6 +410,8 @@ impl DiskState {
     }
     fn commit(&mut self, record: Record) -> Result<()> {
         self.check()?;
+        let mut record = record;
+        record.format = if record.offline.is_some() { 3 } else { 2 };
         let bytes = serde_json::to_vec(&record).map_err(|_| Error::Storage)?;
         if bytes.len() > MAX_BYTES
             || self
@@ -398,6 +438,7 @@ impl InstalledStorage {
         fingerprint_provider: Option<String>,
         origin: String,
         path: Option<&Path>,
+        has_offline_keys: bool,
     ) -> Result<Self> {
         let scope = Scope {
             api_origin: origin,
@@ -422,6 +463,7 @@ impl InstalledStorage {
             credential: None,
             pending_activation: None,
             access: None,
+            offline: None,
         };
         if !access::valid_configuration(&record.config(), &record.device())
             || key.issuer().len() > 2048
@@ -438,8 +480,27 @@ impl InstalledStorage {
             if bytes.len() > MAX_BYTES {
                 return Err(Error::CorruptState);
             }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| Error::CorruptState)?;
+            let object = value.as_object().ok_or(Error::CorruptState)?;
+            let has_offline_field = object.contains_key("offline");
+            // Keep the original bytes for typed decoding: serde_json::Value
+            // collapses duplicate object keys before a typed deserializer sees them.
             record = serde_json::from_slice(&bytes).map_err(|_| Error::CorruptState)?;
+            if (record.format == 2 && has_offline_field)
+                || (record.format == 3 && !has_offline_field)
+            {
+                return Err(Error::CorruptState);
+            }
             record.validate(&scope, key)?;
+            if record
+                .offline
+                .as_ref()
+                .is_some_and(|saved| saved.jws.is_some())
+                && !has_offline_keys
+            {
+                return Err(Error::Configuration);
+            }
             if record.installation.fingerprint != fingerprint
                 || record.installation.fingerprint_provider != fingerprint_provider
             {
@@ -452,6 +513,7 @@ impl InstalledStorage {
                 record.credential = None;
                 record.pending_activation = None;
                 record.access = None;
+                record.offline = None;
                 record.generation = record
                     .generation
                     .checked_add(1)
@@ -531,6 +593,7 @@ impl InstalledStorage {
         let mut record = s.record.clone();
         record.pending_activation = Some(pending);
         record.access = None;
+        clear_offline_authority(&mut record);
         record.generation = record
             .generation
             .checked_add(1)
@@ -562,6 +625,7 @@ impl InstalledStorage {
         record.installation.fingerprint = credential.fingerprint.clone();
         record.installation.fingerprint_provider = credential.fingerprint_provider.clone();
         record.access = Some(cache);
+        clear_offline_authority(&mut record);
         if activation {
             record.pending_activation = None;
         }
@@ -572,6 +636,7 @@ impl InstalledStorage {
         s.check()?;
         let mut record = s.record.clone();
         record.access = None;
+        clear_offline_authority(&mut record);
         if clear_pending {
             record.pending_activation = None;
         }
@@ -625,6 +690,56 @@ impl InstalledStorage {
         }
         Ok(Some((claims, Anchor::restored(now, clock::wall()?)?, keys)))
     }
+    pub(crate) fn restore_offline(
+        &self,
+        key: &AppKey,
+        device: &Device,
+        keys: Option<&Keys>,
+    ) -> Result<Option<crate::offline::Runtime>> {
+        let mut state = self.0.lock().map_err(|_| Error::Storage)?;
+        state.check()?;
+        let Some(saved) = state.record.offline.clone() else {
+            return Ok(None);
+        };
+        if saved.jws.is_none() {
+            return Ok(Some(crate::offline::Runtime {
+                verified: None,
+                anchor: None,
+                saved,
+                authorized: false,
+                uncertain: false,
+                last_checkpoint: Instant::now(),
+            }));
+        }
+        let keys = keys.ok_or(Error::Configuration)?;
+        let wall = clock::wall()?;
+        let verified = crate::offline::verify(
+            saved.jws.as_ref().unwrap().as_bytes(),
+            keys,
+            key,
+            device,
+            saved.verified_at,
+            saved.sequence,
+        )
+        .map_err(|_| Error::CorruptState)?;
+        if verified.sequence != saved.sequence
+            || verified.issuance_id != saved.issuance_id
+            || verified.content_digest != saved.content_digest
+            || saved.verified_at < verified.issued_at.saturating_sub(30)
+            || saved.verified_at >= verified.expires_at
+        {
+            return Err(Error::CorruptState);
+        }
+        let anchor = Anchor::restored(saved.time_high_water.max(wall), wall)?;
+        Ok(Some(crate::offline::Runtime {
+            verified: Some(verified),
+            anchor: Some(anchor),
+            uncertain: wall.saturating_add(30) < saved.wall_high_water,
+            saved,
+            authorized: true,
+            last_checkpoint: Instant::now(),
+        }))
+    }
     pub(crate) fn checkpoint(&self, anchor: Option<&Anchor>, force: bool) -> Result<()> {
         let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
@@ -654,6 +769,107 @@ impl InstalledStorage {
             }
             s.commit(record)?;
         }
+        Ok(())
+    }
+    pub(crate) fn offline_state(&self) -> Result<Option<crate::offline::Persisted>> {
+        let mut state = self.0.lock().map_err(|_| Error::Storage)?;
+        state.check()?;
+        Ok(state.record.offline.clone())
+    }
+    pub(crate) fn save_offline(
+        &self,
+        version: u64,
+        offline: crate::offline::Persisted,
+    ) -> Result<u64> {
+        let mut state = self.0.lock().map_err(|_| Error::Storage)?;
+        state.check()?;
+        if state.record.generation != version {
+            return Err(Error::StaleResponse);
+        }
+        if let Some(previous) = &state.record.offline {
+            if offline.sequence < previous.sequence
+                || offline.sequence == previous.sequence
+                    && (offline.issuance_id != previous.issuance_id
+                        || offline.content_digest != previous.content_digest)
+                || offline.time_high_water < previous.time_high_water
+                || offline.wall_high_water < previous.wall_high_water
+            {
+                return Err(crate::offline::stale());
+            }
+        }
+        let mut record = state.record.clone();
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .filter(|v| *v <= MAX_GENERATION)
+            .ok_or(Error::Storage)?;
+        record.credential = None;
+        record.access = None;
+        record.pending_activation = None;
+        record.offline = Some(offline);
+        let version = record.generation;
+        state.commit(record)?;
+        Ok(version)
+    }
+    fn persist_offline_checkpoint(&self, offline: crate::offline::Persisted) -> Result<()> {
+        let mut state = self.0.lock().map_err(|_| Error::Storage)?;
+        state.check()?;
+        let Some(previous) = &state.record.offline else {
+            return Err(Error::StaleResponse);
+        };
+        if previous.jws.is_none()
+            || offline.jws != previous.jws
+            || offline.sequence != previous.sequence
+            || offline.issuance_id != previous.issuance_id
+            || offline.content_digest != previous.content_digest
+            || offline.verified_at != previous.verified_at
+            || offline.time_high_water < previous.time_high_water
+            || offline.wall_high_water < previous.wall_high_water
+        {
+            return Err(Error::StaleResponse);
+        }
+        let mut record = state.record.clone();
+        record.offline = Some(offline);
+        state.commit(record)
+    }
+    pub(crate) fn checkpoint_offline(
+        &self,
+        runtime: &mut crate::offline::Runtime,
+        force: bool,
+    ) -> Result<()> {
+        if !runtime.authorized {
+            return Ok(());
+        }
+        if !force && runtime.last_checkpoint.elapsed() < Duration::from_secs(60) {
+            return Ok(());
+        }
+        let Some(anchor) = &runtime.anchor else {
+            runtime.uncertain = true;
+            return Err(Error::ClockUncertain);
+        };
+        let (now, wall) = match anchor.now_with_wall() {
+            Ok(value) => value,
+            Err(error) => {
+                runtime.uncertain = true;
+                return Err(error);
+            }
+        };
+        if wall.saturating_add(30) < runtime.saved.wall_high_water
+            || now < runtime.saved.time_high_water
+        {
+            runtime.uncertain = true;
+            return Err(Error::ClockUncertain);
+        }
+        let mut saved = runtime.saved.clone();
+        saved.time_high_water = saved.time_high_water.max(now);
+        saved.wall_high_water = saved.wall_high_water.max(wall);
+        if let Err(error) = self.persist_offline_checkpoint(saved.clone()) {
+            runtime.authorized = false;
+            return Err(error);
+        }
+        runtime.saved = saved;
+        runtime.uncertain = false;
+        runtime.last_checkpoint = Instant::now();
         Ok(())
     }
     pub(crate) fn close(&self) {
@@ -720,6 +936,7 @@ impl Storage for InstalledStorage {
             expires_at: credential.credential_expires_at,
         });
         record.access = None;
+        clear_offline_authority(&mut record);
         s.commit(record)
     }
     fn invalidate(&self) -> Result<u64> {
@@ -760,20 +977,35 @@ impl Client {
         transport: Transport,
     ) -> Result<Self> {
         clock::elapsed_clock()?;
+        let offline_keys = options
+            .offline_keys
+            .as_deref()
+            .map(|bytes| crate::offline::parse_keys(bytes, key.environment()))
+            .transpose()?;
         let storage = Arc::new(InstalledStorage::open(
             &key,
             binding.0.clone(),
             binding.1.clone(),
             transport.canonical_origin(),
             options.state_directory.as_deref(),
+            offline_keys.is_some(),
         )?);
         let (config, mut device) = storage.identity()?;
         // Identity changes rotate the installation ID and clear saved authority
         // before the client resumes from this record.
         device.fingerprint = binding.0.clone();
         device.fingerprint_provider = binding.1.clone();
+        let restored_offline = storage.restore_offline(&key, &device, offline_keys.as_ref())?;
         let mut client = Self::with_installed_storage(config, device, transport, storage.clone())?;
         Arc::get_mut(&mut client.0).ok_or(Error::Storage)?.installed = Some(storage.clone());
+        {
+            let inner = Arc::get_mut(&mut client.0).ok_or(Error::Storage)?;
+            inner.offline_keys = offline_keys;
+            inner.app_key = Some(key.clone());
+        }
+        if let Some(offline) = restored_offline {
+            client.0.state.lock().map_err(|_| Error::Storage)?.offline = Some(offline);
+        }
         match storage.restore(binding.0.as_deref(), binding.1.as_deref()) {
             Ok(Some((claims, anchor, keys))) => {
                 *client.0.keys.lock().map_err(|_| Error::Storage)? = keys;
@@ -822,28 +1054,212 @@ impl Client {
                 if client.0.closed.load(Ordering::Acquire) {
                     break;
                 }
-                let _ = client.refresh_if_needed(&cancel).await;
-                if let Ok(state) = client.0.state.lock() {
-                    let _ = client
-                        .0
-                        .installed
+                let offline_active = client.0.state.lock().ok().is_some_and(|state| {
+                    state
+                        .offline
                         .as_ref()
-                        .expect("installed worker")
-                        .checkpoint(state.anchor.as_ref(), false);
+                        .is_some_and(|offline| offline.authorized)
+                });
+                if !offline_active {
+                    let _ = client.refresh_if_needed(&cancel).await;
+                }
+                if let Ok(mut state) = client.0.state.lock() {
+                    let storage = client.0.installed.as_ref().expect("installed worker");
+                    if let Some(offline) = state.offline.as_mut().filter(|item| item.authorized) {
+                        let _ = storage.checkpoint_offline(offline, false);
+                    } else {
+                        let _ = storage.checkpoint(state.anchor.as_ref(), false);
+                    }
                 }
             }
         });
         *client.0.worker.lock().map_err(|_| Error::Storage)? = Some(worker);
         Ok(client)
     }
+    /// Build the JSON-friendly public installation request for offline issuance.
+    pub fn offline_request(&self) -> Result<crate::offline::OfflineRequest> {
+        let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+        self.sync_storage(&mut state)?;
+        if self.0.installed.is_none() {
+            return Err(Error::Configuration);
+        }
+        let key = self.0.app_key.as_ref().ok_or(Error::Configuration)?;
+        Ok(crate::offline::request(key, &self.0.device))
+    }
+    /// Verify and durably import a signed offline file using the configured trusted JWKS.
+    pub async fn import_offline_file(&self, file: &[u8]) -> Result<crate::Snapshot> {
+        self.import_offline_file_with_cancel(file, &self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn import_offline_file_with_cancel(
+        &self,
+        file: &[u8],
+        cancel: &crate::Cancellation,
+    ) -> Result<crate::Snapshot> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let generation = self.generation()?;
+        self.import_offline_file_for_generation(file, cancel, generation)
+            .await
+    }
+    async fn import_offline_file_for_generation(
+        &self,
+        file: &[u8],
+        cancel: &crate::Cancellation,
+        generation: u64,
+    ) -> Result<crate::Snapshot> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let storage = self.0.installed.as_ref().ok_or(Error::Configuration)?;
+        let keys = self.0.offline_keys.as_ref().ok_or(Error::Configuration)?;
+        let key = self.0.app_key.as_ref().ok_or(Error::Configuration)?;
+        let _serial = tokio::select! {guard=self.0.serial.lock()=>guard,_=cancel.cancelled()=>return Err(Error::Cancelled)};
+        self.check_generation(generation)?;
+        let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+        self.sync_storage(&mut state)?;
+        if state.generation != generation {
+            return Err(Error::StaleResponse);
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let previous = storage.offline_state()?;
+        let start = clock::Start::capture()?;
+        let wall = start.wall();
+        let minimum = previous.as_ref().map_or(1, |saved| saved.sequence);
+        let mut now = wall;
+        let old_time = previous.as_ref().map_or(0, |saved| saved.time_high_water);
+        let old_wall = previous.as_ref().map_or(0, |saved| saved.wall_high_water);
+        now = now.max(old_time);
+        if wall.saturating_add(30) < old_wall {
+            return Err(Error::ClockUncertain);
+        }
+        if let Some(runtime) = state.offline.as_mut() {
+            if let Some(anchor) = &runtime.anchor {
+                match anchor.now_with_wall() {
+                    Ok((estimate, anchor_wall)) => {
+                        if anchor_wall.saturating_add(30) < old_wall {
+                            runtime.uncertain = true;
+                            return Err(Error::ClockUncertain);
+                        };
+                        if estimate < old_time {
+                            runtime.uncertain = true;
+                            return Err(Error::ClockUncertain);
+                        }
+                        runtime.uncertain = false;
+                        now = now.max(estimate)
+                    }
+                    Err(error) => {
+                        runtime.uncertain = true;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let verified = crate::offline::verify(file, keys, key, &self.0.device, now, minimum)?;
+        if let Some(saved) = &previous {
+            if verified.sequence == saved.sequence
+                && (verified.issuance_id != saved.issuance_id
+                    || verified.content_digest != saved.content_digest)
+            {
+                return Err(crate::offline::stale());
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let trusted = now.max(verified.issued_at);
+        let file_text = std::str::from_utf8(file)
+            .map_err(|_| Error::InvalidResponse)?
+            .to_owned();
+        let saved = crate::offline::Persisted {
+            jws: Some(file_text),
+            sequence: verified.sequence,
+            issuance_id: verified.issuance_id.clone(),
+            content_digest: verified.content_digest.clone(),
+            verified_at: now,
+            time_high_water: trusted,
+            wall_high_water: old_wall.max(wall),
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let version = storage.save_offline(state.storage_version, saved.clone())?;
+        clear(&mut state);
+        state.storage_version = version;
+        let anchor = Anchor::from_request(trusted, start);
+        if cancel.is_cancelled() {
+            let cleared = storage.clear_cached(true, false);
+            clear(&mut state);
+            if let Ok(version) = cleared {
+                state.storage_version = version;
+            } else {
+                return Err(Error::Storage);
+            }
+            return Err(Error::Cancelled);
+        }
+        let mut runtime = crate::offline::Runtime {
+            verified: Some(verified),
+            anchor: Some(anchor),
+            saved,
+            authorized: true,
+            uncertain: false,
+            last_checkpoint: Instant::now(),
+        };
+        let (current, current_wall) = match runtime.anchor.as_ref().unwrap().now_with_wall() {
+            Ok((now, wall))
+                if wall.saturating_add(30) >= runtime.saved.wall_high_water
+                    && now >= runtime.saved.time_high_water =>
+            {
+                (now, wall)
+            }
+            Ok(_) => {
+                runtime.uncertain = true;
+                let cleared = storage.clear_cached(true, false);
+                clear(&mut state);
+                if let Ok(version) = cleared {
+                    state.storage_version = version;
+                } else {
+                    return Err(Error::Storage);
+                }
+                return Err(Error::ClockUncertain);
+            }
+            Err(error) => {
+                runtime.uncertain = true;
+                let cleared = storage.clear_cached(true, false);
+                clear(&mut state);
+                if let Ok(version) = cleared {
+                    state.storage_version = version;
+                } else {
+                    return Err(Error::Storage);
+                }
+                return Err(error);
+            }
+        };
+        if current_wall > runtime.saved.wall_high_water {
+            runtime.saved.wall_high_water = current_wall;
+        }
+        let snapshot = Self::offline_snapshot(&runtime, Some(current))?;
+        state.offline = Some(runtime);
+        Ok(snapshot)
+    }
     /// Deliberately abandon an uncertain activation only after reconciling its outcome.
     pub fn resolve_pending_activation(&self) -> Result<()> {
         let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
         let storage = self.0.installed.as_ref().ok_or(Error::Configuration)?;
+        if !storage.activation_pending()? {
+            return Ok(());
+        }
         state.storage_version = storage.clear_cached(true, false)?;
         state.generation = state.generation.wrapping_add(1);
         state.claims = None;
         state.anchor = None;
+        if let Some(offline) = state.offline.as_mut() {
+            offline.authorized = false;
+            offline.verified = None;
+        }
         Ok(())
     }
     /// Cancel owned transport and scheduling, settle serialized work, checkpoint, release the lease.
@@ -859,12 +1275,19 @@ impl Client {
         }
         let _serial = self.0.serial.lock().await;
         if let Some(storage) = &self.0.installed {
-            let checkpoint = self
-                .0
-                .state
-                .lock()
-                .map_err(|_| Error::Storage)
-                .and_then(|state| storage.checkpoint(state.anchor.as_ref(), true));
+            let checkpoint =
+                self.0
+                    .state
+                    .lock()
+                    .map_err(|_| Error::Storage)
+                    .and_then(|mut state| {
+                        if let Some(offline) = state.offline.as_mut().filter(|item| item.authorized)
+                        {
+                            storage.checkpoint_offline(offline, true)
+                        } else {
+                            storage.checkpoint(state.anchor.as_ref(), true)
+                        }
+                    });
             storage.close();
             checkpoint
         } else {
@@ -927,7 +1350,7 @@ mod tests {
         origin: String,
         path: Option<&Path>,
     ) -> Result<InstalledStorage> {
-        InstalledStorage::open(&app_key(app), None, None, origin, path)
+        InstalledStorage::open(&app_key(app), None, None, origin, path, false)
     }
     fn store(dir: &Directory) -> InstalledStorage {
         let app = app();
@@ -981,6 +1404,7 @@ mod tests {
             Some(old_provider),
             key.api_origin().to_owned(),
             Some(&dir.0),
+            false,
         )
         .unwrap();
         let old_id = first.identity().unwrap().1.installation_id;
@@ -1033,6 +1457,7 @@ mod tests {
             Some("custom:new".into()),
             key.api_origin().into(),
             Some(&dir.0),
+            false,
         )
         .unwrap();
         let state = reopened.0.lock().unwrap();
@@ -1060,6 +1485,7 @@ mod tests {
                 Options {
                     state_directory: state_path.map(Path::to_path_buf),
                     machine_binding: MachineBinding::Disabled,
+                    offline_keys: None,
                 },
                 (None, None),
                 transport,
@@ -1192,6 +1618,52 @@ mod tests {
         );
         assert!(
             serde_json::from_str::<Record>(&json.replacen(
+                "\"generation\":0",
+                "\"generation\":0,\"generation\":0",
+                1,
+            ))
+            .is_err()
+        );
+        let mut with_credential = record.clone();
+        with_credential.credential = Some(Credential {
+            activation_id: "activation".into(),
+            licence_id: "licence".into(),
+            bearer: "a".repeat(43),
+            expires_at: None,
+        });
+        let credential_json = serde_json::to_string(&with_credential).unwrap();
+        let credential_json = credential_json.replace(
+            &format!("\"bearer\":\"{}\"", "a".repeat(43)),
+            &format!(
+                "\"bearer\":\"{}\",\"bearer\":\"{}\"",
+                "a".repeat(43),
+                "a".repeat(43)
+            ),
+        );
+        assert!(serde_json::from_str::<Record>(&credential_json).is_err());
+
+        let mut offline_record = record.clone();
+        offline_record.format = 3;
+        offline_record.offline = Some(crate::offline::Persisted {
+            jws: None,
+            sequence: 1,
+            issuance_id: "duplicate_sequence_fixture".into(),
+            content_digest: "a".repeat(64),
+            verified_at: 1,
+            time_high_water: 1,
+            wall_high_water: 1,
+        });
+        let offline_json = serde_json::to_string(&offline_record).unwrap();
+        assert!(
+            serde_json::from_str::<Record>(&offline_json.replacen(
+                "\"sequence\":1",
+                "\"sequence\":1,\"sequence\":1",
+                1,
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Record>(&json.replacen(
                 "\"fingerprint\":null",
                 "\"fingerprint\":null,\"fingerprint\":null",
                 1
@@ -1210,6 +1682,94 @@ mod tests {
                 r.validate(&record.scope, &app_key(&app())).is_err()
             }));
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn duplicate_fields_fail_closed_without_rewriting_installed_records() {
+        fn try_reopen(dir: &Directory, bytes: &[u8]) {
+            let path = dir.0.join("orbit-storage.json");
+            std::fs::write(&path, bytes).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                InstalledStorage::open(
+                    &app_key(&app()),
+                    None,
+                    None,
+                    app().api_origin,
+                    Some(&dir.0),
+                    false,
+                ),
+                Err(Error::CorruptState)
+            ));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+
+        let legacy_dir = Directory::new();
+        let legacy = store(&legacy_dir);
+        drop(legacy);
+        let legacy_path = legacy_dir.0.join("orbit-storage.json");
+        let legacy_bytes = std::fs::read(&legacy_path).unwrap();
+        let duplicate_format = String::from_utf8(legacy_bytes).unwrap().replacen(
+            "\"format\":2",
+            "\"format\":2,\"format\":2",
+            1,
+        );
+        try_reopen(&legacy_dir, duplicate_format.as_bytes());
+
+        let credential_dir = Directory::new();
+        let credential_store = store(&credential_dir);
+        credential_store
+            .save(
+                0,
+                StoredCredential {
+                    application_id: "app".into(),
+                    environment_id: "test".into(),
+                    installation_id: credential_store.identity().unwrap().1.installation_id,
+                    fingerprint: None,
+                    fingerprint_provider: None,
+                    activation_id: "activation".into(),
+                    licence_id: "licence".into(),
+                    credential: "a".repeat(43),
+                    credential_expires_at: None,
+                },
+            )
+            .unwrap();
+        drop(credential_store);
+        let credential_path = credential_dir.0.join("orbit-storage.json");
+        let credential_json = String::from_utf8(std::fs::read(&credential_path).unwrap())
+            .unwrap()
+            .replace(
+                &format!("\"bearer\":\"{}\"", "a".repeat(43)),
+                &format!(
+                    "\"bearer\":\"{}\",\"bearer\":\"{}\"",
+                    "a".repeat(43),
+                    "a".repeat(43)
+                ),
+            );
+        try_reopen(&credential_dir, credential_json.as_bytes());
+
+        let offline_dir = Directory::new();
+        let offline_store = store(&offline_dir);
+        offline_store
+            .save_offline(
+                0,
+                crate::offline::Persisted {
+                    jws: None,
+                    sequence: 1,
+                    issuance_id: "duplicate_sequence_fixture".into(),
+                    content_digest: "a".repeat(64),
+                    verified_at: 1,
+                    time_high_water: 1,
+                    wall_high_water: 1,
+                },
+            )
+            .unwrap();
+        drop(offline_store);
+        let offline_path = offline_dir.0.join("orbit-storage.json");
+        let offline_json = String::from_utf8(std::fs::read(&offline_path).unwrap())
+            .unwrap()
+            .replacen("\"sequence\":1", "\"sequence\":1,\"sequence\":1", 1);
+        try_reopen(&offline_dir, offline_json.as_bytes());
     }
     #[test]
     fn restored_clock_requires_consistent_nondecreasing_pairs() {
@@ -1508,6 +2068,7 @@ mod tests {
                     fingerprint: fingerprint.clone(),
                     provider: provider.clone(),
                 },
+                offline_keys: None,
             },
             (Some(fingerprint), Some(provider)),
             transport,
@@ -2338,6 +2899,926 @@ mod tests {
         }
         assert!(TEST_STORAGE_VERSION_READS.load(Ordering::Relaxed) > reads);
         assert_eq!(TEST_DISK_WRITES.load(Ordering::Relaxed), writes);
+        client.close().await.unwrap();
+    }
+
+    fn signed_offline_file(
+        installation: &str,
+        sequence: u64,
+        issuance: &str,
+        expires: i64,
+    ) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let pem = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/es256-test-private.pem"),
+        )
+        .unwrap();
+        let key = EncodingKey::from_ec_pem(&pem).unwrap();
+        let now = clock::wall().unwrap();
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("orbit-offline+jwt".into());
+        header.kid = Some("offline-test-fixture".into());
+        let claims = json!({"ver":1,"iss":"https://orbit.example.test","aud":"orbit-offline:app:test","sub":"licence","jti":issuance,"iat":now,"nbf":now,"exp":expires,"application_id":"app","environment_id":"test","activation_id":"activation","installation_id":installation,"sequence":sequence,"binding_mode":"none","policy_version":1,"entitlements":{"export":true}});
+        encode(&header, &claims, &key).unwrap()
+    }
+
+    async fn open_offline_fixture(
+        directory: &Directory,
+        fixture: &crate::transport::tests::Fixture,
+        jwks: Vec<u8>,
+    ) -> Client {
+        let app = app();
+        let key = app_key(&app);
+        Client::open_parsed(
+            key,
+            Options {
+                state_directory: Some(directory.0.clone()),
+                machine_binding: MachineBinding::Disabled,
+                offline_keys: Some(jwks),
+            },
+            (None, None),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn installed_offline_import_restart_renewal_logout_and_no_network() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let mut client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let fixed = client.0.device.installation_id.clone();
+        let first = signed_offline_file(
+            &fixed,
+            1,
+            "offline_install_issue_1",
+            clock::wall().unwrap() + 86_400,
+        );
+        let request = client.offline_request().unwrap();
+        assert_eq!(request.format, "orbit-offline-request");
+        assert_eq!(request.installation_id, fixed);
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            client
+                .import_offline_file_with_cancel(first.as_bytes(), &cancellation)
+                .await,
+            Err(Error::Cancelled)
+        ));
+        let snapshot = client.import_offline_file(first.as_bytes()).await.unwrap();
+        assert_eq!(snapshot.access, Access::Offline);
+        assert!(snapshot.offline_file_mode);
+        assert!(snapshot.has_feature("export"));
+        let reordered = crate::offline::vectors::reordered_token(&first, false);
+        client
+            .import_offline_file(reordered.as_bytes())
+            .await
+            .unwrap();
+        let changed = crate::offline::vectors::reordered_token(&first, true);
+        assert!(matches!(
+            client.import_offline_file(changed.as_bytes()).await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_sequence"
+        ));
+        assert!(
+            client
+                .require_access("export")
+                .await
+                .unwrap()
+                .offline_file_mode
+        );
+        fixture.assert_idle();
+        let previous = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        let duplicate = client.import_offline_file(first.as_bytes()).await.unwrap();
+        assert_eq!(duplicate.access, Access::Offline);
+        let repeated = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert!(repeated.time_high_water >= previous.time_high_water);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        client.import_offline_file(first.as_bytes()).await.unwrap();
+        let elapsed_reimport = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert!(elapsed_reimport.time_high_water > repeated.time_high_water);
+        client.resolve_pending_activation().unwrap();
+        assert_eq!(
+            client.require_access("export").await.unwrap().access,
+            Access::Offline
+        );
+        client.close().await.unwrap();
+        let missing_keys = Client::open_parsed(
+            app_key(&app()),
+            Options {
+                state_directory: Some(directory.0.clone()),
+                machine_binding: MachineBinding::Disabled,
+                offline_keys: None,
+            },
+            (None, None),
+            fixture.transport.clone(),
+        )
+        .await;
+        assert!(matches!(missing_keys, Err(Error::Configuration)));
+        client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        assert_eq!(
+            client.require_access("export").await.unwrap().access,
+            Access::Offline
+        );
+        fixture.assert_idle();
+        let renewed = signed_offline_file(
+            &fixed,
+            2,
+            "offline_install_issue_2",
+            clock::wall().unwrap() + 172_800,
+        );
+        client
+            .import_offline_file(renewed.as_bytes())
+            .await
+            .unwrap();
+        assert!(client.import_offline_file(first.as_bytes()).await.is_err());
+        let conflict = signed_offline_file(
+            &fixed,
+            2,
+            "offline_install_conflict",
+            clock::wall().unwrap() + 172_800,
+        );
+        assert!(
+            client
+                .import_offline_file(conflict.as_bytes())
+                .await
+                .is_err()
+        );
+        assert_eq!(client.logout().unwrap(), ());
+        let logged_out = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert!(logged_out.jws.is_none());
+        assert_eq!(logged_out.sequence, 2);
+        assert!(client.import_offline_file(first.as_bytes()).await.is_err());
+        fixture.assert_idle();
+        client.close().await.unwrap();
+        let reopened = open_offline_fixture(&directory, &fixture, jwks).await;
+        assert_eq!(reopened.offline_request().unwrap().installation_id, fixed);
+        assert_eq!(
+            reopened
+                .require_access("export")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Activate a licence to continue."
+        );
+        fixture.assert_idle();
+        reopened.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn offline_clock_uncertainty_cannot_be_reset_by_reimport() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_clock_restart_issue",
+            clock::wall().unwrap() + 86400,
+        );
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        let original_anchor = client
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .offline
+            .as_ref()
+            .unwrap()
+            .anchor
+            .clone()
+            .unwrap();
+        {
+            let mut state = client.0.state.lock().unwrap();
+            let runtime = state.offline.as_mut().unwrap();
+            runtime.anchor = Some(
+                Anchor::restored(runtime.saved.time_high_water, clock::wall().unwrap() + 60)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::ClockUncertain)
+        ));
+        let before = client
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .offline
+            .as_ref()
+            .unwrap()
+            .saved
+            .time_high_water;
+        assert!(matches!(
+            client.import_offline_file(file.as_bytes()).await,
+            Err(Error::ClockUncertain)
+        ));
+        let after = client
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .offline
+            .as_ref()
+            .unwrap()
+            .saved
+            .time_high_water;
+        assert_eq!(before, after);
+        fixture.assert_idle();
+        client
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .offline
+            .as_mut()
+            .unwrap()
+            .anchor = Some(original_anchor);
+        client.logout().unwrap();
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        assert!(
+            client
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .offline
+                .as_ref()
+                .unwrap()
+                .authorized
+        );
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn expired_offline_file_survives_restart_without_prompt_or_network() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_expiry_restart_issue",
+            clock::wall().unwrap() + 86_400,
+        );
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        let expires = client
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .offline
+            .as_ref()
+            .unwrap()
+            .verified
+            .as_ref()
+            .unwrap()
+            .expires_at;
+        {
+            let mut state = client.0.state.lock().unwrap();
+            state.offline.as_mut().unwrap().anchor =
+                Some(Anchor::restored(expires, clock::wall().unwrap()).unwrap());
+        }
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_file_expired"
+        ));
+        let mut prompted = false;
+        assert!(matches!(
+            client
+                .ensure_access("export", || {
+                    prompted = true;
+                    Some("must-not-be-used".into())
+                })
+                .await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_file_expired"
+        ));
+        assert!(!prompted);
+        fixture.assert_idle();
+        client.close().await.unwrap();
+
+        let restarted = open_offline_fixture(&directory, &fixture, jwks).await;
+        assert_eq!(restarted.snapshot().unwrap().access, Access::Expired);
+        assert!(matches!(
+            restarted.require_access("export").await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_file_expired"
+        ));
+        prompted = false;
+        assert!(matches!(
+            restarted
+                .ensure_access("export", || {
+                    prompted = true;
+                    Some("must-not-be-used".into())
+                })
+                .await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_file_expired"
+        ));
+        assert!(!prompted);
+        fixture.assert_idle();
+        restarted.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn offline_downtime_counts_toward_signed_expiry() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_downtime_issue",
+            clock::wall().unwrap() + 8,
+        );
+        let imported = client.import_offline_file(file.as_bytes()).await.unwrap();
+        let deadline = imported.expires_at.unwrap();
+        client.close().await.unwrap();
+        if let Ok(delay) = deadline
+            .duration_since(std::time::SystemTime::now())
+            .map(|remaining| remaining.saturating_sub(Duration::from_secs(2)))
+        {
+            tokio::time::sleep(delay).await;
+        }
+
+        let before_expiry = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        assert_eq!(
+            before_expiry.require_access("export").await.unwrap().access,
+            Access::Offline
+        );
+        before_expiry.close().await.unwrap();
+        if let Ok(remaining) = deadline.duration_since(std::time::SystemTime::now()) {
+            tokio::time::sleep(remaining + Duration::from_secs(1)).await;
+        }
+
+        let after_expiry = open_offline_fixture(&directory, &fixture, jwks).await;
+        assert!(matches!(
+            after_expiry.require_access("export").await,
+            Err(Error::Denied { ref code, .. }) if code == "offline_file_expired"
+        ));
+        fixture.assert_idle();
+        after_expiry.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn tampered_saved_offline_file_fails_closed_without_resetting_identity() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_tamper_restart_issue",
+            clock::wall().unwrap() + 86_400,
+        );
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        client.close().await.unwrap();
+
+        let state_path = directory.0.join("orbit-storage.json");
+        let bytes = std::fs::read(&state_path).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        record["offline"]["jws"] = serde_json::Value::String("a.b.c".into());
+        std::fs::write(&state_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let reopened = Client::open_parsed(
+            app_key(&app()),
+            Options {
+                state_directory: Some(directory.0.clone()),
+                machine_binding: MachineBinding::Disabled,
+                offline_keys: Some(jwks),
+            },
+            (None, None),
+            fixture.transport.clone(),
+        )
+        .await;
+        assert!(matches!(reopened, Err(Error::CorruptState)));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(saved["installation"]["id"], installation);
+        fixture.assert_idle();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn failed_offline_durable_write_exposes_no_authority_and_leaves_pending_fence() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_failed_write_issue",
+            clock::wall().unwrap() + 86_400,
+        );
+        fault(client.0.installed.as_ref().unwrap(), 1, false);
+        assert!(matches!(
+            client.import_offline_file(file.as_bytes()).await,
+            Err(Error::Storage)
+        ));
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Storage)
+        ));
+        fixture.assert_idle();
+
+        let state_path = directory.0.join("orbit-storage.json");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved["format"], 2);
+        assert!(saved.get("offline").is_none());
+        assert!(matches!(client.close().await, Err(Error::Storage)));
+        assert_eq!(
+            std::fs::read(directory.0.join("orbit-storage.lock")).unwrap(),
+            WRITE_PENDING
+        );
+        let reopened = Client::open_parsed(
+            app_key(&app()),
+            Options {
+                state_directory: Some(directory.0.clone()),
+                machine_binding: MachineBinding::Disabled,
+                offline_keys: Some(jwks),
+            },
+            (None, None),
+            fixture.transport.clone(),
+        )
+        .await;
+        assert!(matches!(reopened, Err(Error::CorruptState)));
+        fixture.assert_idle();
+    }
+
+    #[cfg(all(target_os = "linux", feature = "local-development"))]
+    #[tokio::test]
+    async fn replaced_offline_lease_denies_guard_and_never_writes_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_replaced_lease_issue",
+            clock::wall().unwrap() + 86_400,
+        );
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        let data_path = directory.0.join("orbit-storage.json");
+        let lease_path = directory.0.join("orbit-storage.lock");
+        let saved_lease = directory.0.join("orbit-storage.lock.replaced");
+        let data_before = std::fs::read(&data_path).unwrap();
+        std::fs::rename(&lease_path, &saved_lease).unwrap();
+        std::fs::write(&lease_path, [1]).unwrap();
+        std::fs::set_permissions(&lease_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let lease_before = std::fs::read(&lease_path).unwrap();
+
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::Storage)
+        ));
+        fixture.assert_idle();
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+        assert!(matches!(client.close().await, Err(Error::Storage)));
+        assert_eq!(std::fs::read(&data_path).unwrap(), data_before);
+        assert_eq!(std::fs::read(&lease_path).unwrap(), lease_before);
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn machine_identity_change_rotates_installation_and_discards_offline_history() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks.clone()).await;
+        let previous_id = client.0.device.installation_id.clone();
+        let old_file = signed_offline_file(
+            &previous_id,
+            1,
+            "offline_identity_change_issue",
+            clock::wall().unwrap() + 86_400,
+        );
+        client
+            .import_offline_file(old_file.as_bytes())
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+
+        let changed = Client::open_parsed(
+            app_key(&app()),
+            Options {
+                state_directory: Some(directory.0.clone()),
+                machine_binding: MachineBinding::Custom {
+                    fingerprint: "a".repeat(64),
+                    provider: "custom:offline-test".into(),
+                },
+                offline_keys: Some(jwks),
+            },
+            (Some("a".repeat(64)), Some("custom:offline-test".into())),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(changed.0.device.installation_id, previous_id);
+        assert!(changed.0.state.lock().unwrap().offline.is_none());
+        assert!(matches!(
+            changed.require_access("export").await,
+            Err(Error::NotActivated)
+        ));
+        assert!(
+            changed
+                .import_offline_file(old_file.as_bytes())
+                .await
+                .is_err()
+        );
+        assert!(
+            changed
+                .0
+                .installed
+                .as_ref()
+                .unwrap()
+                .offline_state()
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_idle();
+        changed.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn failed_online_activation_does_not_restore_offline_file() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks).await;
+        let installation = client.0.device.installation_id.clone();
+        let file = signed_offline_file(
+            &installation,
+            1,
+            "offline_failed_switch_issue",
+            clock::wall().unwrap() + 86400,
+        );
+        client.import_offline_file(file.as_bytes()).await.unwrap();
+        let cloned = client.clone();
+        let activation = tokio::spawn(async move {
+            cloned
+                .activate_with_id("purchase-key", "offline_switch_operation_123")
+                .await
+        });
+        for _ in 0..3 {
+            fixture.next().await.respond(503,r#"{"error":{"code":"service_unavailable","message":"Unavailable","request_id":"fixture"}}"#);
+        }
+        let outcome = activation.await.unwrap();
+        let outcome_name = outcome.as_ref().err().map(|error| match error {
+            Error::Configuration => "configuration",
+            Error::Cancelled => "cancelled",
+            Error::Transient { .. } => "transient",
+            Error::Denied { .. } => "denied",
+            Error::NotActivated => "not activated",
+            Error::FeatureUnavailable => "feature",
+            Error::InvalidResponse => "invalid response",
+            Error::TransportSecurity => "transport security",
+            Error::ReauthenticationRequired => "reauthentication",
+            Error::StaleResponse => "stale",
+            Error::Storage => "storage",
+            Error::ClockUncertain => "clock",
+            Error::InstallationInUse => "in use",
+            Error::CorruptState => "corrupt",
+            Error::PendingActivation => "pending",
+            Error::Closed => "closed",
+        });
+        assert!(
+            matches!(&outcome, Err(Error::Transient { .. })),
+            "activation returned {outcome_name:?}"
+        );
+        let saved = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert!(saved.jws.is_none());
+        assert_eq!(saved.sequence, 1);
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::NotActivated)
+        ));
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+
+    #[cfg(all(feature = "local-development", target_os = "linux"))]
+    #[tokio::test]
+    async fn offline_import_samples_after_storage_and_clears_cancelled_commit() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks).await;
+        let installation = client.0.device.installation_id.clone();
+        let expires = clock::wall().unwrap() + 2;
+        let file = signed_offline_file(&installation, 1, "offline_storage_delay_expiry", expires);
+        {
+            let storage = client.0.installed.as_ref().unwrap();
+            let state = storage.0.lock().unwrap();
+            state
+                .backend
+                .as_ref()
+                .unwrap()
+                .fault
+                .delay_millis
+                .store(2300, Ordering::Relaxed);
+        }
+        let snapshot = client.import_offline_file(file.as_bytes()).await.unwrap();
+        assert_eq!(snapshot.access, Access::Expired);
+        assert!(!snapshot.has_feature("export"));
+        assert!(snapshot.entitlements.is_empty());
+        fixture.assert_idle();
+        client.close().await.unwrap();
+
+        let cancelled_directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&cancelled_directory, &fixture, jwks).await;
+        let file = signed_offline_file(
+            &client.0.device.installation_id,
+            1,
+            "offline_cancel_during_commit",
+            clock::wall().unwrap() + 86_400,
+        );
+        {
+            let storage = client.0.installed.as_ref().unwrap();
+            let state = storage.0.lock().unwrap();
+            state
+                .backend
+                .as_ref()
+                .unwrap()
+                .fault
+                .delay_millis
+                .store(400, Ordering::Relaxed);
+        }
+        let cancellation = Cancellation::new();
+        let signal = cancellation.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            signal.cancel();
+        });
+        assert!(matches!(
+            client
+                .import_offline_file_with_cancel(file.as_bytes(), &cancellation)
+                .await,
+            Err(Error::Cancelled)
+        ));
+        cancel_thread.join().unwrap();
+        let saved = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.sequence, 1);
+        assert!(saved.jws.is_none());
+        assert!(
+            client
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .offline
+                .as_ref()
+                .is_none_or(|runtime| !runtime.authorized)
+        );
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn cancelled_queued_offline_import_preserves_existing_authority() {
+        let directory = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../contracts/sdk/offline-files.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let jwks = serde_json::to_vec(&corpus["jwks"]).unwrap();
+        let client = open_offline_fixture(&directory, &fixture, jwks).await;
+        let installation = client.0.device.installation_id.clone();
+        let first = signed_offline_file(
+            &installation,
+            1,
+            "offline_queued_import_current",
+            clock::wall().unwrap() + 86_400,
+        );
+        client.import_offline_file(first.as_bytes()).await.unwrap();
+        let second = signed_offline_file(
+            &installation,
+            2,
+            "offline_queued_import_next",
+            clock::wall().unwrap() + 172_800,
+        );
+        let serial = client.0.serial.lock().await;
+        let queued_client = client.clone();
+        let cancellation = Cancellation::new();
+        let queued_cancellation = cancellation.clone();
+        let second_for_queued = second.clone();
+        let queued = tokio::spawn(async move {
+            queued_client
+                .import_offline_file_with_cancel(second_for_queued.as_bytes(), &queued_cancellation)
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        drop(serial);
+        assert!(matches!(queued.await.unwrap(), Err(Error::Cancelled)));
+        assert_eq!(
+            client.require_access("export").await.unwrap().access,
+            Access::Offline
+        );
+        let saved = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.sequence, 1);
+        assert_eq!(saved.jws.as_deref(), Some(first.as_str()));
+
+        let generation = client.generation().unwrap();
+        let serial = client.0.serial.lock().await;
+        let queued_client = client.clone();
+        let queued_cancel = Cancellation::new();
+        let queued = tokio::spawn(async move {
+            queued_client
+                .import_offline_file_for_generation(second.as_bytes(), &queued_cancel, generation)
+                .await
+        });
+        tokio::task::yield_now().await;
+        client.logout().unwrap();
+        drop(serial);
+        assert!(matches!(queued.await.unwrap(), Err(Error::StaleResponse)));
+        let logged_out = client
+            .0
+            .installed
+            .as_ref()
+            .unwrap()
+            .offline_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(logged_out.sequence, 1);
+        assert!(logged_out.jws.is_none());
+        assert!(
+            client
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .offline
+                .as_ref()
+                .is_none_or(|runtime| !runtime.authorized)
+        );
+        fixture.assert_idle();
         client.close().await.unwrap();
     }
 }

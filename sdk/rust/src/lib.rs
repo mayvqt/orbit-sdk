@@ -7,6 +7,7 @@ mod device;
 mod diagnostics;
 mod grants;
 mod installed;
+mod offline;
 #[cfg(test)]
 mod parser_fuzz;
 #[cfg(all(
@@ -28,6 +29,7 @@ pub use app_key::{AppEnvironment, AppKey};
 pub use device::{machine_fingerprint, native_fingerprint};
 pub use diagnostics::SupportSummary;
 pub use installed::{MachineBinding, Options};
+pub use offline::OfflineRequest;
 #[cfg(test)]
 pub(crate) use storage::MemoryStorage;
 pub(crate) use storage::{Storage, StoredCredential};

@@ -90,6 +90,8 @@ func errorGuidance(code string) string {
 		return "Sign in again to continue."
 	case "licence_expired":
 		return "Your licence has expired. Contact application support to renew it."
+	case "offline_file_expired":
+		return "Your offline licence file has expired. Request a renewed file from application support."
 	case "licence_suspended":
 		return "Your licence is suspended. Contact application support."
 	case "licence_revoked":

@@ -41,8 +41,8 @@ func TestSharedGrantVectors(t *testing.T) {
 	if corpus.FormatVersion != 1 {
 		t.Fatalf("unsupported grant vector format: %d", corpus.FormatVersion)
 	}
-	if len(corpus.Cases) == 0 {
-		t.Fatal("shared corpus is empty")
+	if len(corpus.Cases) != 104 {
+		t.Fatalf("shared grant corpus has %d cases, want 104", len(corpus.Cases))
 	}
 	for _, vector := range corpus.Cases {
 		t.Run(vector.Name, func(t *testing.T) {

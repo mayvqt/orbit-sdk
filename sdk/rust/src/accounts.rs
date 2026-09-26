@@ -269,8 +269,19 @@ impl Client {
             if state.generation != generation {
                 return Err(Error::StaleResponse);
             }
+            let checkpoint_error = if let (Some(storage), Some(offline)) = (
+                &self.0.installed,
+                state.offline.as_mut().filter(|item| item.authorized),
+            ) {
+                storage.checkpoint_offline(offline, true).err()
+            } else {
+                None
+            };
             access::clear(&mut state);
             state.storage_version = self.0.storage.invalidate()?;
+            if let Some(error) = checkpoint_error {
+                return Err(error);
+            }
             state.generation
         };
         let response = self
@@ -338,9 +349,20 @@ impl Client {
         let cancel = self.0.transport.owner_cancel.clone();
         let prepared = (|| -> Result<Option<Session>> {
             let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            let checkpoint_error = if let (Some(storage), Some(offline)) = (
+                &self.0.installed,
+                state.offline.as_mut().filter(|item| item.authorized),
+            ) {
+                storage.checkpoint_offline(offline, true).err()
+            } else {
+                None
+            };
             let session = state.account.take();
             access::clear(&mut state);
             state.storage_version = self.0.storage.invalidate()?;
+            if let Some(error) = checkpoint_error {
+                return Err(error);
+            }
             Ok(session)
         })();
         async move {

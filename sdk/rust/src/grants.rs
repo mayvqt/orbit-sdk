@@ -96,6 +96,9 @@ pub struct Keys(BTreeMap<String, DecodingKey>, BTreeMap<String, Jwk>);
 impl Keys {
     pub fn parse(value: serde_json::Value) -> Result<Self> {
         let jwks: Jwks = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
+        Self::from_jwks(jwks)
+    }
+    fn from_jwks(jwks: Jwks) -> Result<Self> {
         if jwks.keys.is_empty() || jwks.keys.len() > 8 {
             return Err(Error::InvalidResponse);
         }
@@ -114,6 +117,24 @@ impl Keys {
             {
                 return Err(Error::InvalidResponse);
             }
+            let mut point = Vec::with_capacity(65);
+            point.push(4);
+            point.extend_from_slice(&canonical(&key.x)?);
+            point.extend_from_slice(&canonical(&key.y)?);
+            let private = aws_lc_rs::agreement::EphemeralPrivateKey::generate(
+                &aws_lc_rs::agreement::ECDH_P256,
+                &aws_lc_rs::rand::SystemRandom::new(),
+            )
+            .map_err(|_| Error::InvalidResponse)?;
+            aws_lc_rs::agreement::agree_ephemeral(
+                private,
+                aws_lc_rs::agreement::UnparsedPublicKey::new(
+                    &aws_lc_rs::agreement::ECDH_P256,
+                    point,
+                ),
+                Error::InvalidResponse,
+                |_| Ok(()),
+            )?;
             let public = DecodingKey::from_ec_components(&key.x, &key.y)
                 .map_err(|_| Error::InvalidResponse)?;
             public_keys.insert(key.kid.clone(), key.clone());
@@ -122,6 +143,26 @@ impl Keys {
             }
         }
         Ok(Self(keys, public_keys))
+    }
+    pub(crate) fn parse_offline(data: &[u8], prefix: &str) -> Result<Self> {
+        if data.is_empty() || data.len() > 16 * 1024 {
+            return Err(Error::Configuration);
+        }
+        let jwks: Jwks = serde_json::from_slice(data).map_err(|_| Error::Configuration)?;
+        if jwks.keys.iter().any(|key| {
+            !key.kid.starts_with(prefix)
+                || key.kid.len() == prefix.len()
+                || !key
+                    .kid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }) {
+            return Err(Error::Configuration);
+        }
+        Self::from_jwks(jwks).map_err(|_| Error::Configuration)
+    }
+    pub(crate) fn decoding_key(&self, kid: &str) -> Option<&DecodingKey> {
+        self.0.get(kid)
     }
     pub(crate) fn public_key(&self, token: &str) -> Result<serde_json::Value> {
         let key = self

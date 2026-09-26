@@ -36,7 +36,7 @@ func TestSharedAppKeyVectors(t *testing.T) {
 			Environment   Environment `json:"environment"`
 		} `json:"cases"`
 	}
-	if err := json.Unmarshal(data, &corpus); err != nil || corpus.FormatVersion != 1 || len(corpus.Cases) == 0 {
+	if err := json.Unmarshal(data, &corpus); err != nil || corpus.FormatVersion != 1 || len(corpus.Cases) != 27 {
 		t.Fatalf("invalid shared app-key corpus: %v", err)
 	}
 	for _, fixture := range corpus.Cases {
