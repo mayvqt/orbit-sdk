@@ -96,6 +96,25 @@ issuance skew and no expiry grace. Ordinary connected, offline and download
 verifiers reject this purpose. A session grant cannot be converted into a
 cached ordinary grant or imported as an offline file.
 
+The issuance-skew bound rejects an `iat` more than 30 seconds in the future.
+A replay of an older, still-active interval remains verifiable until its original
+`exp`; rejecting every replay older than 30 seconds would break the retry contract.
+The verifier also enforces the 45–75-second refresh range above, allowing an earlier
+refresh only when it equals a shorter interval's expiry. Session IDs use the
+16–128-byte opaque grammar and sequences must equal the caller's expected value.
+As with connected grants, unrelated nonsecurity claims may be ignored, while
+case-folded aliases of known claims are rejected. Absent or null purchased expiry
+means no purchased deadline and must match the trusted expected licence state.
+The issuer and audience match trusted scope exactly; the complete audience must
+not be limited to the length of a single application/environment ID.
+
+Trusted connected-purpose JWKS is at most 16 KiB and contains only `keys`, with
+one through eight strict public P-256 entries. Validate all entries, including
+retained unused keys. Each opaque key ID has the configured `test-` or `live-`
+prefix and a nonempty suffix. No key or endpoint is discovered from the token.
+The [shared signed cases](session-grants.json) cover this verification profile;
+they do not exercise seat accounting or the SDK lifecycle.
+
 Seat accounting and deadline changes commit durably. Serialize capacity-changing
 operations by licence, using the established principal-before-licence lock order.
 Count only that licence's unended sessions whose deadline is later than database

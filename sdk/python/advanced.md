@@ -210,6 +210,17 @@ shareable and cannot provide subsequent licence enforcement.
 The [runnable seller backend](../../examples/python/seller-downloads/README.md)
 shows the protected endpoint with private S3-compatible storage and local tests.
 
+## Floating-session verification foundation
+
+The internal session verifier passes the 184 shared signed cases and keeps the
+process session ID and renewal sequence separate from ordinary access grants.
+It returns immutable, redacted metadata without persisting the grant. Tests also
+check strict trusted-key bounds and rejection by ordinary/offline/download verifiers.
+
+Acquisition, renewal, release and the server seat-accounting workflow are still
+being implemented. This internal verifier does not enable floating licensing in
+`Client` yet; see the [floating-session contract](../../contracts/sdk/floating.md).
+
 ## macOS platform checks
 
 The candidate's macOS bindings read `IOPlatformUUID` through IOKit and use

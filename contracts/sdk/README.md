@@ -67,6 +67,16 @@ evidence.
 separate session-grant purpose. It is an implementation baseline; ordinary
 activation grants do not provide concurrent-session enforcement.
 
+[session-grants.json](session-grants.json) supplies 184 signed cases (23 valid,
+161 invalid) for the internal Python verifier and future SDK ports. Its expected
+context extends the connected corpus with `session_id`, exact `sequence` and
+the configured Test/Live `key_environment`. Cases cover process/sequence binding,
+120-second intervals, active retries without deadline extension, exact expiry,
+refresh timing, credential/purchased caps, scope and machine binding, purpose
+separation, strict encodings and retained-key validation. The fixture key is the
+same public test material, with an additional synthetic rotation key. These cases
+do not establish automatic acquisition, renewal, release or durable seat accounting.
+
 ## Usage and resource limits
 
 [limits.md](limits.md) defines online usage consumption and persistent resource
