@@ -5,24 +5,28 @@ Start with [the quickstart](README.md) for normal installed applications.
 ## Operations
 
 `Client` has named synchronous methods for `snapshot`, `activate`,
-`activate_previous`, `refresh`, `require_access`, `deactivate`, `local_logout`,
-`register`, `resend_registration`, `login`, `account`, `owned_licences`,
-`claim_licence`, `activate_account`, `activate_account_previous`,
-`account_logout`, `request_email_change`, `request_password_recovery`, and
-`customer_session_authorization`. Network methods accept an optional
+`activate_previous`, `refresh`, `require_access`, `ensure_access`, `deactivate`,
+`logout`, `register`, `resend_registration`, `login`, `account`,
+`owned_licences`, `claim_licence`, `activate_account`,
+`activate_account_previous`, `logout_account`, `request_email_change`,
+`request_password_recovery`, and `customer_session_authorization`. Network methods accept an optional
 `cancellation=Cancellation.create()` keyword argument. Calls may run
 concurrently; activation, refresh, login, and session-authenticated account
 operations serialize when they change or depend on client state. Closing a
 client waits for active calls to return.
 
-`register()` returns `RegistrationResult(accepted, expires_at, pending)`. Its
-opaque `pending` handle keeps resend proof in memory; use it only with
-`resend_registration()` and close it when finished. `login()` and `account()`
-return safe customer metadata. Listing or claiming a licence does not grant
-access: activate the chosen licence and call `require_access()`.
-`account_logout()` requests remote revocation and clears local account state;
-`local_logout()` clears activation and customer session state without a
-network request.
+`register()` returns a frozen `RegistrationResult(accepted, expires_at, pending)`;
+`expires_at` is a timezone-aware `datetime`. Its opaque `pending` handle keeps
+resend proof in memory; use it only with `resend_registration()` and close it
+when finished. `login()` and `account()` return a frozen `Account`.
+`owned_licences()` returns an `OwnedLicencePage` whose items are frozen
+`OwnedLicence` values. Timestamps use UTC-aware `datetime`, durations use
+`timedelta`, and entitlement maps cannot be mutated. Listing or claiming a
+licence does not grant access: activate the chosen licence and call
+`require_access()`. `logout_account()` requests remote revocation and clears
+local account state; `logout()` clears activation and customer session state
+without a network request. `claim_licence(key)` generates a secure operation
+ID when omitted; pass an explicit ID to reuse it across retries.
 
 Use `with` or call `close()` on clients, cancellation handles and pending
 registration handles. Finalizers are only a fallback for forgotten closes.
@@ -56,10 +60,10 @@ not persisted.
 
 ## Advanced connection, storage and device identity
 
-`Client.connect(Config(...))` is available when the host manages the
-installation ID and storage policy itself. Keep its stable installation ID
-between runs; `installation_id_new()` creates one. Its default `StorageMode.MEMORY`
-forgets activation credentials at process exit.
+`Client.open_with_storage(app_key, installation_id=...)` is available when the
+host manages the installation ID and storage policy itself. Keep its stable
+installation ID between runs; `installation_id_new()` creates one. Its default
+`StorageMode.MEMORY` forgets activation credentials at process exit.
 
 Choose a storage mode when the host should remember an activation:
 
@@ -77,12 +81,17 @@ prevent changes by someone controlling the user's account. These adapters do
 not persist customer sessions, passwords, raw licence keys, signed grants or
 resend proofs.
 
-For an HWID-bound application, set a 64-character lowercase hex `fingerprint`
-and `fingerprint_provider` (`machine_v1` or `custom:<name>`) in `Config`.
-`native_fingerprint(application_id, environment_id)` derives the supported
-machine identity; `machine_fingerprint(...)` normalizes an identity supplied by
-the host. Do not send raw machine IDs to Orbit, and do not request a fingerprint
-when HWID is disabled.
+`Client.open()` binds an installation to the supported native machine identity
+using provider `machine_v1` when it is available. If identity cannot be read,
+the client sends no fingerprint. Use `machine_binding=False` for cloned
+containers or virtual machine images with shared IDs. To supply a stable host
+identity, construct `DeviceBinding(fingerprint, provider)`; the fingerprint
+must be a 64-character lowercase hex value and the provider must be
+`machine_v1` or `custom:<name>`. `machine_fingerprint(...)` can hash a
+host-provided Linux or Windows identity. Never send the raw machine identifier
+to Orbit. If the current identity differs from the one saved with the
+installation, the SDK discards its saved credential and signed grant, so it
+cannot restore offline access on the new machine.
 
 ## Errors and sensitive output
 

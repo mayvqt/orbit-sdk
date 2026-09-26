@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from orbit_sdk.errors import OrbitError
 from orbit_sdk.grants import Expected, Keys, parse_header, verify
@@ -64,6 +65,29 @@ class GrantVectorTests(unittest.TestCase):
         ):
             with self.assertRaises(OrbitError):
                 Keys.parse(mutated)
+
+    def test_signed_unbound_grant_with_local_fingerprint_requires_runtime_opt_in(self) -> None:
+        corpus = fixture_data()
+        case = next(case for case in corpus["cases"] if case["valid"] and case.get("expected", {}).get("fingerprint") is None)
+        data = dict(corpus["expected"])
+        data.update(case.get("expected") or {})
+        expected = Expected(
+            issuer=data["issuer"],
+            application=data["application"],
+            environment=data["environment"],
+            licence=data["licence"],
+            activation=data["activation"],
+            installation=data["installation"],
+            fingerprint="a" * 64,
+            fingerprint_provider="machine_v1",
+            credential_expires_at=data["credential_expires_at"],
+            licence_expires_at=data["licence_expires_at"],
+            now=data["now"],
+        )
+        keys = Keys.parse(case.get("jwks", corpus["jwks"]))
+        with self.assertRaises(OrbitError):
+            verify(case["token"], keys, expected)
+        verify(case["token"], keys, replace(expected, allow_unbound_fingerprint=True))
 
 
 if __name__ == "__main__":

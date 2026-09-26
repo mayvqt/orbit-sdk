@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 import os
 import stat
 import ssl
@@ -12,15 +13,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orbit_sdk import AppConfig, Client, Config, OrbitError
+from orbit_sdk import AppKey, Client, OrbitError, Snapshot
 from orbit_sdk.errors import CANCELLED, CONFIGURATION, DENIED, STORAGE, TRANSIENT, error
 from orbit_sdk.persistent_storage import AccessState, InstallationStorage, _ensure_linux_directory, canonical_scope, scope_key
-from orbit_sdk.client import _validate_app_config
+from orbit_sdk.client import _AppScope, _Config as Config, _validate_app_scope
 
 from support import activation_reply, fixture_data, sign_grant
 
 
-APP = AppConfig("https://orbit.example.test", "app", "test", "https://issuer.example.test")
+APP = AppKey.parse("orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Q.app.test")
+APP_SCOPE = _AppScope(APP.api_origin, APP.application_id, APP.environment_id, APP.issuer)
 
 
 class _WaitProbe:
@@ -105,13 +107,13 @@ class PersistentClientTests(unittest.TestCase):
         self.directory.cleanup()
 
     def open(self, transport: PersistentTransport, *, worker: bool = False) -> Client:
-        return Client._open_for_test(APP, self.directory.name, transport, start_worker=worker)
+        return Client._open_for_test(APP_SCOPE, self.directory.name, transport, start_worker=worker)
 
-    def _activate_offline(self, *, transport: PersistentTransport | None = None) -> tuple[Client, dict]:
+    def _activate_offline(self, *, transport: PersistentTransport | None = None) -> tuple[Client, Snapshot]:
         fake = transport or PersistentTransport(offline=True)
         client = self.open(fake)
         snapshot = client.activate("synthetic-key-for-persistence")
-        self.assertEqual(snapshot["access"], "online")
+        self.assertEqual(snapshot.access.value, "online")
         client.close()
         return client, snapshot
 
@@ -122,7 +124,7 @@ class PersistentClientTests(unittest.TestCase):
             self.assertEqual(transport.requests, [])
             installation_id = client.config.installation_id
             snapshot = client.activate("synthetic-key-never-persist-this")
-            self.assertEqual(snapshot["access"], "online")
+            self.assertEqual(snapshot.access.value, "online")
             method, route, body, _ = transport.requests[0]
             self.assertEqual((method, route), ("POST", "/api/client/v1/activations"))
             self.assertEqual(body["credential_mode"], "persistent")
@@ -141,11 +143,90 @@ class PersistentClientTests(unittest.TestCase):
         restarted = self.open(restarted_transport)
         try:
             self.assertEqual(restarted.config.installation_id, installation_id)
-            self.assertEqual(restarted.snapshot()["access"], "online")
+            self.assertEqual(restarted.snapshot().access.value, "online")
             self.assertEqual(restarted_transport.requests[0][1], "/api/client/v1/activations/activation/validate")
             self.assertEqual(restarted_transport.requests[0][2]["credential"], "a" * 43)
         finally:
             restarted.close()
+
+    def test_device_change_discards_saved_credential_and_offline_grant(self) -> None:
+        original, _ = self._activate_offline()
+        original_installation_id = original.config.installation_id
+        original_generation = json.loads(Path(self.directory.name, "orbit-storage.bin").read_bytes())["generation"]
+        changed_scope = _AppScope(
+            APP_SCOPE.api_origin,
+            APP_SCOPE.application_id,
+            APP_SCOPE.environment_id,
+            APP_SCOPE.issuer,
+            "a" * 64,
+            "machine_v1",
+        )
+        changed = Client._open_for_test(changed_scope, self.directory.name, PersistentTransport(offline=True))
+        try:
+            changed_installation_id = changed.config.installation_id
+            self.assertNotEqual(changed_installation_id, original_installation_id)
+            self.assertEqual(changed.snapshot().access.value, "denied")
+            self.assertIsNone(changed._storage.load()[1])
+            self.assertIsNone(changed._persistent_storage.access)
+            stored = json.loads(Path(self.directory.name, "orbit-storage.bin").read_bytes())
+            self.assertEqual(stored["installation"]["fingerprint"], "a" * 64)
+            self.assertEqual(stored["installation"]["id"], changed_installation_id)
+            self.assertEqual(stored["generation"], original_generation + 1)
+            self.assertIsNone(stored["credential"])
+            self.assertIsNone(stored["access"])
+        finally:
+            changed.close()
+
+        restarted_transport = PersistentTransport(offline=True)
+        restarted = Client._open_for_test(changed_scope, self.directory.name, restarted_transport)
+        try:
+            self.assertEqual(restarted.config.installation_id, changed_installation_id)
+            self.assertEqual(restarted.snapshot().access.value, "denied")
+            restarted.activate("fresh-key-after-device-change")
+            activation = next(
+                entry for entry in restarted_transport.requests
+                if entry[0] == "POST" and entry[1] == "/api/client/v1/activations"
+            )
+            self.assertEqual(activation[2]["installation_id"], changed_installation_id)
+        finally:
+            restarted.close()
+
+    def test_losing_device_identity_rotates_installation_id(self) -> None:
+        bound_scope = _AppScope(
+            APP_SCOPE.api_origin,
+            APP_SCOPE.application_id,
+            APP_SCOPE.environment_id,
+            APP_SCOPE.issuer,
+            "b" * 64,
+            "machine_v1",
+        )
+        bound = Client._open_for_test(bound_scope, self.directory.name, PersistentTransport(offline=True))
+        original_installation_id = bound.config.installation_id
+        bound.activate("bound-key-before-identity-loss")
+        original_generation = bound._persistent_storage.version()
+        bound.close()
+
+        unbound_transport = PersistentTransport(offline=True)
+        unbound = Client._open_for_test(APP_SCOPE, self.directory.name, unbound_transport)
+        try:
+            unbound_installation_id = unbound.config.installation_id
+            self.assertNotEqual(unbound_installation_id, original_installation_id)
+            self.assertEqual(unbound.config.fingerprint, "")
+            stored = json.loads(Path(self.directory.name, "orbit-storage.bin").read_bytes())
+            self.assertEqual(stored["installation"]["id"], unbound_installation_id)
+            self.assertEqual(stored["generation"], original_generation + 1)
+            self.assertIsNone(stored["installation"]["fingerprint"])
+            self.assertIsNone(stored["credential"])
+            self.assertIsNone(stored["pending_activation"])
+            self.assertIsNone(stored["access"])
+            unbound.activate("fresh-key-without-identity")
+            activation = next(
+                entry for entry in unbound_transport.requests
+                if entry[0] == "POST" and entry[1] == "/api/client/v1/activations"
+            )
+            self.assertEqual(activation[2]["installation_id"], unbound_installation_id)
+        finally:
+            unbound.close()
 
     def test_external_previous_credential_is_retry_bound_without_local_saved_credential(self) -> None:
         previous = "p" * 43
@@ -167,7 +248,7 @@ class PersistentClientTests(unittest.TestCase):
 
             transport.activation_error = None
             snapshot = client.activate_previous("rebind-key", previous, operation_id)
-            self.assertEqual(snapshot["access"], "online")
+            self.assertEqual(snapshot.access.value, "online")
             activation_requests = [request[2] for request in transport.requests if request[1] == "/api/client/v1/activations"]
             self.assertEqual([request["idempotency_key"] for request in activation_requests], [operation_id, operation_id])
             self.assertEqual([request["previous_credential"] for request in activation_requests], [previous, previous])
@@ -189,7 +270,7 @@ class PersistentClientTests(unittest.TestCase):
             self.assertIsNone(client._persistent_storage.access)
 
             snapshot = client.activate("same-malformed-key")
-            self.assertEqual(snapshot["access"], "online")
+            self.assertEqual(snapshot.access.value, "online")
             self.assertIsNone(client._persistent_storage.pending_activation)
             requests = [request[2] for request in transport.requests if request[1] == "/api/client/v1/activations"]
             self.assertEqual(requests[-1]["idempotency_key"], pending.operation_id)
@@ -209,8 +290,8 @@ class PersistentClientTests(unittest.TestCase):
 
     def test_codec_and_config_validation_do_not_create_tls_context(self) -> None:
         with patch.object(ssl, "create_default_context", wraps=ssl.create_default_context) as create_context:
-            _validate_app_config(APP)
-            scope_key(canonical_scope(APP))
+            _validate_app_scope(APP_SCOPE)
+            scope_key(canonical_scope(APP_SCOPE))
         create_context.assert_not_called()
 
     def test_linux_directory_creation_syncs_each_new_parent_entry(self) -> None:
@@ -247,9 +328,9 @@ class PersistentClientTests(unittest.TestCase):
         offline = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
             snapshot = offline.snapshot()
-            self.assertEqual(snapshot["access"], "offline")
-            self.assertEqual(snapshot["expires_at"], original["expires_at"])
-            self.assertLessEqual(snapshot["remaining_offline_seconds"], original["remaining_offline_seconds"])
+            self.assertEqual(snapshot.access.value, "offline")
+            self.assertEqual(snapshot.expires_at, original.expires_at)
+            self.assertLessEqual(snapshot.remaining_offline, original.remaining_offline)
         finally:
             offline.close()
 
@@ -262,7 +343,7 @@ class PersistentClientTests(unittest.TestCase):
             with self.assertRaises(OrbitError) as fresh_finite:
                 client.activate("finite-key")
             self.assertEqual(fresh_finite.exception.kind, "invalid_response")
-            client.local_logout()
+            client.logout()
         finally:
             client.close()
 
@@ -281,7 +362,7 @@ class PersistentClientTests(unittest.TestCase):
         finite_restart_transport.credential_expiry = finite_expiry
         finite_restarted = self.open(finite_restart_transport)
         try:
-            self.assertEqual(finite_restarted.snapshot()["credential_expires_at"], finite_expiry)
+            self.assertEqual(finite_restarted.snapshot().credential_expires_at, dt.datetime.fromtimestamp(finite_expiry, dt.timezone.utc))
         finally:
             finite_restarted.close()
 
@@ -292,7 +373,7 @@ class PersistentClientTests(unittest.TestCase):
         os.chmod(record_path, 0o600)
         restarted = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
-            self.assertIsNone(restarted.snapshot()["credential_expires_at"])
+            self.assertIsNone(restarted.snapshot().credential_expires_at)
         finally:
             restarted.close()
 
@@ -332,7 +413,7 @@ class PersistentClientTests(unittest.TestCase):
             self.assertEqual(different.exception.kind, CONFIGURATION)
             self.assertEqual(restarted_transport.requests, [])
             result = restarted.activate("same-key")
-            self.assertEqual(result["access"], "online")
+            self.assertEqual(result.access.value, "online")
             retries = [entry[2]["idempotency_key"] for entry in restarted_transport.requests if entry[0] == "POST" and entry[1] == "/api/client/v1/activations"]
             self.assertEqual(retries, [first_id])
             self.assertIsNone(restarted._persistent_storage.pending_activation)
@@ -354,8 +435,8 @@ class PersistentClientTests(unittest.TestCase):
             with self.assertRaises(OrbitError) as raised:
                 restarted.activate("expired-pending-key")
             self.assertEqual(raised.exception.code, "pending_activation_recovery_required")
-            restarted.local_logout()
-            self.assertEqual(restarted.activate("new-key")["access"], "online")
+            restarted.logout()
+            self.assertEqual(restarted.activate("new-key").access.value, "online")
         finally:
             restarted.close()
 
@@ -368,14 +449,14 @@ class PersistentClientTests(unittest.TestCase):
         with patch("orbit_sdk.client.wall_seconds", return_value=rollback):
             rejected = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
-            self.assertEqual(rejected.snapshot()["access"], "refresh_required")
+            self.assertEqual(rejected.snapshot().access.value, "refresh_required")
         finally:
             rejected.close()
 
         # Restore the original cache for a forward-clock estimate from its
         # receipt pair; a fresh process has no monotonic timestamp to reuse.
         record_path = Path(self.directory.name, "orbit-storage.bin")
-        recovered_state = InstallationStorage.open(self.directory.name, APP)
+        recovered_state = InstallationStorage.open(self.directory.name, APP_SCOPE)
         recovered_state.close()
         record = json.loads(record_path.read_bytes())
         record["access"] = access
@@ -385,8 +466,8 @@ class PersistentClientTests(unittest.TestCase):
         with patch("orbit_sdk.client.wall_seconds", return_value=forward), patch("orbit_sdk.clock.wall_seconds", return_value=forward):
             estimated = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
             try:
-                self.assertEqual(estimated.snapshot()["access"], "offline")
-                self.assertEqual(estimated.snapshot()["expires_at"], original["expires_at"])
+                self.assertEqual(estimated.snapshot().access.value, "offline")
+                self.assertEqual(estimated.snapshot().expires_at, original.expires_at)
             finally:
                 estimated.close()
 
@@ -396,8 +477,8 @@ class PersistentClientTests(unittest.TestCase):
         with patch("orbit_sdk.client.elapsed_ns", return_value=new_boot_elapsed), patch("orbit_sdk.clock.elapsed_ns", return_value=new_boot_elapsed):
             restarted = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
             try:
-                self.assertEqual(restarted.snapshot()["access"], "offline")
-                self.assertEqual(restarted.snapshot()["expires_at"], original["expires_at"])
+                self.assertEqual(restarted.snapshot().access.value, "offline")
+                self.assertEqual(restarted.snapshot().expires_at, original.expires_at)
             finally:
                 restarted.close()
 
@@ -411,7 +492,7 @@ class PersistentClientTests(unittest.TestCase):
         os.chmod(path, 0o600)
         rejected = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
-            self.assertEqual(rejected.snapshot()["access"], "refresh_required")
+            self.assertEqual(rejected.snapshot().access.value, "refresh_required")
         finally:
             rejected.close()
         # Invalid cache evidence is discarded while the stored credential is
@@ -424,7 +505,7 @@ class PersistentClientTests(unittest.TestCase):
         with patch("orbit_sdk.client.wall_seconds", return_value=forward), patch("orbit_sdk.clock.wall_seconds", return_value=forward):
             expired = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
-            self.assertEqual(expired.snapshot()["access"], "refresh_required")
+            self.assertEqual(expired.snapshot().access.value, "refresh_required")
         finally:
             expired.close()
 
@@ -439,7 +520,7 @@ class PersistentClientTests(unittest.TestCase):
                 path.write_text(json.dumps(record, separators=(",", ":")))
                 transport = PersistentTransport(offline=True)
                 with self.open(transport) as client:
-                    self.assertEqual(client.require_access("export")["access"], "online")
+                    self.assertEqual(client.require_access("export").access.value, "online")
                     self.assertEqual(transport.requests[0][1], "/api/client/v1/activations/activation/validate")
                     self.assertFalse(any(x[1] == "/api/client/v1/activations" for x in transport.requests))
 
@@ -458,7 +539,7 @@ class PersistentClientTests(unittest.TestCase):
         os.chmod(path, 0o600)
         client = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))
         try:
-            self.assertEqual(client.snapshot()["access"], "refresh_required")
+            self.assertEqual(client.snapshot().access.value, "refresh_required")
         finally:
             client.close()
 
@@ -486,21 +567,21 @@ class PersistentClientTests(unittest.TestCase):
             unsafe = Path(parent, "public")
             unsafe.mkdir(mode=0o755)
             with self.assertRaises(OrbitError):
-                Client._open_for_test(APP, unsafe, PersistentTransport())
+                Client._open_for_test(APP_SCOPE, unsafe, PersistentTransport())
             self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
             target = Path(parent, "target")
             target.mkdir(mode=0o700)
             link = Path(parent, "link")
             link.symlink_to(target, target_is_directory=True)
             with self.assertRaises(OrbitError):
-                Client._open_for_test(APP, link, PersistentTransport())
+                Client._open_for_test(APP_SCOPE, link, PersistentTransport())
 
     def test_explicit_denial_invalidates_persisted_grant_and_pending(self) -> None:
         self._activate_offline()
         with self.assertRaises(OrbitError) as denied:
             self.open(PersistentTransport(validation_error=error(DENIED, "licence_revoked")))
         self.assertEqual(denied.exception.kind, DENIED)
-        storage = InstallationStorage.open(self.directory.name, APP)
+        storage = InstallationStorage.open(self.directory.name, APP_SCOPE)
         try:
             generation, credential = storage.load()
             self.assertGreater(generation, 0)
@@ -676,13 +757,13 @@ class PersistentClientTests(unittest.TestCase):
         call = threading.Thread(target=refresh)
         call.start()
         self.assertTrue(blocked.entered.wait(2))
-        client.local_logout()
+        client.logout()
         blocked.release.set()
         call.join(2)
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0], OrbitError)
         self.assertEqual(result[0].kind, "stale_response")
-        self.assertEqual(client.snapshot()["access"], "denied")
+        self.assertEqual(client.snapshot().access.value, "denied")
         self.assertIsNone(client._storage.load()[1])
         client.close()
 

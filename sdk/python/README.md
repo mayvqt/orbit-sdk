@@ -5,83 +5,68 @@ and Linux. Requires Python 3.12 or newer.
 
 ## Install
 
+This checkout contains the unreleased v0.4 candidate. From its repository
+root, install the SDK into your application's virtual environment:
+
 ```sh
-python -m pip install https://github.com/mayvqt/orbit-sdk/releases/download/v0.3.0/orbit_sdk-0.3.0-py3-none-any.whl
+python -m pip install ./sdk/python
 ```
 
-For a source checkout, run `python -m pip install ./sdk/python` from the
-repository root.
+## Open and check access
 
-## Configure and activate
-
-Copy the public values from **Integration** in your Orbit dashboard.
-`Client.open()` remembers this installation and refreshes access automatically.
+Copy the app key from **Integration** in your Orbit dashboard, starting with
+the Test environment. The SDK creates a stable installation, uses the native
+machine identity when available, and refreshes access automatically.
 
 ```python
 from getpass import getpass
-from orbit_sdk import AppConfig, Client, OrbitError
+import os
 
-config = AppConfig(
-    api_origin="https://orbit.mayvie.dev",
-    application_id="app_id_from_integration",
-    environment_id="environment_id_from_integration",
-    issuer="https://issuer.example",
-)
+from orbit_sdk import Client
 
-with Client.open(config) as orbit:
-    try:
-        orbit.require_access("export")
-    except OrbitError as failure:
-        if failure.code != "access_unavailable":
-            raise
-        orbit.activate(getpass("Licence key: "))
-        orbit.require_access("export")
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    snapshot = orbit.ensure_access("export", lambda: getpass("Licence key: "))
     # Perform the protected export here.
 ```
 
-## Access checks and restarts
-
-Call `require_access()` before each protected operation. `snapshot()` is for
-display only. Reopen the same configuration after restarting; the customer
-only enters their key for the first activation.
-
-On restart, Orbit checks the saved credential online. During an outage, access
-continues only while a verified offline-enabled grant is valid. An outage is
-not a reason to ask for the licence key again.
-
-If activation has an uncertain result, retry with the same key. The SDK keeps
-the operation ID for up to 24 hours and never saves the raw key or password.
+`ensure_access()` asks for a licence key only when no usable activation exists.
+It does not prompt after an outage, a denied request or a missing feature.
+`snapshot()` returns a frozen `Snapshot` with timezone-aware datetimes,
+`timedelta` values, an immutable entitlement map and `snapshot.has(name)`.
+Always call `require_access()` or `ensure_access()` before protected work;
+`snapshot()` is for display.
 
 State uses a private directory on Linux and current-user DPAPI on Windows.
-For a service or container, pass `state_path` to `Client.open()` with a dedicated
-persistent directory. Share one client per installation and close it at shutdown;
-the `with` block above handles that automatically.
+Pass `state_path` to use a dedicated directory for a service or container.
+Share one client per installation and close it at shutdown; the `with` block
+above handles that automatically. If activation has an uncertain result, retry
+with the same key. The SDK keeps the operation ID for up to 24 hours and never
+saves the raw key or password.
 
-## Optional: username/password sign-in
+## Optional: customer accounts
 
 These accounts belong to people using **your software**, separate from Orbit
-dashboard accounts. Skip this section if customers use licence keys only.
-For Account or Both mode, register and confirm the email link before signing in.
-
-After opening a client, sign in and let the customer choose an owned licence:
+dashboard accounts. For Account or Both mode, register and confirm the email
+link before signing in.
 
 ```python
-import uuid
-
-orbit.login(username, password)
-licences = orbit.owned_licences()["items"]
-licence_id = choose_licence(licences)  # Your application's selection UI.
-operation_id = str(uuid.uuid4())  # 16–128 characters; reuse it for retries.
-orbit.activate_account(licence_id, operation_id)
-orbit.require_access("export")
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    account = orbit.login(username, password)
+    page = orbit.owned_licences()
+    licence = choose_licence(page.items)  # Your application's selection UI.
+    orbit.activate_account(licence.id)
+    orbit.require_access("export")
 ```
 
-Sign-in alone does not grant access. Create one `operation_id` per selection and
-keep it unchanged if you retry that account activation. On later starts, check saved
-access before showing a sign-in form.
+`login()` returns an `Account`, and `owned_licences()` returns an
+`OwnedLicencePage`. Claiming a licence does not activate it. Mutation IDs such
+as the optional ID for `claim_licence()` are generated securely when omitted;
+provide and reuse an ID when your application needs explicit retry control.
+`logout()` clears local activation and customer state. `logout_account()` also
+asks Orbit to revoke the remote customer session.
 
 ## Advanced integration
 
 [Advanced APIs and storage](advanced.md) cover registration, cancellation,
-hardware binding, custom storage, explicit operation IDs and recovery.
+custom machine identities, manual storage and recovery.
 [Run the console example](../../examples/python/README.md) for a complete app.

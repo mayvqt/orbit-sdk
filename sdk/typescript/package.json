@@ -1,6 +1,6 @@
 {
   "name": "@orbit/trusted-backend-sdk",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Small online JavaScript and TypeScript client for Orbit's trusted backend API",
   "repository": {
     "type": "git",
@@ -18,7 +18,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node test/client.test.mjs"
   },
   "license": "MIT"
 }

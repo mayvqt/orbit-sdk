@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 import threading
 import time
 import unittest
 
-from orbit_sdk import Cancellation, Client, Config, OrbitError, SensitiveAuthorization
+from orbit_sdk import Cancellation, Client, NotActivatedError, OrbitError, SensitiveAuthorization
+from orbit_sdk.client import _Config as Config
 from orbit_sdk.errors import CANCELLED, DENIED, REAUTHENTICATION_REQUIRED, STALE_RESPONSE, TRANSIENT, error
 from orbit_sdk.storage import MemoryStorage, StoredCredential
 
@@ -27,13 +29,14 @@ class ClientFlowTests(unittest.TestCase):
 
     def test_activation_access_accounts_registration_and_redacted_customer_proof(self) -> None:
         snapshot = self.client.activate("synthetic-licence-key", "operation-id-00001")
-        self.assertEqual(snapshot["access"], "online")
-        self.assertTrue(snapshot["entitlements"]["export"])
-        self.assertEqual(self.client.require_access("export")["access"], "online")
+        self.assertEqual(snapshot.access.value, "online")
+        self.assertTrue(snapshot.entitlements["export"])
+        self.assertEqual(self.client.require_access("export").access.value, "online")
 
         account = self.client.login("alice", "synthetic-password")
-        self.assertEqual(account["customer"]["username"], "alice")
-        self.assertIsNone(self.client.account()["customer"].get("session"))
+        self.assertEqual(account.username, "alice")
+        self.assertIsNotNone(account.created_at.tzinfo)
+        self.assertEqual(self.client.account(), account)
         proof = self.client.customer_session_authorization()
         self.assertIsInstance(proof, SensitiveAuthorization)
         self.assertEqual(proof.reveal(), b"Bearer " + b"s" * 43)
@@ -43,21 +46,22 @@ class ClientFlowTests(unittest.TestCase):
             proof.reveal()
 
         page = self.client.owned_licences()
-        self.assertEqual(page["items"][0]["id"], "licence")
-        self.assertNotIn("internal_note", page["items"][0])
+        self.assertEqual(page.items[0].id, "licence")
+        self.assertFalse(hasattr(page.items[0], "internal_note"))
         claimed = self.client.claim_licence("another-synthetic-key", "operation-id-00002")
-        self.assertEqual(claimed["id"], "licence")
+        self.assertEqual(claimed.id, "licence")
         self.client.request_email_change("synthetic-password", "new@example.test")
 
         registration = self.client.register("synthetic-key", "alice2", "a2@example.test", "synthetic-password")
         self.assertTrue(registration.accepted)
+        self.assertEqual(registration.expires_at.utcoffset(), dt.timedelta(0))
         self.assertNotIn("r" * 43, repr(registration.pending))
         self.client.resend_registration(registration.pending)
         registration.pending.close()
         with self.assertRaises(RuntimeError):
             self.client.resend_registration(registration.pending)
 
-        self.client.account_logout()
+        self.client.logout_account()
         self.assertIsNone(self.client.account())
         methods = [(method, route) for method, route, _, _ in self.transport.requests]
         self.assertIn(("DELETE", "/api/client/v1/sessions/current?application_id=app&environment_id=test"), methods)
@@ -65,9 +69,73 @@ class ClientFlowTests(unittest.TestCase):
     def test_account_activation_keeps_customer_session_and_returns_snapshot(self) -> None:
         self.client.login("alice", "synthetic-password")
         snapshot = self.client.activate_account("licence", "operation-id-account-01")
-        self.assertEqual(snapshot["access"], "online")
+        self.assertEqual(snapshot.access.value, "online")
         self.assertIsNotNone(self.client.account())
-        self.assertEqual(self.client.snapshot()["access"], "online")
+        self.assertEqual(self.client.snapshot().access.value, "online")
+
+    def test_ensure_access_prompts_only_for_not_activated(self) -> None:
+        prompts: list[str] = []
+        snapshot = self.client.ensure_access("export", lambda: prompts.append("key") or "synthetic-key")
+        self.assertEqual(snapshot.access.value, "online")
+        self.assertEqual(prompts, ["key"])
+
+        self.transport.post_overrides["/api/client/v1/activations/activation/validate"] = error(TRANSIENT, "network_unavailable")
+        self.client._transient = True
+        outage_prompts: list[str] = []
+        with self.assertRaises(OrbitError) as outage:
+            self.client.ensure_access("export", lambda: outage_prompts.append("key") or "another-key")
+        self.assertEqual(outage.exception.kind, TRANSIENT)
+        self.assertEqual(outage_prompts, [])
+
+    def test_claim_generates_optional_id_and_returns_native_licence(self) -> None:
+        self.client.login("alice", "synthetic-password")
+        licence = self.client.claim_licence("another-synthetic-key")
+        self.assertEqual(licence.id, "licence")
+        request = next(request for request in self.transport.requests if request[1] == "/api/client/v1/licence-claims")
+        self.assertRegex(request[2]["idempotency_key"], r"^[A-Za-z0-9_-]{32}$")
+        with self.assertRaises((AttributeError, TypeError)):
+            licence.entitlements["export"] = False
+
+    def test_custom_fingerprint_accepts_signed_unbound_grant_and_checks_provider(self) -> None:
+        config = Config(
+            "https://orbit.example.test", "app", "test", "https://issuer.example.test",
+            "synthetic_installation_custom", "a" * 64, "custom:host-v1",
+        )
+        transport = FakeTransport(config)
+        transport.post_overrides["/api/client/v1/activations"] = lambda _route, _body: activation_reply(config, binding_mode="none")
+        client = Client._for_test(config, transport)
+        try:
+            snapshot = client.activate("synthetic-key")
+            self.assertEqual(snapshot.access.value, "online")
+            request = transport.requests[0][2]
+            self.assertEqual(request["fingerprint"], "a" * 64)
+            self.assertEqual(request["fingerprint_provider"], "custom:host-v1")
+        finally:
+            client.close()
+
+    def test_hw_id_claims_are_strict_and_response_mode_must_match(self) -> None:
+        config = Config(
+            "https://orbit.example.test", "app", "test", "https://issuer.example.test",
+            "synthetic_installation_hwid", "b" * 64, "machine_v1",
+        )
+        transport = FakeTransport(config)
+        client = Client._for_test(config, transport)
+        try:
+            self.assertEqual(client.activate("synthetic-key").access.value, "online")
+        finally:
+            client.close()
+
+        reply = json.loads(activation_reply(config, binding_mode="hwid"))
+        reply["binding_mode"] = "none"
+        transport = FakeTransport(config)
+        transport.post_overrides["/api/client/v1/activations"] = json.dumps(reply).encode()
+        client = Client._for_test(config, transport)
+        try:
+            with self.assertRaises(OrbitError) as invalid:
+                client.activate("synthetic-key")
+            self.assertEqual(invalid.exception.code, "invalid_activation_response")
+        finally:
+            client.close()
 
     def test_denial_clears_persisted_credential_and_cached_access(self) -> None:
         storage = MemoryStorage()
@@ -80,7 +148,7 @@ class ClientFlowTests(unittest.TestCase):
                 client.refresh()
             self.assertEqual(raised.exception.kind, DENIED)
             self.assertEqual(raised.exception.request_id, "synthetic-request")
-            self.assertEqual(client.snapshot()["access"], "denied")
+            self.assertEqual(client.snapshot().access.value, "denied")
             self.assertIsNone(storage.load()[1])
         finally:
             client.close()
@@ -100,7 +168,7 @@ class ClientFlowTests(unittest.TestCase):
                 client.refresh()
             self.assertEqual(raised.exception.kind, TRANSIENT)
             self.assertEqual(storage.load()[1], stored)
-            self.assertEqual(client.snapshot()["access"], "refresh_required")
+            self.assertEqual(client.snapshot().access.value, "refresh_required")
             self.assertIsNone(client._claims)
         finally:
             client.close()
@@ -113,9 +181,9 @@ class ClientFlowTests(unittest.TestCase):
         validate = "/api/client/v1/activations/activation/validate"
         self.transport.post_overrides[validate] = error(TRANSIENT, "network_unavailable")
         snapshot = self.client.refresh()
-        self.assertEqual(snapshot["access"], "offline")
+        self.assertEqual(snapshot.access.value, "offline")
         before = len(self.transport.requests)
-        self.assertEqual(self.client.require_access("export")["access"], "offline")
+        self.assertEqual(self.client.require_access("export").access.value, "offline")
         self.assertEqual(len(self.transport.requests), before)
 
     def test_duplicate_response_fields_fail_closed(self) -> None:
@@ -123,7 +191,7 @@ class ClientFlowTests(unittest.TestCase):
         with self.assertRaises(OrbitError) as raised:
             self.client.activate("synthetic-key", "operation-id-malformed-01")
         self.assertEqual(raised.exception.kind, "invalid_response")
-        self.assertEqual(self.client.snapshot()["access"], "denied")
+        self.assertEqual(self.client.snapshot().access.value, "denied")
 
     def test_logout_fences_a_late_activation_response(self) -> None:
         self.transport.block_route = "/api/client/v1/activations"
@@ -138,14 +206,14 @@ class ClientFlowTests(unittest.TestCase):
         thread = threading.Thread(target=activate)
         thread.start()
         self.assertTrue(self.transport.entered.wait(2))
-        self.client.local_logout()
+        self.client.logout()
         self.transport.release.set()
         thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0], OrbitError)
         self.assertEqual(result[0].kind, STALE_RESPONSE)
-        self.assertEqual(self.client.snapshot()["access"], "denied")
+        self.assertEqual(self.client.snapshot().access.value, "denied")
 
     def test_logout_between_generation_check_and_credential_commit_keeps_tombstone(self) -> None:
         storage = MemoryStorage()
@@ -176,7 +244,7 @@ class ClientFlowTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(checked.wait(2))
-            client.local_logout()
+            client.logout()
         finally:
             release.set()
         thread.join(2)
@@ -185,7 +253,7 @@ class ClientFlowTests(unittest.TestCase):
         self.assertIsInstance(result[0], OrbitError)
         self.assertEqual(result[0].kind, STALE_RESPONSE)
         self.assertEqual(storage.load(), (2, None))
-        self.assertEqual(client.snapshot()["access"], "denied")
+        self.assertEqual(client.snapshot().access.value, "denied")
         client.close()
 
     def test_failed_response_invalidation_is_fenced_with_client_state(self) -> None:
@@ -232,7 +300,7 @@ class ClientFlowTests(unittest.TestCase):
         self.assertIsInstance(result[0], OrbitError)
         self.assertEqual(result[0].kind, DENIED)
         self.assertEqual(storage.load(), (1, None))
-        self.assertEqual(client.snapshot()["access"], "denied")
+        self.assertEqual(client.snapshot().access.value, "denied")
         client.close()
 
     def test_login_result_after_logout_is_stale_and_cannot_restore_account(self) -> None:
@@ -248,7 +316,7 @@ class ClientFlowTests(unittest.TestCase):
         thread = threading.Thread(target=login)
         thread.start()
         self.assertTrue(self.transport.entered.wait(2))
-        self.client.local_logout()
+        self.client.logout()
         self.transport.release.set()
         thread.join(2)
         self.assertEqual(len(result), 1)

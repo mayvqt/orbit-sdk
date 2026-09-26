@@ -135,6 +135,7 @@ class Expected:
     credential_expires_at: int | None
     licence_expires_at: int | None
     now: int
+    allow_unbound_fingerprint: bool = False
 
 
 def valid_entitlements(value: Any) -> bool:
@@ -185,8 +186,11 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         claims["binding_mode"] == "none"
         and claims["fingerprint"] is None
         and claims["fingerprint_provider"] is None
-        and expected.fingerprint is None
-        and expected.fingerprint_provider is None
+        and (
+            expected.fingerprint is None and expected.fingerprint_provider is None
+            or expected.allow_unbound_fingerprint
+            and expected.fingerprint is not None and expected.fingerprint_provider is not None
+        )
     ) or (
         claims["binding_mode"] == "hwid"
         and claims["fingerprint"] == expected.fingerprint

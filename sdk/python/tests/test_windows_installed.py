@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orbit_sdk import AppConfig, OrbitError
+from orbit_sdk import AppKey, OrbitError
+from orbit_sdk.client import _AppScope
 from orbit_sdk.persistent_storage import InstallationStorage
 from orbit_sdk.storage import StoredCredential
 
@@ -18,7 +19,8 @@ class WindowsInstallationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parent = tempfile.TemporaryDirectory(prefix="orbit-installed-windows-")
         self.directory = Path(self.parent.name, "state")
-        self.config = AppConfig("https://orbit.example.test", "app", "test", "https://issuer.example.test")
+        app_key = AppKey.parse("orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Q.app.test")
+        self.config = _AppScope(app_key.api_origin, app_key.application_id, app_key.environment_id, app_key.issuer)
 
     def tearDown(self) -> None:
         self.parent.cleanup()

@@ -6,7 +6,7 @@ import struct
 import unittest
 from unittest.mock import patch
 
-from orbit_sdk import Config, installation_id_new, machine_fingerprint
+from orbit_sdk import installation_id_new, machine_fingerprint
 from orbit_sdk.clock import Anchor, Start, timestamp
 from orbit_sdk.device import _smbios_uuid, native_fingerprint
 from orbit_sdk.errors import OrbitError
