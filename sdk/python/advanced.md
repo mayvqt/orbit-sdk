@@ -90,8 +90,30 @@ must be a 64-character lowercase hex value and the provider must be
 `machine_v1` or `custom:<name>`. `machine_fingerprint(...)` can hash a
 host-provided Linux or Windows identity. Never send the raw machine identifier
 to Orbit. If the current identity differs from the one saved with the
-installation, the SDK discards its saved credential and signed grant, so it
-cannot restore offline access on the new machine.
+installation, the SDK discards its saved credential and signed grant and
+creates a fresh installation ID. The new machine must activate within the
+licence's device limit before it can restore access.
+
+## Access-check performance
+
+Reuse one open client per installation. A warm `require_access()` checks the
+current clock, storage generation and feature in local verified state. It
+contacts Orbit when a refresh is due. Avoid opening a new client for every
+protected operation.
+
+From a source checkout, measure the local path with signed synthetic fixtures
+and private installation storage:
+
+```sh
+python3 sdk/python/benchmarks/access.py
+```
+
+On Linux x86-64 with Python 3.14.7, five batches of 5,000 checks measured a
+median **23.9 µs** per warm `require_access()`, down from **37.5 µs** before
+removing duplicate storage and clock checks. `snapshot()` measured 23.0 µs,
+down from 24.3 µs. These timings exclude activation and network refresh and
+vary with the machine and filesystem; they are not latency guarantees.
+Each call still checks storage validity and trusted elapsed time.
 
 ## Errors and sensitive output
 

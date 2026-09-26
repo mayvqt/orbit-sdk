@@ -795,9 +795,10 @@ class Client:
     def _snapshot(self) -> dict[str, Any]:
         self._sync_storage()
         with self._state_lock:
+            now = None
             if self._anchor is not None:
                 try:
-                    self._anchor.now()
+                    now = self._anchor.now()
                 except OrbitError:
                     self._claims = None
                     self._anchor = None
@@ -809,9 +810,9 @@ class Client:
                         except BaseException as exc:
                             self._clear_all_locked()
                             raise error(STORAGE, "storage_failed") from exc
-            return self._snapshot_locked()
+            return self._snapshot_locked(now)
 
-    def _snapshot_locked(self) -> dict[str, Any]:
+    def _snapshot_locked(self, now: int | None = None) -> dict[str, Any]:
         result: dict[str, Any] = {
             "access": "refresh_required" if self._credential is not None else "denied",
             "entitlements": {},
@@ -824,10 +825,11 @@ class Client:
         }
         if self._claims is None or self._anchor is None:
             return result
-        try:
-            now = self._anchor.now()
-        except OrbitError:
-            return result
+        if now is None:
+            try:
+                now = self._anchor.now()
+            except OrbitError:
+                return result
         claims = self._claims
         expiry, refresh = claims["exp"], claims["refresh_after"]
         result["expires_at"] = expiry
@@ -1223,7 +1225,7 @@ class Client:
                 except OrbitError as exc:
                     if exc.kind != TRANSIENT:
                         raise
-            snapshot = self._snapshot()
+                snapshot = self._snapshot()
             _check_cancel(cancel)
             if snapshot["access"] not in ("online", "offline"):
                 with self._state_lock:
@@ -1282,8 +1284,7 @@ class Client:
             _check_cancel(cancel)
             self._sync_storage()
             with self._state_lock:
-                metadata = None if self._account is None else json.loads(json.dumps(self._account.metadata))
-            return None if metadata is None else _to_account(metadata)
+                return None if self._account is None else _to_account(self._account.metadata)
 
     def customer_session_authorization(self, *, cancellation: Cancellation | None = None) -> SensitiveAuthorization:
         with self._operation(cancellation) as cancel:

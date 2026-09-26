@@ -5,6 +5,7 @@ import datetime as dt
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from orbit_sdk import Cancellation, Client, NotActivatedError, OrbitError, SensitiveAuthorization
 from orbit_sdk.client import _Config as Config
@@ -185,6 +186,25 @@ class ClientFlowTests(unittest.TestCase):
         before = len(self.transport.requests)
         self.assertEqual(self.client.require_access("export").access.value, "offline")
         self.assertEqual(len(self.transport.requests), before)
+
+    def test_warm_access_rejects_clock_rollback_during_an_outage(self) -> None:
+        self.transport.post_overrides["/api/client/v1/activations"] = lambda _route, _body: activation_reply(self.config, offline=True)
+        self.client.activate("synthetic-key")
+        self.client.require_access("export")
+        self.transport.post_overrides["/api/client/v1/activations/activation/validate"] = error(TRANSIENT, "network_unavailable")
+        elapsed = self.client._anchor.start.elapsed
+        with patch("orbit_sdk.clock.elapsed_ns", return_value=elapsed - 1):
+            with self.assertRaises(OrbitError) as raised:
+                self.client.require_access("export")
+        self.assertEqual(raised.exception.kind, TRANSIENT)
+        self.assertIsNone(self.client._claims)
+
+    def test_warm_access_observes_storage_invalidation(self) -> None:
+        self.client.activate("synthetic-key")
+        self.client.require_access("export")
+        self.client._storage.invalidate()
+        with self.assertRaises(NotActivatedError):
+            self.client.require_access("export")
 
     def test_duplicate_response_fields_fail_closed(self) -> None:
         self.transport.post_overrides["/api/client/v1/activations"] = b'{"activation_id":"one","activation_id":"two"}'
