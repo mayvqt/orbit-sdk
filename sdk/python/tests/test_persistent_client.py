@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orbit_sdk import AppKey, Client, OrbitError, Snapshot
-from orbit_sdk.errors import CANCELLED, CONFIGURATION, DENIED, STORAGE, TRANSIENT, error
+from orbit_sdk.errors import CANCELLED, CONFIGURATION, DENIED, INVALID_RESPONSE, STORAGE, TRANSIENT, error
 from orbit_sdk.persistent_storage import AccessState, InstallationStorage, _ensure_linux_directory, canonical_scope, scope_key
 from orbit_sdk.client import _AppScope, _Config as Config, _validate_app_scope
 
@@ -48,6 +48,9 @@ class PersistentTransport:
         self.offline = offline
         self.validation_error = validation_error
         self.activation_error = activation_error
+        self.login_error: OrbitError | None = None
+        self.customer_id = "customer-alice"
+        self.session_token = "s" * 43
         self.requests: list[tuple[str, str, dict | None, bool]] = []
         self.jwks = json.dumps(fixture_data()["jwks"], separators=(",", ":")).encode()
         self.credential_expiry: int | None = None
@@ -68,6 +71,17 @@ class PersistentTransport:
 
     def post(self, route: str, body: dict, retry_safe: bool, cancel=None):
         self.requests.append(("POST", route, dict(body), retry_safe))
+        if route == "/api/client/v1/sessions":
+            if self.login_error is not None:
+                raise self.login_error
+            now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            return json.dumps({
+                "customer": {"id": self.customer_id, "username": body["username"],
+                             "email": "alice@example.test", "suspended": False,
+                             "created_at": now.isoformat()},
+                "session": self.session_token,
+                "expires_at": (now + dt.timedelta(hours=12)).isoformat(),
+            }).encode()
         if route == "/api/client/v1/activations":
             if self.activation_error is not None:
                 raise self.activation_error
@@ -148,6 +162,59 @@ class PersistentClientTests(unittest.TestCase):
             self.assertEqual(restarted_transport.requests[0][2]["credential"], "a" * 43)
         finally:
             restarted.close()
+
+    def test_account_activation_recovers_original_id_after_restart_and_login_failures(self) -> None:
+        transport = PersistentTransport(activation_error=error(TRANSIENT, "network_error"))
+        first = self.open(transport)
+        password = "never-persist-this-password"
+        record_path = Path(self.directory.name, "orbit-storage.bin")
+        try:
+            first.login("alice", password)
+            with self.assertRaises(OrbitError):
+                first.activate_account("licence")
+            original_id = transport.requests[-1][2]["idempotency_key"]
+            self.assertEqual(first._persistent_storage.pending_activation.operation_id, original_id)
+        finally:
+            first.close()
+
+        retry_transport = PersistentTransport()
+        retry = self.open(retry_transport)
+        try:
+            self.assertEqual(retry_transport.requests, [])
+            for failure in (error(DENIED, "invalid_credentials"), error(INVALID_RESPONSE, "invalid_login")):
+                retry_transport.login_error = failure
+                with self.assertRaises(OrbitError):
+                    retry.login("alice", password)
+                self.assertIsNone(retry.account())
+                self.assertEqual(retry.snapshot().access.value, "denied")
+                self.assertEqual(retry._persistent_storage.pending_activation.operation_id, original_id)
+
+            retry_transport.login_error = None
+            retry_transport.customer_id = "customer-bob"
+            retry_transport.session_token = "b" * 43
+            retry.login("bob", password)
+            sent = len(retry_transport.requests)
+            with self.assertRaises(OrbitError) as rejected:
+                retry.activate_account("licence")
+            self.assertEqual(rejected.exception.code, "pending_activation_conflict")
+            self.assertEqual(len(retry_transport.requests), sent)
+            self.assertEqual(retry._persistent_storage.pending_activation.operation_id, original_id)
+
+            retry_transport.customer_id = "customer-alice"
+            retry_transport.session_token = "t" * 43
+            retry.login("alice", password)
+            stored = record_path.read_bytes()
+            for secret in (password, "s" * 43, "b" * 43, "t" * 43):
+                self.assertNotIn(secret.encode(), stored)
+            self.assertEqual(retry.activate_account("licence").access.value, "online")
+            activation = next(body for _, route, body, _ in retry_transport.requests
+                              if route == "/api/client/v1/activations")
+            self.assertEqual(activation["idempotency_key"], original_id)
+            self.assertEqual(activation["customer_session"], "t" * 43)
+            self.assertIsNone(retry._persistent_storage.pending_activation)
+            self.assertEqual(retry.account().id, "customer-alice")
+        finally:
+            retry.close()
 
     def test_device_change_discards_saved_credential_and_offline_grant(self) -> None:
         original, _ = self._activate_offline()

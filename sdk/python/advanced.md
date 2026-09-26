@@ -28,6 +28,13 @@ local account state; `logout()` clears activation and customer session state
 without a network request. `claim_licence(key)` generates a secure operation
 ID when omitted; pass an explicit ID to reuse it across retries.
 
+Installed key and account activations save their operation ID before sending.
+After a lost account-activation response, sign in again as the same customer
+and retry the same licence. The SDK recovers the original operation, including
+after restart or a failed login. The pending digest is bound to the verified
+customer ID; another customer cannot reuse it. Passwords and session tokens
+remain in memory. Explicit logout discards local recovery state.
+
 Use `with` or call `close()` on clients, cancellation handles and pending
 registration handles. Finalizers are only a fallback for forgotten closes.
 

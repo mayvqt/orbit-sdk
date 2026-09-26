@@ -899,13 +899,14 @@ class Client:
                     raise error(REAUTHENTICATION_REQUIRED, "reauthentication_required")
                 saved_before = self._credential
             effective_operation_id = operation_id
-            if self._persistent_storage is not None and principal == "key":
+            if self._persistent_storage is not None:
                 digest = _activation_input_digest(
                     self.config,
-                    "key",
+                    principal,
                     key,
-                    None,
+                    licence,
                     previous,
+                    session.metadata["customer"]["id"] if principal == "account" else None,
                 )
                 pending = self._persistent_storage.pending_activation
                 if pending is not None:
@@ -914,7 +915,7 @@ class Client:
                         raise error(CLOCK_UNCERTAIN, "clock_uncertain")
                     if now - pending.created_at > 86400:
                         raise error(CONFIGURATION, "pending_activation_recovery_required")
-                    if pending.principal_kind != "key" or pending.input_digest != digest:
+                    if pending.principal_kind != principal or pending.input_digest != digest:
                         raise error(CONFIGURATION, "pending_activation_conflict")
                     if operation_id is not None and operation_id != pending.operation_id:
                         raise error(CONFIGURATION, "pending_activation_conflict")
@@ -922,7 +923,7 @@ class Client:
                     pending = PendingActivation(pending.operation_id, pending.principal_kind, pending.input_digest, pending.created_at)
                 else:
                     effective_operation_id = operation_id or secrets.token_urlsafe(24)
-                    pending = PendingActivation(effective_operation_id, "key", digest, wall_seconds())
+                    pending = PendingActivation(effective_operation_id, principal, digest, wall_seconds())
                 with self._state_lock:
                     if self._generation != original:
                         raise error(STALE_RESPONSE, "stale_response")
@@ -940,10 +941,9 @@ class Client:
                     self._persisted_access = None
                     self._transient = False
                     self._retry_deadline = None
-                    self._account = None
+                    if principal == "key":
+                        self._account = None
             else:
-                if self._persistent_storage is not None and self._persistent_storage.pending_activation is not None:
-                    raise error(CONFIGURATION, "pending_activation_conflict")
                 generation = self._invalidate(clear_account=principal == "key")
             # Idempotency IDs are optional on every mutation; generate one
             # with the SDK's existing secure random generator when omitted.
@@ -1307,7 +1307,7 @@ class Client:
             generation = self._generation_now()
             self._acquire_serial(generation, cancel)
             try:
-                generation = self._invalidate(clear_account=True)
+                generation = self._invalidate(clear_account=True, preserve_pending=True)
                 body = self._scope_body({"username": username, "password": password})
                 try:
                     data = self.transport.post(CLIENT_PREFIX + "sessions", body, False, cancel)
@@ -1481,7 +1481,11 @@ class Client:
                 raise error(STALE_RESPONSE, "stale_response")
             self._clear_all_locked()
             try:
-                self._storage_version = self._storage.invalidate()
+                self._storage_version = (
+                    self._persistent_storage.invalidate(preserve_pending=True)
+                    if self._persistent_storage is not None
+                    else self._storage.invalidate()
+                )
             except BaseException as exc:
                 raise error(STORAGE, "storage_failed") from exc
 
@@ -1704,6 +1708,7 @@ def _activation_input_digest(
     licence_key: str,
     licence_id: str | None,
     previous_credential: str = "",
+    customer_id: str | None = None,
 ) -> str:
     value: dict[str, Any] = {
         "scope": canonical_scope(config),
@@ -1719,6 +1724,7 @@ def _activation_input_digest(
         value["licence_key"] = licence_key
     else:
         value["licence_id"] = licence_id
+        value["customer_id"] = customer_id
     if previous_credential:
         value["previous_credential_sha256"] = hashlib.sha256(previous_credential.encode("ascii")).hexdigest()
     raw = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
