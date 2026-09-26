@@ -37,10 +37,12 @@ trusted rotation. These files
 are distinct from short-lived connected access grants. `expected` contains the
 app key, installation, optional binding, verification time and minimum accepted
 renewal sequence; per-case overrides and replacement trusted `jwks` work like the
-connected corpus. Python, C# and C++ verifiers consume the corpus. Python's installed
-import, renewal and restart behavior is covered separately; C#/C++ lifecycle
-integration, other SDK consumers and the server issuance workflow are still
-being implemented.
+connected corpus. Python, Go, Rust, C# and C++ verifiers consume the corpus.
+Python, Go and Rust installed import, renewal and restart behavior is covered
+separately. The matching private Orbit candidate includes authenticated issuance,
+dashboard export and recovery handling; real Python interoperability and
+desktop/mobile browser checks pass. C#/C++, installed TypeScript and embedded
+lifecycle work remains in progress. Neither candidate has been released or deployed.
 
 Do not treat a passing file-verification corpus as evidence that issuance,
 durable renewal or reboot behavior is complete. Those require the behavioral

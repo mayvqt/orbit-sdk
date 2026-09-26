@@ -109,8 +109,9 @@ licence's device limit before it can restore access.
 ## Offline licence files
 
 The candidate implements local request export, verification and durable import.
-Server issuance and the dashboard workflow are still pending; this is not yet a
-complete customer workflow. The wire format and issuance rules are defined in
+The matching unreleased Orbit candidate includes authenticated server issuance
+and the dashboard workflow. These changes are not deployed. The wire format and
+issuance rules are defined in
 the [offline-file contract](../../contracts/sdk/offline.md).
 
 Supply an offline-purpose JWKS from your application's trusted bundle through
@@ -132,8 +133,11 @@ with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbi
 
 The request contains public configuration and the installation identity; it is
 not proof of ownership or authority. Transfer it to the seller's authenticated
-issuance workflow. When you receive the signed file, import it on that same
-installation:
+issuance workflow. In the matching Orbit candidate, the seller enables an
+offline-file duration on the policy, opens the licence's offline-file action,
+pastes the request and downloads the signed `.orbit` file. The file remains
+usable until its signed expiry even if the seller later revokes the licence.
+When you receive it, import it on that same installation:
 
 ```python
 import os

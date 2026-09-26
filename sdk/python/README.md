@@ -71,7 +71,8 @@ asks Orbit to revoke the remote customer session.
 
 [Offline licence files](advanced.md#offline-licence-files) support installations
 that cannot contact Orbit. This candidate includes local file verification and
-durable import; the server issuance workflow is still being implemented.
+durable import. The matching unreleased Orbit candidate includes authenticated
+issuance and the dashboard's offline-file action; neither candidate is deployed.
 
 [Advanced APIs and storage](advanced.md) cover registration, cancellation,
 custom machine identities, manual storage and recovery.
