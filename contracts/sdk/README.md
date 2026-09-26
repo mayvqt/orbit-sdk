@@ -37,8 +37,10 @@ orbit_app_{test|live}_{base64url(api_origin)}.{application_id}.{environment_id}
 ```
 
 Parsing trims surrounding whitespace, then requires at most 512 characters,
-the exact lowercase `orbit_app_test_` or `orbit_app_live_` prefix (secret
-licence keys start with `orb_`) and exactly three `.`-separated parts. The origin uses the unpadded URL-safe base64 alphabet and
+the exact lowercase `orbit_app_test_` or `orbit_app_live_` prefix and exactly
+three `.`-separated parts. Customer licence keys use the application's chosen
+prefix and are separate from this public configuration. The origin uses the
+unpadded URL-safe base64 alphabet and
 must decode to UTF-8 that passes the SDK's ordinary HTTPS origin rules. Both IDs
 are 1–128 ASCII letters, digits, `_` or `-`. The grant issuer is the API origin.
 Any other input is a configuration error. Valid cases list the parsed values.
