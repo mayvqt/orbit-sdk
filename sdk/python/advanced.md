@@ -207,6 +207,9 @@ client must not forward the Orbit bearer to that storage redirect. A ticket is
 replayable until its deadline, at most 120 seconds. A permanent public URL remains
 shareable and cannot provide subsequent licence enforcement.
 
+The [runnable seller backend](../../examples/python/seller-downloads/README.md)
+shows the protected endpoint with private S3-compatible storage and local tests.
+
 ## macOS platform checks
 
 The candidate's macOS bindings read `IOPlatformUUID` through IOKit and use

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -55,7 +56,8 @@ class DownloadTicketVerifier:
             if (
                 not isinstance(endpoint, str) or not 1 <= len(endpoint) <= 2048
                 or not endpoint.isascii() or not endpoint.startswith("https://")
-                or any(ord(char) <= 32 or ord(char) == 127 or char in "\\?#" for char in endpoint)
+                or any(ord(char) <= 32 or ord(char) == 127 or char in "\\?#<>\"{}|^`" for char in endpoint)
+                or re.search(r"%(?![0-9A-Fa-f]{2})", endpoint) is not None
             ):
                 raise ValueError("invalid endpoint")
             parsed = urlsplit(endpoint)

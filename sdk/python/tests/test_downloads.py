@@ -51,6 +51,8 @@ class DownloadTicketTests(unittest.TestCase):
             "https://downloads.example.test/has space", "https://downloads.example.test/\nfile",
             "https://downloads.example.test/\\file", "https://downloads.example.test/☃",
             "https://downloads.example.test:0/file", "https://downloads.example.test:65536/file",
+            "https://downloads.example.test/<file>", "https://downloads.example.test/%xx",
+            "https://downloads.example.test/%", "https://downloads.example.test/{file}",
             "https:///file", "https://downloads.example.test/" + "a" * 2048,
         ):
             with self.subTest(endpoint=endpoint), self.assertRaises(OrbitError) as raised:

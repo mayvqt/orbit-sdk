@@ -80,7 +80,8 @@ part of a valid HTTP bearer token.
 
 The protected endpoint is a configured, exact HTTPS URL of at most 2048 ASCII
 characters, without credentials, query, fragment, whitespace or backslashes.
-Use percent encoding for non-ASCII path characters. A seller verifier returns
+Use valid percent encoding for non-ASCII or other characters outside URI syntax.
+A seller verifier returns
 verified artifact metadata, which the seller matches against its own artifact
 registry before selecting a file or storage object. It must not use an artifact
 ID directly as an unchecked filesystem path or fetch a URL supplied by a ticket.

@@ -48,3 +48,10 @@ python examples/python/quickstart.py
 The example prompts for the password without echoing it, lists the customer's
 owned licences and activates the selected licence. `ORBIT_MODE` defaults to
 `key`.
+
+## Seller-hosted downloads
+
+The [seller backend example](seller-downloads/README.md) verifies Orbit download
+tickets and returns an expiring URL for the seller's private S3-compatible
+storage. It runs separately from installed software. Ticket issuance and release
+discovery are still being implemented; its local tests use synthetic tickets.
