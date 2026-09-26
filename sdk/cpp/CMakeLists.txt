@@ -38,6 +38,7 @@ endif()
 
 set(ORBIT_SDK_SOURCES
     src/core.cpp
+    src/downloads.cpp
     src/grants.cpp
     src/installed_storage.cpp
     src/json.cpp
@@ -137,6 +138,19 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         target_compile_options(orbit_offline_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME orbit_offline_tests COMMAND orbit_offline_tests)
+
+    add_executable(orbit_download_tests tests/download_test.cpp)
+    target_include_directories(orbit_download_tests PRIVATE include src)
+    target_compile_features(orbit_download_tests PRIVATE cxx_std_17)
+    target_link_libraries(orbit_download_tests PRIVATE Orbit::Sdk)
+    target_compile_definitions(orbit_download_tests PRIVATE
+        ORBIT_DOWNLOAD_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/download-tickets.json")
+    if(MSVC)
+        target_compile_options(orbit_download_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_download_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME orbit_download_tests COMMAND orbit_download_tests)
 
     add_executable(orbit_platform_tests tests/platform_test.cpp)
     target_include_directories(orbit_platform_tests PRIVATE include src)

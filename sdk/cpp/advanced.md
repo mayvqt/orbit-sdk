@@ -70,8 +70,8 @@ cmake --build build/cpp-tests -j2
 ctest --test-dir build/cpp-tests --output-on-failure
 ```
 
-The native suite loads shared app-key and grant vectors. TLS tests use Python 3
-and the repository's synthetic certificates.
+The native suite loads shared app-key, connected-grant, offline-file and download
+ticket vectors. TLS tests use Python 3 and the repository's synthetic certificates.
 
 macOS build and native-runtime validation should be performed on macOS x64 and
 arm64 with the installed CMake, Apple SDK, libcurl, OpenSSL and JsonCpp:
@@ -103,6 +103,52 @@ with the ordinary CTest suite, including exact JWKS size and duplicate-key check
 Installed import, renewal and durable restart integration are still pending.
 Passing the verifier corpus does not establish restored offline access; see the
 [offline contract](../../contracts/sdk/offline.md).
+
+## Seller-hosted downloads
+
+`DownloadTicketVerifier` checks a short-lived download ticket on your seller
+backend. Configure it once with the public app key, the exact protected HTTPS
+endpoint, and the application's trusted connected-purpose JWKS JSON. Get the keys
+through trusted configuration or verified HTTPS; the verifier never fetches them.
+Copies share immutable configuration and support concurrent verification.
+
+```cpp
+#include <orbit_sdk.hpp>
+#include <string_view>
+
+bool authorize_artifact(const orbit::DownloadTicketVerifier& verifier,
+                        std::string_view token, std::string_view release_id,
+                        std::string_view artifact_id, std::string_view sha256,
+                        std::int64_t byte_length) {
+    try {
+        const auto ticket = verifier.verify(token);
+        return ticket.release_id == release_id && ticket.artifact_id == artifact_id &&
+            ticket.sha256 == sha256 && ticket.byte_length == byte_length;
+    } catch (const orbit::Error&) {
+        return false;
+    }
+}
+```
+
+Construct the verifier with `orbit::DownloadTicketVerifier(app_key, endpoint,
+jwks_json)` and pass your own artifact registry's metadata to the function above.
+Send the exact compact ticket without a `Bearer ` prefix. Verification uses the
+server clock; its optional `Timestamp` override is only for a trusted application
+clock, never request data. Invalid or expired tickets return `ErrorKind::denied`
+with `invalid_download_ticket`. Invalid endpoint/key configuration returns
+`ErrorKind::configuration` with `invalid_download_endpoint`/`invalid_download_keys`.
+
+The seller owns storage and credentials. After authorization, serve the matching
+artifact or generate a storage URL that expires no later than the verified
+ticket's `expires_at`. Recheck that deadline after any slow operation. Do not log
+tickets or storage URLs; use no-store responses. A permanent public URL remains
+shareable. The [Python seller example](../../examples/python/seller-downloads/README.md)
+shows the full endpoint and expiring storage redirect.
+
+`orbit_download_tests` checks all 110 shared cases, strict key/endpoint bounds,
+owned configuration, expiry and concurrent verification. Server release management
+and C++ update/download helpers are still being implemented; this verifier alone
+does not provide those workflows. See the [download contract](../../contracts/sdk/downloads.md).
 
 ## Warm access benchmark
 

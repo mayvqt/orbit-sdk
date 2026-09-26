@@ -54,9 +54,9 @@ The pending seller-hosted delivery feature is defined in
 download authorization or SDK helpers are implemented.
 
 [download-tickets.json](download-tickets.json) has 110 synthetic cases (10 valid,
-100 invalid), consumed by the Python and C# seller-endpoint verifiers. `expected` pins the
-public app key, exact endpoint and verification time. Each case may override that
-context or the trusted JWKS. The fixture signing keys are the same public test
+100 invalid), consumed by the Python, C# and C++ seller-endpoint verifiers.
+`expected` pins the public app key, exact endpoint and verification time. Each
+case may override that context or the trusted JWKS. The fixture signing keys are the same public test
 material described above. These checks cover ticket verification; server
 issuance, storage redirects and verified streaming need separate integration
 evidence.

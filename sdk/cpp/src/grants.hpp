@@ -63,6 +63,8 @@ public:
     // Signature/purpose validation only. OfflineKeys owns the full offline
     // claim, binding, lifetime and renewal-sequence checks.
     SignedOfflinePayload verify_offline_signature(std::string_view token) const;
+    // Signature/purpose validation only. DownloadTicketVerifier checks claims.
+    Json::Value verify_download_signature(std::string_view token) const;
 
 private:
     std::map<std::string, std::shared_ptr<EVP_PKEY>> keys_;

@@ -93,6 +93,36 @@ enum class Access : std::uint32_t { denied, online, offline, refresh_required, e
 
 using Timestamp = std::chrono::time_point<std::chrono::system_clock, std::chrono::seconds>;
 
+// Verified metadata. Match it to the seller's artifact registry before delivery.
+struct DownloadTicket {
+    std::string licence_id;
+    std::string release_id;
+    std::string artifact_id;
+    std::string sha256;
+    std::int64_t byte_length = 0;
+    std::string ticket_id;
+    Timestamp issued_at;
+    Timestamp expires_at;
+};
+
+class DownloadTicketVerifier {
+public:
+    // Configure the exact HTTPS endpoint and trusted connected-purpose JWKS JSON.
+    // Construction copies configuration; verification never fetches keys or files.
+    DownloadTicketVerifier(std::string_view app_key, std::string_view endpoint,
+                           std::string_view public_keys);
+    DownloadTicketVerifier(const DownloadTicketVerifier&) noexcept = default;
+    DownloadTicketVerifier& operator=(const DownloadTicketVerifier&) noexcept = default;
+
+    // now is an optional trusted application clock, never a request parameter.
+    DownloadTicket verify(std::string_view token,
+                          std::optional<Timestamp> now = std::nullopt) const;
+
+private:
+    struct State;
+    std::shared_ptr<const State> state_;
+};
+
 struct Snapshot {
     Access access = Access::denied;
     std::map<std::string, bool> entitlements;

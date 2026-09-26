@@ -263,6 +263,13 @@ GrantKeys::SignedOfflinePayload GrantKeys::verify_offline_signature(std::string_
     return {std::move(parsed.kid), std::move(parsed.claims)};
 }
 
+Json::Value GrantKeys::verify_download_signature(std::string_view token) const {
+    auto parsed = parse_token(token, "orbit-download+jwt");
+    const auto key = keys_.find(parsed.kid);
+    if (key == keys_.end() || !verify_signature(key->second.get(), parsed.signing_input, parsed.signature)) invalid();
+    return std::move(parsed.claims);
+}
+
 GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expected) const {
     const auto parsed = parse_token(token);
     const auto key = keys_.find(std::string(parsed.kid));
