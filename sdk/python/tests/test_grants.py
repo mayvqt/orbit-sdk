@@ -4,14 +4,36 @@ import json
 import unittest
 from dataclasses import replace
 
+from orbit_sdk.app_key import AppKey
+from orbit_sdk.client import _Config as Config
 from orbit_sdk.errors import OrbitError
 from orbit_sdk.grants import Expected, Keys, parse_header, verify
 from orbit_sdk.jsonutil import unique_json
 
-from support import fixture_data
+from support import b64url, fixture_data, sign_grant
 
 
 class GrantVectorTests(unittest.TestCase):
+    def test_valid_app_key_scope_does_not_inherit_an_individual_id_limit(self) -> None:
+        corpus = fixture_data()
+        keys = Keys.parse(corpus["jwks"])
+        long_origin = "https://" + ".".join(["a" * 50] * 3) + ".test"
+        for origin, application, environment in (
+            (long_origin, "app", "test"),
+            ("https://orbit.example.test", "a" * 128, "e" * 128),
+        ):
+            with self.subTest(origin=origin, application_length=len(application)):
+                app = AppKey.parse(f"orbit_app_test_{b64url(origin.encode())}.{application}.{environment}")
+                config = Config(app.api_origin, app.application_id, app.environment_id, app.issuer, "installation")
+                token, now, expiry = sign_grant(config, server_time=corpus["expected"]["now"])
+                expected = replace(Expected(**corpus["expected"]), issuer=app.issuer, application=application,
+                                   environment=environment, now=now, credential_expires_at=expiry)
+                self.assertTrue(verify(token, keys, expected)["entitlements"]["export"])
+                with self.assertRaises(OrbitError):
+                    verify(token, keys, replace(expected, issuer="https://other.example.test"))
+                with self.assertRaises(OrbitError):
+                    verify(token, keys, replace(expected, application="other"))
+
     def test_all_shared_grant_vectors(self) -> None:
         corpus = fixture_data()
         self.assertEqual(corpus["format_version"], 1)

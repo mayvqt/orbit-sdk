@@ -172,7 +172,9 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         _invalid()
     if not valid_entitlements(claims["entitlements"]):
         _invalid()
-    for name in ("iss", "aud", "sub", "jti", "application_id", "environment_id", "activation_id", "installation_id", "binding_mode"):
+    # Issuer/audience match trusted scope below. The HTTPS origin and an audience
+    # containing two valid IDs may each exceed an individual ID's 128-byte limit.
+    for name in ("sub", "jti", "application_id", "environment_id", "activation_id", "installation_id", "binding_mode"):
         if not text(claims[name], maximum=128):
             _invalid()
     for name in ("fingerprint", "fingerprint_provider"):
