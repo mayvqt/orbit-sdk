@@ -52,6 +52,12 @@ The pending seller-hosted delivery feature is defined in
 [downloads.md](downloads.md). Its contract does not imply that release discovery,
 download authorization or SDK helpers are implemented.
 
+## Floating sessions
+
+[floating.md](floating.md) defines seat acquisition, renewal, release and the
+separate session-grant purpose. It is an implementation baseline; ordinary
+activation grants do not provide concurrent-session enforcement.
+
 ## App keys
 
 [app-keys.json](app-keys.json) fixes how every SDK parses the public app key
