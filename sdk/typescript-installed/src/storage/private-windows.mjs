@@ -3,7 +3,9 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { canonicalScope, scopeHash } from "../app-key.mjs";
 import { fail, ErrorKind } from "../errors.mjs";
+import { uniqueJson } from "../json.mjs";
 import { initialState, decodeState } from "./private-files.mjs";
+import { emptyOfflineState } from "../offline.mjs";
 
 const LOCK = "orbit-storage.lock";
 const RECORD = "orbit-storage.bin";
@@ -113,8 +115,10 @@ export class WindowsPrivateFileStore {
       this.state = initialState(this.key, this.binding, this.provider);
       await this.#commit(this.state);
     } else {
-      this.state = decodeState(this.key, this.provider, await this.#decode(cipher));
-      if (this.reencryptNeeded) await this.#commit(this.state);
+      const decoded = await this.#decode(cipher);
+      const legacyFormat = uniqueJson(decoded).format === 2;
+      this.state = decodeState(this.key, this.provider, decoded);
+      if (legacyFormat || this.reencryptNeeded) await this.#commit(this.state);
       if (this.state.installation.fingerprint !== this.binding.fingerprint ||
           this.state.installation.fingerprint_provider !== this.binding.provider) {
         this.state = {
@@ -124,6 +128,7 @@ export class WindowsPrivateFileStore {
           credential: null,
           pending_activation: null,
           access: null,
+          offline: emptyOfflineState(),
         };
         await this.#commit(this.state);
       }
@@ -264,6 +269,7 @@ export class WindowsPrivateFileStore {
           throw fail(ErrorKind.STORAGE, "storage_failed");
         }
         replaced = true;
+        checkGuard(guard);
         const record = openHandle(path.win32.join(this.target, RECORD), GENERIC_READ, 0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
         try {
           this.recordId = checkRegular(record, bytes.length, MAX_CIPHER);

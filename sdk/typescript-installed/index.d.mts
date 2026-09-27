@@ -61,6 +61,35 @@ export interface ClientOptions {
   readonly statePath?: string;
   readonly machineBinding?: boolean;
   readonly deviceBinding?: DeviceBindingLike;
+  /** Trusted public keys for locally imported long-term offline files. */
+  readonly offlineKeys?: string | Uint8Array | OfflineJwkSet;
+}
+export interface OfflineJwk {
+  readonly kty: "EC";
+  readonly crv: "P-256";
+  readonly alg: "ES256";
+  readonly use: "sig";
+  readonly kid: string;
+  readonly x: string;
+  readonly y: string;
+}
+export interface OfflineJwkSet { readonly keys: readonly OfflineJwk[] }
+export interface OfflineRequest {
+  readonly format: "orbit-offline-request";
+  readonly version: 1;
+  readonly appKey: string;
+  readonly installationId: string;
+  readonly fingerprint: string | null;
+  readonly fingerprintProvider: DeviceBindingLike["provider"] | null;
+  toJSON(): Readonly<{
+    format: "orbit-offline-request";
+    version: 1;
+    app_key: string;
+    installation_id: string;
+    fingerprint: string | null;
+    fingerprint_provider: string | null;
+  }>;
+  toString(): string;
 }
 export interface Account {
   readonly id: string;
@@ -114,6 +143,8 @@ export declare class Client {
   on(event: "error", listener: (error: Readonly<{ kind: ErrorKindName; code: string; requestId?: string }>) => void): this;
   off(event: "state" | "error", listener: (...args: never[]) => void): this;
   snapshot(): Snapshot;
+  offlineRequest(): OfflineRequest;
+  importOfflineFile(file: string | Uint8Array, options?: OperationOptions): Promise<Snapshot>;
   requireAccess(feature: string, options?: OperationOptions): Promise<Snapshot>;
   ensureAccess(feature: string, askForKey: () => string | null | undefined | Promise<string | null | undefined>, options?: OperationOptions): Promise<Snapshot>;
   activate(licenceKey: string, options?: ActivationOptions): Promise<Snapshot>;

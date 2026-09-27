@@ -4,6 +4,7 @@ import { validateAppKey, canonicalScope, isOpaqueId } from "./app-key.mjs";
 import { fail, ErrorKind, NotActivatedError, FeatureUnavailableError } from "./errors.mjs";
 import { validEntitlements, parseJwks, verifyGrant } from "./grants.mjs";
 import { isInteger, isText, uniqueJson } from "./json.mjs";
+import { makeOfflineRequest, parseOfflineKeys, verifyOfflineFile } from "./offline.mjs";
 import { PrivateFileStore } from "./storage/private-files.mjs";
 import { elapsedNs, machineFingerprint, wallSeconds } from "./platform/native.mjs";
 import { HttpTransport } from "./transport.mjs";
@@ -52,9 +53,13 @@ export class Client extends EventEmitter {
   #transport;
   #session;
   #keys;
+  #offlineKeys;
   #generation;
+  #intentEpoch;
   #claims;
   #anchor;
+  #offlineFile;
+  #offlineAnchor;
   #transient;
   #retryAt;
   #retryTimer;
@@ -74,6 +79,7 @@ export class Client extends EventEmitter {
       validateClientOptions(options);
     }
     const key = validateAppKey(appKey);
+    const offlineKeys = options.offlineKeys === undefined ? null : parseOfflineKeys(options.offlineKeys, key.environment);
     const binding = await resolveBinding(key, options);
     const client = new Client(CLIENT_TOKEN, key, binding, options);
     client.#lifecycle = internal?.lifecycle !== false;
@@ -81,9 +87,10 @@ export class Client extends EventEmitter {
       client.#store = await PrivateFileStore.open(key, options.statePath, binding, internal?.storageCodec);
       client.#state = client.#store.state;
       client.#generation = client.#state.generation;
+      client.#offlineKeys = offlineKeys;
       client.#transport = internal?.transport ?? new HttpTransport(key.api_origin);
       await client.#restoreCache();
-      if (!internal?.skipInitialRefresh && client.#state.pending_activation === null) {
+      if (!internal?.skipInitialRefresh && client.#state.pending_activation === null && client.#state.offline.jws === null) {
         try {
           await client.refresh();
         } catch (error) {
@@ -108,8 +115,11 @@ export class Client extends EventEmitter {
     this.#store = null;
     this.#transport = null;
     this.#generation = 0;
+    this.#intentEpoch = Symbol("intent");
     this.#claims = null;
     this.#anchor = null;
+    this.#offlineFile = null;
+    this.#offlineAnchor = null;
     this.#transient = false;
     this.#retryAt = 0;
     this.#retryTimer = null;
@@ -122,6 +132,7 @@ export class Client extends EventEmitter {
     this.#pendingRegistrations = new Set();
     this.#session = null;
     this.#keys = null;
+    this.#offlineKeys = null;
     this.#lastCheckpoint = readElapsedNs();
     this.#lifecycle = true;
   }
@@ -138,6 +149,7 @@ export class Client extends EventEmitter {
     const state = this.#store.state;
     this.#state = state;
     this.#queueCheckpoint(false);
+    if (state.offline?.jws !== null) return this.#offlineSnapshot(state);
     const now = this.#nowOrNull();
     let access = state.credential ? "refresh_required" : "denied";
     let entitlements = Object.create(null);
@@ -174,6 +186,13 @@ export class Client extends EventEmitter {
     validateFeature(feature);
     return this.#run(signal, async (combined) => {
       let snapshot = this.snapshot();
+      if (this.#state.offline?.jws !== null) {
+        throwIfAborted(combined);
+        if (snapshot.access === "expired") throw fail(ErrorKind.DENIED, "offline_file_expired");
+        if (snapshot.access !== "offline") throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+        if (!snapshot.has(feature)) throw new FeatureUnavailableError();
+        return snapshot;
+      }
       if (["refresh_required", "expired", "offline"].includes(snapshot.access)) {
         try {
           await this.#refresh(combined, true);
@@ -223,13 +242,19 @@ export class Client extends EventEmitter {
   }
 
   async #activate(principal, licenceKey, licenceId, requestedOperationId, previousCredential, signal) {
+    this.#advanceIntent();
+    const intentEpoch = this.#intentEpoch;
     const operation = await this.#activationMutex(signal);
     try {
+      if (intentEpoch !== this.#intentEpoch) throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
       const customerId = principal === "account" ? this.#session?.customer.id : null;
       if (principal === "account" && !this.#session) throw fail(ErrorKind.REAUTHENTICATION_REQUIRED, "reauthentication_required");
+      const checkpointContext = { claims: this.#claims, anchor: this.#anchor, offlineAnchor: this.#offlineAnchor };
       const generation = this.#fence();
       this.#claims = null;
       this.#anchor = null;
+      this.#offlineFile = null;
+      await this.#checkpointForTransition(checkpointContext);
       this.#transient = false;
       if (principal === "key") this.#session = null;
       let pending;
@@ -259,6 +284,7 @@ export class Client extends EventEmitter {
           credential: null,
           access: null,
           pending_activation: pending,
+          offline: state.offline.jws === null ? state.offline : { ...state.offline, jws: null },
         };
       }, () => generation === this.#generation && !this.#closed && !signal.aborted);
       this.#state = current;
@@ -319,6 +345,108 @@ export class Client extends EventEmitter {
     return this.#run(signal, (combined) => this.#refresh(combined, false));
   }
 
+  offlineRequest() {
+    this.#assertOpen();
+    this.#assertStorageHealthy();
+    return makeOfflineRequest(this.#key, this.#state.installation.id, this.#binding);
+  }
+
+  async importOfflineFile(file, { signal } = {}) {
+    if (this.#offlineKeys === null) throw fail(ErrorKind.CONFIGURATION, "offline_keys_required");
+    return this.#run(signal, async (combined) => {
+      const intentEpoch = this.#intentEpoch;
+      const operation = await this.#activationMutex(combined);
+      let committed = false;
+      try {
+        if (intentEpoch !== this.#intentEpoch) throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+        const checkpointContext = { claims: this.#claims, anchor: this.#anchor, offlineAnchor: this.#offlineAnchor };
+        const generation = this.#fence();
+        await this.#checkpoint(true, false, checkpointContext);
+        await this.#store.sync();
+        this.#state = this.#store.state;
+        this.#checkGeneration(generation);
+        const prior = this.#store.state.offline;
+        const { started, now: untrustedNow } = this.#offlineNowAndStart(prior, checkpointContext.anchor);
+        const now = Math.max(untrustedNow, prior.time_high_water);
+        const verified = verifyOfflineFile(file, this.#key, this.#binding, this.#state.installation.id,
+          this.#offlineKeys, now, prior.sequence > 0 ? prior.sequence : 1);
+        if (verified.sequence === prior.sequence && prior.sequence > 0 &&
+            (verified.issuanceId !== prior.issuance_id || verified.contentDigest !== prior.content_digest)) {
+          throw fail(ErrorKind.INVALID_RESPONSE, "offline_sequence_conflict");
+        }
+        const sameIssuance = verified.sequence === prior.sequence && prior.sequence > 0 &&
+          verified.issuanceId === prior.issuance_id && verified.contentDigest === prior.content_digest;
+        const saved = sameIssuance ? {
+          ...prior,
+          jws: verified.token,
+          wall_high_water: Math.max(prior.wall_high_water, started.wall),
+        } : {
+          jws: verified.token,
+          sequence: verified.sequence,
+          issuance_id: verified.issuanceId,
+          content_digest: verified.contentDigest,
+          verified_at: now,
+          time_high_water: Math.max(now, verified.issuedAt, prior.time_high_water),
+          wall_high_water: Math.max(started.wall, prior.wall_high_water),
+        };
+        this.#state = await this.#store.updateState((state) => ({
+          ...state,
+          generation: nextGeneration(state.generation),
+          credential: null,
+          access: null,
+          pending_activation: null,
+          offline: saved,
+        }), () => generation === this.#generation && !this.#closed && !combined.aborted);
+        committed = true;
+        this.#claims = null;
+        this.#anchor = null;
+        this.#offlineFile = null;
+        this.#transient = false;
+        this.#retryAt = 0;
+        this.#keys = null;
+        this.#session = null;
+        if (combined.aborted || this.#closed || generation !== this.#generation) {
+          await this.#discardOfflineAuthority();
+          throw fail(ErrorKind.CANCELLED, "operation_cancelled");
+        }
+        this.#assertStorageHealthy();
+        const priorAnchor = this.#offlineAnchor;
+        const anchor = priorAnchor
+          ? priorAnchor
+          : { server: saved.time_high_water, ...started };
+        anchorNow(anchor);
+        const elapsed = readElapsedNs();
+        if (elapsed < anchor.elapsed) throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+        const wholeElapsed = ((elapsed - anchor.elapsed) / 1000000000n) * 1000000000n;
+        const wholeSeconds = Number(wholeElapsed / 1000000000n);
+        const anchoredWall = anchor.wall + wholeSeconds;
+        if (!isInteger(anchoredWall) || Math.abs(readWallSeconds() - anchoredWall) > 30) {
+          throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+        }
+        const rebasedAnchor = {
+          server: Math.max(anchor.server + wholeSeconds, saved.time_high_water),
+          elapsed: anchor.elapsed + wholeElapsed,
+          wall: anchoredWall,
+        };
+        anchorNow(rebasedAnchor);
+        this.#assertStorageHealthy();
+        if (combined.aborted || this.#closed || generation !== this.#generation) {
+          await this.#discardOfflineAuthority();
+          throw fail(ErrorKind.CANCELLED, "operation_cancelled");
+        }
+        this.#offlineAnchor = rebasedAnchor;
+        this.#offlineFile = verified;
+        this.#state = this.#store.state;
+        const snapshot = this.snapshot();
+        this.#safeEmit("state", snapshot);
+        return snapshot;
+      } finally {
+        operation.release();
+        if (!committed) this.#scheduleRefresh();
+      }
+    });
+  }
+
   async #refresh(signal, respectRetry) {
     const operation = await this.#mutex("refreshQueue", signal);
     try {
@@ -333,6 +461,7 @@ export class Client extends EventEmitter {
     const currentState = await this.#store.sync();
     this.#checkGeneration(generation);
     this.#state = currentState;
+    if (currentState.offline.jws !== null) return this.snapshot();
     if (currentState.pending_activation) throw fail(ErrorKind.CONFIGURATION, "pending_activation_recovery_required");
     const credential = currentState.credential;
     if (!credential) throw fail(ErrorKind.REAUTHENTICATION_REQUIRED, "reauthentication_required");
@@ -611,6 +740,7 @@ export class Client extends EventEmitter {
 
   async close() {
     if (this.#closing) return this.#closing;
+    this.#advanceIntent();
     this.#fence();
     this.#closed = true;
     this.#closeController.abort();
@@ -665,9 +795,13 @@ export class Client extends EventEmitter {
   }
 
   async #invalidate({ preservePending = false, clearAccount = false } = {}) {
+    this.#advanceIntent();
+    const checkpointContext = { claims: this.#claims, anchor: this.#anchor, offlineAnchor: this.#offlineAnchor };
     const generation = this.#fence();
     this.#claims = null;
     this.#anchor = null;
+    this.#offlineFile = null;
+    await this.#checkpointForTransition(checkpointContext);
     this.#transient = false;
     this.#retryAt = 0;
     this.#keys = null;
@@ -678,6 +812,7 @@ export class Client extends EventEmitter {
       credential: null,
       access: null,
       pending_activation: preservePending ? state.pending_activation : null,
+      offline: state.offline.jws === null ? state.offline : { ...state.offline, jws: null },
     }), () => generation === this.#generation && !this.#closed);
     clearTimeout(this.#refreshTimer);
     clearTimeout(this.#retryTimer);
@@ -690,6 +825,21 @@ export class Client extends EventEmitter {
     clearTimeout(this.#refreshTimer);
     clearTimeout(this.#retryTimer);
     return this.#generation;
+  }
+
+  #advanceIntent() {
+    this.#intentEpoch = Symbol("intent");
+  }
+
+  async #checkpointForTransition(context) {
+    try {
+      await this.#checkpoint(true, false, context);
+    } catch (error) {
+      if (error?.kind !== ErrorKind.CLOCK_UNCERTAIN || this.#store.state.offline?.jws === null) throw error;
+      // Explicit mode changes must clear offline authority even when the local clock
+      // cannot safely advance the checkpoint. The durable transition below retains
+      // the last trusted floors and removes the signed file.
+    }
   }
 
   #scopeBody(body) {
@@ -739,6 +889,24 @@ export class Client extends EventEmitter {
   }
 
   async #restoreCache() {
+    if (this.#state.offline.jws !== null) {
+      if (!this.#offlineKeys) throw fail(ErrorKind.CONFIGURATION, "offline_keys_required");
+      const saved = this.#state.offline;
+      const file = verifyOfflineFile(saved.jws, this.#key, this.#binding, this.#state.installation.id,
+        this.#offlineKeys, saved.verified_at, saved.sequence);
+      if (file.sequence !== saved.sequence || file.issuanceId !== saved.issuance_id || file.contentDigest !== saved.content_digest) {
+        throw fail(ErrorKind.STORAGE, "storage_failed");
+      }
+      const wall = readWallSeconds();
+      if (!isInteger(wall, 0, 253402300799) || wall + 30 < saved.wall_high_water) {
+        throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+      }
+      const server = Math.max(wall, saved.time_high_water, file.issuedAt);
+      this.#offlineAnchor = { server, ...startClock() };
+      anchorNow(this.#offlineAnchor);
+      this.#offlineFile = file;
+      return;
+    }
     const access = this.#state.access;
     const credential = this.#state.credential;
     if (!access || !credential) return;
@@ -795,29 +963,58 @@ export class Client extends EventEmitter {
     void task.finally(() => this.#background.delete(task));
   }
 
-  async #checkpoint(force, allowClosing = false) {
+  async #checkpoint(force, allowClosing = false, context = undefined) {
     if (!this.#store || this.#closed && !force && !allowClosing) return;
     const elapsed = readElapsedNs();
     if (!force && elapsed - this.#lastCheckpoint < 60_000_000_000n) return;
     const current = this.#store.state;
-    if (!current.access || !this.#anchor || !this.#claims) {
+    const onlineAnchor = context?.anchor ?? this.#anchor;
+    const onlineClaims = context?.claims ?? this.#claims;
+    const offlineAnchor = context?.offlineAnchor ?? this.#offlineAnchor;
+    const haveOnline = Boolean(current.access && onlineAnchor && onlineClaims);
+    const haveOffline = Boolean(current.offline?.sequence > 0 && offlineAnchor);
+    if (!haveOnline && !haveOffline) {
       this.#lastCheckpoint = elapsed;
       return;
     }
     const generation = this.#generation;
-    const jws = current.access.jws;
+    const jws = current.access?.jws;
+    const offlineSequence = current.offline?.sequence ?? 0;
     try {
-      const now = anchorNow(this.#anchor);
-      const wall = readWallSeconds();
-      const serverDelta = now - current.access.server_high_water;
-      const wallDelta = wall - current.access.wall_high_water;
-      if (serverDelta < 0 || wallDelta < 0 || Math.abs(serverDelta - wallDelta) > 30) throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+      let onlineCheckpoint = null;
+      if (haveOnline) {
+        const now = anchorNow(onlineAnchor);
+        const wall = readWallSeconds();
+        const serverDelta = now - current.access.server_high_water;
+        const wallDelta = wall - current.access.wall_high_water;
+        if (serverDelta < 0 || wallDelta < 0 || Math.abs(serverDelta - wallDelta) > 30) throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+        onlineCheckpoint = { now, wall };
+      }
+      let offlineCheckpoint = null;
+      if (haveOffline) {
+        const now = anchorNow(offlineAnchor);
+        const wall = readWallSeconds();
+        const serverDelta = now - current.offline.time_high_water;
+        const wallDelta = wall - current.offline.wall_high_water;
+        if (serverDelta < 0 || wallDelta < 0 || Math.abs(serverDelta - wallDelta) > 30) throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+        offlineCheckpoint = { now, wall };
+      }
       this.#state = await this.#store.updateState((state) => {
-        if (state.access?.jws !== jws || !state.credential) return state;
-        return { ...state, access: { ...state.access, server_high_water: now, wall_high_water: wall } };
+        let next = state;
+        if (onlineCheckpoint && state.access?.jws === jws && state.credential) {
+          next = { ...next, access: { ...state.access, server_high_water: onlineCheckpoint.now, wall_high_water: onlineCheckpoint.wall } };
+        }
+        if (offlineCheckpoint && state.offline.sequence === offlineSequence) {
+          next = { ...next, offline: { ...next.offline,
+            time_high_water: Math.max(next.offline.time_high_water, offlineCheckpoint.now),
+            wall_high_water: Math.max(next.offline.wall_high_water, offlineCheckpoint.wall),
+          } };
+        }
+        return next;
       }, () => generation === this.#generation && (!this.#closed || allowClosing));
     } catch (error) {
       if (error?.kind === ErrorKind.STALE_RESPONSE || error?.kind === ErrorKind.CANCELLED) throw error;
+      if (error?.kind === ErrorKind.CLOCK_UNCERTAIN && haveOffline) throw error;
       if (error?.kind === ErrorKind.STORAGE) {
         this.#clearMemory();
         throw error;
@@ -835,7 +1032,7 @@ export class Client extends EventEmitter {
   #scheduleRefresh() {
     clearTimeout(this.#refreshTimer);
     clearTimeout(this.#retryTimer);
-    if (this.#closed || !this.#lifecycle || !this.#state?.credential) return;
+    if (this.#closed || !this.#lifecycle || !this.#state?.credential || this.#state?.offline?.jws !== null) return;
     const now = this.#nowOrNull();
     const due = this.#claims && now !== null ? this.#claims.refresh_after - now : 0;
     const delay = this.#transient ? Math.max(1000, this.#retryAt - Date.now()) : Math.max(1000, due * 1000);
@@ -862,6 +1059,58 @@ export class Client extends EventEmitter {
     }
   }
 
+  #offlineSnapshot(state) {
+    const file = this.#offlineFile;
+    const now = this.#offlineNowOrNull();
+    let access = "denied";
+    if (file && now !== null) access = file.expiresAt > now ? "offline" : "expired";
+    const remaining = access === "offline" ? Math.max(0, file.expiresAt - now) : 0;
+    return freezeSnapshot({
+      access,
+      entitlements: access === "offline" ? file.entitlements : Object.create(null),
+      expiresAt: file ? dateFromSeconds(file.expiresAt) : null,
+      nextCheckAt: null,
+      credentialExpiresAt: null,
+      reauthenticationRequired: false,
+      offlineAllowed: true,
+      remainingOfflineSeconds: remaining,
+    });
+  }
+
+  #offlineNowOrNull() {
+    if (!this.#offlineAnchor) return null;
+    try { return anchorNow(this.#offlineAnchor); }
+    catch { return null; }
+  }
+
+  #offlineNowAndStart(prior, transitionAnchor = null) {
+    const started = startClock();
+    if (!isInteger(started.wall, 0, 253402300799) || started.wall + 30 < prior.wall_high_water) {
+      throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+    }
+    let now = started.wall;
+    if (this.#offlineAnchor) now = Math.max(now, anchorNow(this.#offlineAnchor));
+    else if (transitionAnchor) now = Math.max(now, anchorNow(transitionAnchor));
+    else if (this.#anchor) now = Math.max(now, anchorNow(this.#anchor));
+    return { started, now: Math.max(now, prior.time_high_water) };
+  }
+
+  async #discardOfflineAuthority() {
+    try {
+      this.#state = await this.#store.updateState((state) => state.offline.jws === null ? state : {
+        ...state,
+        offline: { ...state.offline, jws: null },
+        credential: null,
+        access: null,
+        pending_activation: null,
+      });
+    } catch {
+      this.#clearMemory();
+      throw fail(ErrorKind.STORAGE, "storage_failed");
+    }
+    this.#offlineFile = null;
+  }
+
   #checkGeneration(generation) {
     if (this.#closed || generation !== this.#generation) throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
   }
@@ -884,9 +1133,12 @@ export class Client extends EventEmitter {
   #clearMemory() {
     this.#claims = null;
     this.#anchor = null;
+    this.#offlineFile = null;
+    this.#offlineAnchor = null;
     this.#transient = false;
     this.#session = null;
     this.#keys = null;
+    this.#offlineKeys = null;
     this.#state = null;
   }
 
@@ -904,9 +1156,9 @@ export function openClientWithStorageCodec(appKey, options, storageCodec) {
 }
 
 export function openClientForTesting(appKey, options = {}) {
-  const { statePath, machineBinding, deviceBinding, transport, storageCodec,
+  const { statePath, machineBinding, deviceBinding, offlineKeys, transport, storageCodec,
     skipInitialRefresh = true, lifecycle = false } = options;
-  return Client.open(appKey, { statePath, machineBinding, deviceBinding }, CLIENT_TOKEN, {
+  return Client.open(appKey, { statePath, machineBinding, deviceBinding, offlineKeys }, CLIENT_TOKEN, {
     transport, storageCodec, skipInitialRefresh, lifecycle,
   });
 }
@@ -916,7 +1168,7 @@ export function validateClientOptions(options) {
       Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null) {
     throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");
   }
-  const allowed = new Set(["statePath", "machineBinding", "deviceBinding"]);
+  const allowed = new Set(["statePath", "machineBinding", "deviceBinding", "offlineKeys"]);
   if (Object.keys(options).some((name) => !allowed.has(name)) ||
       options.machineBinding !== undefined && typeof options.machineBinding !== "boolean") {
     throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");

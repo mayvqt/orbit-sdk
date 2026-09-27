@@ -5,9 +5,11 @@ import test from "node:test";
 import { AppKey } from "../src/app-key.mjs";
 import { parseJwks, verifyGrant } from "../src/grants.mjs";
 import { HttpTransport } from "../src/transport.mjs";
+import { parseOfflineKeys, verifyOfflineFile } from "../src/offline.mjs";
 
 const appKeyVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/app-keys.json", import.meta.url), "utf8"));
 const grantVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/grants.json", import.meta.url), "utf8"));
+const offlineVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/offline-files.json", import.meta.url), "utf8"));
 const signingKey = createPrivateKey(await readFile(new URL("../../rust/tests/fixtures/es256-test-private.pem", import.meta.url)));
 
 test("all shared app-key vectors", () => {
@@ -49,6 +51,27 @@ test("all shared signed-grant vectors", () => {
   }
   assert.equal(grantVectors.cases.length, 104);
   assert.equal(accepted, 12);
+});
+
+test("all shared signed offline-file vectors", () => {
+  let accepted = 0;
+  for (const item of offlineVectors.cases) {
+    let valid = false;
+    try {
+      const expected = { ...offlineVectors.expected, ...item.expected };
+      const key = AppKey.parse(expected.app_key);
+      const keys = parseOfflineKeys(item.jwks ?? offlineVectors.jwks, key.environment);
+      verifyOfflineFile(item.token, key, {
+        fingerprint: expected.fingerprint ?? null,
+        provider: expected.fingerprint_provider ?? null,
+      }, expected.installation_id, keys, expected.now, expected.minimum_sequence);
+      valid = true;
+    } catch {}
+    assert.equal(valid, item.valid, item.name);
+    accepted += Number(valid);
+  }
+  assert.equal(offlineVectors.cases.length, 104);
+  assert.equal(accepted, offlineVectors.cases.filter((item) => item.valid).length);
 });
 
 test("long valid origin and maximum app-key IDs verify without individual-field truncation", () => {

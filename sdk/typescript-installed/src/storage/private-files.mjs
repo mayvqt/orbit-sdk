@@ -7,6 +7,7 @@ import { scopeHash, canonicalScope } from "../app-key.mjs";
 import { fail, ErrorKind } from "../errors.mjs";
 import { uniqueJson, isInteger } from "../json.mjs";
 import { parseJwks } from "../grants.mjs";
+import { emptyOfflineState, validOfflineState } from "../offline.mjs";
 import { lockExclusive, posixFilesystem, syncDirectory, unlock } from "../platform/native.mjs";
 
 const MAX_ENVELOPE = 64 * 1024;
@@ -107,8 +108,12 @@ export class PrivateFileStore {
       this.state = initialState(this.key, this.binding, this.provider);
       await this.#commit(this.state);
     } else {
-      this.state = decodeState(this.key, this.provider, await this.#decode(raw));
-      if (this.reencryptNeeded) await this.#commit(this.state);
+      const decodedBytes = await this.#decode(raw);
+      let legacyFormat;
+      try { legacyFormat = uniqueJson(decodedBytes).format === 2; }
+      catch { throw fail(ErrorKind.STORAGE, "storage_failed"); }
+      this.state = decodeState(this.key, this.provider, decodedBytes);
+      if (legacyFormat || this.reencryptNeeded) await this.#commit(this.state);
       if (this.state.installation.fingerprint !== this.binding.fingerprint ||
           this.state.installation.fingerprint_provider !== this.binding.provider) {
         this.state = {
@@ -118,6 +123,7 @@ export class PrivateFileStore {
           credential: null,
           pending_activation: null,
           access: null,
+          offline: emptyOfflineState(),
         };
         await this.#commit(this.state);
       }
@@ -352,6 +358,7 @@ export class PrivateFileStore {
       injectStorageFault("rename");
       renameAt(directoryHandle.fd, temporary, directoryHandle.fd, RECORD);
       replaced = true;
+      checkGuard(guard);
       const newRecord = statAt(directoryHandle.fd, RECORD);
       if (!newRecord.isFile() || newRecord.nlink !== 1n || newRecord.uid !== BigInt(process.getuid()) ||
           (newRecord.mode & 0o077n) !== 0n) throw fail(ErrorKind.STORAGE, "storage_failed");
@@ -436,7 +443,7 @@ function checkGuard(guard) {
 export function initialState(key, binding, provider) {
   return {
     sdk: "orbit.installed-client",
-    format: 2,
+    format: 3,
     provider,
     scope: canonicalScope(key),
     installation: { id: installationId(), fingerprint: binding.fingerprint, fingerprint_provider: binding.provider },
@@ -444,22 +451,31 @@ export function initialState(key, binding, provider) {
     credential: null,
     pending_activation: null,
     access: null,
+    offline: emptyOfflineState(),
   };
 }
 
 export function decodeState(key, provider, raw) {
-  const state = uniqueJson(raw);
-  if (!exactKeys(state, ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access"]) ||
-      state.sdk !== "orbit.installed-client" || state.format !== 2 || !["private_file", "electron_safe_storage", "windows_dpapi"].includes(provider) ||
+  let state;
+  try { state = uniqueJson(raw); }
+  catch { throw fail(ErrorKind.STORAGE, "storage_failed"); }
+  const legacy = state && state.format === 2;
+  const names = legacy
+    ? ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access"]
+    : ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access", "offline"];
+  if (!exactKeys(state, names) ||
+      state.sdk !== "orbit.installed-client" || (state.format !== 2 && state.format !== 3) || !["private_file", "electron_safe_storage", "windows_dpapi"].includes(provider) ||
       state.provider !== provider || !exactKeys(state.scope, ["api_origin", "issuer", "application_id", "environment_id"]) ||
       !sameJson(state.scope, canonicalScope(key)) || !isInteger(state.generation, 0, Number.MAX_SAFE_INTEGER) ||
       !validInstallation(state.installation) || state.credential !== null && !validCredential(state.credential) ||
       state.pending_activation !== null && !validPending(state.pending_activation) || state.access !== null && !validAccess(state.access) ||
+      !legacy && !validOfflineState(state.offline) ||
       state.access !== null && state.credential === null ||
-      state.pending_activation !== null && (state.credential !== null || state.access !== null)) {
+      state.pending_activation !== null && (state.credential !== null || state.access !== null) ||
+      !legacy && state.offline.jws !== null && (state.credential !== null || state.access !== null || state.pending_activation !== null)) {
     throw fail(ErrorKind.STORAGE, "storage_failed");
   }
-  return state;
+  return legacy ? { ...state, format: 3, offline: emptyOfflineState() } : state;
 }
 
 function validInstallation(value) {
