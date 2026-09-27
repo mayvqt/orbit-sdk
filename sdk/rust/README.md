@@ -4,6 +4,9 @@ Use the installed client to activate a licence and check protected features. The
 current workspace version is an unreleased v0.4.0 candidate; build it from this
 checkout rather than relying on a release tag or registry package.
 
+Use the matching Orbit development server for this candidate. Its app-key
+integration has not been deployed to the hosted production service yet.
+
 ```toml
 [dependencies]
 orbit-sdk = { path = "../Orbit-SDK/sdk/rust" }

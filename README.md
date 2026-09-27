@@ -4,6 +4,10 @@ Add licence activation and feature checks to your application with one public
 app key. This checkout contains the **unreleased v0.4 candidate**. It is a
 pre-1.0 API and may change; no v0.4 packages or release tags are available yet.
 
+This candidate requires the matching unreleased Orbit server changes. Use a
+compatible development environment: the app-key setup described below has not
+been deployed to the hosted production service during this work.
+
 1. Select your application's **Test** environment in Orbit and copy the
    **App key** from **Integration**.
 2. Create a policy with your feature enabled (for example, `export`), then
