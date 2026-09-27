@@ -361,6 +361,8 @@ export class OrbitBackendClient {
       return value;
     } finally {
       clearTimeout(timeout);
+      // Stop any unread response after an early content-type/length rejection.
+      controller.abort();
     }
   }
 }
@@ -597,7 +599,7 @@ async function readJsonResponse(response) {
     throw new OrbitTransportError("response_too_large");
   }
   const reader = response.body.getReader();
-  const chunks = [];
+  let bytes = new Uint8Array(0);
   let size = 0;
   try {
     for (;;) {
@@ -608,7 +610,13 @@ async function readJsonResponse(response) {
         await reader.cancel();
         throw new OrbitTransportError("response_too_large");
       }
-      chunks.push(value);
+      if (size > bytes.length) {
+        const capacity = Math.min(MAX_RESPONSE_BYTES, Math.max(size, 1024, bytes.length * 2));
+        const grown = new Uint8Array(capacity);
+        grown.set(bytes.subarray(0, size - value.byteLength));
+        bytes = grown;
+      }
+      bytes.set(value, size - value.byteLength);
     }
   } catch (error) {
     if (error instanceof OrbitTransportError) throw error;
@@ -616,14 +624,8 @@ async function readJsonResponse(response) {
   } finally {
     reader.releaseLock();
   }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size)));
   } catch {
     throw new OrbitTransportError("invalid_response");
   }

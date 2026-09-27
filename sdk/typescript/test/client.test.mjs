@@ -341,6 +341,63 @@ test("oversized and malformed JSON responses fail closed", async () => {
     error instanceof OrbitTransportError && error.code === "invalid_response");
 });
 
+test("fragmented responses preserve UTF-8 and do not retain borrowed chunk buffers", async () => {
+  const expected = licenceShape({ note: "Export ☃ and café", padding: "x".repeat(8192) });
+  const encoded = new TextEncoder().encode(JSON.stringify(expected));
+  for (const chunkSize of [1, 3, 1024, 65536]) {
+    let offset = 0;
+    const buffer = new Uint8Array(chunkSize);
+    const body = new ReadableStream({
+      pull(controller) {
+        if (offset === encoded.length) { controller.close(); return; }
+        const size = Math.min(buffer.length, encoded.length - offset);
+        buffer.set(encoded.subarray(offset, offset + size));
+        offset += size;
+        controller.enqueue(buffer.subarray(0, size));
+      },
+    }, { highWaterMark: 0 });
+    const client = new OrbitBackendClient(config, {
+      fetchImpl: async () => new Response(body, { headers: { "content-type": "application/json" } }),
+    });
+    assert.equal((await client.getLicence("licence_example")).note, expected.note);
+  }
+});
+
+test("streaming limits count actual bytes and cancel oversized bodies", async () => {
+  for (const declaredLength of [null, "1"]) {
+    let cancelled = false;
+    const headers = { "content-type": "application/json" };
+    if (declaredLength !== null) headers["content-length"] = declaredLength;
+    const body = new ReadableStream({
+      pull(controller) { controller.enqueue(new Uint8Array(65536)); },
+      cancel() { cancelled = true; },
+    });
+    const client = new OrbitBackendClient(config, {
+      fetchImpl: async () => new Response(body, { headers }),
+    });
+    await assert.rejects(client.getLicence("licence_example"), (error) =>
+      error instanceof OrbitTransportError && error.code === "response_too_large");
+    assert.equal(cancelled, true);
+  }
+});
+
+test("early response rejection aborts the unread transport", async () => {
+  for (const headers of [
+    { "content-type": "text/plain" },
+    { "content-type": "application/json", "content-length": String(1024 * 1024 + 1) },
+  ]) {
+    let signal;
+    const client = new OrbitBackendClient(config, {
+      fetchImpl: async (_url, options) => {
+        signal = options.signal;
+        return new Response("unread", { headers });
+      },
+    });
+    await assert.rejects(client.getLicence("licence_example"), OrbitTransportError);
+    assert.equal(signal.aborted, true);
+  }
+});
+
 test("a failed mutation is sent once without an automatic retry", async () => {
   let calls = 0;
   const client = new OrbitBackendClient(config, {
