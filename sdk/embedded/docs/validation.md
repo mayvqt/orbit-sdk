@@ -13,8 +13,9 @@ cmake -S sdk/embedded -B build/embedded-compact -DCMAKE_BUILD_TYPE=Release \
   -DORBIT_CLIENT_ARENA_BYTES=8192
 cmake --build build/embedded-compact
 ctest --test-dir build/embedded-compact --output-on-failure
-cargo test --manifest-path sdk/embedded/rust/Cargo.toml --offline
-cargo check --manifest-path sdk/embedded/rust/Cargo.toml --offline --features external-c
+cargo test --manifest-path sdk/embedded/Cargo.toml --offline
+cargo check --manifest-path sdk/embedded/Cargo.toml --offline --features external-c
+cargo package --manifest-path sdk/embedded/Cargo.toml --offline --locked
 python3 sdk/embedded/tests/measure_arm.py --output /tmp/orbit-arm-size
 ```
 
@@ -26,6 +27,12 @@ ownership/corruption and host-bridge time/entropy framing. Rust checks match the
 real C layout, parse an app key, exercise default and compact buffers and
 callback drop/restart, and compile-fail attempts to reuse buffers or drop an
 AppKey while its client is active.
+
+The crate archive includes the C core, required headers, Rust wrapper and MIT
+licence. Package verification and the four Rust unit tests plus two compile-fail
+documentation tests pass from an extracted standalone archive on Linux. This
+checks local packaging only; `publish = false` remains set. Use `--allow-dirty`
+only when deliberately packaging uncommitted source for validation.
 
 For this local candidate, the same seven CTest executables were cross-built and
 all passed under QEMU AArch64 11.1.1 with a Debian trixie arm64 sysroot, both
@@ -41,16 +48,16 @@ the wrapper checks from the SDK root with:
 ```sh
 export ORBIT_CC=arm-none-eabi-gcc ORBIT_AR=arm-none-eabi-ar
 ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
-  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
   --target thumbv6m-none-eabi
 ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
-  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
   --target thumbv6m-none-eabi
 ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
-  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
   --target thumbv8m.main-none-eabi
 ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
-  cargo check --locked --offline --manifest-path sdk/embedded/rust/Cargo.toml \
+  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
   --target thumbv8m.main-none-eabi
 ```
 

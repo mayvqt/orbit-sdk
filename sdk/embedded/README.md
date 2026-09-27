@@ -85,7 +85,7 @@ the [native HTTP API](../../examples/http/README.md).
 
 ## Rust
 
-Add a path dependency on `sdk/embedded/rust` and implement its `Platform` trait
+Add a path dependency on `sdk/embedded` and implement its `Platform` trait
 with your maintained platform libraries. Parse one key into `AppKey`, then
 create `Buffers::<32768>` (or `Buffers::<8192>`), `Config` and `Client`, then
 use `activate`, `tick` and `require_access`. The wrapper adds no

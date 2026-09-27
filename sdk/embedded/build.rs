@@ -27,7 +27,7 @@ fn main() {
     for name in [
         "grant", "json", "prepare", "jwks", "client", "wire", "storage", "app_key",
     ] {
-        let src = format!("../src/orbit_{name}.c");
+        let src = format!("src/orbit_{name}.c");
         println!("cargo:rerun-if-changed={src}");
         let object = out.join(format!("{name}.o"));
         let mut cmd = Command::new(&cc);
@@ -36,7 +36,7 @@ fn main() {
             "-Os",
             "-ffunction-sections",
             "-fdata-sections",
-            "-I../include",
+            "-Iinclude",
             "-c",
             &src,
             "-o",
@@ -48,16 +48,16 @@ fn main() {
         run(&mut cmd);
         objects.push(object);
     }
-    println!("cargo:rerun-if-changed=../include");
+    println!("cargo:rerun-if-changed=include");
     let object = out.join("layout.o");
     let mut cmd = Command::new(&cc);
     cmd.args([
         "-std=c11",
         "-Os",
         "-ffunction-sections",
-        "-I../include",
+        "-Iinclude",
         "-c",
-        "src/layout.c",
+        "rust/src/layout.c",
         "-o",
     ])
     .arg(&object);
@@ -66,7 +66,7 @@ fn main() {
     }
     run(&mut cmd);
     objects.push(object);
-    println!("cargo:rerun-if-changed=src/layout.c");
+    println!("cargo:rerun-if-changed=rust/src/layout.c");
     let archive = out.join("liborbit_embedded.a");
     run(Command::new(ar).arg("crs").arg(&archive).args(objects));
     println!("cargo:rustc-link-search=native={}", out.display());

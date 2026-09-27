@@ -8,8 +8,13 @@ Add it from the local checkout:
 
 ```toml
 [dependencies]
-orbit-embedded = { path = "path/to/Orbit-SDK/sdk/embedded/rust" }
+orbit-embedded = { path = "path/to/Orbit-SDK/sdk/embedded" }
 ```
+
+The Cargo manifest lives at the embedded SDK root so the crate contains its C
+sources and headers alongside the Rust wrapper. A local crate archive builds
+without sibling repository directories; it does not require a separately
+downloaded C SDK. No package has been published.
 
 Implement `Platform` with the board's maintained TLS/crypto, trusted clock,
 CSPRNG and durable storage. `begin_request` must send the complete request

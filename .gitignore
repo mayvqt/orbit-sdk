@@ -14,3 +14,4 @@
 .DS_Store
 
 /sdk/embedded/rust/target/
+/sdk/embedded/target/

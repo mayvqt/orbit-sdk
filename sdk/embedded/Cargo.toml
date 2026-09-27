@@ -7,6 +7,21 @@ description = "Allocation-free Orbit licensing client for firmware"
 links = "orbit_embedded"
 publish = false
 build = "build.rs"
+repository = "https://github.com/mayvqt/orbit-sdk"
+readme = "rust/README.md"
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "LICENSE",
+    "README.md",
+    "rust/README.md",
+    "rust/src/**",
+    "include/**",
+    "src/**",
+]
+
+[lib]
+path = "rust/src/lib.rs"
 
 [features]
 default = []
