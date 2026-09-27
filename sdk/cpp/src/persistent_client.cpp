@@ -83,6 +83,7 @@ void ClientState::commit_persistent_locked(Json::Value record) {
         persistence_failed.store(true, std::memory_order_relaxed);
         claims.reset();
         anchor.reset();
+        offline.reset();
         transient = true;
         worker_cancelled.store(true, std::memory_order_relaxed);
         wake_worker();
@@ -91,6 +92,10 @@ void ClientState::commit_persistent_locked(Json::Value record) {
 }
 
 void ClientState::checkpoint_persistent_locked(bool force) {
+    if (offline) {
+        checkpoint_offline_locked(force);
+        return;
+    }
     if (!persistent || !installed_storage || !claims || !anchor ||
         !persistent_record.isObject() || persistent_record["access"].isNull()) {
         return;
@@ -124,6 +129,55 @@ void ClientState::checkpoint_persistent_locked(bool force) {
     }
     persist_record_locked();
     last_checkpoint = steady_now;
+}
+
+void ClientState::checkpoint_offline_locked(bool force) {
+    if (!persistent || !installed_storage || !offline ||
+        !persistent_record.isObject() || !persistent_record.isMember("offline") ||
+        persistent_record["offline"]["jws"].isNull()) return;
+    if (!offline_clock) {
+        offline_clock = OfflineClockState{offline->anchor, offline->time_high_water,
+            offline->wall_high_water, offline->uncertain, offline->last_checkpoint};
+    }
+    const auto steady_now = std::chrono::steady_clock::now();
+    if (!force && offline_clock->last_checkpoint != std::chrono::steady_clock::time_point{} &&
+        steady_now - offline_clock->last_checkpoint < std::chrono::seconds(60)) return;
+    try {
+        const auto wall = capture_clock().wall_seconds;
+        const auto server = offline_clock->anchor.now();
+        if (wall + 30 < offline_clock->wall_high_water || server < offline_clock->time_high_water ||
+            wall < 0 || server < 0) {
+            raise(ErrorKind::clock_uncertain, "clock_uncertain");
+        }
+        auto candidate = persistent_record;
+        candidate["offline"]["time_high_water"] = static_cast<Json::Int64>(std::max(server, offline_clock->time_high_water));
+        candidate["offline"]["wall_high_water"] = static_cast<Json::Int64>(std::max(wall, offline_clock->wall_high_water));
+        if (candidate != persistent_record) commit_persistent_locked(std::move(candidate));
+        offline_clock->time_high_water = std::max(server, offline_clock->time_high_water);
+        offline_clock->wall_high_water = std::max(wall, offline_clock->wall_high_water);
+        offline_clock->uncertain = false;
+        offline_clock->last_checkpoint = steady_now;
+        offline->anchor = offline_clock->anchor;
+        offline->time_high_water = offline_clock->time_high_water;
+        offline->wall_high_water = offline_clock->wall_high_water;
+        offline->uncertain = false;
+        offline->last_checkpoint = steady_now;
+        last_checkpoint = steady_now;
+    } catch (const Error& error) {
+        if (error.kind() == ErrorKind::clock_uncertain) {
+            offline_clock->uncertain = true;
+            if (offline) offline->uncertain = true;
+        }
+        throw;
+    }
+}
+
+void ClientState::checkpoint_offline_before_transition_locked() {
+    try {
+        checkpoint_offline_locked(true);
+    } catch (const Error& error) {
+        if (error.kind() != ErrorKind::clock_uncertain) throw;
+    }
 }
 
 bool ClientState::restore_persistent_cache(bool allow_offline) {
@@ -244,7 +298,16 @@ void ClientState::worker_loop() noexcept {
         auto wake_at = std::chrono::steady_clock::now() + std::chrono::hours(1);
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!persistent || !credential || !persistent_record["pending_activation"].isNull()) {
+            if (persistent && offline && persistent_record.isMember("offline") &&
+                !persistent_record["offline"]["jws"].isNull()) {
+                const auto last = offline->last_checkpoint;
+                if (last == std::chrono::steady_clock::time_point{} ||
+                    std::chrono::steady_clock::now() - last >= std::chrono::seconds(60)) {
+                    checkpoint_now = true;
+                } else {
+                    wake_at = std::min(wake_at, last + std::chrono::seconds(60));
+                }
+            } else if (!persistent || !credential || !persistent_record["pending_activation"].isNull()) {
                 // A pending key mutation is resumed only by the caller with the same key.
             } else if (retry_deadline) {
                 const auto now = std::chrono::steady_clock::now();
@@ -288,11 +351,27 @@ void ClientState::worker_loop() noexcept {
             try {
                 std::lock_guard<std::mutex> lock(mutex);
                 checkpoint_persistent_locked(false);
+            } catch (const Error& error) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (error.kind() == ErrorKind::clock_uncertain && offline) {
+                        offline->uncertain = true;
+                        if (offline_clock) offline_clock->uncertain = true;
+                    } else {
+                        claims.reset();
+                        anchor.reset();
+                        offline.reset();
+                        transient = true;
+                    }
+                }
+                worker_cancelled.store(true, std::memory_order_relaxed);
+                break;
             } catch (...) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     claims.reset();
                     anchor.reset();
+                    offline.reset();
                     transient = true;
                 }
                 worker_cancelled.store(true, std::memory_order_relaxed);

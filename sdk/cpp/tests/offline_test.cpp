@@ -36,7 +36,7 @@ int main() {
                     fingerprint = Fingerprint{text(context, "fingerprint"), text(context, "fingerprint_provider")};
                 OfflineExpected expected{app, text(context, "installation_id"), std::move(fingerprint),
                     json_int64(context["now"]), json_int64(context["minimum_sequence"])};
-                const auto keys = OfflineKeys::parse(item.isMember("jwks") ? item["jwks"] : corpus["jwks"], app.environment());
+                const auto keys = orbit::detail::OfflineKeys::parse(item.isMember("jwks") ? item["jwks"] : corpus["jwks"], app.environment());
                 const auto file = keys.verify(text(item, "token"), expected);
                 require(file.expires_at > expected.now && file.entitlements.at("export"), "Invalid verified metadata");
                 if (text(item, "name") == "valid_six_month_term")
@@ -52,13 +52,13 @@ int main() {
         }
         const auto encoded = encode_json(corpus["jwks"]);
         const auto exact = encoded + std::string(16384 - encoded.size(), ' ');
-        require(OfflineKeys::parse_jwks(exact, "test").verify(text(corpus["cases"][0], "token"),
+        require(orbit::detail::OfflineKeys::parse_jwks(exact, "test").verify(text(corpus["cases"][0], "token"),
             OfflineExpected{AppKey::parse(text(corpus["expected"], "app_key")),
                 text(corpus["expected"], "installation_id"), std::nullopt,
                 json_int64(corpus["expected"]["now"])}).sequence == 1, "Exact key boundary rejected");
         for (const auto& malformed : {exact + " ", encoded.substr(0, encoded.size() - 1) + ",\"keys\":[]}"}) {
             bool rejected = false;
-            try { (void)OfflineKeys::parse_jwks(malformed, "test"); }
+            try { (void)orbit::detail::OfflineKeys::parse_jwks(malformed, "test"); }
             catch (const Error& error) { rejected = error.kind() == ErrorKind::invalid_response; }
             require(rejected, "Oversized or duplicate-key JWKS accepted");
         }

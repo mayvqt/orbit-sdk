@@ -90,11 +90,27 @@ the check needs only the derived expected digest.
 
 ## Long-term offline files
 
-The offline-file verifier consumes 104 shared security cases covering the
-separate token purpose, trusted keys, scope, binding, expiry and renewal sequence.
-Ordinary cached access grants are not long-term licence files.
-See the [offline contract](../../contracts/sdk/offline.md) and
-[verifier checks](tests/README.md#long-term-offline-file-verification).
+`OrbitOptions.OfflineKeys` accepts only trusted offline-purpose public JWKS.
+`OfflineKeys.Parse` validates the entire key set before installed state opens.
+`CreateOfflineRequest()` returns serializable public scope for an authorized
+online issuance workflow; it contains no licence key or account proof.
+`ImportOfflineFile()` verifies the signed file and durably stores its original
+JWS, sequence and clock floors before returning a typed snapshot. Format-3
+records restore when the currently configured trusted offline-purpose keys
+still verify the file, allowing trusted key rotation.
+
+While a file is active, `Snapshot()`, `RequireAccessAsync()` and
+`EnsureAccessAsync()` check the storage lease, clock, expiry and signed feature
+locally. They perform no HTTP validation and do not prompt for a key. Expired
+files remain available for deliberate renewal, while online activation and
+logout clear file authority but preserve its sequence and time floors. A full
+old machine snapshot cannot be detected reliably. `OwnedLicence.OfflineFileDuration`
+reports the server policy's `offline_file_seconds` value.
+
+The installed workflow is exercised by the offline fixture in `--installed`;
+the separate verifier consumes all 104 shared security cases. See the
+[offline contract](../../contracts/sdk/offline.md) and
+[test commands](tests/README.md#long-term-offline-file-verification).
 
 ## Floating-session verification
 

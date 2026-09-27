@@ -27,6 +27,17 @@ bool hex(unsigned char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+void validate_port(std::string_view port) {
+    if (port.empty()) invalid_endpoint();
+    unsigned value = 0;
+    for (const auto c : port) {
+        if (c < '0' || c > '9') invalid_endpoint();
+        value = value * 10 + static_cast<unsigned>(c - '0');
+        if (value > 65535) invalid_endpoint();
+    }
+    if (value == 0) invalid_endpoint();
+}
+
 void validate_endpoint(std::string_view endpoint) {
     try {
         if (endpoint.empty() || endpoint.size() > 2048 || endpoint.substr(0, 8) != "https://" ||
@@ -38,18 +49,30 @@ void validate_endpoint(std::string_view endpoint) {
             if (i + 2 >= endpoint.size() || !hex(endpoint[i + 1]) || !hex(endpoint[i + 2])) invalid_endpoint();
             i += 2;
         }
-        const auto origin = endpoint.substr(0, endpoint.find('/', 8));
-        const detail::Transport parsed(origin);
-        // libcurl accepts port zero. A configured delivery endpoint must use a
-        // usable port; its parser has already rejected malformed authorities.
-        const auto authority = origin.substr(8);
-        const auto colon = authority.rfind(':');
-        if (colon != std::string_view::npos && authority.back() != ']') {
-            const auto port = authority.substr(colon + 1);
-            if (port.empty() || !std::all_of(port.begin(), port.end(), [](unsigned char c) {
-                return c >= '0' && c <= '9';
-            }) || std::all_of(port.begin(), port.end(), [](char c) { return c == '0'; })) invalid_endpoint();
+        const auto path_start = endpoint.find('/', 8);
+        const auto authority = endpoint.substr(8, path_start == std::string_view::npos
+            ? endpoint.size() - 8 : path_start - 8);
+        if (authority.empty() || authority.find('@') != std::string_view::npos ||
+            authority.find('%') != std::string_view::npos) invalid_endpoint();
+        if (authority.front() == '[') {
+            const auto close = authority.find(']');
+            if (close == std::string_view::npos || close < 2) invalid_endpoint();
+            const auto suffix = authority.substr(close + 1);
+            if (!suffix.empty()) {
+                if (suffix.front() != ':') invalid_endpoint();
+                validate_port(suffix.substr(1));
+            }
+        } else {
+            if (authority.find_first_of("[]") != std::string_view::npos) invalid_endpoint();
+            const auto colon = authority.find(':');
+            if (colon != std::string_view::npos) {
+                if (colon != authority.rfind(':')) invalid_endpoint();
+                validate_port(authority.substr(colon + 1));
+                if (colon == 0) invalid_endpoint();
+            }
         }
+        const auto origin = endpoint.substr(0, path_start);
+        const detail::Transport parsed(origin);
     } catch (const Error&) { invalid_endpoint(); }
 }
 

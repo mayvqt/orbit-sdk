@@ -164,11 +164,13 @@ std::string base64url_decode(std::string_view input) {
     return decoded;
 }
 
-std::string sign_test_token(const Json::Value& claims) {
+std::string sign_test_token(const Json::Value& claims,
+                            std::string_view purpose = "orbit-access+jwt",
+                            std::string_view key_id = "test-key") {
     Json::Value header(Json::objectValue);
     header["alg"] = "ES256";
-    header["typ"] = "orbit-access+jwt";
-    header["kid"] = "test-key";
+    header["typ"] = std::string(purpose);
+    header["kid"] = std::string(key_id);
     const auto header_json = encode_json(header);
     const auto claims_json = encode_json(claims);
     const auto signing_input = base64url_encode(
@@ -445,6 +447,8 @@ struct ApiFixture {
     std::atomic_bool missing_expiry{false};
     std::atomic_bool pre_epoch_server_time{false};
     std::atomic_bool far_future_metadata{false};
+    std::atomic<std::int64_t> offline_file_seconds{86400};
+    std::atomic_bool omit_offline_file_seconds{false};
     std::atomic_bool activation_response_lost{false};
     std::atomic_bool login_denied{false};
     std::string last_activation_idempotency;
@@ -563,13 +567,17 @@ struct ApiFixture {
                 require(method == "GET" && bearer_value == std::string(43, 's'), "licence list authorization missing");
                 Json::Value page(Json::objectValue);
                 page["items"] = Json::Value(Json::arrayValue);
-                page["items"].append(ApiFixture::sample_licence(far_future_metadata.load()));
+                auto licence = ApiFixture::sample_licence(far_future_metadata.load(), offline_file_seconds.load());
+                if (omit_offline_file_seconds.load()) licence.removeMember("offline_file_seconds");
+                page["items"].append(std::move(licence));
                 page["next_cursor"] = "cursor_2";
                 return HttpResponse{200, encode_json(page), {}};
             }
             if (route == "/api/client/v1/licence-claims") {
                 require(method == "POST" && bearer_value.empty(), "licence claim leaked bearer header");
-                return HttpResponse{200, encode_json(ApiFixture::sample_licence(far_future_metadata.load())), {}};
+                auto licence = ApiFixture::sample_licence(far_future_metadata.load(), offline_file_seconds.load());
+                if (omit_offline_file_seconds.load()) licence.removeMember("offline_file_seconds");
+                return HttpResponse{200, encode_json(licence), {}};
             }
             if (route.find("/api/client/v1/sessions/current?") == 0 && method == "DELETE") {
                 if (logout_gate) logout_gate->block();
@@ -584,7 +592,7 @@ struct ApiFixture {
         };
     }
 
-    static Json::Value sample_licence(bool far_future = false) {
+    static Json::Value sample_licence(bool far_future = false, std::int64_t file_seconds = 86400) {
         Json::Value licence(Json::objectValue);
         licence["id"] = "licence_1";
         licence["policy_name"] = "Standard";
@@ -599,6 +607,7 @@ struct ApiFixture {
         licence["hwid_locked"] = false;
         licence["offline_allowed"] = true;
         licence["offline_seconds"] = 3600;
+        licence["offline_file_seconds"] = static_cast<Json::Int64>(file_seconds);
         licence["entitlements"] = Json::Value(Json::objectValue);
         licence["entitlements"]["export"] = true;
         return licence;
@@ -625,6 +634,434 @@ Client persistent_client_for(ApiFixture& fixture, const std::string& path,
     auto storage = open_installed_storage(setup, path);
     return make_test_installed_client(setup,
         Transport("https://example.test", fixture.handler()), std::move(storage));
+}
+
+std::string offline_file(const AppKey& app_key, std::string_view installation,
+                         std::int64_t sequence, std::string_view issuance,
+                         std::int64_t issued, std::int64_t expires, bool export_feature = true) {
+    Json::Value claims(Json::objectValue);
+    claims["ver"] = 1;
+    claims["iss"] = app_key.issuer();
+    claims["aud"] = "orbit-offline:" + app_key.application_id() + ":" + app_key.environment_id();
+    claims["sub"] = "licence";
+    claims["jti"] = std::string(issuance);
+    claims["iat"] = static_cast<Json::Int64>(issued);
+    claims["nbf"] = static_cast<Json::Int64>(issued);
+    claims["exp"] = static_cast<Json::Int64>(expires);
+    claims["application_id"] = app_key.application_id();
+    claims["environment_id"] = app_key.environment_id();
+    claims["activation_id"] = "activation";
+    claims["installation_id"] = std::string(installation);
+    claims["sequence"] = static_cast<Json::Int64>(sequence);
+    claims["binding_mode"] = "none";
+    claims["policy_version"] = 1;
+    claims["entitlements"] = Json::Value(Json::objectValue);
+    claims["entitlements"]["export"] = export_feature;
+    return sign_test_token(claims, "orbit-offline+jwt", "offline-test-fixture");
+}
+
+struct FakeClock {
+    std::atomic<std::int64_t> elapsed{100'000'000'000LL};
+    std::atomic<std::int64_t> wall{1'700'000'000};
+    FakeClock() {
+        auto self = this;
+        set_test_clock([self] {
+            return std::make_pair(self->elapsed.load(), self->wall.load());
+        });
+    }
+    ~FakeClock() { set_test_clock({}); }
+    void advance(std::int64_t seconds) {
+        elapsed.fetch_add(seconds * 1'000'000'000LL);
+        wall.fetch_add(seconds);
+    }
+};
+
+template <class Predicate>
+bool wait_for_condition(Predicate predicate);
+
+void test_installed_offline_file_lifecycle(const Corpus& corpus) {
+    std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+    require(offline_input.good(), "offline test vector file is unavailable");
+    const std::string offline_bytes((std::istreambuf_iterator<char>(offline_input)), {});
+    const auto offline_corpus = parse_json(offline_bytes, 2 * 1024 * 1024);
+    const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+        orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+    const auto app_key = AppKey::parse(
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test");
+    require(app_key.public_key() ==
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test",
+        "public app-key serialization must round trip exactly");
+
+    constexpr std::int64_t issued = 1800000000;
+    std::atomic<std::int64_t> elapsed{1000000000};
+    std::atomic<std::int64_t> wall{issued};
+    set_test_clock([&] { return std::pair{elapsed.load(), wall.load()}; });
+    const auto path = persistent_test_path();
+    auto make_client = [&](ApiFixture& fixture, bool include_keys = true) {
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.public_app_key = app_key.public_key();
+        if (include_keys) setup.offline_keys = trusted;
+        auto storage = open_installed_storage(setup, path);
+        return make_test_installed_client(setup,
+            Transport("https://example.test", fixture.handler()), std::move(storage));
+    };
+    auto inspect_record = [&] {
+        auto setup = config();
+        setup.installation_id.reset();
+        auto storage = open_installed_storage(setup, path);
+        const auto bytes = storage->load();
+        require(bytes.has_value(), "offline installed record disappeared");
+        return persistent_codec::decode(setup, storage->provider(), *bytes);
+    };
+    try {
+        std::string installation;
+        std::string first;
+        std::string renewed;
+        {
+            ApiFixture fixture(corpus.value);
+            auto client = make_client(fixture);
+            const auto request = client.offline_request();
+            installation = request.installation_id;
+            const auto request_json = parse_json(request.to_json());
+            require(request_json["format"] == "orbit-offline-request" && request_json["version"] == 1 &&
+                    request_json["app_key"] == app_key.public_key() &&
+                    request_json["installation_id"] == installation &&
+                    request_json["fingerprint"].isNull() && request_json["fingerprint_provider"].isNull(),
+                "offline request must serialize stable scope and null binding fields");
+            first = offline_file(app_key, installation, 1, "offline_issue_1", issued, issued + 120);
+            const auto imported = client.import_offline_file(" \t" + first + "\n");
+            require(imported.access == Access::offline && imported.offline_file_mode &&
+                    imported.has_feature("export") && imported.expires_at &&
+                    imported.expires_at->time_since_epoch().count() == issued + 120,
+                    "offline file import must expose only signed typed metadata");
+            require(client.require_access("export").access == Access::offline,
+                    "offline file must authorize its signed feature without HTTP");
+            auto missing = expect_error([&] { (void)client.require_access("missing"); },
+                                        ErrorKind::feature_unavailable);
+            require(missing.code() == "feature_unavailable", "offline feature denial lost its typed code");
+            require(fixture.requests.empty(), "offline file request/guard made an HTTP request");
+            const auto conflict = offline_file(app_key, installation, 1,
+                "offline_issue_conflict", issued, issued + 120, false);
+            const auto sequence_error = expect_error(
+                [&] { (void)client.import_offline_file(conflict); }, ErrorKind::denied);
+            require(sequence_error.code() == "offline_sequence", "equal-sequence conflict was not rejected");
+            require(client.import_offline_file(first).access == Access::offline,
+                    "exact equal-sequence reimport should be idempotent");
+            elapsed.fetch_add(500000000);
+            (void)client.import_offline_file(first);
+            elapsed.fetch_add(500000000);
+            require(client.import_offline_file(first).remaining_offline == std::chrono::seconds(119),
+                    "reimport must count fractional elapsed time exactly once");
+            require(client.import_offline_file(first).remaining_offline == std::chrono::seconds(119),
+                    "reimport without elapsed time must not move the deadline");
+            Cancellation cancelled;
+            cancelled.cancel();
+            const auto cancelled_error = expect_error(
+                [&] { (void)client.import_offline_file(first, &cancelled); }, ErrorKind::cancelled);
+            require(cancelled_error.code() == "cancelled" && fixture.requests.empty(),
+                    "cancelled import changed access or made a request");
+            client.close();
+            const auto saved = inspect_record();
+            require(saved["format"] == 3 && saved["offline"]["jws"] == first &&
+                    saved["offline"]["sequence"] == 1 && saved["credential"].isNull() &&
+                    saved["access"].isNull() && saved["pending_activation"].isNull(),
+                "offline import must durably store one authority without online access");
+        }
+        {
+            ApiFixture missing_keys(corpus.value);
+            expect_error([&] { (void)make_client(missing_keys, false); }, ErrorKind::configuration);
+            require(missing_keys.requests.empty() && inspect_record()["offline"]["jws"] == first,
+                    "missing trusted keys must preserve an active signed file without HTTP");
+        }
+        wall.store(issued + 121);
+        elapsed.store(2000000000);
+        {
+            ApiFixture restarted(corpus.value);
+            auto client = make_client(restarted);
+            const auto expired = client.snapshot();
+            require(expired.access == Access::expired && expired.offline_file_mode &&
+                    expired.expires_at && expired.expires_at->time_since_epoch().count() == issued + 120,
+                    "restart downtime must count toward absolute file expiry");
+            const auto expired_error = expect_error([&] { (void)client.require_access("export"); },
+                                                   ErrorKind::denied);
+            int prompts = 0;
+            expect_error([&] {
+                (void)client.ensure_access("export", [&]() -> std::optional<std::string> {
+                    ++prompts;
+                    return "unexpected-key";
+                });
+            }, ErrorKind::denied);
+            require(expired_error.code() == "offline_file_expired" && restarted.requests.empty(),
+                    "expired file must not prompt or validate online");
+            require(prompts == 0, "expired file access must never prompt for an activation key");
+            const auto renewal_issued = wall.load() + 2;
+            renewed = offline_file(app_key, installation, 2, "offline_issue_2",
+                                   renewal_issued, renewal_issued + 240);
+            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(240) &&
+                    restarted.requests.empty(),
+                    "future-skewed renewal must advance the original anchor only to the signed time floor");
+            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(240),
+                    "repeating a future-skewed renewal without elapsed time must not move its deadline");
+            elapsed.fetch_add(4000000000LL);
+            wall.fetch_add(4);
+            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(236),
+                    "a renewed file must count whole elapsed seconds exactly once");
+            expect_error([&] { (void)client.import_offline_file(first); }, ErrorKind::invalid_response);
+            wall.store(issued + 200);
+            elapsed.store(81000000000LL);
+            client.logout();
+            require(client.snapshot().access == Access::denied, "logout retained offline authority");
+            elapsed.fetch_add(121000000000LL);
+            const auto frozen_clock = expect_error(
+                [&] { (void)client.import_offline_file(first); }, ErrorKind::clock_uncertain);
+            require(frozen_clock.code() == "clock_uncertain" && restarted.requests.empty(),
+                    "offline anchor and floors must survive logout without accepting a frozen-wall replay");
+            client.close();
+        }
+        const auto after_logout = inspect_record();
+        require(after_logout["format"] == 3 && after_logout["offline"]["jws"].isNull() &&
+                after_logout["offline"]["sequence"] == 2 &&
+                after_logout["offline"]["time_high_water"].asInt64() >= issued + 200 &&
+                after_logout["offline"]["wall_high_water"].asInt64() >= issued + 200,
+                "logout must clear authority while retaining renewal and clock floors");
+    } catch (...) {
+        set_test_clock({});
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        throw;
+    }
+    set_test_clock({});
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_offline_transition_floors(const Corpus& corpus) {
+    std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+    require(offline_input.good(), "offline test vector file is unavailable");
+    const auto offline_corpus = parse_json(
+        std::string((std::istreambuf_iterator<char>(offline_input)), {}), 2 * 1024 * 1024);
+    const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+        orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+    const auto app_key = AppKey::parse(
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test");
+
+    for (const bool account_transition : {false, true}) {
+        constexpr std::int64_t issued = 1700000000;
+        FakeClock clock;
+        clock.wall = issued;
+        const auto path = persistent_test_path();
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.public_app_key = app_key.public_key();
+        setup.offline_keys = trusted;
+        ApiFixture fixture(corpus.value);
+        auto state = open_installed_state(setup,
+            Transport("https://example.test", fixture.handler()), open_installed_storage(setup, path));
+        try {
+            const auto request = state->offline_request();
+            const auto file = offline_file(app_key, request.installation_id, 1,
+                account_transition ? "offline_account_transition" : "offline_online_transition",
+                issued, issued + 120);
+            std::atomic_bool cancelled{false};
+            require(state->import_offline_file(file, cancelled).access == Access::offline,
+                    "initial transition-floor file import failed");
+            if (account_transition) {
+                (void)state->login("alice", "synthetic-password", cancelled);
+                state->account_logout(cancelled);
+            } else {
+                (void)state->activate("transition-key", {}, std::nullopt, cancelled);
+            }
+            state->local_logout();
+            clock.advance(7);
+            require(state->import_offline_file(file, cancelled).remaining_offline == std::chrono::seconds(113),
+                    "a transition must retain the original offline anchor and report exact remaining time");
+            require(state->import_offline_file(file, cancelled).remaining_offline == std::chrono::seconds(113),
+                    "a repeated post-transition import must not move the offline deadline");
+            clock.advance(2);
+            require(state->import_offline_file(file, cancelled).remaining_offline == std::chrono::seconds(111),
+                    "a post-transition import must count whole elapsed seconds exactly once");
+            state->local_logout();
+            const auto request_count = [&] {
+                std::lock_guard<std::mutex> lock(fixture.mutex);
+                return fixture.requests.size();
+            };
+            const auto requests_before = request_count();
+            clock.elapsed.fetch_add(121000000000LL);
+            expect_error([&] { (void)state->import_offline_file(file, cancelled); },
+                         ErrorKind::clock_uncertain);
+            require(request_count() == requests_before && !state->offline &&
+                        state->offline_clock && state->offline_clock->time_high_water >= issued + 9,
+                    "account or online transitions must keep offline time evidence without restoring authority");
+            state->close();
+            state.reset();
+            auto saved = open_installed_storage(setup, path);
+            const auto bytes = saved->load();
+            require(bytes.has_value(), "transition floor record disappeared");
+            const auto record = persistent_codec::decode(setup, saved->provider(), *bytes);
+            require(record["offline"]["jws"].isNull() &&
+                        record["offline"]["sequence"] == 1 &&
+                        record["offline"]["time_high_water"].asInt64() >= issued + 9 &&
+                        record["offline"]["wall_high_water"].asInt64() >= issued + 9 &&
+                        record["credential"].isNull() && record["access"].isNull(),
+                    "transitions must durably clear authority while retaining the offline replay floor");
+        } catch (...) {
+            state->close();
+            state.reset();
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+            throw;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
+
+void test_offline_identity_change_clears_file(const Corpus& corpus) {
+    FakeClock clock;
+    constexpr std::int64_t issued = 1700000000;
+    clock.wall = issued;
+    std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+    require(offline_input.good(), "offline test vector file is unavailable");
+    const auto offline_corpus = parse_json(
+        std::string((std::istreambuf_iterator<char>(offline_input)), {}), 2 * 1024 * 1024);
+    const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+        orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+    const auto app_key = AppKey::parse(
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test");
+    const auto path = persistent_test_path();
+    std::string original_id;
+    {
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.public_app_key = app_key.public_key();
+        setup.offline_keys = trusted;
+        ApiFixture fixture(corpus.value);
+        auto state = open_installed_state(setup,
+            Transport("https://example.test", fixture.handler()), open_installed_storage(setup, path));
+        original_id = state->offline_request().installation_id;
+        std::atomic_bool cancelled{false};
+        const auto file = offline_file(app_key, original_id, 1, "offline_identity_change",
+            issued, issued + 120);
+        require(state->import_offline_file(file, cancelled).access == Access::offline,
+                "identity-change offline setup failed");
+        state->close();
+    }
+    auto changed_setup = config();
+    changed_setup.installation_id.reset();
+    changed_setup.public_app_key = app_key.public_key();
+    changed_setup.offline_keys = trusted;
+    changed_setup.fingerprint = Fingerprint{std::string(64, 'a'), "custom:fixture"};
+    ApiFixture changed(corpus.value);
+    auto state = open_installed_state(changed_setup,
+        Transport("https://example.test", changed.handler()), open_installed_storage(changed_setup, path));
+    const auto changed_request = state->offline_request();
+    const auto no_network_requests = [&] {
+        std::lock_guard<std::mutex> lock(changed.mutex);
+        return changed.requests.empty();
+    };
+    require(changed_request.installation_id != original_id && !state->offline &&
+                state->snapshot().access == Access::denied && no_network_requests(),
+            "machine identity change must rotate installation and clear offline authority without HTTP");
+    state->close();
+    auto installed = open_installed_storage(changed_setup, path);
+    const auto bytes = installed->load();
+    require(bytes.has_value(), "identity-change storage record disappeared");
+    const auto record = persistent_codec::decode(changed_setup, installed->provider(), *bytes);
+    require(record["installation"]["id"] == changed_request.installation_id &&
+                record["offline"].isNull() && record["credential"].isNull() && record["access"].isNull(),
+            "identity change must persist fresh installation identity without old offline floors");
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_offline_activation_logout_race(const Corpus& corpus) {
+    FakeClock clock;
+    constexpr std::int64_t issued = 1700000000;
+    clock.wall = issued;
+    std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+    require(offline_input.good(), "offline test vector file is unavailable");
+    const auto offline_corpus = parse_json(
+        std::string((std::istreambuf_iterator<char>(offline_input)), {}), 2 * 1024 * 1024);
+    const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+        orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+    const auto app_key = AppKey::parse(
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test");
+    const auto path = persistent_test_path();
+    auto setup = config();
+    setup.installation_id.reset();
+    setup.public_app_key = app_key.public_key();
+    setup.offline_keys = trusted;
+    ApiFixture fixture(corpus.value);
+    fixture.activation_gate = std::make_shared<Gate>();
+    auto state = open_installed_state(setup,
+        Transport("https://example.test", fixture.handler()), open_installed_storage(setup, path));
+    std::atomic_bool cancelled{false};
+    std::atomic_int activation_result{-1};
+    std::atomic_int import_result{-1};
+    std::thread activation;
+    std::thread importing;
+    try {
+        const auto request = state->offline_request();
+        const auto file = offline_file(app_key, request.installation_id, 1,
+            "offline_activation_logout_race", issued, issued + 120);
+        require(state->import_offline_file(file, cancelled).access == Access::offline,
+                "activation-race offline setup failed");
+        activation = std::thread([&] {
+            try { (void)state->activate("race-key", {}, std::nullopt, cancelled); }
+            catch (const Error& error) { activation_result = static_cast<int>(error.kind()); }
+            catch (...) { activation_result = static_cast<int>(ErrorKind::internal); }
+        });
+        fixture.activation_gate->wait_until_entered();
+        importing = std::thread([&] {
+            try { (void)state->import_offline_file(file, cancelled); import_result = 0; }
+            catch (const Error& error) { import_result = static_cast<int>(error.kind()); }
+            catch (...) { import_result = static_cast<int>(ErrorKind::internal); }
+        });
+        const bool import_waiting = wait_for_condition([&] {
+            std::lock_guard<std::mutex> lock(state->lifecycle_mutex);
+            return state->active_calls == 2;
+        });
+        require(import_waiting, "offline import did not queue behind the network activation");
+        state->local_logout();
+        fixture.activation_gate->release();
+        activation.join();
+        importing.join();
+        require(activation_result == static_cast<int>(ErrorKind::stale_response) &&
+                    import_result == static_cast<int>(ErrorKind::stale_response) &&
+                    state->snapshot().access == Access::denied,
+                "concurrent logout must fence both the activation response and queued import");
+        state->close();
+        state.reset();
+        auto stored = open_installed_storage(setup, path);
+        const auto bytes = stored->load();
+        require(bytes.has_value(), "activation-race storage record disappeared");
+        const auto record = persistent_codec::decode(setup, stored->provider(), *bytes);
+        require(record["offline"]["jws"].isNull() && record["offline"]["sequence"] == 1 &&
+                    record["credential"].isNull() && record["access"].isNull(),
+                "concurrent logout must durably retain floors without authority resurrection");
+    } catch (...) {
+        fixture.activation_gate->release();
+        if (activation.joinable()) activation.join();
+        if (importing.joinable()) importing.join();
+        if (state) state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
 }
 
 void test_installed_identity_mismatch_rotates_installation(const Corpus& corpus) {
@@ -733,6 +1170,8 @@ void test_activation_accounts_and_proofs(const Corpus& corpus) {
             "owned licence metadata mismatch");
     require(page.items[0].duration == std::optional<std::chrono::seconds>(std::chrono::seconds(3000000000LL)),
             "owned licence duration must preserve values above i32 range");
+    require(page.items[0].offline_file_duration == std::chrono::seconds(86400),
+            "owned licence offline-file policy must parse exact server seconds");
     require(page.items[0].first_used_at && page.items[0].expires_at &&
                 page.items[0].first_used_at->time_since_epoch().count() == 1767225600 &&
                 page.items[0].expires_at->time_since_epoch().count() == 1798761600,
@@ -745,6 +1184,25 @@ void test_activation_accounts_and_proofs(const Corpus& corpus) {
     require(!client.account(), "account logout did not clear local session");
     require(sibling.snapshot().access == Access::denied,
             "client copies should observe logout state");
+}
+
+void test_owned_licence_offline_file_policy_bounds(const Corpus& corpus) {
+    ApiFixture fixture(corpus.value);
+    auto client = client_for(fixture);
+    (void)client.login("alice", "password");
+    for (const std::int64_t seconds : {0, 86400, 31622400}) {
+        fixture.offline_file_seconds = seconds;
+        const auto page = client.owned_licences();
+        require(page.items.size() == 1 && page.items.front().offline_file_duration ==
+                std::chrono::seconds(seconds), "valid offline_file_seconds was not parsed exactly");
+    }
+    for (const std::int64_t seconds : {-1, 1, 86399, 31622401}) {
+        fixture.offline_file_seconds = seconds;
+        expect_error([&] { (void)client.owned_licences(); }, ErrorKind::invalid_response);
+        (void)client.login("alice", "password");
+    }
+    fixture.omit_offline_file_seconds = true;
+    expect_error([&] { (void)client.owned_licences(); }, ErrorKind::invalid_response);
 }
 
 void test_public_timestamp_seconds_range() {
@@ -1044,22 +1502,6 @@ void test_unauthenticated_generation_fences(const Corpus& corpus) {
     }
 }
 
-struct FakeClock {
-    std::atomic<std::int64_t> elapsed{100'000'000'000LL};
-    std::atomic<std::int64_t> wall{1'700'000'000};
-    FakeClock() {
-        auto self = this;
-        set_test_clock([self] {
-            return std::make_pair(self->elapsed.load(), self->wall.load());
-        });
-    }
-    ~FakeClock() { set_test_clock({}); }
-    void advance(std::int64_t seconds) {
-        elapsed.fetch_add(seconds * 1'000'000'000LL);
-        wall.fetch_add(seconds);
-    }
-};
-
 template <class Predicate>
 bool wait_for_condition(Predicate predicate) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -1160,20 +1602,172 @@ public:
     std::optional<std::string> load() override { return wrapped_->load(); }
     void initialize(std::string_view bytes) override { wrapped_->initialize(bytes); }
     void save(std::string_view bytes) override {
-        ++save_attempts;
+        const auto attempt = ++save_attempts;
         if (fail.load()) {
             ++failed_writes;
             throw Error(1, ErrorKind::storage, "installation_state_write_failed", {});
         }
         wrapped_->save(bytes);
+        if (after_successful_save) after_successful_save(attempt);
     }
     std::string_view provider() const noexcept override { return wrapped_->provider(); }
     std::atomic_bool fail{false};
     std::atomic_int failed_writes{0};
     std::atomic_int save_attempts{0};
+    std::function<void(int)> after_successful_save;
 private:
     std::shared_ptr<InstalledStorage> wrapped_;
 };
+
+void test_offline_worker_preserves_clock_uncertainty(const Corpus& corpus) {
+    FakeClock clock;
+    constexpr std::int64_t issued = 1700000000;
+    clock.wall = issued;
+    std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+    require(offline_input.good(), "offline test vector file is unavailable");
+    const auto offline_corpus = parse_json(
+        std::string((std::istreambuf_iterator<char>(offline_input)), {}), 2 * 1024 * 1024);
+    const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+        orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+    const auto app_key = AppKey::parse(
+        "orbit_app_test_" + base64url_encode(
+            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+            std::string_view("https://orbit.example.test").size()) + ".app.test");
+    const auto path = persistent_test_path();
+    auto setup = config();
+    setup.installation_id.reset();
+    setup.public_app_key = app_key.public_key();
+    setup.offline_keys = trusted;
+    ApiFixture fixture(corpus.value);
+    auto state = open_installed_state(setup,
+        Transport("https://example.test", fixture.handler()), open_installed_storage(setup, path));
+    auto public_client = make_test_client_from_state(state);
+    const auto no_requests = [&] {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        return fixture.requests.empty();
+    };
+    try {
+        const auto request = state->offline_request();
+        const auto file = offline_file(app_key, request.installation_id, 1,
+            "offline_worker_clock_error", issued, issued + 300);
+        std::atomic_bool cancelled{false};
+        require(state->import_offline_file(file, cancelled).access == Access::offline,
+                "worker clock regression file import failed");
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            const auto expired_checkpoint = std::chrono::steady_clock::now() - std::chrono::seconds(61);
+            state->offline->last_checkpoint = expired_checkpoint;
+            state->offline_clock->last_checkpoint = expired_checkpoint;
+        }
+        clock.elapsed.fetch_add(61000000000LL); // Deliberately hold wall time fixed.
+        state->wake_worker();
+        const bool rejected_checkpoint = wait_for_condition([&] {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            return state->worker_cancelled.load() && state->offline && state->offline->uncertain &&
+                state->offline_clock && state->offline_clock->uncertain;
+        });
+        require(rejected_checkpoint,
+                "worker clock-checkpoint failure must retain uncertain active file mode and its time floor");
+        int prompts = 0;
+        const auto access_error = expect_error([&] {
+            (void)public_client.ensure_access("export", [&]() -> std::optional<std::string> {
+                ++prompts;
+                return "unexpected-key";
+            });
+        }, ErrorKind::clock_uncertain);
+        require(access_error.code() == "clock_uncertain" && prompts == 0 && no_requests(),
+                "uncertain file mode must fail closed without becoming activation-required or sending HTTP");
+        clock.wall.fetch_add(61);
+        const auto renewed = offline_file(app_key, request.installation_id, 2,
+            "offline_worker_clock_recovered", issued + 61, issued + 240);
+        require(state->import_offline_file(renewed, cancelled).access == Access::offline,
+                "a corrected clock must permit deliberate signed renewal after a worker error");
+        require(no_requests(), "offline worker failure or renewal must not send HTTP");
+        public_client.close();
+        state->close();
+        state.reset();
+    } catch (...) {
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_offline_durable_import_fences(const Corpus& corpus) {
+    for (const std::string scenario : {"cancel_save", "cancel_checkpoint", "expire_write"}) {
+        FakeClock clock;
+        constexpr std::int64_t issued = 1700000000;
+        clock.wall = issued;
+        std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
+        require(offline_input.good(), "offline test vector file is unavailable");
+        const auto offline_corpus = parse_json(
+            std::string((std::istreambuf_iterator<char>(offline_input)), {}), 2 * 1024 * 1024);
+        const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
+            orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
+        const auto app_key = AppKey::parse(
+            "orbit_app_test_" + base64url_encode(
+                reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
+                std::string_view("https://orbit.example.test").size()) + ".app.test");
+        const auto path = persistent_test_path();
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.public_app_key = app_key.public_key();
+        setup.offline_keys = trusted;
+        ApiFixture fixture(corpus.value);
+        auto storage = std::make_shared<FailingInstalledStorage>(open_installed_storage(setup, path));
+        auto state = open_installed_state(setup,
+            Transport("https://example.test", fixture.handler()), storage);
+        try {
+            const auto request = state->offline_request();
+            const auto file = offline_file(app_key, request.installation_id, 1,
+                "offline_durable_" + scenario, issued, issued + 120);
+            std::atomic_bool cancelled{false};
+            storage->after_successful_save = [&](int attempt) {
+                if (scenario == "cancel_save" && attempt == 1) cancelled = true;
+                if (scenario == "cancel_checkpoint" && attempt == 1) {
+                    clock.elapsed.fetch_add(1000000000LL);
+                    clock.wall.fetch_add(1);
+                }
+                if (scenario == "cancel_checkpoint" && attempt == 2) cancelled = true;
+                if (scenario == "expire_write" && attempt == 1) {
+                    clock.elapsed.fetch_add(121000000000LL);
+                    clock.wall.fetch_add(121);
+                }
+            };
+            expect_error([&] { (void)state->import_offline_file(file, cancelled); },
+                scenario == "expire_write" ? ErrorKind::denied : ErrorKind::cancelled);
+            storage->after_successful_save = {};
+            const auto bytes = storage->load();
+            require(bytes.has_value(), "durable import fence lost its record");
+            const auto record = persistent_codec::decode(setup, storage->provider(), *bytes);
+            require(record["offline"]["jws"].isNull() && record["offline"]["sequence"] == 1 &&
+                        record["credential"].isNull() && record["access"].isNull(),
+                    "post-write cancellation or expiry must durably clear the signed file and retain its floor");
+            storage->after_successful_save = {};
+            state->close();
+            state.reset();
+            storage.reset();
+            auto reopened = open_installed_state(setup,
+                Transport("https://example.test", fixture.handler()), open_installed_storage(setup, path));
+            require(reopened->snapshot().access == Access::denied,
+                    "a cleared durable import must not restore after reopening");
+            reopened->close();
+        } catch (...) {
+            if (storage) storage->after_successful_save = {};
+            if (state) state->close();
+            state.reset();
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+            throw;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
 
 void test_persistent_worker_stops_on_storage_failure(const Corpus& corpus) {
     FakeClock clock;
@@ -1642,6 +2236,33 @@ void test_persistent_storage_format_and_contention() {
     auto decoded = persistent_codec::decode(setup, installed_provider(), bytes);
     require(decoded["format"].asInt() == 2 && decoded["credential"].isNull(),
             "format-2 initialization record must contain required nullable fields");
+    require(decoded["installation"]["id"] == *setup.installation_id,
+            "format-2 decode must preserve the existing installation ID");
+    auto offline_record = decoded;
+    offline_record["format"] = 3;
+    offline_record["offline"] = Json::Value(Json::objectValue);
+    offline_record["offline"]["jws"] = "a.b.c";
+    offline_record["offline"]["sequence"] = 7;
+    offline_record["offline"]["issuance_id"] = "offline_issue_7";
+    offline_record["offline"]["content_digest"] = std::string(64, 'a');
+    offline_record["offline"]["verified_at"] = Json::Int64{1800000000};
+    offline_record["offline"]["time_high_water"] = Json::Int64{1800000010};
+    offline_record["offline"]["wall_high_water"] = Json::Int64{1800000010};
+    const auto offline_storage = persistent_codec::encode(setup, installed_provider(), offline_record);
+    const auto decoded_offline = persistent_codec::decode(setup, installed_provider(), offline_storage);
+    require(decoded_offline["format"] == 3 && decoded_offline["offline"]["sequence"] == 7,
+            "format-3 offline record did not preserve signed-file floors");
+    const auto offline_text = std::string(offline_storage.begin(), offline_storage.end());
+    const auto offline_field = offline_text.find("\"offline\":{");
+    require(offline_field != std::string::npos, "format-3 test record omitted offline object");
+    auto duplicate_offline = offline_text;
+    duplicate_offline.insert(offline_field, "\"offline\":{},");
+    expect_error([&] { (void)persistent_codec::decode(setup, installed_provider(), duplicate_offline); },
+                 ErrorKind::corrupt_state);
+    auto malformed_offline = offline_record;
+    malformed_offline["offline"]["unexpected"] = true;
+    expect_error([&] { (void)persistent_codec::encode(setup, installed_provider(), malformed_offline); },
+                 ErrorKind::corrupt_state);
     expect_error([&] {
         (void)persistent_codec::decode(setup, installed_provider() == "private_file"
             ? "windows_dpapi" : "private_file", bytes);
@@ -1885,6 +2506,7 @@ int main(int argc, char** argv) {
         test_empty_explicit_activation_operation_ids(corpus);
         test_transport_retry_errors_and_cancellation();
         test_activation_accounts_and_proofs(corpus);
+        test_owned_licence_offline_file_policy_bounds(corpus);
         test_public_timestamp_seconds_range();
         test_ensure_access_prompt_semantics(corpus);
         test_unauthenticated_generation_fences(corpus);
@@ -1893,6 +2515,8 @@ int main(int argc, char** argv) {
         test_persistent_close_cancels_foreground(corpus);
         test_owner_cancellation_during_backoff();
         test_persistent_worker_stops_on_storage_failure(corpus);
+        test_offline_worker_preserves_clock_uncertainty(corpus);
+        test_offline_durable_import_fences(corpus);
 #if defined(__linux__)
         test_installed_lease_replacement_fails_closed(corpus);
 #endif
@@ -1904,6 +2528,10 @@ int main(int argc, char** argv) {
         test_persistent_close_discards_invalid_clock(corpus);
         test_persistent_strict_outage_is_not_activation_required(corpus);
         test_persistent_online_restart_and_offline_recovery(corpus);
+        test_installed_offline_file_lifecycle(corpus);
+        test_offline_transition_floors(corpus);
+        test_offline_identity_change_clears_file(corpus);
+        test_offline_activation_logout_race(corpus);
         test_persistent_uncertain_activation_reuses_identity(corpus);
         test_persistent_account_activation_survives_failed_login(corpus);
         test_persistent_previous_rebind_and_expiry_contract(corpus);

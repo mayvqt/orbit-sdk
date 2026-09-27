@@ -6,7 +6,10 @@ public sealed record Customer(string Id, string Username, string Email, bool Sus
 public sealed record Account(Customer Customer, DateTimeOffset ExpiresAt);
 public sealed record OwnedLicence(string Id, string PolicyName, string State, string ExpiryMode,
     DateTimeOffset? FirstUsedAt, DateTimeOffset? ExpiresAt, TimeSpan? Duration, int DeviceLimit, bool HwidLocked,
-    bool OfflineAllowed, TimeSpan OfflineDuration, IReadOnlyDictionary<string, bool> Entitlements);
+    bool OfflineAllowed, TimeSpan OfflineDuration, IReadOnlyDictionary<string, bool> Entitlements)
+{
+    public TimeSpan OfflineFileDuration { get; init; }
+}
 public sealed record OwnedLicencePage(IReadOnlyList<OwnedLicence> Items, string? NextCursor);
 
 /// <summary>
@@ -98,6 +101,7 @@ public sealed partial class OrbitClient
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
                 var preservePending = installed?.Record.PendingActivation != null;
+                CheckpointOfflineBeforeTransition();
                 Clear();
                 InvalidateStorage(clearPending: !preservePending);
                 expected = generation;
@@ -143,6 +147,7 @@ public sealed partial class OrbitClient
         {
             SyncStorage();
             saved = session;
+            CheckpointOfflineBeforeTransition();
             Clear();
             InvalidateStorage();
             expected = generation;
@@ -323,7 +328,10 @@ public sealed partial class OrbitClient
         var policy = JsonWire.String(value, "policy_name");
         var deviceLimit = JsonWire.Integer(value, "device_limit");
         var offlineSeconds = JsonWire.Integer(value, "offline_seconds");
-        if (!JsonWire.Opaque(id) || policy.EnumerateRunes().Count() > 80 || deviceLimit is < 1 or > 100 || offlineSeconds is < 0 or > 86400)
+        var offlineFileSeconds = JsonWire.Integer(value, "offline_file_seconds");
+        if (!JsonWire.Opaque(id) || policy.EnumerateRunes().Count() > 80 || deviceLimit is < 1 or > 100 ||
+            offlineSeconds is < 0 or > 86400 ||
+            offlineFileSeconds != 0 && (offlineFileSeconds is < 86400 or > 31622400))
             throw JsonWire.Invalid();
         var firstUsed = JsonWire.OptionalString(value, "first_used_at");
         var expires = JsonWire.OptionalString(value, "expires_at");
@@ -335,6 +343,7 @@ public sealed partial class OrbitClient
             expires == null ? null : DateTimeOffset.FromUnixTimeSeconds(JsonWire.Timestamp(expires)),
             duration == null ? null : TimeSpan.FromTicks(duration.Value * TimeSpan.TicksPerSecond), (int)deviceLimit,
             JsonWire.Boolean(value, "hwid_locked"), JsonWire.Boolean(value, "offline_allowed"), TimeSpan.FromSeconds(offlineSeconds),
-            JsonWire.Entitlements(JsonWire.Field(value, "entitlements")));
+            JsonWire.Entitlements(JsonWire.Field(value, "entitlements")))
+        { OfflineFileDuration = TimeSpan.FromSeconds(offlineFileSeconds) };
     }
 }

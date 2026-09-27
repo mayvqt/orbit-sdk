@@ -5,6 +5,10 @@ namespace Orbit.Sdk;
 // Native elapsed-clock ABIs stay isolated from credential and grant state.
 internal static class Clock
 {
+#if ORBIT_LOCAL_DEVELOPMENT
+    private static Func<ClockStart>? testClock;
+    internal static void SetTestClock(Func<ClockStart>? clock) => Volatile.Write(ref testClock, clock);
+#endif
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec { public long Seconds; public long Nanoseconds; }
     [StructLayout(LayoutKind.Sequential)]
@@ -42,6 +46,10 @@ internal static class Clock
 
     internal static long ElapsedTicks()
     {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test().ElapsedTicks;
+#endif
         try
         {
             if (OperatingSystem.IsWindows())
@@ -74,7 +82,23 @@ internal static class Clock
         }
     }
 
-    internal static ClockStart Capture() => new(ElapsedTicks(), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    internal static long WallSeconds()
+    {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test().WallSeconds;
+#endif
+        return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    }
+
+    internal static ClockStart Capture()
+    {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test();
+#endif
+        return new ClockStart(ElapsedTicks(), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    }
 }
 
 internal readonly record struct ClockStart(long ElapsedTicks, long WallSeconds);
@@ -83,6 +107,17 @@ internal sealed class ClockAnchor(long serverSeconds, ClockStart start)
 {
     internal long ServerSeconds => serverSeconds;
     internal long WallSeconds => start.WallSeconds;
+    internal ClockAnchor AdvanceFloor(long seconds)
+    {
+        var current = Now();
+        if (seconds <= current) return this;
+        try
+        {
+            var advance = checked(seconds - current);
+            return new ClockAnchor(checked(serverSeconds + advance), start);
+        }
+        catch (OverflowException) { throw new OrbitException(OrbitError.ClockUncertain); }
+    }
     internal long Now()
     {
         try
@@ -91,7 +126,7 @@ internal sealed class ClockAnchor(long serverSeconds, ClockStart start)
             if (elapsed < 0) throw new OrbitException(OrbitError.ClockUncertain);
             var seconds = elapsed / TimeSpan.TicksPerSecond;
             var expected = checked(start.WallSeconds + seconds);
-            if (Math.Abs(checked(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - expected)) > 30)
+            if (Math.Abs(checked(Clock.WallSeconds() - expected)) > 30)
                 throw new OrbitException(OrbitError.ClockUncertain);
             return checked(serverSeconds + seconds);
         }

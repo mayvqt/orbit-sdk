@@ -9,9 +9,13 @@ internal sealed record InstalledCredential(string ActivationId, string LicenceId
 internal sealed record InstalledPending(string OperationId, string PrincipalKind, string InputDigest, long CreatedAt);
 internal sealed record InstalledAccess(string Jws, JsonElement Jwks, long? LicenceExpiresAt, long ReceivedServerTime,
     long ReceivedWallTime, long ServerHighWater, long WallHighWater);
+internal sealed record InstalledOffline(string? Jws, long Sequence, string IssuanceId, string ContentDigest,
+    long VerifiedAt, long TimeHighWater, long WallHighWater);
 internal sealed record InstalledRecord(string Sdk, int Format, string Provider, InstalledScope Scope,
     InstalledIdentity Installation, long Generation, InstalledCredential? Credential, InstalledPending? PendingActivation,
-    InstalledAccess? Access)
+    InstalledAccess? Access,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    InstalledOffline? Offline = null)
 {
     internal StoredCredential? Stored => Credential is not { } c ? null : new()
     {
@@ -50,7 +54,12 @@ internal static class InstalledCodec
             if (bytes.Length is 0 or > Limit)
                 throw JsonWire.Invalid();
             var json = JsonWire.Parse(bytes);
-            JsonWire.ExactFields(json, "sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access");
+            var format = JsonWire.Integer(json, "format");
+            if (format == 2)
+                JsonWire.ExactFields(json, "sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access");
+            else if (format == 3)
+                JsonWire.ExactFields(json, "sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access", "offline");
+            else throw JsonWire.Invalid();
             JsonWire.ExactFields(JsonWire.Field(json, "scope"), "api_origin", "issuer", "application_id", "environment_id");
             JsonWire.ExactFields(JsonWire.Field(json, "installation"), "id", "fingerprint", "fingerprint_provider");
             if (JsonWire.Field(json, "credential").ValueKind != JsonValueKind.Null)
@@ -59,9 +68,12 @@ internal static class InstalledCodec
                 JsonWire.ExactFields(JsonWire.Field(json, "pending_activation"), "operation_id", "principal_kind", "input_digest", "created_at");
             if (JsonWire.Field(json, "access").ValueKind != JsonValueKind.Null)
                 JsonWire.ExactFields(JsonWire.Field(json, "access"), "jws", "jwks", "licence_expires_at", "received_server_time", "received_wall_time", "server_high_water", "wall_high_water");
+            if (format == 3)
+                JsonWire.ExactFields(JsonWire.Field(json, "offline"), "jws", "sequence", "issuance_id", "content_digest", "verified_at", "time_high_water", "wall_high_water");
             var r = JsonSerializer.Deserialize<InstalledRecord>(bytes, Options) ?? throw JsonWire.Invalid();
             var identityMatches = r.Installation.Fingerprint == fingerprint && r.Installation.FingerprintProvider == fingerprintProvider;
-            if (r.Sdk != Sdk || r.Format != 2 || r.Provider != provider || r.Scope != scope || r.Generation < 0 ||
+            if (r.Sdk != Sdk || r.Format != format || r.Provider != provider || r.Scope != scope || r.Generation < 0 ||
+                (format == 2) != (r.Offline == null) ||
                 (!allowIdentityMismatch && !identityMatches))
                 throw JsonWire.Invalid();
             new OrbitConfig(scope.ApplicationId, scope.EnvironmentId, scope.Issuer).Validate(new Device(r.Installation.Id,
@@ -81,6 +93,14 @@ internal static class InstalledCodec
                     throw JsonWire.Invalid();
                 _ = GrantKeys.Parse(a.Jwks);
             }
+            if (r.Offline is { } offline && (offline.Sequence is < 1 or > OfflineKeys.MaximumSequence ||
+                !JsonWire.Opaque(offline.IssuanceId) || offline.ContentDigest.Length != 64 ||
+                !offline.ContentDigest.All(c => c is >= 'a' and <= 'f' or >= '0' and <= '9') ||
+                !Time(offline.VerifiedAt) || offline.TimeHighWater < offline.VerifiedAt ||
+                !Time(offline.TimeHighWater) || !Time(offline.WallHighWater) ||
+                offline.Jws is { } jws && (jws.Length is 0 or > OfflineKeys.MaximumFileBytes ||
+                    r.Credential != null || r.PendingActivation != null || r.Access != null)))
+                throw JsonWire.Invalid();
             return r;
         }
         catch (Exception) { throw new OrbitException(OrbitError.Storage); }

@@ -94,15 +94,32 @@ with the awake-only `mach_absolute_time` counter.
 
 ## Long-term offline-file verification
 
-The internal offline verifier consumes all 104 shared signed-file cases and
-checks the same canonical renewal digest as Python and C#. It uses the existing
-P-256 signature implementation with a separate token purpose, trusted key prefix,
-strict claims, binding, expiry and sequence rules. `orbit_offline_tests` runs
-with the ordinary CTest suite, including exact JWKS size and duplicate-key checks.
+`orbit::OfflineKeys::parse(jwks_json, "test" or "live")` accepts a trusted
+offline-purpose public JWKS. Put it in `Options::offline_keys` before opening an
+installed client. The SDK validates every configured key before it opens
+installed state and never trusts keys embedded in a file.
 
-The verifier corpus tests signed-file acceptance. Durable import, renewal and
-restart behavior require separate lifecycle checks; see the
-[offline contract](../../contracts/sdk/offline.md).
+`Client::offline_request()` returns serializable public installation scope for
+an authorized online issuance workflow. `Client::import_offline_file()` verifies
+the signed file and stores its original JWS, sequence, issuance identity and
+clock floors in the existing private installed store before returning a typed
+`Snapshot`. Active offline files use format-3 storage records; after restart,
+verification uses the currently configured trusted offline keys that still
+verify the file, allowing trusted key rotation. `offline_file_mode` distinguishes
+these files from cached connected grants.
+
+While file mode is active, snapshots and access guards verify the storage lease,
+clock, expiry and feature locally. They do not validate online or prompt for a
+key. Expired files can be deliberately renewed using a higher signed sequence.
+Logout, activation and account login clear local file authority while retaining
+sequence/time floors. Disconnected files cannot be recalled immediately, and a
+complete old machine snapshot cannot be detected reliably. The typed
+`OwnedLicence::offline_file_duration` reports `offline_file_seconds`.
+
+`orbit_offline_tests` runs all 104 shared signed-file cases, including strict key
+boundaries and canonical-claims digest checks. Installed import, restart,
+renewal, expiry, no-network behavior and logout-floor preservation run in
+`orbit_sdk_tests`. See the [offline contract](../../contracts/sdk/offline.md).
 
 ## Seller-hosted downloads
 
@@ -175,7 +192,7 @@ were:
 | `require_access` | 5.78126 µs/op | 3.02612 µs/op |
 | `snapshot` | 5.4326 µs/op | 2.99526 µs/op |
 
-The baseline uses the `4e735f8` source with only the same installed-storage
+The baseline uses the `4e735f8` source with the same installed-storage
 verification check and benchmark harness applied; it retains the internal JSON
 snapshot path. After timing, a separate 500-guard/500-snapshot verification
 pass observed 1,000 successful lease checks. The timed loops had zero writes

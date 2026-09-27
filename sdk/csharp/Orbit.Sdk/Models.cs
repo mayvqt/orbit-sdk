@@ -46,6 +46,7 @@ public sealed record Snapshot(
     TimeSpan RemainingOffline)
 {
     public int? PolicyVersion { get; init; }
+    public bool OfflineFileMode { get; init; }
     public bool HasFeature(string feature) => Entitlements.TryGetValue(feature, out var enabled) && enabled;
     internal static readonly IReadOnlyDictionary<string, bool> EmptyEntitlements =
         new ReadOnlyDictionary<string, bool>(new Dictionary<string, bool>());

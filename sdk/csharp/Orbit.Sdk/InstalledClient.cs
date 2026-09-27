@@ -5,7 +5,8 @@ namespace Orbit.Sdk;
 
 /// <summary>Test-only/internal representation derived from an app key.</summary>
 internal sealed record AppConfig(string ApiOrigin, string ApplicationId, string EnvironmentId, string Issuer,
-    string? StatePath = null, string? Fingerprint = null, string? FingerprintProvider = null);
+    string? StatePath = null, string? Fingerprint = null, string? FingerprintProvider = null,
+    OfflineKeys? OfflineKeys = null, string? PublicAppKey = null, AppKey? ParsedAppKey = null);
 
 internal sealed class InstalledLifetime
 {
@@ -69,8 +70,10 @@ public sealed partial class OrbitClient : IAsyncDisposable
     {
         options ??= new OrbitOptions();
         var fingerprint = ResolveFingerprint(key, options);
+        if (options.OfflineKeys != null && options.OfflineKeys.Environment != key.Environment)
+            throw new OrbitException(OrbitError.Configuration, "invalid_offline_keys");
         return new AppConfig(key.ApiOrigin, key.ApplicationId, key.EnvironmentId, key.Issuer,
-            options.StatePath, fingerprint?.Value, fingerprint?.Provider);
+            options.StatePath, fingerprint?.Value, fingerprint?.Provider, options.OfflineKeys, key.PublicKey(), key);
     }
     internal static Fingerprint? ResolveFingerprint(AppKey key, OrbitOptions? options)
     {
@@ -135,13 +138,17 @@ public sealed partial class OrbitClient : IAsyncDisposable
             client = new OrbitClient(config, new Device(record.Installation.Id, app.Fingerprint, app.FingerprintProvider), transport, storage, true)
             {
                 installed = storage,
-                lifetime = new InstalledLifetime()
+                lifetime = new InstalledLifetime(),
+                offlineKeys = app.OfflineKeys,
+                publicAppKey = app.PublicAppKey,
+                offlineAppKey = app.ParsedAppKey
             };
             transport.InstallationCancellation = client.lifetime.Cancellation.Token;
             if (record.PendingActivation != null)
                 storage.DropCache();
             else
                 await client.RestoreInstalledAsync(record).ConfigureAwait(false);
+            client.RestoreOffline(record);
             if (record.Credential != null && record.PendingActivation == null)
             {
                 try
@@ -165,6 +172,168 @@ public sealed partial class OrbitClient : IAsyncDisposable
             if (error is OrbitException)
                 throw;
             throw new OrbitException(OrbitError.Storage);
+        }
+    }
+
+    /// <summary>Returns the public, serializable installation request for authenticated offline issuance.</summary>
+    public OfflineRequest CreateOfflineRequest()
+    {
+        lock (gate)
+        {
+            SyncStorage();
+            if (installed == null || publicAppKey == null)
+                throw new OrbitException(OrbitError.Configuration);
+            return new OfflineRequest("orbit-offline-request", 1, publicAppKey, device.InstallationId,
+                device.Fingerprint, device.FingerprintProvider);
+        }
+    }
+
+    /// <summary>Verifies and durably selects a signed offline file without network access.</summary>
+    public Snapshot ImportOfflineFile(string signedFile, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(signedFile);
+        if (signedFile.Length is 0 or > OfflineKeys.MaximumFileBytes || signedFile.Any(c => !char.IsAscii(c)))
+            throw new OrbitException(OrbitError.InvalidResponse, "invalid_offline_file");
+        if (installed == null || offlineKeys == null || offlineAppKey == null)
+            throw new OrbitException(OrbitError.Configuration);
+        using var ownedOperation = InstallationOperation(cancellationToken);
+        var operationToken = ownedOperation?.Token ?? cancellationToken;
+        OrbitException.CheckCancellation(operationToken);
+        var expectedGeneration = Generation();
+#if ORBIT_LOCAL_DEVELOPMENT
+        InstalledStorageDiagnostics.OfflineImportQueued?.Invoke();
+#endif
+        try { serial.Wait(operationToken); }
+        catch (OperationCanceledException) { throw new OrbitException(OrbitError.Cancelled); }
+        try
+        {
+            lock (gate)
+            {
+                CheckGeneration(expectedGeneration);
+                OrbitException.CheckCancellation(operationToken);
+                var previous = installed.OfflineState();
+                var start = Clock.Capture();
+                var wall = start.WallSeconds;
+                if (wall < 0 || wall > OfflineKeys.MaximumTime)
+                    throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                var minimum = previous?.Sequence ?? 1;
+                var highTime = previous?.TimeHighWater ?? 0;
+                var highWall = previous?.WallHighWater ?? 0;
+                if (offlineClock is { } retained)
+                {
+                    highTime = Math.Max(highTime, retained.TimeHighWater);
+                    highWall = Math.Max(highWall, retained.WallHighWater);
+                }
+                if (wall + 30 < highWall)
+                    throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                var now = Math.Max(wall, highTime);
+                if (offlineClock is { } retainedClock)
+                {
+                    var anchoredNow = retainedClock.Anchor.Now();
+                    if (anchoredNow < highTime || wall < highWall - 30)
+                        throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                    now = Math.Max(now, anchoredNow);
+                }
+                var verified = offlineKeys.Verify(signedFile,
+                    new OfflineExpected(offlineAppKey, device, now, minimum));
+                if (previous != null && verified.Sequence == previous.Sequence &&
+                    (verified.IssuanceId != previous.IssuanceId || verified.ContentDigest != previous.ContentDigest))
+                    throw new OrbitException(OrbitError.Denied, "offline_sequence");
+                OrbitException.CheckCancellation(operationToken);
+                var trusted = Math.Max(now, verified.IssuedAt);
+                var anchor = offlineClock?.Anchor.AdvanceFloor(trusted) ?? new ClockAnchor(trusted, start);
+                var saved = new InstalledOffline(signedFile.Trim(' ', '\t', '\r', '\n', '\v', '\f'),
+                    verified.Sequence, verified.IssuanceId, verified.ContentDigest, now, trusted,
+                    Math.Max(highWall, wall));
+                storageVersion = installed.SaveOffline(storageVersion, saved);
+                offlineClock = new OfflineClockState(anchor, saved.TimeHighWater, saved.WallHighWater);
+                Clear();
+                try
+                {
+                    var current = anchor.Now();
+                    var currentWall = Clock.Capture().WallSeconds;
+                    if (currentWall + 30 < saved.WallHighWater || current < saved.TimeHighWater)
+                        throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                    if (operationToken.IsCancellationRequested)
+                        throw new OrbitException(OrbitError.Cancelled);
+                    var updated = saved with
+                    {
+                        TimeHighWater = Math.Max(saved.TimeHighWater, current),
+                        WallHighWater = Math.Max(saved.WallHighWater, currentWall)
+                    };
+                    if (updated != saved)
+                        installed.CheckpointOffline(updated);
+                    offlineClock = new OfflineClockState(anchor, updated.TimeHighWater,
+                        updated.WallHighWater, LastCheckpointElapsedTicks: Clock.ElapsedTicks());
+                    var afterWrite = anchor.Now();
+                    var afterWall = Clock.Capture().WallSeconds;
+                    if (afterWall + 30 < updated.WallHighWater || afterWrite < updated.TimeHighWater)
+                        throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                    if (afterWrite >= verified.ExpiresAt)
+                        throw new OrbitException(OrbitError.Denied, "offline_file_expired");
+                    if (operationToken.IsCancellationRequested)
+                        throw new OrbitException(OrbitError.Cancelled);
+                    offline = new OfflineRuntime(verified, anchor, updated,
+                        LastCheckpointElapsedTicks: Clock.ElapsedTicks());
+                    offlineFileMode = true;
+                    lifetime?.Signal();
+                    var snapshot = SnapshotOfflineLocked();
+                    if (operationToken.IsCancellationRequested)
+                        throw new OrbitException(OrbitError.Cancelled);
+                    return snapshot;
+                }
+                catch (OrbitException error) when (error.Error is OrbitError.Cancelled or OrbitError.ClockUncertain ||
+                    error.Error == OrbitError.Denied && error.Code == "offline_file_expired")
+                {
+                    try { storageVersion = installed.Invalidate(); }
+                    catch { Clear(); throw new OrbitException(OrbitError.Storage); }
+                    Clear();
+                    throw;
+                }
+                catch
+                {
+                    try { storageVersion = installed.Invalidate(); }
+                    catch { }
+                    Clear();
+                    throw new OrbitException(OrbitError.Storage);
+                }
+            }
+        }
+        finally { serial.Release(); }
+    }
+
+    private void RestoreOffline(InstalledRecord record)
+    {
+        if (record.Offline is not { } saved)
+            return;
+        var start = Clock.Capture();
+        var trustedNow = Math.Max(saved.TimeHighWater, start.WallSeconds);
+        var restoredAnchor = new ClockAnchor(trustedNow, start);
+        var uncertain = start.WallSeconds + 30 < saved.WallHighWater ||
+            saved.TimeHighWater < saved.VerifiedAt;
+        var restoredClock = new OfflineClockState(restoredAnchor, saved.TimeHighWater,
+            saved.WallHighWater, uncertain, Clock.ElapsedTicks());
+        offlineClock = restoredClock;
+        if (saved.Jws is not { } token)
+            return;
+        offlineFileMode = true;
+        if (offlineKeys == null || offlineAppKey == null)
+            throw new OrbitException(OrbitError.Configuration, "offline_keys_required");
+        try
+        {
+            var verified = offlineKeys.Verify(token,
+                new OfflineExpected(offlineAppKey, device, saved.VerifiedAt, saved.Sequence));
+            if (verified.Sequence != saved.Sequence || verified.IssuanceId != saved.IssuanceId ||
+                verified.ContentDigest != saved.ContentDigest || saved.VerifiedAt < verified.IssuedAt - 30 ||
+                saved.VerifiedAt >= verified.ExpiresAt)
+                throw new OrbitException(OrbitError.Storage);
+            offline = new OfflineRuntime(verified, restoredAnchor, saved, uncertain,
+                restoredClock.LastCheckpointElapsedTicks);
+        }
+        catch (Exception error) when (error is OrbitException or OverflowException)
+        {
+            if (error is OrbitException { Error: OrbitError.Configuration }) throw;
+            throw new OrbitException(OrbitError.Storage, "offline_state_invalid");
         }
     }
 
@@ -201,6 +370,54 @@ public sealed partial class OrbitClient : IAsyncDisposable
 
     private void CheckpointInstalled(bool force)
     {
+        if (offlineFileMode && offline is { } offlineRuntime)
+        {
+            var continuity = offlineClock ?? new OfflineClockState(offlineRuntime.Anchor,
+                offlineRuntime.Saved.TimeHighWater, offlineRuntime.Saved.WallHighWater,
+                offlineRuntime.Uncertain, offlineRuntime.LastCheckpointElapsedTicks);
+            if (!force && Clock.ElapsedTicks() - continuity.LastCheckpointElapsedTicks < TimeSpan.TicksPerMinute)
+                return;
+            try
+            {
+                var now = continuity.Anchor.Now();
+                var wall = Clock.Capture().WallSeconds;
+                if (now < continuity.TimeHighWater || wall < continuity.WallHighWater - 30)
+                    throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+                var saved = offlineRuntime.Saved with
+                {
+                    TimeHighWater = Math.Max(continuity.TimeHighWater, now),
+                    WallHighWater = Math.Max(continuity.WallHighWater, wall)
+                };
+                // Snapshots advance the in-memory floor without performing IO.
+                // Compare against the durable copy so a later transition still
+                // checkpoints every elapsed second before clearing authority.
+                if (installed!.OfflineState() is not { } persisted || saved != persisted)
+                    installed!.CheckpointOffline(saved);
+                var elapsed = Clock.ElapsedTicks();
+                offlineClock = continuity with
+                {
+                    TimeHighWater = saved.TimeHighWater,
+                    WallHighWater = saved.WallHighWater,
+                    Uncertain = false,
+                    LastCheckpointElapsedTicks = elapsed
+                };
+                offline = offlineRuntime with
+                {
+                    Anchor = continuity.Anchor,
+                    Saved = saved,
+                    Uncertain = false,
+                    LastCheckpointElapsedTicks = elapsed
+                };
+                lifetime!.LastCheckpoint = elapsed;
+            }
+            catch (OrbitException)
+            {
+                offlineClock = continuity with { Uncertain = true };
+                offline = offlineRuntime with { Uncertain = true };
+                throw;
+            }
+            return;
+        }
         if (installed == null || lifetime == null || claims == null || anchor == null)
             return;
         if (!force && Clock.ElapsedTicks() - lifetime.LastCheckpoint < TimeSpan.TicksPerMinute)
@@ -279,7 +496,14 @@ public sealed partial class OrbitClient : IAsyncDisposable
         }
         lock (client.gate)
         {
-            if (client.credential == null || client.disposed != 0)
+            if (client.disposed != 0)
+                return Timeout.InfiniteTimeSpan;
+            if (client.offlineFileMode && client.offline != null)
+            {
+                var checkpoint = client.lifetime!.LastCheckpoint + TimeSpan.TicksPerMinute - Clock.ElapsedTicks();
+                return TimeSpan.FromTicks(Math.Clamp(checkpoint, TimeSpan.TicksPerMillisecond * 10, TimeSpan.TicksPerMinute));
+            }
+            if (client.credential == null)
                 return Timeout.InfiniteTimeSpan;
             var nowTicks = Clock.ElapsedTicks();
             if (client.nextRetryElapsedTicks == long.MaxValue)

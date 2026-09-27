@@ -85,6 +85,8 @@ public sealed class AppKey
     private static bool Opaque(ReadOnlySpan<char> value) => value.Length is >= 1 and <= 128 &&
         value.IndexOfAnyExcept("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") < 0;
 
+    internal string PublicKey() => $"orbit_app_{Environment}_{JsonWire.EncodeBase64(Encoding.UTF8.GetBytes(ApiOrigin))}.{ApplicationId}.{EnvironmentId}";
+
     private static OrbitException InvalidKey() => new(OrbitError.Configuration, "invalid_app_key");
 }
 
@@ -97,4 +99,6 @@ public sealed record OrbitOptions
     public string? StatePath { get; init; }
     public bool DisableMachineBinding { get; init; }
     public Fingerprint? Fingerprint { get; init; }
+    /// <summary>Trusted offline-purpose public keys. These keys are never read from an imported file.</summary>
+    public OfflineKeys? OfflineKeys { get; init; }
 }

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Orbit.Sdk;
 
@@ -14,9 +15,16 @@ internal sealed record OfflineFile(string Token, string KeyId, string LicenceId,
     public override string ToString() => "OfflineFile(<redacted>)";
 }
 
+internal sealed record OfflineRuntime(OfflineFile File, ClockAnchor Anchor, InstalledOffline Saved,
+    bool Uncertain = false, long LastCheckpointElapsedTicks = 0);
+
+internal sealed record OfflineClockState(ClockAnchor Anchor, long TimeHighWater, long WallHighWater,
+    bool Uncertain = false, long LastCheckpointElapsedTicks = 0);
+
 // Original signed files, sequence floors and clock evidence are integrated by
 // the installed client separately. This verifier alone is not restored access.
-internal sealed class OfflineKeys
+/// <summary>Trusted offline-purpose verification keys configured by the application.</summary>
+public sealed class OfflineKeys
 {
     internal const int MaximumFileBytes = 16384;
     internal const long MaximumLifetime = 366L * 86400;
@@ -27,7 +35,18 @@ internal sealed class OfflineKeys
 
     private OfflineKeys(string environment) => this.environment = environment;
 
-    internal static OfflineKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
+    /// <summary>Parse a trusted public JWKS for one app-key environment.</summary>
+    public static OfflineKeys Parse(string jwksJson, string environment)
+    {
+        ArgumentNullException.ThrowIfNull(jwksJson);
+        if (Encoding.UTF8.GetByteCount(jwksJson) > MaximumFileBytes) throw InvalidKeys();
+        return Parse(Encoding.UTF8.GetBytes(jwksJson), environment);
+    }
+
+    /// <summary>Parse a trusted public JWKS for one app-key environment.</summary>
+    internal string Environment => environment;
+
+    public static OfflineKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
     {
         if (bytes.Length > MaximumFileBytes) throw InvalidKeys();
         try { return Parse(JsonWire.Parse(bytes), environment); }
@@ -165,3 +184,12 @@ internal sealed class OfflineKeys
     private static OrbitException InvalidKeys() => new(OrbitError.InvalidResponse, "invalid_offline_keys");
     private static OrbitException InvalidFile() => new(OrbitError.InvalidResponse, "invalid_offline_file");
 }
+
+/// <summary>Public installation information to send to an authenticated seller for offline issuance.</summary>
+public sealed record OfflineRequest(
+    [property: JsonPropertyName("format")] string Format,
+    [property: JsonPropertyName("version")] int Version,
+    [property: JsonPropertyName("app_key")] string AppKey,
+    [property: JsonPropertyName("installation_id")] string InstallationId,
+    [property: JsonPropertyName("fingerprint"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Fingerprint,
+    [property: JsonPropertyName("fingerprint_provider"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? FingerprintProvider);

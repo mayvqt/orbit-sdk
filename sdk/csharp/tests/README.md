@@ -27,8 +27,9 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --o
 All 104 shared cases exercise the separate offline purpose, keys, scope, binding,
 expiry and sequence floor. Additional checks compare the canonical claim digest
 with Python, reorder signed JSON fields, and enforce immutable entitlements and
-bounded strict keys. This corpus tests signed-file verification; durable import,
-renewal and restart behavior require separate lifecycle checks.
+bounded strict keys. The installed suite also imports and restores a format-3
+file, rejects equal-sequence conflicts, permits expired-file renewal, checks
+restart downtime and confirms no network calls or prompts in file mode.
 
 ## Seller download-ticket verification
 
@@ -64,7 +65,7 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:Orb
 This suite checks cancellation, retries, logout, offline expiry, malformed
 responses, device parsing and credential storage. The installed suite also covers
 first activation, restart, cached access, uncertain mutations, private file ownership,
-clock failure, cancellation and automatic refresh. Test HTTP servers bind to
+clock failure, cancellation, automatic refresh and offline-file lifecycle. Test HTTP servers bind to
 loopback only. The build flag permits those local test connections; ordinary
 application builds require HTTPS.
 

@@ -72,6 +72,45 @@ Customer accounts are separate from Orbit dashboard accounts. When account
 authentication is enabled, call `login`, inspect `owned_licences`, then use
 `activate_account` and `require_access`. Login alone grants no licensed access.
 
+## Long-term offline files
+
+When a licence policy enables `offline_file_seconds`, configure the trusted
+offline-purpose public keys, export the current installation request, and import
+the signed `.orbit` file returned through your authorized issuance workflow:
+
+```cpp
+#include <orbit_sdk.hpp>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+std::string read_file(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void run_offline(const std::string& app_key) {
+    auto keys = orbit::OfflineKeys::parse(read_file("trusted-offline-jwks.json"), "test");
+    orbit::Options options;
+    options.offline_keys = keys;
+    auto client = orbit::Client::open(app_key, options);
+    std::cout << client.offline_request().to_json() << '\n';
+    // Transfer this public request to an authorized seller/customer issuance flow.
+    const auto snapshot = client.import_offline_file(read_file("licence.orbit"));
+    if (snapshot.has_feature("export")) client.require_access("export");
+    client.close();
+}
+```
+
+The importer stores the original signed file, renewal sequence and clock floors
+before exposing its features. Offline guards make no HTTP request, refresh or
+key prompt. Reopening an active file requires currently configured trusted
+offline-purpose keys that still verify the file, allowing trusted key rotation.
+Logout clears local authority while retaining renewal and time floors; the signed
+file cannot be revoked while disconnected. `OwnedLicence::offline_file_duration`
+reports the server's `offline_file_seconds` policy.
+
 See the [runnable example](../../examples/cpp/README.md) and
 [advanced usage](advanced.md) for storage options, cancellation and account APIs.
 The library target for consumers building alongside this checkout is

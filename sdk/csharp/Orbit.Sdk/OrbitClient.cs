@@ -25,6 +25,12 @@ public sealed partial class OrbitClient : IDisposable
     private bool transient;
     private long nextRetryElapsedTicks;
     private int disposed;
+    private bool offlineFileMode;
+    private OfflineRuntime? offline;
+    private OfflineClockState? offlineClock;
+    private OfflineKeys? offlineKeys;
+    private string? publicAppKey;
+    private AppKey? offlineAppKey;
 
     public StorageCapability StorageCapability { get; }
 
@@ -81,6 +87,8 @@ public sealed partial class OrbitClient : IDisposable
     private Snapshot SnapshotLocked()
     {
         SyncStorage();
+        if (offlineFileMode)
+            return SnapshotOfflineLocked();
         long? now = null;
         if (anchor != null)
         {
@@ -97,6 +105,43 @@ public sealed partial class OrbitClient : IDisposable
             }
         }
         return SnapshotState(now);
+    }
+
+    private Snapshot SnapshotOfflineLocked()
+    {
+        var runtime = offline ?? throw new OrbitException(OrbitError.Storage);
+        var continuity = offlineClock ?? new OfflineClockState(runtime.Anchor,
+            runtime.Saved.TimeHighWater, runtime.Saved.WallHighWater, runtime.Uncertain,
+            runtime.LastCheckpointElapsedTicks);
+        long now;
+        long wall;
+        try
+        {
+            now = continuity.Anchor.Now();
+            wall = Clock.Capture().WallSeconds;
+            if (wall < continuity.WallHighWater - 30 || now < continuity.TimeHighWater)
+                throw new OrbitException(OrbitError.ClockUncertain, "clock_uncertain");
+        }
+        catch (OrbitException error) when (error.Error == OrbitError.ClockUncertain)
+        {
+            offlineClock = continuity with { Uncertain = true };
+            offline = runtime with { Uncertain = true };
+            throw;
+        }
+        var highTime = Math.Max(continuity.TimeHighWater, now);
+        var highWall = Math.Max(continuity.WallHighWater, wall);
+        var saved = runtime.Saved with { TimeHighWater = highTime, WallHighWater = highWall };
+        offlineClock = continuity with { TimeHighWater = highTime, WallHighWater = highWall, Uncertain = false };
+        offline = runtime with { Saved = saved, Uncertain = false };
+        var expired = now >= runtime.File.ExpiresAt;
+        return new Snapshot(expired ? Access.Expired : Access.Offline,
+            expired ? global::Orbit.Sdk.Snapshot.EmptyEntitlements : runtime.File.Entitlements,
+            DateTimeOffset.FromUnixTimeSeconds(runtime.File.ExpiresAt), null, null, false, true,
+            TimeSpan.FromSeconds(now >= runtime.File.ExpiresAt ? 0 : runtime.File.ExpiresAt - now))
+        {
+            PolicyVersion = runtime.File.PolicyVersion,
+            OfflineFileMode = true
+        };
     }
 
     private Snapshot SnapshotState(long? now)
@@ -133,7 +178,12 @@ public sealed partial class OrbitClient : IDisposable
             throw new OrbitException(OrbitError.Storage);
         }
         if (version < 0) { Clear(); throw new OrbitException(OrbitError.Storage); }
-        if (version != storageVersion) { Clear(); storageVersion = version; }
+        if (version != storageVersion)
+        {
+            Clear();
+            offlineClock = null;
+            storageVersion = version;
+        }
     }
 
     private void InvalidateStorage(bool clearPending = true)
@@ -144,6 +194,14 @@ public sealed partial class OrbitClient : IDisposable
             lifetime?.Signal();
         }
         catch (Exception) { Clear(); throw new OrbitException(OrbitError.Storage); }
+    }
+
+    private void CheckpointOfflineBeforeTransition()
+    {
+        if (!offlineFileMode || offline == null)
+            return;
+        try { CheckpointInstalled(true); }
+        catch (OrbitException error) when (error.Error == OrbitError.ClockUncertain) { }
     }
 
     private long Generation()
@@ -165,13 +223,15 @@ public sealed partial class OrbitClient : IDisposable
         anchor = null;
         transient = false;
         nextRetryElapsedTicks = 0;
+        offline = null;
+        offlineFileMode = false;
         if (!keepAccount) session = null;
     }
 
     /// <summary>Clear local access synchronously. This neither revokes the server session nor frees a device slot.</summary>
     public void Logout()
     {
-        lock (gate) { Clear(); InvalidateStorage(); }
+        lock (gate) { SyncStorage(); CheckpointOfflineBeforeTransition(); Clear(); InvalidateStorage(); }
     }
 
     public Task<Snapshot> ActivateAsync(string licenceKey, string? idempotencyKey = null,
@@ -200,6 +260,7 @@ public sealed partial class OrbitClient : IDisposable
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
                 customerSession = account ? (session?.Token ?? throw new OrbitException(OrbitError.ReauthenticationRequired)) : null;
+                CheckpointOfflineBeforeTransition();
                 if (installed != null)
                     (idempotencyKey, storageVersion) = installed.Begin(principal, account, previousCredential,
                         idempotencyKey, account ? session?.Account.Customer.Id : null);
@@ -234,6 +295,8 @@ public sealed partial class OrbitClient : IDisposable
             {
                 CheckGeneration(expected);
                 OrbitException.CheckCancellation(cancellationToken);
+                if (offlineFileMode)
+                    return SnapshotLocked();
                 if (installed?.Record.PendingActivation != null)
                     throw new OrbitException(OrbitError.Storage, "pending_activation");
                 saved = credential ?? throw new OrbitException(OrbitError.ReauthenticationRequired);
@@ -260,6 +323,14 @@ public sealed partial class OrbitClient : IDisposable
         {
             snapshot = SnapshotLocked();
             OrbitException.CheckCancellation(cancellationToken);
+            if (offlineFileMode)
+            {
+                if (snapshot.Access == Access.Expired)
+                    throw new OrbitException(OrbitError.Denied, "offline_file_expired");
+                if (!snapshot.HasFeature(feature))
+                    throw new OrbitException(OrbitError.FeatureUnavailable, "feature_unavailable");
+                return snapshot;
+            }
             if (snapshot.Access == Access.Online)
             {
                 if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
@@ -331,6 +402,8 @@ public sealed partial class OrbitClient : IDisposable
             {
                 var snapshot = SnapshotLocked();
                 OrbitException.CheckCancellation(cancellationToken);
+                if (snapshot.OfflineFileMode)
+                    return snapshot;
                 if (snapshot.Access is not (Access.RefreshRequired or Access.Expired or Access.Offline) || !RetryDueLocked())
                     return snapshot;
                 if (installed?.Record.PendingActivation != null)
@@ -354,7 +427,17 @@ public sealed partial class OrbitClient : IDisposable
         lock (gate)
         {
             SyncStorage();
-            saved = credential ?? throw new OrbitException(OrbitError.ReauthenticationRequired);
+            CheckpointOfflineBeforeTransition();
+            if (credential == null)
+            {
+                if (offlineFileMode)
+                {
+                    Clear(keepAccount: true);
+                    InvalidateStorage();
+                }
+                throw new OrbitException(OrbitError.ReauthenticationRequired);
+            }
+            saved = credential;
             Clear(keepAccount: true);
             InvalidateStorage();
             expected = generation;

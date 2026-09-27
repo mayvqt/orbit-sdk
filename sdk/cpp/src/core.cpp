@@ -295,9 +295,11 @@ Json::Value owned_licence(const Json::Value& input) {
     const auto hwid_locked = boolean(required(input, "hwid_locked"));
     const auto offline_allowed = boolean(required(input, "offline_allowed"));
     const auto offline_seconds = integer(required(input, "offline_seconds"));
+    const auto offline_file_seconds = integer(required(input, "offline_file_seconds"));
     const auto& entitlements = required(input, "entitlements");
     if (!opaque(id) || device_limit < 1 || device_limit > 100 || entitlements.size() > 64 ||
         utf8_characters(policy) > 80 || offline_seconds < INT32_MIN || offline_seconds > INT32_MAX ||
+        (offline_file_seconds != 0 && (offline_file_seconds < 86400 || offline_file_seconds > 31622400)) ||
         device_limit > INT32_MAX) invalid_response();
     if (first_used) (void)timestamp(*first_used);
     if (expires) (void)timestamp(*expires);
@@ -319,6 +321,7 @@ Json::Value owned_licence(const Json::Value& input) {
     output["hwid_locked"] = hwid_locked;
     output["offline_allowed"] = offline_allowed;
     output["offline_seconds"] = static_cast<Json::Int64>(offline_seconds);
+    output["offline_file_seconds"] = static_cast<Json::Int64>(offline_file_seconds);
     output["entitlements"] = std::move(entitlement_output);
     return output;
 }
@@ -409,6 +412,7 @@ void ClientState::clear_access_locked() {
     credential.reset();
     claims.reset();
     anchor.reset();
+    offline.reset();
     transient = false;
     retry_deadline.reset();
 }
@@ -424,6 +428,8 @@ void ClientState::invalidate_locked(bool clear_pending) {
         persistent_record["credential"] = null_value();
         if (clear_pending) persistent_record["pending_activation"] = null_value();
         persistent_record["access"] = null_value();
+        if (persistent_record.isMember("offline") && persistent_record["offline"].isObject())
+            persistent_record["offline"]["jws"] = null_value();
         persist_record_locked();
         return;
     }
@@ -436,6 +442,7 @@ void ClientState::sync_storage_locked() {
             credential.reset();
             claims.reset();
             anchor.reset();
+            offline.reset();
             customer.reset();
             transient = false;
             retry_deadline.reset();
@@ -452,6 +459,7 @@ void ClientState::sync_storage_locked() {
             credential.reset();
             claims.reset();
             anchor.reset();
+            offline.reset();
             customer.reset();
             transient = false;
             retry_deadline.reset();
@@ -551,6 +559,7 @@ std::string ClientState::account_path(std::string_view path,
 }
 
 ::orbit::Snapshot ClientState::snapshot_locked(bool tolerate_clock_error) {
+    if (offline) return offline_snapshot_locked();
     ::orbit::Snapshot result;
     result.access = credential ? ::orbit::Access::refresh_required : ::orbit::Access::denied;
     result.reauthentication_required = !credential.has_value();
@@ -602,11 +611,275 @@ std::string ClientState::account_path(std::string_view path,
     return result;
 }
 
+::orbit::Snapshot ClientState::offline_snapshot_locked() {
+    if (!offline) raise(ErrorKind::storage, "offline_state_unavailable");
+    auto& current = *offline;
+    if (!offline_clock) {
+        offline_clock = OfflineClockState{current.anchor, current.time_high_water,
+            current.wall_high_water, current.uncertain, current.last_checkpoint};
+    }
+    std::int64_t now = 0;
+    try {
+        now = offline_clock->anchor.now();
+        const auto wall = capture_clock().wall_seconds;
+        if (wall < offline_clock->wall_high_water - 30 || now < offline_clock->time_high_water)
+            raise(ErrorKind::clock_uncertain, "clock_uncertain");
+        offline_clock->time_high_water = std::max(offline_clock->time_high_water, now);
+        offline_clock->wall_high_water = std::max(offline_clock->wall_high_water, wall);
+        offline_clock->uncertain = false;
+        current.anchor = offline_clock->anchor;
+        current.time_high_water = offline_clock->time_high_water;
+        current.wall_high_water = offline_clock->wall_high_water;
+        current.uncertain = false;
+    } catch (const Error& error) {
+        if (error.kind() == ErrorKind::clock_uncertain) {
+            offline_clock->uncertain = true;
+            current.uncertain = true;
+        }
+        throw;
+    }
+    ::orbit::Snapshot result;
+    const bool expired = now >= current.file.expires_at;
+    result.access = expired ? ::orbit::Access::expired : ::orbit::Access::offline;
+    result.expires_at = ::orbit::Timestamp(std::chrono::seconds(current.file.expires_at));
+    result.offline_allowed = true;
+    result.offline_file_mode = true;
+    result.policy_version = current.file.policy_version;
+    result.remaining_offline = std::chrono::seconds(expired ? 0 : current.file.expires_at - now);
+    if (!expired) result.entitlements = current.file.entitlements;
+    return result;
+}
+
 ::orbit::Snapshot ClientState::snapshot() {
     ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
     sync_storage_locked();
     return snapshot_locked(true);
+}
+
+::orbit::OfflineRequest ClientState::offline_request() {
+    ClientOperation call(*this);
+    std::lock_guard<std::mutex> lock(mutex);
+    sync_storage_locked();
+    if (!persistent || !config.public_app_key || !config.installation_id)
+        raise(ErrorKind::configuration, "configuration");
+    return {*config.public_app_key, *config.installation_id,
+            config.fingerprint ? std::optional<std::string>(config.fingerprint->value) : std::nullopt,
+            config.fingerprint ? std::optional<std::string>(config.fingerprint->provider) : std::nullopt};
+}
+
+void ClientState::restore_offline() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!persistent_record.isObject() || !persistent_record.isMember("offline") ||
+        persistent_record["offline"].isNull()) return;
+    const auto& saved = persistent_record["offline"];
+    const auto time_high = json_int64(saved["time_high_water"]);
+    const auto wall_high = json_int64(saved["wall_high_water"]);
+    const auto start = capture_clock();
+    const auto trusted = std::max(time_high, start.wall_seconds);
+    const bool uncertain = start.wall_seconds + 30 < wall_high || time_high < json_int64(saved["verified_at"]);
+    ClockAnchor restored_anchor{trusted, start.elapsed_nanoseconds, start.wall_seconds};
+    offline_clock = OfflineClockState{restored_anchor, time_high, wall_high, uncertain,
+        std::chrono::steady_clock::now()};
+    if (saved["jws"].isNull()) return;
+    if (!config.offline_keys || !config.public_app_key || !config.installation_id)
+        raise(ErrorKind::configuration, "offline_keys_required");
+    try {
+        const auto token = saved["jws"].asString();
+        const auto verified_at = json_int64(saved["verified_at"]);
+        const auto sequence = json_int64(saved["sequence"]);
+        const auto app_key = ::orbit::AppKey::parse(*config.public_app_key);
+        auto verified = config.offline_keys->verify(token,
+            OfflineExpected{app_key, *config.installation_id, config.fingerprint, verified_at, sequence});
+        if (verified.sequence != sequence || verified.issuance_id != saved["issuance_id"].asString() ||
+            verified.content_digest != saved["content_digest"].asString() ||
+            verified_at < verified.issued_at - 30 || verified_at >= verified.expires_at)
+            raise(ErrorKind::corrupt_state, "offline_state_invalid");
+        offline = OfflineRuntime{std::move(verified), restored_anchor,
+            time_high, wall_high, uncertain, offline_clock->last_checkpoint};
+    } catch (const Error& error) {
+        if (error.kind() == ErrorKind::configuration) throw;
+        if (error.kind() == ErrorKind::clock_uncertain) throw;
+        raise(ErrorKind::corrupt_state, "offline_state_invalid");
+    } catch (...) {
+        raise(ErrorKind::corrupt_state, "offline_state_invalid");
+    }
+}
+
+::orbit::Snapshot ClientState::import_offline_file(
+    std::string_view input, const std::atomic_bool& cancelled) {
+    ClientOperation call(*this);
+    if (!persistent || !config.offline_keys || !config.public_app_key || !config.installation_id)
+        raise(ErrorKind::configuration, "offline_keys_required");
+    if (input.empty() || input.size() > 16384 ||
+        std::any_of(input.begin(), input.end(), [](unsigned char c) { return c > 127; }))
+        raise(ErrorKind::invalid_response, "invalid_offline_file");
+    throw_if_cancelled(cancelled);
+    const auto expected_generation = generation();
+    auto serial_lock = lock_serial(cancelled);
+    std::lock_guard<std::mutex> lock(mutex);
+    sync_storage_locked();
+    if (current_generation != expected_generation)
+        raise(ErrorKind::stale_response, "stale_response");
+    throw_if_cancelled(cancelled);
+
+    const Json::Value previous = persistent_record.isMember("offline")
+        ? persistent_record["offline"] : Json::Value(Json::nullValue);
+    std::int64_t minimum = 1, old_time = 0, old_wall = 0;
+    if (previous.isObject()) {
+        minimum = json_int64(previous["sequence"]);
+        old_time = json_int64(previous["time_high_water"]);
+        old_wall = json_int64(previous["wall_high_water"]);
+    }
+    if (offline_clock) {
+        old_time = std::max(old_time, offline_clock->time_high_water);
+        old_wall = std::max(old_wall, offline_clock->wall_high_water);
+    }
+    const auto start = capture_clock();
+    if (start.wall_seconds < 0 || start.wall_seconds > 253402300799LL ||
+        start.wall_seconds + 30 < old_wall)
+        raise(ErrorKind::clock_uncertain, "clock_uncertain");
+    auto now = std::max(start.wall_seconds, old_time);
+    if (offline_clock) {
+        try {
+            const auto current = offline_clock->anchor.now();
+            if (current < old_time || start.wall_seconds + 30 < old_wall) {
+                offline_clock->uncertain = true;
+                if (offline) offline->uncertain = true;
+                raise(ErrorKind::clock_uncertain, "clock_uncertain");
+            }
+            now = std::max(now, current);
+        } catch (const Error& error) {
+            if (error.kind() == ErrorKind::clock_uncertain) {
+                offline_clock->uncertain = true;
+                if (offline) offline->uncertain = true;
+            }
+            throw;
+        }
+    }
+    const auto app_key = ::orbit::AppKey::parse(*config.public_app_key);
+    const auto verified = config.offline_keys->verify(input,
+        OfflineExpected{app_key, *config.installation_id, config.fingerprint, now, minimum});
+    if (previous.isObject() && verified.sequence == minimum &&
+        (verified.issuance_id != previous["issuance_id"].asString() ||
+         verified.content_digest != previous["content_digest"].asString()))
+        raise(ErrorKind::denied, "offline_sequence");
+    throw_if_cancelled(cancelled);
+
+    const auto trusted = std::max(now, verified.issued_at);
+    ClockAnchor import_anchor = offline_clock
+        ? offline_clock->anchor : ClockAnchor{trusted, start.elapsed_nanoseconds, start.wall_seconds};
+    const auto anchored_now = import_anchor.now();
+    if (trusted > anchored_now) {
+        const auto advance = trusted - anchored_now;
+        if (advance > std::numeric_limits<std::int64_t>::max() - import_anchor.server_seconds)
+            raise(ErrorKind::clock_uncertain, "clock_uncertain");
+        import_anchor.server_seconds += advance;
+    }
+
+    if (current_generation >= persistent_codec::max_generation)
+        raise(ErrorKind::storage, "installation_generation_exhausted");
+    ++current_generation;
+    Json::Value saved(Json::objectValue);
+    saved["jws"] = verified.token;
+    saved["sequence"] = static_cast<Json::Int64>(verified.sequence);
+    saved["issuance_id"] = verified.issuance_id;
+    saved["content_digest"] = verified.content_digest;
+    saved["verified_at"] = static_cast<Json::Int64>(now);
+    saved["time_high_water"] = static_cast<Json::Int64>(std::max(now, verified.issued_at));
+    saved["wall_high_water"] = static_cast<Json::Int64>(std::max(old_wall, start.wall_seconds));
+    Json::Value candidate = persistent_record;
+    candidate["format"] = 3;
+    candidate["generation"] = static_cast<Json::UInt64>(current_generation);
+    candidate["credential"] = null_value();
+    candidate["pending_activation"] = null_value();
+    candidate["access"] = null_value();
+    candidate["offline"] = saved;
+    commit_persistent_locked(std::move(candidate));
+    offline_clock = OfflineClockState{import_anchor,
+        json_int64(persistent_record["offline"]["time_high_water"]),
+        json_int64(persistent_record["offline"]["wall_high_water"]), false,
+        std::chrono::steady_clock::now()};
+    credential.reset();
+    claims.reset();
+    anchor.reset();
+    customer.reset();
+    transient = false;
+    retry_deadline.reset();
+    offline.reset();
+
+    OfflineRuntime runtime{verified, import_anchor,
+        json_int64(persistent_record["offline"]["time_high_water"]),
+        json_int64(persistent_record["offline"]["wall_high_water"]), false,
+        offline_clock->last_checkpoint};
+    bool durable_cleared = false;
+    auto abandon = [&](ErrorKind reason, std::string code) -> void {
+        offline.reset();
+        if (persistence_failed.load(std::memory_order_relaxed))
+            raise(ErrorKind::storage, "installation_state_write_failed");
+        if (current_generation >= persistent_codec::max_generation)
+            raise(ErrorKind::storage, "installation_generation_exhausted");
+        ++current_generation;
+        auto cleared = persistent_record;
+        cleared["generation"] = static_cast<Json::UInt64>(current_generation);
+        cleared["credential"] = null_value();
+        cleared["access"] = null_value();
+        cleared["pending_activation"] = null_value();
+        const auto time_floor = std::max(runtime.time_high_water,
+            offline_clock ? offline_clock->time_high_water : std::int64_t{0});
+        const auto wall_floor = std::max(runtime.wall_high_water,
+            offline_clock ? offline_clock->wall_high_water : std::int64_t{0});
+        cleared["offline"]["time_high_water"] = static_cast<Json::Int64>(time_floor);
+        cleared["offline"]["wall_high_water"] = static_cast<Json::Int64>(wall_floor);
+        cleared["offline"]["jws"] = null_value();
+        try { commit_persistent_locked(std::move(cleared)); }
+        catch (...) { raise(ErrorKind::storage, "installation_state_write_failed"); }
+        if (offline_clock) {
+            offline_clock->time_high_water = time_floor;
+            offline_clock->wall_high_water = wall_floor;
+            if (reason == ErrorKind::clock_uncertain) offline_clock->uncertain = true;
+        }
+        durable_cleared = true;
+        raise(reason, std::move(code));
+    };
+    try {
+        throw_if_cancelled(cancelled);
+        const auto sampled_now = runtime.anchor.now();
+        const auto sampled_wall = capture_clock().wall_seconds;
+        if (sampled_wall + 30 < runtime.wall_high_water || sampled_now < runtime.time_high_water)
+            abandon(ErrorKind::clock_uncertain, "clock_uncertain");
+        runtime.time_high_water = std::max(runtime.time_high_water, sampled_now);
+        runtime.wall_high_water = std::max(runtime.wall_high_water, sampled_wall);
+        if (sampled_now >= runtime.file.expires_at)
+            abandon(ErrorKind::denied, "offline_file_expired");
+        auto checkpoint = persistent_record;
+        checkpoint["offline"]["time_high_water"] = static_cast<Json::Int64>(runtime.time_high_water);
+        checkpoint["offline"]["wall_high_water"] = static_cast<Json::Int64>(runtime.wall_high_water);
+        if (checkpoint != persistent_record) commit_persistent_locked(std::move(checkpoint));
+        offline_clock->time_high_water = runtime.time_high_water;
+        offline_clock->wall_high_water = runtime.wall_high_water;
+        throw_if_cancelled(cancelled);
+        const auto after_write = runtime.anchor.now();
+        const auto after_wall = capture_clock().wall_seconds;
+        if (after_wall + 30 < runtime.wall_high_water || after_write < runtime.time_high_water)
+            abandon(ErrorKind::clock_uncertain, "clock_uncertain");
+        runtime.time_high_water = std::max(runtime.time_high_water, after_write);
+        runtime.wall_high_water = std::max(runtime.wall_high_water, after_wall);
+        if (after_write >= runtime.file.expires_at)
+            abandon(ErrorKind::denied, "offline_file_expired");
+        throw_if_cancelled(cancelled);
+        offline = std::move(runtime);
+        const auto snapshot = offline_snapshot_locked();
+        throw_if_cancelled(cancelled);
+        return snapshot;
+    } catch (const Error& error) {
+        if (durable_cleared || persistence_failed.load(std::memory_order_relaxed)) throw;
+        abandon(error.kind(), error.code());
+    } catch (...) {
+        if (durable_cleared || persistence_failed.load(std::memory_order_relaxed)) throw;
+        abandon(ErrorKind::storage, "installation_state_write_failed");
+    }
+    raise(ErrorKind::internal, "offline_import_failed");
 }
 
 std::pair<Credential, GrantClaims> ClientState::verify_reply(
@@ -827,6 +1100,7 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
         throw_if_cancelled(cancelled);
+        checkpoint_offline_before_transition_locked();
         if (persistent) {
             std::optional<std::string> customer_identity;
             if (account_licence) {
@@ -876,6 +1150,9 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
             retry_deadline.reset();
             candidate["credential"] = null_value();
             candidate["access"] = null_value();
+            if (candidate.isMember("offline") && candidate["offline"].isObject())
+                candidate["offline"]["jws"] = null_value();
+            offline.reset();
             if (candidate != persistent_record) {
                 commit_persistent_locked(std::move(candidate));
             }
@@ -932,11 +1209,13 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         throw_if_cancelled(cancelled);
         if (if_needed) {
             const auto current = snapshot_locked(true);
+            if (current.offline_file_mode) return current;
             const bool refreshable = current.access == ::orbit::Access::refresh_required ||
                 current.access == ::orbit::Access::expired || current.access == ::orbit::Access::offline;
             const bool due = !retry_deadline || std::chrono::steady_clock::now() >= *retry_deadline;
             if (!refreshable || !due) return current;
         }
+        if (offline) return snapshot_locked(true);
         if (!credential) raise(ErrorKind::reauthentication_required, "reauthentication_required");
         saved = *credential;
         request_generation = current_generation;
@@ -966,6 +1245,14 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         sync_storage_locked();
         throw_if_cancelled(cancelled);
         const auto current = snapshot_locked(true);
+        if (current.offline_file_mode) {
+            if (current.access == ::orbit::Access::expired)
+                raise(ErrorKind::denied, "offline_file_expired");
+            if (current.access != ::orbit::Access::offline)
+                raise(ErrorKind::not_activated, "access_unavailable");
+            if (!current.has_feature(feature)) raise(ErrorKind::feature_unavailable, "feature_unavailable");
+            return current;
+        }
         if (current.access == ::orbit::Access::online) {
             if (!current.has_feature(feature)) {
                 raise(ErrorKind::feature_unavailable, "feature_unavailable");
@@ -1006,7 +1293,14 @@ void ClientState::deactivate(std::string_view idempotency_key, const std::atomic
     {
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
-        if (!credential) raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        checkpoint_offline_before_transition_locked();
+        if (!credential) {
+            if (offline) {
+                clear_access_locked();
+                invalidate_locked();
+            }
+            raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        }
         saved = *credential;
         clear_access_locked();
         invalidate_locked();
@@ -1027,6 +1321,8 @@ void ClientState::deactivate(std::string_view idempotency_key, const std::atomic
 void ClientState::local_logout() {
     ClientOperation call(*this);
     std::lock_guard<std::mutex> lock(mutex);
+    sync_storage_locked();
+    checkpoint_offline_before_transition_locked();
     clear_all_locked();
     invalidate_locked();
 }
@@ -1154,6 +1450,7 @@ Json::Value ClientState::login(std::string_view username, std::string_view passw
         sync_storage_locked();
         if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
         const bool preserve_pending = persistent && !persistent_record["pending_activation"].isNull();
+        checkpoint_offline_before_transition_locked();
         clear_all_locked();
         invalidate_locked(!preserve_pending);
         request_generation = current_generation;
@@ -1266,6 +1563,7 @@ void ClientState::account_logout(const std::atomic_bool& cancelled) {
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
         session = customer;
+        checkpoint_offline_before_transition_locked();
         clear_all_locked();
         invalidate_locked();
         request_generation = current_generation;
@@ -1377,7 +1675,9 @@ std::shared_ptr<ClientState> open_installed_state(
     state->installed_storage = std::move(installed);
     state->persistent_record = std::move(record);
 
-    if (state->credential && state->persistent_record["pending_activation"].isNull()) {
+    state->restore_offline();
+
+    if (state->credential && state->persistent_record["pending_activation"].isNull() && !state->offline) {
         std::atomic_bool cancelled{false};
         try {
             (void)state->refresh(cancelled, false);
@@ -1433,6 +1733,10 @@ void set_test_clock(TestClock clock) {
                                       std::move(installed));
     return ::orbit::Client(std::move(state));
 }
+
+::orbit::Client make_test_client_from_state(std::shared_ptr<ClientState> state) {
+    return ::orbit::Client(std::move(state));
+}
 #endif
 
 const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation* cancellation,
@@ -1478,11 +1782,14 @@ namespace {
     if (duration) output.duration = std::chrono::seconds(*duration);
     const auto device_limit = integer(required(value, "device_limit"));
     const auto offline_seconds = integer(required(value, "offline_seconds"));
-    if (device_limit < 0 || device_limit > INT32_MAX || offline_seconds < 0) invalid_response();
+    const auto offline_file_seconds = integer(required(value, "offline_file_seconds"));
+    if (device_limit < 0 || device_limit > INT32_MAX || offline_seconds < 0 ||
+        (offline_file_seconds != 0 && (offline_file_seconds < 86400 || offline_file_seconds > 31622400))) invalid_response();
     output.device_limit = static_cast<std::int32_t>(device_limit);
     output.hwid_locked = boolean(required(value, "hwid_locked"));
     output.offline_allowed = boolean(required(value, "offline_allowed"));
     output.offline_duration = std::chrono::seconds(offline_seconds);
+    output.offline_file_duration = std::chrono::seconds(offline_file_seconds);
     const auto& entitlements = required(value, "entitlements");
     if (!entitlements.isObject() || entitlements.size() > 64) invalid_response();
     for (const auto& name : entitlements.getMemberNames()) {
@@ -1511,6 +1818,20 @@ int app_key_base64_value(char value) {
     if (value == '-') return 62;
     if (value == '_') return 63;
     return -1;
+}
+
+std::string encode_app_key_origin(std::string_view value) {
+    std::string encoded(4 * ((value.size() + 2) / 3), '\0');
+    const auto length = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()),
+        reinterpret_cast<const unsigned char*>(value.data()), static_cast<int>(value.size()));
+    if (length < 0) invalid_app_key();
+    encoded.resize(static_cast<std::size_t>(length));
+    while (!encoded.empty() && encoded.back() == '=') encoded.pop_back();
+    for (auto& character : encoded) {
+        if (character == '+') character = '-';
+        else if (character == '/') character = '_';
+    }
+    return encoded;
 }
 
 std::string decode_app_key_origin(std::string_view encoded) {
@@ -1601,6 +1922,29 @@ AppKey AppKey::parse(std::string_view input) {
                   std::string(environment));
 }
 
+std::string AppKey::public_key() const {
+    return "orbit_app_" + environment_ + "_" + encode_app_key_origin(api_origin_) +
+        "." + application_id_ + "." + environment_id_;
+}
+
+OfflineKeys OfflineKeys::parse(std::string_view jwks_json, std::string_view environment) {
+    auto keys = detail::OfflineKeys::parse_jwks(jwks_json, environment);
+    return OfflineKeys(std::make_shared<const detail::OfflineKeys>(std::move(keys)),
+                       std::string(environment));
+}
+
+std::string OfflineRequest::to_json() const {
+    Json::Value value(Json::objectValue);
+    value["format"] = "orbit-offline-request";
+    value["version"] = 1;
+    value["app_key"] = app_key;
+    value["installation_id"] = installation_id;
+    value["fingerprint"] = fingerprint ? Json::Value(*fingerprint) : Json::Value(Json::nullValue);
+    value["fingerprint_provider"] = fingerprint_provider
+        ? Json::Value(*fingerprint_provider) : Json::Value(Json::nullValue);
+    return detail::encode_json(value);
+}
+
 Error::Error(std::uint32_t status, ErrorKind kind, std::string code,
              std::string request_id)
     : std::runtime_error("Orbit SDK operation failed"), status_(status), kind_(kind),
@@ -1658,6 +2002,12 @@ Client Client::open(const AppKey& app_key, Options options) {
     config.application_id = app_key.application_id();
     config.environment_id = app_key.environment_id();
     config.issuer = app_key.issuer();
+    config.public_app_key = app_key.public_key();
+    if (options.offline_keys) {
+        if (options.offline_keys->environment() != app_key.environment())
+            detail::raise(ErrorKind::configuration, "invalid_offline_keys");
+        config.offline_keys = options.offline_keys->keys_;
+    }
     config.fingerprint = detail::resolve_fingerprint(app_key, options);
     (void)detail::capture_clock();
     detail::Transport transport(config.api_origin);
@@ -1686,6 +2036,17 @@ Snapshot Client::snapshot(const Cancellation* cancellation) const {
         detail::raise(ErrorKind::cancelled, "cancelled");
     }
     return require_state(state_).snapshot();
+}
+
+OfflineRequest Client::offline_request() const {
+    return require_state(state_).offline_request();
+}
+
+Snapshot Client::import_offline_file(std::string_view file,
+                                      const Cancellation* cancellation) const {
+    std::atomic_bool inactive{false};
+    return require_state(state_).import_offline_file(
+        file, detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::activate(std::string_view licence_key,

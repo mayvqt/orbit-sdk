@@ -1,4 +1,6 @@
 using System.Security.Cryptography;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 
@@ -119,8 +121,42 @@ public sealed class DownloadTicketVerifier
                 index += 2;
             }
             var pathStart = endpoint.IndexOf('/', 8);
-            var origin = Transport.ValidateOrigin(pathStart < 0 ? endpoint : endpoint[..pathStart]);
-            if (new Uri(origin).Port is < 1 or > 65535) throw InvalidEndpoint();
+            var authority = pathStart < 0 ? endpoint[8..] : endpoint[8..pathStart];
+            if (authority.Length == 0 || authority.Contains('@') || authority.Contains('%')) throw InvalidEndpoint();
+            string host;
+            string? port = null;
+            if (authority[0] == '[')
+            {
+                var close = authority.IndexOf(']');
+                if (close < 2 || !IPAddress.TryParse(authority[1..close], out var address) ||
+                    address.AddressFamily != AddressFamily.InterNetworkV6) throw InvalidEndpoint();
+                host = authority[..(close + 1)];
+                var suffix = authority[(close + 1)..];
+                if (suffix.Length != 0)
+                {
+                    if (suffix[0] != ':') throw InvalidEndpoint();
+                    port = suffix[1..];
+                }
+            }
+            else
+            {
+                if (authority.Contains('[') || authority.Contains(']')) throw InvalidEndpoint();
+                var colon = authority.IndexOf(':');
+                if (colon >= 0)
+                {
+                    if (colon != authority.LastIndexOf(':')) throw InvalidEndpoint();
+                    host = authority[..colon];
+                    port = authority[(colon + 1)..];
+                }
+                else host = authority;
+            }
+            if (host.Length == 0 || (port != null &&
+                (!int.TryParse(port, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsedPort) || parsedPort is < 1 or > 65535)))
+                throw InvalidEndpoint();
+            _ = Transport.ValidateOrigin("https://" + authority);
+            if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var parsed) || parsed.Scheme != "https" ||
+                string.IsNullOrEmpty(parsed.Host) || parsed.UserInfo.Length != 0) throw InvalidEndpoint();
         }
         catch (Exception error) when (error is OrbitException or ArgumentException)
         { throw InvalidEndpoint(); }

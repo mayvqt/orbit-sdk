@@ -55,9 +55,12 @@ internal static class DownloadTicketTests
             OrbitError.Configuration, "invalid_download_keys");
         var duplicate = Encoding.UTF8.GetBytes("{\"keys\":[]," + Encoding.UTF8.GetString(keys)[1..]);
         Expect(() => new DownloadTicketVerifier(appKey, endpoint, duplicate), OrbitError.Configuration, "invalid_download_keys");
-        foreach (var invalid in new[] { "http://host/file", "https://user:password@host/file", "https://host/file?", "https://host/file#", "https://host/\\file",
+        foreach (var invalid in new[] { "http://host/file", "https://user:password@host/file", "https://@host/file",
+            "https://host:/file", "https://%64ownloads.example.test/file", "https://host:65536/file",
+            "https://[::1]:/file", "https://[::1]suffix/file", "https://host/file?", "https://host/file#", "https://host/\\file",
             "https://host/f ile", "https://host/<file>", "https://host/\"file\"", "https://host/{file}", "https://host/雪", "https://host/%", "https://host/%aZ", "https://host:0/file" })
             Expect(() => new DownloadTicketVerifier(appKey, invalid, keys), OrbitError.Configuration, "invalid_download_endpoint");
+        _ = new DownloadTicketVerifier(appKey, "https://host:00080/file%2Fname", keys);
         Console.WriteLine($"Shared download-ticket vectors: {passed} passed; key bounds/copy, endpoints, redaction and exact clock boundaries passed.");
         return 0;
     }

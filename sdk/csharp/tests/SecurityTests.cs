@@ -42,6 +42,7 @@ internal static class SecurityTests
             ("cancelled account logout clears synchronously", CancelledLogoutAsync),
             ("shared storage invalidates account metadata", SharedStorageAsync),
             ("customer session proof is explicit redacted and locally invalidated", CustomerSessionProofAsync),
+            ("owned licence parses and bounds offline-file policy seconds", OwnedLicenceOfflineFileDurationAsync),
             ("HTTP errors retain only strict request references", ErrorRequestIdsAsync),
             ("support summaries are safe and independent of state", SupportSummaryAsync),
             ("HTTP transient metadata preserves offline policy", TransientMetadataAsync),
@@ -1300,6 +1301,53 @@ internal static class SecurityTests
             using var transport = new Transport("http://127.0.0.1:8080");
             return Task.CompletedTask;
         });
+    }
+
+    private static async Task OwnedLicenceOfflineFileDurationAsync(CancellationToken cancellationToken)
+    {
+        long seconds = 0;
+        var omit = false;
+        await using var server = new LoopbackServer((request, _) =>
+        {
+            if (request.Path == "/api/client/v1/sessions") return Task.FromResult(LoginReply);
+            if (request.Path.StartsWith("/api/client/v1/licences?", StringComparison.Ordinal))
+            {
+                var licence = new Dictionary<string, object?>
+                {
+                    ["id"] = "licence_1", ["policy_name"] = "Standard", ["state"] = "active",
+                    ["expiry_mode"] = "never", ["first_used_at"] = null, ["expires_at"] = null,
+                    ["duration_seconds"] = null, ["device_limit"] = 1, ["hwid_locked"] = false,
+                    ["offline_allowed"] = false, ["offline_seconds"] = 0,
+                    ["entitlements"] = new Dictionary<string, bool> { ["export"] = true }
+                };
+                if (!omit) licence["offline_file_seconds"] = seconds;
+                return Task.FromResult(new FixtureReply(200, JsonSerializer.Serialize(new
+                {
+                    items = new[] { licence }, next_cursor = (string?)null
+                })));
+            }
+            return Task.FromResult(ErrorReply(404, "not_found"));
+        });
+        using var transport = Transport.LocalLoopback(server.Origin);
+        var client = Client(transport);
+        await client.LoginAsync("alice", "synthetic password", cancellationToken);
+        foreach (var value in new long[] { 0, 86400, 31622400 })
+        {
+            seconds = value;
+            var licence = (await client.OwnedLicencesAsync(cancellationToken: cancellationToken)).Items.Single();
+            Require(licence.OfflineFileDuration == TimeSpan.FromSeconds(value));
+        }
+        foreach (var value in new long[] { -1, 1, 86399, 31622401 })
+        {
+            seconds = value;
+            await ExpectAsync(OrbitError.InvalidResponse,
+                () => client.OwnedLicencesAsync(cancellationToken: cancellationToken));
+            await client.LoginAsync("alice", "synthetic password", cancellationToken);
+        }
+        omit = true;
+        await ExpectAsync(OrbitError.InvalidResponse,
+            () => client.OwnedLicencesAsync(cancellationToken: cancellationToken));
+        Require(server.RequestCount == 13);
     }
 
     private static async Task RedirectsAsync(CancellationToken cancellationToken)

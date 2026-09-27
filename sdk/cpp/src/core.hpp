@@ -2,6 +2,7 @@
 
 #include "grants.hpp"
 #include "installed_storage.hpp"
+#include "offline.hpp"
 #include "persistent_codec.hpp"
 #include "platform.hpp"
 #include "transport.hpp"
@@ -49,6 +50,8 @@ struct Config {
     std::string issuer;
     std::optional<std::string> installation_id;
     std::optional<Fingerprint> fingerprint;
+    std::optional<std::string> public_app_key;
+    std::shared_ptr<const OfflineKeys> offline_keys;
     Storage storage;
 };
 
@@ -85,6 +88,23 @@ struct ClockAnchor {
     std::int64_t now() const;
 };
 
+struct OfflineRuntime {
+    OfflineFile file;
+    ClockAnchor anchor;
+    std::int64_t time_high_water = 0;
+    std::int64_t wall_high_water = 0;
+    bool uncertain = false;
+    std::chrono::steady_clock::time_point last_checkpoint{};
+};
+
+struct OfflineClockState {
+    ClockAnchor anchor;
+    std::int64_t time_high_water = 0;
+    std::int64_t wall_high_water = 0;
+    bool uncertain = false;
+    std::chrono::steady_clock::time_point last_checkpoint{};
+};
+
 struct AccountSession {
     std::string bearer;
     Json::Value account;
@@ -99,6 +119,10 @@ public:
 
     ~ClientState() noexcept;
     ::orbit::Snapshot snapshot();
+    ::orbit::OfflineRequest offline_request();
+    ::orbit::Snapshot import_offline_file(std::string_view file,
+                                          const std::atomic_bool& cancelled);
+    void restore_offline();
     void close();
     void start_worker();
     void begin_call();
@@ -156,6 +180,8 @@ public:
     std::optional<Credential> credential;
     std::optional<GrantClaims> claims;
     std::optional<ClockAnchor> anchor;
+    std::optional<OfflineRuntime> offline;
+    std::optional<OfflineClockState> offline_clock;
     std::optional<AccountSession> customer;
     bool transient = false;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
@@ -186,6 +212,9 @@ private:
                           const std::atomic_bool& cancelled);
     std::unique_lock<std::timed_mutex> lock_serial(const std::atomic_bool& cancelled);
     ::orbit::Snapshot snapshot_locked(bool tolerate_clock_error);
+    ::orbit::Snapshot offline_snapshot_locked();
+    void checkpoint_offline_locked(bool force);
+    void checkpoint_offline_before_transition_locked();
     std::pair<Credential, GrantClaims> verify_reply(
         const Json::Value& reply, const std::optional<Credential>& previous,
         std::optional<std::string_view> expected_licence, ClockStart start,
@@ -233,6 +262,7 @@ void set_test_clock(TestClock clock);
                                  std::shared_ptr<CredentialStorage> storage);
 ::orbit::Client make_test_installed_client(
     Config config, Transport transport, std::shared_ptr<InstalledStorage> storage);
+::orbit::Client make_test_client_from_state(std::shared_ptr<ClientState> state);
 #endif
 
 } // namespace orbit::detail

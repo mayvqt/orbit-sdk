@@ -19,6 +19,10 @@ internal static class InstalledTests
         (string Name, Func<Task> Run)[] cases =
         [
             ("persistent activation and online restart",OnlineRestart),
+            ("offline file import restart renewal expiry and retained sequence floor", OfflineFiles),
+            ("offline time anchor survives account and online transitions", OfflineTransitionFloors),
+            ("offline durable import fences cancellation and expiry", OfflineDurableFences),
+            ("offline import queued behind activation is fenced by logout", OfflineStaleImport),
             ("original offline deadline survives qualified outage",OfflineRestart),
             ("strict restart outage does not request another key",StrictRestart),
             ("uncertain activation keeps identity after restart",PendingIdentity),
@@ -155,6 +159,11 @@ internal static class InstalledTests
         if (!condition)
             throw new InvalidOperationException("Installed client assertion failed");
     }
+    private static void Require(bool condition, string message)
+    {
+        if (!condition)
+            throw new InvalidOperationException(message);
+    }
     private static async Task Expect(OrbitError kind, Func<Task> run, string? code = null)
     {
         try
@@ -187,15 +196,25 @@ internal static class InstalledTests
         internal string? Previous;
         internal TaskCompletionSource? Received, Release;
         private readonly ECDsa signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        private readonly ECDsa offlineSigner = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        internal OfflineKeys TrustedOfflineKeys { get; }
+        internal string OfflineJwks { get; }
         internal Fixture()
         {
             Server = new LoopbackServer(Respond);
+            var publicKey = offlineSigner.ExportParameters(false).Q;
+            OfflineJwks = JsonSerializer.Serialize(new
+            {
+                keys = new[] { new { kty = "EC", crv = "P-256", alg = "ES256", use = "sig", kid = "offline-test-fixture",
+                    x = JsonWire.EncodeBase64(publicKey.X!), y = JsonWire.EncodeBase64(publicKey.Y!) } }
+            });
+            TrustedOfflineKeys = OfflineKeys.Parse(OfflineJwks, "test");
         }
         internal string Issuer => Server.Origin;
         internal InstalledScope Scope => new(Server.Origin, Issuer, "app", "test");
         internal string? CurrentFingerprint, CurrentProvider;
         internal Task<OrbitClient> Open(string? statePath = null, string? fingerprint = null,
-            string? provider = null, bool disableMachineBinding = true)
+            string? provider = null, bool disableMachineBinding = true, bool withOfflineKeys = true)
         {
             var origin = JsonWire.EncodeBase64(Encoding.UTF8.GetBytes(Server.Origin));
             var appKey = $"orbit_app_test_{origin}.app.test";
@@ -205,12 +224,35 @@ internal static class InstalledTests
             {
                 StatePath = statePath ?? Path,
                 DisableMachineBinding = disableMachineBinding,
+                OfflineKeys = withOfflineKeys ? TrustedOfflineKeys : null,
                 Fingerprint = fingerprint == null ? null : new Fingerprint(fingerprint, provider!)
             });
+        }
+        internal string SignOffline(string installation, long sequence, string issuance,
+            long issued, long expires, bool export = true, bool reverseFields = false)
+        {
+            var header = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(new
+            { alg = "ES256", typ = "orbit-offline+jwt", kid = "offline-test-fixture" }));
+            var claims = new Dictionary<string, object?>
+            {
+                ["ver"] = 1, ["iss"] = Issuer, ["aud"] = "orbit-offline:app:test", ["sub"] = "licence",
+                ["jti"] = issuance, ["iat"] = issued, ["nbf"] = issued, ["exp"] = expires,
+                ["application_id"] = "app", ["environment_id"] = "test", ["activation_id"] = "activation",
+                ["installation_id"] = installation, ["sequence"] = sequence, ["binding_mode"] = "none",
+                ["policy_version"] = 1, ["entitlements"] = new Dictionary<string, bool> { ["export"] = export }
+            };
+            var ordered = reverseFields ? claims.Reverse().ToDictionary(item => item.Key, item => item.Value) : claims;
+            var payload = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(ordered));
+            var input = header + "." + payload;
+            var signature = offlineSigner.SignData(Encoding.ASCII.GetBytes(input), HashAlgorithmName.SHA256,
+                DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
+            return input + "." + JsonWire.EncodeBase64(signature);
         }
         internal async Task Activate(OrbitClient client) => Require((await client.ActivateAsync("synthetic-key")).Access == Access.Online);
         private async Task<FixtureReply> Respond(FixtureRequest request, CancellationToken cancellationToken)
         {
+            if (request.Method == "DELETE" && request.Path.StartsWith("/api/client/v1/sessions/current?", StringComparison.Ordinal))
+                return new(204, string.Empty);
             if (request.Path.StartsWith("/.well-known/", StringComparison.Ordinal))
             {
                 var key = signer.ExportParameters(false);
@@ -329,6 +371,7 @@ internal static class InstalledTests
             Release?.TrySetResult();
             await Server.DisposeAsync();
             signer.Dispose();
+            offlineSigner.Dispose();
             Directory.Delete(Root, true);
         }
     }
@@ -346,6 +389,275 @@ internal static class InstalledTests
             Require((await c.RequireAccessAsync("export")).Access == Access.Online);
             Require(f.Record().Installation.Id == id && f.Activations == 1 && f.Validations == 1);
             await Expect(OrbitError.FeatureUnavailable, () => c.RequireAccessAsync("missing"), "feature_unavailable");
+        }
+    }
+    private static async Task OfflineFiles()
+    {
+        long elapsed = 10 * TimeSpan.TicksPerSecond;
+        long wall = 1_800_000_000;
+        Clock.SetTestClock(() => new ClockStart(Volatile.Read(ref elapsed), Volatile.Read(ref wall)));
+        try
+        {
+            await using var f = new Fixture();
+            var requestsBefore = f.Server.RequestCount;
+            string installation;
+            string first;
+            string renewed;
+            await using (var client = await f.Open())
+            {
+                var request = client.CreateOfflineRequest();
+                installation = request.InstallationId;
+                using var json = JsonDocument.Parse(JsonSerializer.Serialize(request));
+                Require(json.RootElement.GetProperty("format").GetString() == "orbit-offline-request" &&
+                    json.RootElement.GetProperty("version").GetInt32() == 1 &&
+                    json.RootElement.GetProperty("fingerprint").ValueKind == JsonValueKind.Null);
+                first = f.SignOffline(installation, 1, "offline_issue_1", wall, wall + 120);
+                var imported = client.ImportOfflineFile(" \t" + first + "\n");
+                Require(imported.Access == Access.Offline && imported.OfflineFileMode &&
+                    imported.ExpiresAt == DateTimeOffset.FromUnixTimeSeconds(wall + 120) && imported.HasFeature("export"));
+                Require((await client.RequireAccessAsync("export")).Access == Access.Offline);
+                await Expect(OrbitError.FeatureUnavailable, () => client.RequireAccessAsync("missing"), "feature_unavailable");
+                var saved = f.Record();
+                Require(saved.Format == 3 && saved.Offline?.Jws == first && saved.Offline.Sequence == 1 &&
+                    saved.Credential == null && saved.Access == null && saved.PendingActivation == null,
+                    "format-3 import must persist only offline authority");
+                var equivalent = f.SignOffline(installation, 1, "offline_issue_1", wall, wall + 120, reverseFields: true);
+                Require(client.ImportOfflineFile(equivalent).Access == Access.Offline,
+                    "equivalent equal-sequence import must remain active");
+                elapsed += TimeSpan.TicksPerSecond / 2;
+                _ = client.ImportOfflineFile(first);
+                elapsed += TimeSpan.TicksPerSecond / 2;
+                Require(client.ImportOfflineFile(first).RemainingOffline == TimeSpan.FromSeconds(119),
+                    "reimport must count fractional elapsed time exactly once");
+                Require(client.ImportOfflineFile(first).RemainingOffline == TimeSpan.FromSeconds(119),
+                    "reimport without elapsed time must not move the deadline");
+                var conflict = f.SignOffline(installation, 1, "offline_issue_conflict", wall, wall + 120, export: false);
+                await Expect(OrbitError.Denied, () => Task.Run(() => client.ImportOfflineFile(conflict)), "offline_sequence");
+                var renewalIssued = wall + 2;
+                renewed = f.SignOffline(installation, 2, "offline_issue_2", renewalIssued, renewalIssued + 240);
+                Require(client.ImportOfflineFile(renewed).RemainingOffline == TimeSpan.FromSeconds(240),
+                    "a future-skewed renewal must advance the original anchor only to the signed time floor");
+                Require(client.ImportOfflineFile(renewed).RemainingOffline == TimeSpan.FromSeconds(240),
+                    "repeating a future-skewed renewal without elapsed time must not move its deadline");
+                elapsed += 4 * TimeSpan.TicksPerSecond;
+                wall += 4;
+                Require(client.ImportOfflineFile(renewed).RemainingOffline == TimeSpan.FromSeconds(236),
+                    "a renewed file must count whole elapsed seconds exactly once");
+                await Expect(OrbitError.InvalidResponse, () => Task.Run(() => client.ImportOfflineFile(first)));
+                Require(f.Server.RequestCount == requestsBefore);
+            }
+            await Expect(OrbitError.Configuration, async () =>
+            {
+                await using var missingKeys = await f.Open(withOfflineKeys: false);
+            }, "offline_keys_required");
+            Require(f.Record().Offline?.Jws != null && f.Server.RequestCount == requestsBefore);
+            wall += 241;
+            elapsed = 2 * TimeSpan.TicksPerSecond;
+            await using (var client = await f.Open())
+            {
+                Require(client.Snapshot().Access == Access.Expired && client.Snapshot().OfflineFileMode);
+                await Expect(OrbitError.Denied, () => client.RequireAccessAsync("export"), "offline_file_expired");
+                var refresh = await client.RefreshAsync();
+                Require(refresh.Access == Access.Expired && refresh.OfflineFileMode && f.Server.RequestCount == requestsBefore);
+                var refreshIfDue = (Task<Snapshot>)typeof(OrbitClient)
+                    .GetMethod("RefreshIfDueAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .Invoke(client, [CancellationToken.None])!;
+                var guardedRefresh = await refreshIfDue;
+                Require(guardedRefresh.Access == Access.Expired && guardedRefresh.OfflineFileMode &&
+                    f.Server.RequestCount == requestsBefore,
+                    "the background refresh guard must return an expired local file snapshot without HTTP");
+                var prompts = 0;
+                await Expect(OrbitError.Denied, () => client.EnsureAccessAsync("export", _ =>
+                {
+                    prompts++;
+                    return ValueTask.FromResult<string?>("unexpected-key");
+                }), "offline_file_expired");
+                Require(prompts == 0, "expired offline file must never prompt for an activation key");
+                var next = f.SignOffline(installation, 3, "offline_issue_3", wall, wall + 120);
+                Require(client.ImportOfflineFile(next).Access == Access.Offline);
+                wall++;
+                elapsed += TimeSpan.TicksPerSecond;
+                Require(client.Snapshot().Access == Access.Offline,
+                    $"offline authority must still validate before logout (elapsed={elapsed}, wall={wall})");
+                client.Logout();
+                var record = f.Record();
+                Require(record.Offline?.Sequence == 3 && record.Offline.Jws == null &&
+                    record.Offline.TimeHighWater >= wall && record.Offline.WallHighWater >= wall &&
+                    client.Snapshot().Access == Access.Denied && f.Server.RequestCount == requestsBefore,
+                    $"logout must clear authority while checkpointing the same offline time floor (record={record.Offline?.Sequence}/{record.Offline?.Jws is null}/{record.Offline?.TimeHighWater}/{record.Offline?.WallHighWater}, wall={wall}, access={client.Snapshot().Access}, requests={f.Server.RequestCount}/{requestsBefore})");
+                elapsed += 121 * TimeSpan.TicksPerSecond;
+                await Expect(OrbitError.ClockUncertain,
+                    () => Task.Run(() => client.ImportOfflineFile(next)));
+                wall += 121;
+                await Expect(OrbitError.InvalidResponse,
+                    () => Task.Run(() => client.ImportOfflineFile(next)));
+            }
+            Require(f.Server.RequestCount == requestsBefore);
+        }
+        finally { Clock.SetTestClock(null); }
+    }
+    private static async Task OfflineTransitionFloors()
+    {
+        foreach (var accountTransition in new[] { false, true })
+        {
+            var stage = "clock setup";
+            long elapsed = Clock.ElapsedTicks();
+            long wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            Clock.SetTestClock(() => new ClockStart(Volatile.Read(ref elapsed), Volatile.Read(ref wall)));
+            try
+            {
+                await using var f = new Fixture();
+                stage = "open client";
+                await using var client = await f.Open();
+                var installation = client.CreateOfflineRequest().InstallationId;
+                var issued = wall;
+                var file = f.SignOffline(installation, 1, "offline_transition_floor", issued, issued + 120);
+                stage = "initial import";
+                Require(client.ImportOfflineFile(file).Access == Access.Offline);
+                stage = "transition";
+                try
+                {
+                    if (accountTransition)
+                    {
+                        stage = "account login";
+                        await client.LoginAsync("alice", "synthetic password");
+                        stage = "account logout";
+                        await client.LogoutAccountAsync();
+                    }
+                    else
+                    {
+                        stage = "online activation";
+                        await client.ActivateAsync("synthetic-key");
+                    }
+                }
+                catch (OrbitException error)
+                {
+                    throw new InvalidOperationException($"transition {(accountTransition ? "account" : "online")} failed before floor check: {error.Error}/{error.Code}", error);
+                }
+                catch (Exception error)
+                {
+                    throw new InvalidOperationException($"transition {(accountTransition ? "account" : "online")} failed before floor check: {error.GetType().Name}/{error.Message}", error);
+                }
+                stage = "local logout";
+                client.Logout();
+                stage = "post-transition reimport";
+                elapsed += 7 * TimeSpan.TicksPerSecond;
+                wall += 7;
+                Require(client.ImportOfflineFile(file).RemainingOffline == TimeSpan.FromSeconds(113),
+                    "a transition must retain the original offline anchor and report exact remaining time");
+                Require(client.ImportOfflineFile(file).RemainingOffline == TimeSpan.FromSeconds(113),
+                    "a repeated post-transition import must not move the offline deadline");
+                elapsed += 2 * TimeSpan.TicksPerSecond;
+                wall += 2;
+                Require(client.ImportOfflineFile(file).RemainingOffline == TimeSpan.FromSeconds(111),
+                    "a post-transition renewal must count whole elapsed seconds exactly once");
+                client.Logout();
+                var checkpoint = f.Record().Offline;
+                Require(checkpoint != null && checkpoint.Jws == null && checkpoint.Sequence == 1 &&
+                    checkpoint.TimeHighWater >= issued + 9 && checkpoint.WallHighWater >= issued + 9,
+                    "transition logout must preserve the updated durable clock floor");
+                var requests = f.Server.RequestCount;
+                elapsed += 121 * TimeSpan.TicksPerSecond;
+                await Expect(OrbitError.ClockUncertain,
+                    () => Task.Run(() => client.ImportOfflineFile(file)));
+                Require(f.Server.RequestCount == requests && f.Record().Offline?.Jws == null,
+                    "an unrelated account or online transition must retain the offline time anchor without restoring authority");
+            }
+            catch (Exception error)
+            {
+                throw new InvalidOperationException($"offline transition {(accountTransition ? "account" : "online")} failed during {stage}: {error.GetType().Name}/{error.Message}", error);
+            }
+            finally { Clock.SetTestClock(null); }
+        }
+    }
+
+    private static async Task OfflineDurableFences()
+    {
+        foreach (var scenario in new[] { "cancel-save", "cancel-checkpoint", "expire-during-write" })
+        {
+            long elapsed = 10 * TimeSpan.TicksPerSecond;
+            long wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            Clock.SetTestClock(() => new ClockStart(Volatile.Read(ref elapsed), Volatile.Read(ref wall)));
+            try
+            {
+                await using var f = new Fixture();
+                var token = new CancellationTokenSource();
+                await using (var client = await f.Open())
+                {
+                    var installation = client.CreateOfflineRequest().InstallationId;
+                    var file = f.SignOffline(installation, 1, "offline_durable_fence", wall, wall + 120);
+                    InstalledStorageDiagnostics.OfflineWriteCompleted = stage =>
+                    {
+                        if (scenario == "cancel-save" && stage == "save") token.Cancel();
+                        if (scenario == "cancel-checkpoint")
+                        {
+                            if (stage == "save") { elapsed += TimeSpan.TicksPerSecond; wall++; }
+                            if (stage == "checkpoint") token.Cancel();
+                        }
+                        if (scenario == "expire-during-write" && stage == "save")
+                        {
+                            elapsed += 121 * TimeSpan.TicksPerSecond;
+                            wall += 121;
+                        }
+                    };
+                    try
+                    {
+                        if (scenario == "expire-during-write")
+                            await Expect(OrbitError.Denied,
+                                () => Task.Run(() => client.ImportOfflineFile(file)), "offline_file_expired");
+                        else
+                            await Expect(OrbitError.Cancelled,
+                                () => Task.Run(() => client.ImportOfflineFile(file, token.Token)));
+                    }
+                    finally { InstalledStorageDiagnostics.OfflineWriteCompleted = null; }
+                    var saved = f.Record().Offline;
+                    Require(saved is { Jws: null, Sequence: 1 } &&
+                        (scenario != "expire-during-write" || saved.TimeHighWater >= wall),
+                        "cancelled or expired durable import must clear its JWS and retain observed time floors");
+                }
+                await using var reopened = await f.Open();
+                Require(reopened.Snapshot().Access == Access.Denied && !reopened.Snapshot().OfflineFileMode,
+                    "a cleared durable offline import must not restore after restart");
+            }
+            finally
+            {
+                InstalledStorageDiagnostics.OfflineWriteCompleted = null;
+                Clock.SetTestClock(null);
+            }
+        }
+    }
+
+    private static async Task OfflineStaleImport()
+    {
+        await using var f = new Fixture();
+        await using var client = await f.Open();
+        var request = client.CreateOfflineRequest();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var file = f.SignOffline(request.InstallationId, 1, "offline_stale_import", now, now + 120);
+        f.Mode = 6;
+        f.Received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        InstalledStorageDiagnostics.OfflineImportQueued = () => queued.TrySetResult();
+        try
+        {
+            var activation = client.ActivateAsync("synthetic-key");
+            await f.Received.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var import = Task.Run(() => client.ImportOfflineFile(file));
+            await queued.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            client.Logout();
+            f.Release.TrySetResult();
+            await Expect(OrbitError.StaleResponse, () => activation);
+            await Expect(OrbitError.StaleResponse, () => import);
+            var saved = f.Record();
+            Require(saved.Credential == null && saved.Access == null && saved.PendingActivation == null &&
+                client.Snapshot().Access == Access.Denied && f.Activations == 1,
+                "logout must fence an import queued behind activation and prevent authority resurrection");
+        }
+        finally
+        {
+            InstalledStorageDiagnostics.OfflineImportQueued = null;
+            f.Release.TrySetResult();
         }
     }
     private static async Task OfflineRestart()
@@ -462,6 +774,27 @@ internal static class InstalledTests
             Require(unavailable.Installation.Id != currentId && unavailable.Credential == null &&
                 unavailable.PendingActivation == null && unavailable.Access == null &&
                 unavailable.Installation.Fingerprint == null && f.Validations == 0);
+        }
+
+        await using var offlineFixture = new Fixture();
+        const string oldOfflineFingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const string newOfflineFingerprint = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        string offlineInstallation;
+        await using (var oldIdentity = await offlineFixture.Open(fingerprint: oldOfflineFingerprint,
+            provider: "custom:fixture", disableMachineBinding: false))
+        {
+            offlineInstallation = oldIdentity.CreateOfflineRequest().InstallationId;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var file = offlineFixture.SignOffline(offlineInstallation, 1, "offline_machine_change", now, now + 120);
+            Require(oldIdentity.ImportOfflineFile(file).Access == Access.Offline);
+        }
+        await using (var newIdentity = await offlineFixture.Open(fingerprint: newOfflineFingerprint,
+            provider: "custom:fixture", disableMachineBinding: false))
+        {
+            var changed = offlineFixture.Record(newOfflineFingerprint, "custom:fixture");
+            Require(changed.Installation.Id != offlineInstallation && changed.Offline == null &&
+                newIdentity.Snapshot().Access == Access.Denied,
+                "a changed device identity must rotate scope and discard stored offline authority");
         }
     }
     private static async Task MalformedIdentity()
@@ -638,6 +971,9 @@ internal static class InstalledTests
         var record = f.Record();
         var bytes = InstalledCodec.Encode(record);
         Require(!Encoding.UTF8.GetString(bytes).Contains("synthetic-key", StringComparison.Ordinal));
+        var decodedFormat2 = InstalledCodec.Decode(bytes, f.Scope, record.Provider, null, null);
+        Require(decodedFormat2.Format == 2 && decodedFormat2.Installation.Id == record.Installation.Id,
+            "format-2 decode must preserve the installation ID");
         foreach (var field in new[] { "credential", "pending_activation", "access", "scope", "installation" })
         {
             var node = JsonNode.Parse(bytes)!.AsObject();
@@ -647,6 +983,18 @@ internal static class InstalledTests
         var text = Encoding.UTF8.GetString(bytes);
         foreach (var bad in new[] { text[..^1] + ",\"format\":2}", text.Replace("\"credential\":{", "\"credential\":{\"password\":\"secret\",", StringComparison.Ordinal) })
             await Expect(OrbitError.Storage, () => { _ = InstalledCodec.Decode(Encoding.UTF8.GetBytes(bad), f.Scope, record.Provider, null, null); return Task.CompletedTask; });
+        var offlineRecord = record with
+        {
+            Format = 3, Credential = null, PendingActivation = null, Access = null,
+            Offline = new InstalledOffline(null, 1, "offline_codec", new string('a', 64), 1800000000, 1800000000, 1800000000)
+        };
+        var format3 = Encoding.UTF8.GetString(InstalledCodec.Encode(offlineRecord));
+        var duplicateOffline = format3.Replace("\"offline\":{", "\"offline\":{},\"offline\":{", StringComparison.Ordinal);
+        await Expect(OrbitError.Storage, () =>
+        {
+            _ = InstalledCodec.Decode(Encoding.UTF8.GetBytes(duplicateOffline), f.Scope, record.Provider, null, null);
+            return Task.CompletedTask;
+        });
     }
     private static async Task Files()
     {

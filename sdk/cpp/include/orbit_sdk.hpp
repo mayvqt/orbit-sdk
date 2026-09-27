@@ -20,7 +20,11 @@ class Client;
 namespace detail {
 struct Config;
 class ClientState;
+class OfflineKeys;
 struct PendingRegistrationState;
+#ifdef ORBIT_SDK_TESTING
+::orbit::Client make_test_client_from_state(std::shared_ptr<ClientState> state);
+#endif
 }
 
 enum class ErrorKind : std::uint32_t {
@@ -72,6 +76,7 @@ public:
     const std::string& application_id() const noexcept { return application_id_; }
     const std::string& environment_id() const noexcept { return environment_id_; }
     const std::string& environment() const noexcept { return environment_; }
+    std::string public_key() const;
 
 private:
     AppKey(std::string api_origin, std::string application_id,
@@ -83,10 +88,25 @@ private:
     std::string environment_;
 };
 
+/// Trusted public keys for signed offline files. This contains no private key material.
+class OfflineKeys {
+public:
+    static OfflineKeys parse(std::string_view jwks_json, std::string_view environment);
+    const std::string& environment() const noexcept { return environment_; }
+
+private:
+    OfflineKeys(std::shared_ptr<const detail::OfflineKeys> keys, std::string environment)
+        : keys_(std::move(keys)), environment_(std::move(environment)) {}
+    std::shared_ptr<const detail::OfflineKeys> keys_;
+    std::string environment_;
+    friend class Client;
+};
+
 struct Options {
     std::optional<std::string> state_directory;
     bool disable_machine_binding = false;
     std::optional<Fingerprint> fingerprint;
+    std::optional<OfflineKeys> offline_keys;
 };
 
 enum class Access : std::uint32_t { denied, online, offline, refresh_required, expired };
@@ -133,8 +153,18 @@ struct Snapshot {
     bool offline_allowed = false;
     std::chrono::seconds remaining_offline{0};
     std::int32_t policy_version = 0;
+    bool offline_file_mode = false;
 
     bool has_feature(std::string_view feature) const;
+};
+
+/// Public, JSON-serializable installation scope for an authorized offline-file request.
+struct OfflineRequest {
+    std::string app_key;
+    std::string installation_id;
+    std::optional<std::string> fingerprint;
+    std::optional<std::string> fingerprint_provider;
+    std::string to_json() const;
 };
 
 struct Customer {
@@ -162,6 +192,7 @@ struct OwnedLicence {
     bool hwid_locked = false;
     bool offline_allowed = false;
     std::chrono::seconds offline_duration{0};
+    std::chrono::seconds offline_file_duration{0};
     std::map<std::string, bool> entitlements;
 };
 
@@ -238,6 +269,9 @@ public:
     const std::string& installation_id() const noexcept;
 
     Snapshot snapshot(const Cancellation* cancellation = nullptr) const;
+    OfflineRequest offline_request() const;
+    Snapshot import_offline_file(std::string_view file,
+                                 const Cancellation* cancellation = nullptr) const;
     Snapshot activate(std::string_view licence_key,
                       std::optional<std::string_view> idempotency_key = std::nullopt,
                       const Cancellation* cancellation = nullptr) const;
@@ -297,6 +331,8 @@ private:
 #ifdef ORBIT_SDK_TESTING
     friend Client detail::make_test_installed_client(detail::Config, detail::Transport,
         std::shared_ptr<detail::InstalledStorage>);
+    friend Client detail::make_test_client_from_state(
+        std::shared_ptr<detail::ClientState>);
     friend Client detail::make_test_client(detail::Config, detail::Transport,
         std::shared_ptr<detail::CredentialStorage>);
 #endif

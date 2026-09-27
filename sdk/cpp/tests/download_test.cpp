@@ -67,14 +67,15 @@ int main() {
                 ErrorKind::configuration, "invalid_download_keys");
 
         for (const auto* invalid_url : {"http://download.test/x", "https://user@download.test/x",
+            "https://@download.test/x", "https://download.test:/x", "https://%64ownloads.example.test/x",
             "https://download.test:0/x", "https://download.test:000/x", "https://download.test:65536/x",
-            "https://download.test:/x", "https://download.test/x?", "https://download.test/x#",
+            "https://[::1]:/x", "https://[::1]suffix/x", "https://download.test/x?", "https://download.test/x#",
             "https://download.test/x\\y", "https://download.test/x%", "https://download.test/x%2g",
             "https://download.test/x{y}", "https://download.test/x y", "https://download.test/x\x7f"})
             rejects([&] { (void)DownloadTicketVerifier(app, invalid_url, encoded); },
                 ErrorKind::configuration, "invalid_download_endpoint");
         for (const auto* valid_url : {"https://download.test", "https://download.test:65535/x%20y",
-            "https://[::1]/x", "https://[::1]:443/x"})
+            "https://download.test:00080/x%2Fname", "https://[::1]/x", "https://[::1]:443/x"})
             (void)DownloadTicketVerifier(app, valid_url, encoded);
 
         DownloadTicketVerifier owned(app, endpoint, encoded);

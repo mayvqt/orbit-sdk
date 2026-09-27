@@ -81,5 +81,40 @@ results use native C# types, including `DateTimeOffset` and `TimeSpan` values.
 The [console example](../../examples/csharp/licensed-export/README.md) also
 shows registration, recovery and account logout.
 
+## Long-term offline files
+
+For products with an enabled `offline_file_seconds` policy, configure the
+trusted offline-purpose JWKS, export the installation request for an authorized
+online issuance workflow, then import the returned `.orbit` file locally:
+
+```csharp
+using Orbit.Sdk;
+using System.Text.Json;
+
+var appKey = Environment.GetEnvironmentVariable("ORBIT_APP_KEY")
+    ?? throw new InvalidOperationException("Set ORBIT_APP_KEY first.");
+var trustedKeys = OfflineKeys.Parse(
+    await File.ReadAllTextAsync("trusted-offline-jwks.json"), "test");
+await using var orbit = await OrbitClient.OpenAsync(appKey,
+    new OrbitOptions { OfflineKeys = trustedKeys });
+
+var request = orbit.CreateOfflineRequest();
+await File.WriteAllTextAsync("offline-request.json",
+    JsonSerializer.Serialize(request, new JsonSerializerOptions { WriteIndented = true }));
+// Transfer the public request to an authorized seller/customer issuance flow.
+var signedFile = await File.ReadAllTextAsync("licence.orbit");
+var access = orbit.ImportOfflineFile(signedFile);
+if (access.HasFeature("export"))
+    await orbit.RequireAccessAsync("export");
+```
+
+Import verifies scope, binding, signature, expiry and renewal sequence before it
+stores the original file. `RequireAccessAsync` and `EnsureAccessAsync` use only
+that file while it is active; they do not refresh, make network requests or
+prompt for a key. A restart requires currently configured trusted offline-purpose
+keys that still verify the file, allowing trusted key rotation. Logout clears
+local authority while retaining renewal and clock floors. A disconnected file
+cannot be revoked immediately. See [offline storage details](ADVANCED.md#long-term-offline-files).
+
 See [advanced integration](ADVANCED.md) for storage, backend proofs, local HTTP
 tests and recovery details. Source and examples are [MIT licensed](LICENSE).
