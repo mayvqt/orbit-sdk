@@ -293,6 +293,7 @@ function abortableDelay(ms, signal) {
       reject(fail(ErrorKind.CANCELLED, "operation_cancelled"));
     };
     signal?.addEventListener("abort", abort, { once: true });
-    timer.unref?.();
+    // This delay is part of the caller's awaited request. Keep the event loop
+    // alive until the retry proceeds or cancellation clears the timer.
   });
 }
