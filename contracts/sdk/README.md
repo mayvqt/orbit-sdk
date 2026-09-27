@@ -9,7 +9,7 @@ production signing key. Twelve valid and 92 invalid cases cover scope, claim typ
 time/lifetime limits, negotiated refresh timing, binding, duplicate fields, boolean entitlements, JOSE headers,
 signature/encoding rejection and bounded trusted JWKS handling.
 
-The grant-verifying Rust, Go, C#, C++, and Python SDKs consume the same bytes
+The Rust, Go, C#, C++, Python, installed TypeScript and embedded C verifiers consume the same bytes
 with a fixed clock. `expected` supplies
 the trusted verification context; a case's optional `expected` object overrides
 only those fields. A case's optional `jwks` replaces the whole trusted key set.
@@ -37,7 +37,8 @@ trusted rotation. These files
 are distinct from short-lived connected access grants. `expected` contains the
 app key, installation, optional binding, verification time and minimum accepted
 renewal sequence; per-case overrides and replacement trusted `jwks` work like the
-connected corpus. Python, Go, Rust, C# and C++ verifiers consume the corpus.
+connected corpus. Python, Go, Rust, C#, C++, installed TypeScript and embedded C
+verifiers consume the corpus.
 
 Do not treat a passing file-verification corpus as evidence that issuance,
 durable renewal or reboot behavior is complete. Those require the behavioral
@@ -50,7 +51,8 @@ discovering a key from the file being verified.
 authorization and verified streaming.
 
 [download-tickets.json](download-tickets.json) has 110 synthetic cases (10 valid,
-100 invalid), consumed by the Python, Go, Rust, C# and C++ seller-endpoint verifiers.
+100 invalid), consumed by the Python, Go, Rust, C#, C++ and backend TypeScript
+seller-endpoint verifiers.
 `expected` pins the public app key, exact endpoint and verification time. Each
 case may override that context or the trusted JWKS. The fixture signing keys are the same public test
 material described above. These checks cover ticket verification; server
@@ -64,7 +66,8 @@ separate session-grant purpose. It is an implementation baseline; ordinary
 activation grants do not provide concurrent-session enforcement.
 
 [session-grants.json](session-grants.json) supplies 184 signed cases (23 valid,
-161 invalid), consumed by the internal Python, Go, Rust and C# verifiers. Its expected
+161 invalid), consumed by the Python, Go, Rust, C#, C++, installed TypeScript and
+embedded C verifiers. Its expected
 context extends the connected corpus with `session_id`, exact `sequence` and
 the configured Test/Live `key_environment`. Cases cover process/sequence binding,
 120-second intervals, active retries without deadline extension, exact expiry,

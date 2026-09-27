@@ -28,8 +28,9 @@ is separate from the connected `offline_duration`; a zero file duration means
 issuance is disabled. Listing or claiming a licence does not grant access:
 activate the chosen licence and call
 `require_access()`. `logout_account()` requests remote revocation and clears
-local account state; `logout()` clears activation and customer session state
-without a network request. `claim_licence(key)` generates a secure operation
+local account state; `logout()` clears local activation and customer session
+state and schedules a bounded, best-effort release of any floating seat. It does
+not revoke the customer session remotely. `claim_licence(key)` generates a secure operation
 ID when omitted; pass an explicit ID to reuse it across retries.
 
 Installed key and account activations save their operation ID before sending.

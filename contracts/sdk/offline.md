@@ -70,9 +70,9 @@ history. Do not log the file, raw request fingerprint or authentication secrets.
 
 ### HTTP issuance profile
 
-The following routes are the implementation target; this contract alone does not
-make them available. The normal body limits, admission limits and strict JSON
-rules apply. Nested request objects reject unknown and duplicate fields too.
+The following routes issue offline files and expose their trusted public keys.
+The normal body limits, admission limits and strict JSON rules apply. Nested
+request objects reject unknown and duplicate fields too.
 
 - `GET /.well-known/orbit-offline-jwks.json?application_id=...&environment_id=...`
   returns only that environment's configured offline-purpose public keys. It uses
