@@ -180,7 +180,9 @@ activation proof (`application_id`, `environment_id`, `credential`,
   `{"release": null, "artifact": null}` when no eligible update exists, or
   the matching published release and exact target artifact. At most one artifact
   is selected. Filter by licence/feature eligibility before choosing the newest
-  release; another target is never a fallback.
+  release; another target is never a fallback. In this discovery result,
+  `release.artifacts` contains only that selected artifact. Do not disclose other
+  targets' URLs or feature-restricted artifacts through the nested release.
 - `/downloads/authorize` additionally takes `release_id` and `artifact_id`.
   It returns `artifact`, `ticket` and `expires_at`. Public delivery has null
   ticket and expiry. Protected delivery contains the short ticket and its
@@ -207,6 +209,14 @@ update metadata. Download authorization is separate from downloading bytes.
 Streaming requires a caller-chosen destination and maximum size, allows at most
 five HTTPS redirects, and forwards no Orbit bearer on any redirect, including
 one to the same origin. Do not use ambient cookies or caller-global credentials.
+Apply the byte limit while streaming, even when `Content-Length` is absent or
+false. Hash the exact artifact bytes; request identity encoding and reject an
+unexpected content encoding instead of silently hashing decompressed output.
+Use a temporary file in the destination's directory and expose it atomically
+only after length and digest validation. Refuse an existing destination unless
+the caller explicitly opts into replacement; a failed download preserves any
+existing file. Embedded callbacks must stage bytes separately and acknowledge
+completion only after verification, with an abort path for incomplete data.
 
 Store only metadata in Orbit. Use scoped indexes for release discovery and
 artifact lookup, and serialize publication numbering within its own channel.

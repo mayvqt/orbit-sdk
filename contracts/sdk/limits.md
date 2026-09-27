@@ -21,6 +21,15 @@ fractional numbers, booleans used as numbers and arithmetic overflow. An absent
 definition is `unknown_limit`, not an implicit unlimited allowance. The same name
 may exist in each map because their API routes and counters are distinct.
 
+Policy create/version bodies and policy/licence/owned-licence results use JSON
+objects keyed by the limit name. A usage value is
+`{"limit": 100, "period": "day", "required_feature": "export"}`; a resource
+value is `{"limit": 5, "required_feature": null}`. Omitted input maps default
+to empty objects and an omitted `required_feature` defaults to null. Responses
+include both maps and the explicit nullable feature. Definitions are immutable
+with the rest of the pinned policy, and grants retain boolean entitlements only;
+numeric metadata is never evidence of available quota without an online result.
+
 Periods use database time in UTC: day boundaries are midnight; month boundaries
 are the first day of the calendar month. Lifetime usage does not reset. Never
 accept a period boundary or authoritative usage total from the caller. Changing
@@ -78,6 +87,15 @@ bodies contain only the extra operation fields, never an activation proof.
 Dashboard actions call the same authoritative services after cookie/RBAC/CSRF
 authorization. Do not provide an unauthenticated licence-ID lookup.
 
+Management and dashboard allocation lists use
+`GET .../licences/{licence_id}/resources/{name}/allocations` and `resources:read`
+or the equivalent dashboard read permission. Return `items` and nullable
+`next_cursor`, with default page size 50 and maximum 100. Optional `state` is
+`active` or `released`; omission includes both retained states. Order by creation
+time and allocation ID descending, with cursors bound to licence, limit and
+filter. Items contain `allocation_id`, `resource_id`, `units`, `state`,
+`created_at` and nullable `released_at`, without activation credentials or tokens.
+
 ## Usage consumption
 
 Read results contain `name`, `period`, `limit`, `used`, `remaining`,
@@ -91,6 +109,12 @@ does not exceed the limit. Success returns the counter after that operation,
 plus `idempotency_key` and `consumed_units`. A rejected consume returns the typed
 `usage_limit_reached` error with the same bounded counter details; it changes
 no total. Check `units <= limit - used` instead of overflowing an addition.
+
+Capacity denials use HTTP 409 and the ordinary safe `code`, plus a typed
+`counter` containing the read result, the `idempotency_key` and `requested_units`.
+Resource-capacity denials use the same envelope with `resource_limit_reached`
+and the resource counter shape. Other errors keep the existing error envelope;
+never place arbitrary request bodies or database diagnostics into these details.
 
 Save both accepted and limit-denied outcomes for the replay window. Reusing an
 operation ID with different normalized input is a conflict. An identical retry
@@ -114,6 +138,10 @@ sum of units in active allocations. Acquire returns those fields plus
 `allocation_id`, `resource_id`, `units` and `state=active`. Allocation units are
 immutable. If the same resource is already active with identical units, return
 that allocation without charging again; different units are a conflict.
+
+Successful acquire and release responses also include the operation's
+`idempotency_key`. Release contains the same allocation fields as acquire, with
+`state=released` and the current resource counter.
 
 If acquiring would exceed capacity, return `resource_limit_reached` with bounded
 counter details and create no allocation. Save its outcome like a usage denial.
@@ -155,6 +183,12 @@ only after their operation replay window has also expired. Lifetime totals and
 active allocations remain until their owning data is deleted. Bounded pagination
 is required for allocation lists. Do not log credentials, signed grants or
 unbounded caller metadata in diagnostic events.
+
+Retain released allocation metadata for 90 days after release and at least
+through every associated replay's expiry. A cleanup cannot remove an allocation
+needed to qualify a still-valid acquire retry as released. Meter time is read
+after its serialization lock, so waiting across midnight selects the new period;
+an already-recorded operation keeps its original outcome under the replay rule.
 
 Include definitions, counters, allocations and replay records in scoped export,
 backup, recovery and app/customer purge handling. Recovery must preserve quota
