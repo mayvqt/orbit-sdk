@@ -130,7 +130,10 @@ contract.
 - `POST /releases` creates a draft from `channel`, `version`, `notes` and
   `idempotency_key`. `GET /releases` lists bounded, cursor-paginated releases
   within the scope, optionally filtered by channel; `GET /releases/{id}` reads
-  one. Default page size is 50, maximum 100.
+  one. Pagination uses `after` and `limit`; default page size is 50, maximum
+  100. A non-null `next_cursor` is opaque ASCII, 1–256 characters from letters,
+  digits, `_`, `-` and `.`. Pass it unchanged as `after`; it is bound to the
+  application/environment and channel filter, and is not a release ID.
 - `PATCH /releases/{id}` changes draft metadata. Artifact create/update/delete
   uses `/releases/{id}/artifacts` and `/releases/{id}/artifacts/{artifact_id}`.
   Only drafts that have never been published are editable.

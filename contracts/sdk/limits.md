@@ -92,7 +92,10 @@ All responses use `Cache-Control: no-store`.
 Management and dashboard allocation lists use
 `GET .../licences/{licence_id}/resources/{name}/allocations` and `resources:read`
 or the equivalent dashboard read permission. Return `items` and nullable
-`next_cursor`, with default page size 50 and maximum 100. Optional `state` is
+`next_cursor`, with `after` and `limit` query parameters, default page size 50
+and maximum 100. A non-null cursor is opaque ASCII, 1–256 characters from
+letters, digits, `_`, `-` and `.`; pass it unchanged as `after`, not as an
+allocation ID. Optional `state` is
 `active` or `released`; omission includes both retained states. Order by creation
 time and allocation ID descending, with cursors bound to licence, limit and
 filter. Items contain `allocation_id`, `resource_id`, `units`, `state`,
