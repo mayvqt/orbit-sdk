@@ -150,7 +150,9 @@ each call; it is not cached across protected operations.
   and never log them.
 * `getLicence(id)` returns safe licence metadata. `offline_file_seconds` is the
   policy's separate long-term file limit (zero means disabled); `offline_seconds`
-  remains the connected grant's offline allowance.
+  remains the connected grant's offline allowance. `concurrent_session_limit`
+  gives the floating-seat capacity separately from `device_limit`; zero means
+  floating sessions are disabled.
 * `replaceLicenceKey(id, { reason, idempotencyKey })` invalidates old
   activation credentials and returns any ephemeral key disclosure.
   `idempotencyKey` is optional, generated and returned the same way as above.

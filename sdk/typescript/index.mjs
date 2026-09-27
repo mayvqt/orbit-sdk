@@ -547,6 +547,7 @@ function isLicence(value) {
     nullableDuration(value.duration_seconds) &&
     nullableTimestamp(value.first_used_at) && nullableTimestamp(value.expires_at) &&
     isSafeInteger(value.device_limit, 1, 100) && typeof value.hwid_locked === "boolean" &&
+    isSafeInteger(value.concurrent_session_limit, 0, 65_535) &&
     typeof value.offline_allowed === "boolean" && isSafeInteger(value.offline_seconds, 0, 86_400) &&
     (value.offline_file_seconds === 0 || isSafeInteger(value.offline_file_seconds, 86_400, 31_622_400)) &&
     isEntitlements(entitlements) &&
@@ -585,6 +586,7 @@ function freezeLicence(value) {
     first_used_at: value.first_used_at,
     expires_at: value.expires_at,
     device_limit: value.device_limit,
+    concurrent_session_limit: value.concurrent_session_limit,
     hwid_locked: value.hwid_locked,
     offline_allowed: value.offline_allowed,
     offline_seconds: value.offline_seconds,

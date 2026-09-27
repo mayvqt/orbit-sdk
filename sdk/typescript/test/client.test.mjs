@@ -58,6 +58,7 @@ function licenceShape(overrides = {}) {
     first_used_at: null,
     expires_at: null,
     device_limit: 2,
+    concurrent_session_limit: 0,
     hwid_locked: false,
     offline_allowed: true,
     offline_seconds: 900,
@@ -469,6 +470,25 @@ test("licence responses validate the server shape before returning typed fields"
   });
   await assert.rejects(client.getLicence("licence_example"), (error) =>
     error instanceof OrbitTransportError && error.code === "invalid_response");
+});
+
+test("licence results preserve and bound session capacity independently of device limits", async () => {
+  let limit = 0;
+  const client = new OrbitBackendClient(config, {
+    fetchImpl: async () => jsonResponse(licenceShape({
+      concurrent_session_limit: limit, offline_allowed: false, offline_seconds: 0,
+    })),
+  });
+  for (limit of [0, 1, 65_535]) {
+    const licence = await client.getLicence("licence_example");
+    assert.equal(licence.concurrent_session_limit, limit);
+    assert.equal(licence.device_limit, 2);
+    assert.ok(Object.isFrozen(licence));
+  }
+  for (limit of [undefined, null, true, "1", -1, 1.5, 65_536]) {
+    await assert.rejects(client.getLicence("licence_example"), (error) =>
+      error instanceof OrbitTransportError && error.code === "invalid_response");
+  }
 });
 
 test("licence responses preserve and bound the separate offline file term", async () => {

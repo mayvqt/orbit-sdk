@@ -126,6 +126,8 @@ export interface OrbitLicence {
   readonly first_used_at: string | null;
   readonly expires_at: string | null;
   readonly device_limit: number;
+  /** Concurrent sessions per licence; zero means sessions are not required. */
+  readonly concurrent_session_limit: number;
   readonly hwid_locked: boolean;
   readonly offline_allowed: boolean;
   readonly offline_seconds: number;
