@@ -211,7 +211,8 @@ truncate a signed file, allocate an unbounded fallback or accept only a prefix.
 Document the profile's accepted file size and test its exact boundary.
 
 The current connected journal holds a record of at most 1024 bytes in two
-independently erasable slots, with board examples reserving 8 KiB in total.
+independently erasable slots. The STM32G0B1RE example reserves two 2 KiB pages;
+the ESP and Pico examples reserve two 4 KiB slots.
 That reservation is not sufficient for two full-size offline files plus their
 metadata. Offline-enabled board profiles need explicitly sized, reserved storage
 and updated firmware/image-end checks. Do not increase the connected record-size
