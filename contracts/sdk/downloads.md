@@ -140,6 +140,19 @@ contract.
   `POST /releases/{id}/unpublish` stops discovery and new authorization. Repeating
   either action is a no-op; republishing preserves its original number and bytes.
 
+Creation returns HTTP 201 with the created release or artifact. Release reads,
+metadata edits, publication and unpublication return HTTP 200 with the release;
+artifact edits return HTTP 200 with the artifact. Release lists return `items`
+and nullable `next_cursor`.
+
+Draft metadata edits use `PATCH` with the complete `channel`, `version`, `notes`
+and `idempotency_key` fields. Artifact creation uses `POST`; artifact edits use
+`PATCH`. Both take the complete artifact input below plus `idempotency_key`.
+Artifact deletion uses `DELETE` with an `idempotency_key` JSON body and returns
+HTTP 204. Publish and unpublish bodies contain only `idempotency_key`. Reject
+unknown or duplicate input fields. Identical mutation retries retain the original
+result and publication number, with current authorization checked first.
+
 Channel, platform and architecture are 1–32 ASCII lowercase letters, digits,
 `_` or `-`, beginning with a letter. Display versions are nonempty plain text
 of at most 64 UTF-8 bytes. Notes are plain text of at most 8192 UTF-8 bytes and
