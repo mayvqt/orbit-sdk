@@ -90,7 +90,10 @@ impl Orbit {
             .await
             .map_err(|error| match error {
                 orbit_sdk::Error::Denied { code, .. }
-                    if matches!(code.as_str(), "invalid_credentials" | "session_expired") =>
+                    if matches!(
+                        code.as_str(),
+                        "invalid_credentials" | "session_expired" | "session_revoked"
+                    ) =>
                 {
                     Failure::Authentication
                 }

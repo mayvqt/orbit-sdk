@@ -239,7 +239,7 @@ int32_t orbit_client_import_offline_file(orbit_client_t *client,
   orbit_client_state_t *c;
   orbit_client_extension_t *e;
   uint32_t start = 0, end = file.length;
-  if (!client || client->private_state.magic != 0x4f524243u || !file.data)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC || !file.data)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   e = c->extension;
@@ -281,7 +281,7 @@ int32_t orbit_client_import_offline_reader(orbit_client_t *client,
   uint64_t generation, record_generation;
   uint32_t n = 0, got, capacity, loaded;
   int32_t r = 0, restore;
-  if (!client || !read || client->private_state.magic != 0x4f524243u)
+  if (!client || !read || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   e = c->extension;
@@ -345,7 +345,7 @@ int32_t orbit_client_offline_request(orbit_client_t *client, uint8_t *out,
   orbit_writer_t w;
   orbit_client_config_t parsed;
   uint8_t origin[ORBIT_APP_KEY_ORIGIN_MAX_BYTES];
-  if (!client || !out || !length || client->private_state.magic != 0x4f524243u)
+  if (!client || !out || !length || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   e = c->extension;

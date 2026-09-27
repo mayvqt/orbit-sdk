@@ -57,6 +57,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 target = "/download/bytes" if remaining == 1 else f"/download/redirect/{remaining - 1}"
                 self._respond(302, b"redirect", headers={"Location": target, "Set-Cookie": "secret=fixture"})
                 return
+            if route == "/download/missing":
+                self._respond(404, b"not found")
+                return
             if route == "/download/downgrade":
                 self._respond(302, b"", headers={"Location": "http://127.0.0.1/bytes"})
                 return
@@ -331,6 +334,7 @@ def main() -> None:
         reservation.bind(("127.0.0.1", 0))
         refused_port = reservation.getsockname()[1]
     run_driver(args.driver, "refused", f"https://127.0.0.1:{refused_port}", args.ca)
+    run_driver(args.driver, "unresolvable", "https://orbit-sdk-fixture.invalid", args.ca)
 
     print("TLS transport checks passed: 22 driver scenarios plus retry/redirect/stream assertions")
 

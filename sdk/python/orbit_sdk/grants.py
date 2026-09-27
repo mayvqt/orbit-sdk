@@ -55,7 +55,7 @@ def _canonical_b64(value: str) -> bytes:
 
 
 def parse_header(token: str) -> tuple[dict[str, str], bytes, bytes, bytes]:
-    if not isinstance(token, str) or len(token.encode("utf-8", "strict")) > 16384 or not token.isascii():
+    if not isinstance(token, str) or not token.isascii() or len(token) > 16384:
         _invalid()
     parts = token.split(".")
     if len(parts) != 3:

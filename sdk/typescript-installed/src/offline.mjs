@@ -1,7 +1,8 @@
 import { createHash, verify as verifySignature } from "node:crypto";
 import { fail, ErrorKind } from "./errors.mjs";
-import { parseJwks } from "./grants.mjs";
-import { isInteger, uniqueJson } from "./json.mjs";
+import { validProvider } from "./app-key.mjs";
+import { parseJwks, validEntitlements } from "./grants.mjs";
+import { isInteger, stableJson, uniqueJson } from "./json.mjs";
 
 const MAX_FILE_BYTES = 16 * 1024;
 const MAX_LIFETIME = 366 * 86400;
@@ -60,7 +61,7 @@ export function verifyOfflineFile(value, key, binding, installationId, keys, now
     if (Object.keys(claims).length !== expectedFields.length || Object.keys(claims).some((field) => !expectedFields.includes(field))) invalidFile();
     if (!isInteger(claims.ver, 1, 1) || !isInteger(claims.iat, 0, MAX_TIME) || !isInteger(claims.nbf, 0, MAX_TIME) ||
         !isInteger(claims.exp, 0, MAX_TIME) || !isInteger(claims.sequence, minimumSequence, MAX_SEQUENCE) ||
-        !isInteger(claims.policy_version, 1, 0x7fffffff) || !validOfflineEntitlements(claims.entitlements) ||
+        !isInteger(claims.policy_version, 1, 0x7fffffff) || !validEntitlements(claims.entitlements) ||
         !["sub", "jti"].every((field) => opaque(claims[field])) ||
         !["application_id", "environment_id", "activation_id", "installation_id"].every((field) => opaque(claims[field])) ||
         claims.installation_id.length < 16) invalidFile();
@@ -142,21 +143,11 @@ export function emptyOfflineState() {
   return { jws: null, sequence: 0, issuance_id: null, content_digest: null, verified_at: 0, time_high_water: 0, wall_high_water: 0 };
 }
 
-export function validOfflineEntitlements(value) {
-  return record(value) && Object.keys(value).length <= 64 && Object.entries(value).every(([name, enabled]) => /^[a-z][a-z0-9_]{0,63}$/.test(name) && typeof enabled === "boolean");
-}
-
-function validProvider(value) { return value === "machine_v1" || typeof value === "string" && /^custom:[a-z0-9_.-]{1,48}$/.test(value); }
 function decodeB64(value) {
   if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) invalidFile();
   const decoded = Buffer.from(value, "base64url");
   if (decoded.toString("base64url") !== value) invalidFile();
   return decoded;
-}
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (record(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  return JSON.stringify(value);
 }
 function invalidKeys() { throw fail(ErrorKind.INVALID_RESPONSE, "invalid_offline_keys"); }
 function invalidFile() { throw fail(ErrorKind.INVALID_RESPONSE, "invalid_offline_file"); }

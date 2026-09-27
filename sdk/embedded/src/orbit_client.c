@@ -6,8 +6,8 @@
 #define ORBIT_NOINLINE
 #endif
 
-#define CLIENT_MAGIC 0x4f524243u
 #define KEY_FETCH_TRANSIENT ((int32_t)22)
+#define KEY_FETCH_LINK ((int32_t)23)
 _Static_assert(sizeof(orbit_client_state_t) <= ORBIT_CLIENT_STORAGE_BYTES,
                "client storage bound");
 _Static_assert(_Alignof(orbit_client_t) >= _Alignof(orbit_client_state_t),
@@ -15,7 +15,7 @@ _Static_assert(_Alignof(orbit_client_t) >= _Alignof(orbit_client_state_t),
 
 static orbit_client_state_t *state(orbit_client_t *client) {
   orbit_client_state_t *c = client != NULL ? &client->private_state : NULL;
-  return c != NULL && c->magic == CLIENT_MAGIC ? c : NULL;
+  return c != NULL && c->magic == ORBIT_CLIENT_MAGIC ? c : NULL;
 }
 static orbit_embedded_slice_t slice(const uint8_t *p, uint32_t n) {
   orbit_embedded_slice_t s = {p, n};
@@ -30,6 +30,7 @@ static void wipe(void *p, uint32_t n) {
 #define clear_access orbit_client_clear_access
 #define clock_now orbit_client_clock
 #define fetch_keys orbit_client_fetch_keys
+#define apply_claims orbit_client_apply_claims
 #define ORBIT_INTERNAL
 #else
 #define ORBIT_INTERNAL static
@@ -261,7 +262,7 @@ int32_t orbit_client_init(orbit_client_t *client,
   c->arena_capacity = arena_length;
   c->scratch = (uint8_t *)scratch;
   c->last_wall = -1;
-  c->magic = CLIENT_MAGIC;
+  c->magic = ORBIT_CLIENT_MAGIC;
   c->busy = 1u;
   result = scope_digest(cfg, &services->crypto, scope);
   if (result != 0)
@@ -287,7 +288,7 @@ int32_t orbit_client_init(orbit_client_t *client,
   if (result != 0)
     goto failed;
   c->generation = c->record.generation;
-  c->magic = CLIENT_MAGIC;
+  c->magic = ORBIT_CLIENT_MAGIC;
   c->busy = 0u;
   return 0;
 failed:
@@ -370,6 +371,14 @@ static int32_t response_status(int32_t transport, uint16_t http) {
     return ORBIT_CLIENT_DENIED;
   return http == 200u ? 0 : ORBIT_CLIENT_UNTRUSTED;
 }
+/* A connection that failed without a transient signal (for example a TLS
+ * certificate failure) denies access now, but says nothing about the saved
+ * credential: only a verified denial or a bad signed reply revokes it. */
+static int link_failed(int32_t transport, int32_t sink_error) {
+  return transport != 0 && sink_error == 0 &&
+         transport != ORBIT_CLIENT_TRANSIENT &&
+         transport != ORBIT_CLIENT_RESOURCE_LIMIT;
+}
 typedef struct key_sink {
   orbit_client_state_t *c;
   orbit_jwks_importer_t importer;
@@ -390,8 +399,8 @@ static int32_t receive_keys(void *context, const uint8_t *bytes,
     return sink->error = ORBIT_CLIENT_UNTRUSTED;
   return 0;
 }
-ORBIT_INTERNAL int32_t fetch_keys(orbit_client_state_t *c,
-                                  uint64_t generation) {
+static int32_t fetch_keys_from(orbit_client_state_t *c, uint64_t generation,
+                               uint8_t *link) {
   uint8_t path[384];
   uint16_t http = 0u;
   int32_t status;
@@ -421,10 +430,45 @@ ORBIT_INTERNAL int32_t fetch_keys(orbit_client_state_t *c,
     return ORBIT_CLIENT_STALE;
   if (sink.error)
     return sink.error;
+  if (link != NULL)
+    *link = (uint8_t)link_failed(status, sink.error);
   status = response_status(status, http);
   if (status == 0 && orbit_jwks_finish(&sink.importer, &c->keys) != 0)
     status = ORBIT_CLIENT_UNTRUSTED;
   return status;
+}
+#ifdef ORBIT_ENABLE_SERVICES
+ORBIT_INTERNAL int32_t fetch_keys(orbit_client_state_t *c,
+                                  uint64_t generation) {
+  return fetch_keys_from(c, generation, NULL);
+}
+#endif
+ORBIT_INTERNAL void apply_claims(orbit_client_state_t *c,
+                                 const orbit_grant_claims_t *claims,
+                                 int64_t server_time, uint64_t started) {
+  uint32_t i, used = 0u;
+  orbit_zero(&c->active, sizeof(c->active));
+  for (i = 0; i < claims->entitlement_count; ++i) {
+    c->active.names[i].offset = (uint16_t)used;
+    c->active.names[i].length = claims->entitlements[i].name.length;
+    orbit_copy(c->active.pool + used,
+               c->arena + claims->entitlements[i].name.offset,
+               claims->entitlements[i].name.length);
+    used += claims->entitlements[i].name.length;
+  }
+  orbit_copy(c->active.enabled, claims->entitlement_enabled,
+             sizeof(c->active.enabled));
+  c->active.count = claims->entitlement_count;
+  c->active.expires = claims->expires_at;
+  c->active.refresh = claims->refresh_after;
+  c->active.policy = claims->policy_version;
+  c->active.offline_allowed = claims->offline_allowed;
+  c->anchor_server = server_time;
+  c->anchor_ticks = started;
+  c->anchored = 1u;
+  c->transient = 0u;
+  c->retry_ticks = 0u;
+  c->active.valid = 1u;
 }
 static int has_key(const orbit_grant_keyset_t *keys,
                    const orbit_grant_pending_t *pending) {
@@ -592,11 +636,14 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     goto done;
   }
   if (!has_key(&c->keys, &pending)) {
-    result = fetch_keys(c, generation);
+    uint8_t link = 0u;
+    result = fetch_keys_from(c, generation, &link);
     if (result != 0) {
       clear_access(c);
       if (result == ORBIT_CLIENT_TRANSIENT)
         result = KEY_FETCH_TRANSIENT;
+      else if (link)
+        result = KEY_FETCH_LINK;
       goto done;
     }
   }
@@ -645,33 +692,7 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     result = ORBIT_CLIENT_STALE;
     goto done;
   }
-#ifdef ORBIT_ENABLE_SERVICES
-  orbit_client_apply_claims(c, &claims, reply.server_time, started);
-#else
-  orbit_zero(&c->active, sizeof(c->active));
-  used = 0u;
-  for (i = 0; i < claims.entitlement_count; ++i) {
-    c->active.names[i].offset = (uint16_t)used;
-    c->active.names[i].length = claims.entitlements[i].name.length;
-    orbit_copy(c->active.pool + used,
-               c->arena + claims.entitlements[i].name.offset,
-               claims.entitlements[i].name.length);
-    used += claims.entitlements[i].name.length;
-  }
-  orbit_copy(c->active.enabled, claims.entitlement_enabled,
-             sizeof(c->active.enabled));
-  c->active.count = claims.entitlement_count;
-  c->active.expires = claims.expires_at;
-  c->active.refresh = claims.refresh_after;
-  c->active.policy = claims.policy_version;
-  c->active.offline_allowed = claims.offline_allowed;
-  c->anchor_server = reply.server_time;
-  c->anchor_ticks = started;
-  c->anchored = 1u;
-  c->transient = 0u;
-  c->retry_ticks = 0u;
-  c->active.valid = 1u;
-#endif
+  apply_claims(c, &claims, reply.server_time, started);
   result = 0;
 done:
   if (result == 0) {
@@ -691,6 +712,7 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
   response_sink_t sink = {c, 0u, 0};
   uint16_t http = 0u;
   int32_t result;
+  int link = 0;
   int64_t now;
   uint64_t started, generation = c->generation;
   result = clock_now(c, &now, &started);
@@ -732,6 +754,7 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
                ? result
                : ORBIT_CLIENT_STALE;
   }
+  link = link_failed(result, sink.error);
   if (sink.error)
     result = sink.error;
   if (operation == 2u && result == 0 && http == 204u) {
@@ -755,10 +778,19 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
     return result == ORBIT_CLIENT_STORAGE || result == ORBIT_CLIENT_CLOCK
                ? result
                : ORBIT_CLIENT_STALE;
-  if (result == KEY_FETCH_TRANSIENT) {
+  if (result == KEY_FETCH_TRANSIENT || result == KEY_FETCH_LINK) {
     if (advance(c) != 0)
       return ORBIT_CLIENT_STORAGE;
-    result = ORBIT_CLIENT_TRANSIENT;
+    link = result == KEY_FETCH_LINK;
+    result = link ? ORBIT_CLIENT_UNTRUSTED : ORBIT_CLIENT_TRANSIENT;
+  }
+  if (link && operation == 0u) {
+    /* Keep the credential and retry later; access stays unavailable until a
+     * verified validation succeeds. */
+    clear_access(c);
+    c->retry_ticks =
+        started > UINT64_MAX - 30000u ? UINT64_MAX : started + 30000u;
+    return result;
   }
   if (result == ORBIT_CLIENT_TRANSIENT) {
     if (clock_now(c, &now, &started) != 0)
@@ -1157,33 +1189,3 @@ void orbit_client_destroy(orbit_client_t *client) {
   wipe(c->scratch, ORBIT_GRANT_WORKSPACE_BYTES);
   wipe(client, sizeof(*client));
 }
-
-#ifdef ORBIT_ENABLE_SERVICES
-void orbit_client_apply_claims(orbit_client_state_t *c,
-                               const orbit_grant_claims_t *claims,
-                               int64_t server_time, uint64_t started) {
-  orbit_zero(&c->active, sizeof(c->active));
-  uint32_t i, used = 0u;
-  for (i = 0; i < claims->entitlement_count; ++i) {
-    c->active.names[i].offset = (uint16_t)used;
-    c->active.names[i].length = claims->entitlements[i].name.length;
-    orbit_copy(c->active.pool + used,
-               c->arena + claims->entitlements[i].name.offset,
-               claims->entitlements[i].name.length);
-    used += claims->entitlements[i].name.length;
-  }
-  orbit_copy(c->active.enabled, claims->entitlement_enabled,
-             sizeof(c->active.enabled));
-  c->active.count = claims->entitlement_count;
-  c->active.expires = claims->expires_at;
-  c->active.refresh = claims->refresh_after;
-  c->active.policy = claims->policy_version;
-  c->active.offline_allowed = claims->offline_allowed;
-  c->anchor_server = server_time;
-  c->anchor_ticks = started;
-  c->anchored = 1u;
-  c->transient = 0u;
-  c->retry_ticks = 0u;
-  c->active.valid = 1u;
-}
-#endif

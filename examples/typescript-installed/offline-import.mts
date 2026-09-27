@@ -13,8 +13,7 @@ const offlineFile = await readFile(offlineFilePath);
 const client = await Client.open(appKey, { offlineKeys });
 try {
   await client.importOfflineFile(offlineFile);
-  const access = await client.requireAccess("export");
-  if (!access.has("export")) throw new Error("offline export access is unavailable");
+  await client.requireAccess("export");
   await exportProtectedData();
 } finally {
   await client.close();

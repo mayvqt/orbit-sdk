@@ -214,6 +214,17 @@ class TransportTests(unittest.TestCase):
             transport.get("/api/client/v1/status")
         self.assertEqual(raised.exception.kind, "invalid_response")
 
+    def test_oversized_retry_after_is_clamped_instead_of_escaping(self) -> None:
+        requests: list[tuple[str, str, dict[str, str]]] = []
+        body = b'{"error":{"code":"licence_revoked","message":"Denied","request_id":"req_1"}}'
+        transport = Transport(
+            "https://orbit.example.test",
+            _connection_factory=lambda *_args, **_kwargs: _Connection(_Response(403, body, {"Retry-After": "9" * 400}), requests),
+        )
+        with self.assertRaises(OrbitError) as raised:
+            transport.get("/api/client/v1/status")
+        self.assertEqual((raised.exception.kind, raised.exception.code), ("denied", "licence_revoked"))
+
     def test_only_safe_reads_retry_valid_transient_envelopes(self) -> None:
         requests: list[tuple[str, str, dict[str, str]]] = []
         queue = [
@@ -264,6 +275,21 @@ class TransportTests(unittest.TestCase):
     def test_windows_socket_outages_are_transient(self) -> None:
         for code in (10051, 10053, 10054, 10060, 10061, 10065, 11002):
             self.assertTrue(_transient_os_error(OSError(code, "synthetic network failure")), code)
+
+    def test_unknown_host_on_start_is_an_outage(self) -> None:
+        def unresolved(*_args, **_kwargs):
+            raise socket.gaierror(getattr(socket, "EAI_NONAME", -2), "Name or service not known")
+
+        transport = Transport("https://orbit.example.test", _connection_factory=unresolved)
+        with self.assertRaises(OrbitError) as raised:
+            transport.post("/api/client/v1/activations/synthetic/validate", {"operation": "synthetic"}, False)
+        self.assertEqual((raised.exception.kind, raised.exception.code), ("transient", "network_unavailable"))
+
+    def test_dns_failures_are_transient(self) -> None:
+        self.assertTrue(_transient_os_error(socket.gaierror(socket.EAI_AGAIN, "temporary failure")))
+        self.assertTrue(_transient_os_error(socket.gaierror(11002, "WSATRY_AGAIN")))
+        self.assertTrue(_transient_os_error(socket.gaierror(socket.EAI_NONAME, "unknown host")))
+        self.assertTrue(_transient_os_error(socket.gaierror(11001, "WSAHOST_NOT_FOUND")))
 
     def test_proxy_errors_are_transient_but_duplicate_orbit_envelopes_fail_closed(self) -> None:
         requests: list[tuple[str, str, dict[str, str]]] = []

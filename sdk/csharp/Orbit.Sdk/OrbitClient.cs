@@ -307,7 +307,7 @@ public sealed partial class OrbitClient : IDisposable
     {
         using var ownedOperation = InstallationOperation(cancellationToken);
         cancellationToken = ownedOperation?.Token ?? cancellationToken;
-        if ((account ? !JsonWire.Opaque(principal) : principal.Length is < 1 or > 256) ||
+        if ((account ? !JsonWire.Opaque(principal) : principal is not { Length: >= 1 and <= 256 }) ||
             (idempotencyKey != null && !JsonWire.OperationId(idempotencyKey)) || (previousCredential != null && !JsonWire.Bearer(previousCredential)))
             throw new OrbitException(OrbitError.Configuration);
         if (idempotencyKey == null && installed == null)
@@ -385,6 +385,7 @@ public sealed partial class OrbitClient : IDisposable
     /// <summary>Checks current access and entitlement immediately before protected work, refreshing when needed.</summary>
     public async Task<Snapshot> RequireAccessAsync(string feature, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(feature);
         OrbitException.CheckCancellation(cancellationToken);
         Snapshot snapshot;
         bool retryDue;

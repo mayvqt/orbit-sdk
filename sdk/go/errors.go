@@ -43,6 +43,9 @@ func (e *Error) Error() string {
 	case Configuration:
 		return "Invalid Orbit configuration"
 	case Cancelled:
+		if e.Code == "closed" {
+			return "The Orbit client is closed"
+		}
 		return "Operation cancelled"
 	case Transient:
 		return "Orbit is temporarily unreachable. Try again later."
@@ -114,6 +117,8 @@ func errorGuidance(code string) string {
 		return "Too many requests. Wait before trying again."
 	case "service_unavailable":
 		return "Orbit is temporarily unavailable. Try again later."
+	case "invalid_download_ticket":
+		return "The download ticket is invalid or expired."
 	default:
 		return ""
 	}
@@ -143,6 +148,9 @@ var (
 	ErrNativeSupportRequired    = &Error{Kind: StorageFailure, Code: "macos_cgo_required"}
 	ErrClockUncertain           = &Error{Kind: ClockUncertain}
 )
+
+// errClosed matches ErrCancelled and reports use of a closed client.
+var errClosed = &Error{Kind: Cancelled, Code: "closed"}
 
 var ErrInstallationInUse = &Error{Kind: StorageFailure, Code: "installation_in_use"}
 var ErrPendingActivation = &Error{Kind: StorageFailure, Code: "pending_activation"}

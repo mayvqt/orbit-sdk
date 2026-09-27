@@ -69,30 +69,6 @@ bool valid_lower_hex(std::string_view value, std::size_t length) {
     });
 }
 
-bool valid_utf8(std::string_view text) {
-    std::size_t i = 0;
-    while (i < text.size()) {
-        const auto c = static_cast<unsigned char>(text[i]);
-        if (c <= 0x7f) { ++i; continue; }
-        std::size_t count;
-        std::uint32_t code;
-        if ((c & 0xe0) == 0xc0) { count = 2; code = c & 0x1f; if (code < 2) return false; }
-        else if ((c & 0xf0) == 0xe0) { count = 3; code = c & 0x0f; }
-        else if ((c & 0xf8) == 0xf0) { count = 4; code = c & 0x07; if (code > 4) return false; }
-        else return false;
-        if (i + count > text.size()) return false;
-        for (std::size_t j = 1; j < count; ++j) {
-            const auto continuation = static_cast<unsigned char>(text[i + j]);
-            if ((continuation & 0xc0) != 0x80) return false;
-            code = (code << 6) | (continuation & 0x3f);
-        }
-        if ((count == 3 && code < 0x800) || (count == 4 && code < 0x10000) || code > 0x10ffff ||
-            (code >= 0xd800 && code <= 0xdfff)) return false;
-        i += count;
-    }
-    return true;
-}
-
 std::size_t utf8_characters(std::string_view value) {
     if (!valid_utf8(value)) raise(ErrorKind::configuration, "configuration");
     return static_cast<std::size_t>(std::count_if(value.begin(), value.end(), [](unsigned char c) {
@@ -163,12 +139,14 @@ std::int64_t timestamp(std::string_view value) {
 }
 
 std::optional<std::string> optional_string(const Json::Value& value, const char* key) {
+    if (!value.isObject()) invalid_response();
     if (!value.isMember(key) || value[key].isNull()) return std::nullopt;
     if (!value[key].isString()) invalid_response();
     return value[key].asString();
 }
 
 std::optional<std::int64_t> optional_integer(const Json::Value& value, const char* key) {
+    if (!value.isObject()) invalid_response();
     if (!value.isMember(key) || value[key].isNull()) return std::nullopt;
     return json_int64(value[key]);
 }
@@ -434,6 +412,7 @@ void ClientState::clear_access_locked() {
     session_licence_expiry.reset();
     session_binding_mode.clear();
     transient = false;
+    refresh_failure.reset();
     retry_deadline.reset();
     update_available.reset();
     version_denial.reset();
@@ -1134,6 +1113,7 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
             accepted->session_required ? accepted->licence_expires_at : std::nullopt;
         session_binding_mode = accepted->session_required ? accepted->binding_mode : std::string{};
         transient = false;
+        refresh_failure.reset();
         retry_deadline.reset();
         update_available = std::move(hint);
         version_denial.reset();
@@ -1180,6 +1160,7 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
         pending_renewal_sequence.reset();
         transient = false;
         update_available.reset();
+        refresh_failure.reset();
         version_denial = *failure;
         std::uint8_t entropy = 0;
         const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
@@ -1208,12 +1189,40 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
             }
         }
         transient = true;
+        refresh_failure.reset();
         std::uint8_t entropy = 0;
         const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
             ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
         retry_deadline = std::chrono::steady_clock::now() + delay;
         auto current = snapshot_locked(true);
         if (current.access == ::orbit::Access::offline) return current;
+        throw *failure;
+    }
+
+    if (persistent && !mutation && previous && failure->kind() != ErrorKind::denied) {
+        // Only an authoritative Orbit denial revokes the saved activation. TLS,
+        // proxy, malformed-reply and local failures drop cached authority but
+        // keep the credential so a later refresh can recover it.
+        advance_generation_locked();
+        claims.reset();
+        anchor.reset();
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+        credential = previous;
+        persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
+        persistent_record["credential"] = credential_json(*credential);
+        persistent_record["access"] = null_value();
+        persist_record_locked();
+        transient = false;
+        version_denial.reset();
+        refresh_failure = *failure;
+        std::uint8_t entropy = 0;
+        const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
+            ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
+        retry_deadline = std::chrono::steady_clock::now() + delay;
+        wake_worker();
         throw *failure;
     }
 
@@ -1843,6 +1852,7 @@ SessionGrant ClientState::verify_session_reply(const Json::Value &reply,
         }
         if (credential && transient) raise(ErrorKind::transient, "network_unavailable");
         if (credential && version_denial) throw *version_denial;
+        if (credential && refresh_failure) throw *refresh_failure;
         raise(ErrorKind::not_activated, "access_unavailable");
     }
     if (!current.has_feature(feature)) {
@@ -2505,16 +2515,55 @@ std::string AppKey::public_key() const {
         "." + application_id_ + "." + environment_id_;
 }
 
+namespace {
+// Returns the explicit environment, or the one every key ID's purpose prefix names.
+std::string key_set_environment(std::string_view jwks_json, std::string_view environment,
+                                std::string_view purpose, const char* code) {
+    if (!environment.empty()) return std::string(environment);
+    std::string inferred;
+    try {
+        const auto jwks = detail::parse_json(jwks_json, 16384);
+        if (!jwks.isObject() || !jwks["keys"].isArray() || jwks["keys"].empty())
+            detail::raise(ErrorKind::configuration, code);
+        for (const auto& key : jwks["keys"]) {
+            if (!key.isObject() || !key["kid"].isString()) detail::raise(ErrorKind::configuration, code);
+            const auto kid = key["kid"].asString();
+            std::string candidate;
+            for (const char* name : {"test", "live"}) {
+                const auto prefix = std::string(purpose) + name + "-";
+                if (kid.compare(0, prefix.size(), prefix) == 0) candidate = name;
+            }
+            if (candidate.empty() || (!inferred.empty() && inferred != candidate))
+                detail::raise(ErrorKind::configuration, code);
+            inferred = std::move(candidate);
+        }
+    } catch (const Error&) {
+        detail::raise(ErrorKind::configuration, code);
+    }
+    return inferred;
+}
+} // namespace
+
 OfflineKeys OfflineKeys::parse(std::string_view jwks_json, std::string_view environment) {
-    auto keys = detail::OfflineKeys::parse_jwks(jwks_json, environment);
-    return OfflineKeys(std::make_shared<const detail::OfflineKeys>(std::move(keys)),
-                       std::string(environment));
+    auto selected = key_set_environment(jwks_json, environment, "offline-", "invalid_offline_keys");
+    try {
+        auto keys = detail::OfflineKeys::parse_jwks(jwks_json, selected);
+        return OfflineKeys(std::make_shared<const detail::OfflineKeys>(std::move(keys)),
+                           std::move(selected));
+    } catch (const Error&) {
+        detail::raise(ErrorKind::configuration, "invalid_offline_keys");
+    }
 }
 
 SessionKeys SessionKeys::parse(std::string_view jwks_json, std::string_view environment) {
-    auto keys = detail::SessionKeys::parse_jwks(jwks_json, environment);
-    return SessionKeys(std::make_shared<const detail::SessionKeys>(std::move(keys)),
-                       std::string(environment));
+    auto selected = key_set_environment(jwks_json, environment, "", "invalid_session_keys");
+    try {
+        auto keys = detail::SessionKeys::parse_jwks(jwks_json, selected);
+        return SessionKeys(std::make_shared<const detail::SessionKeys>(std::move(keys)),
+                           std::move(selected));
+    } catch (const Error&) {
+        detail::raise(ErrorKind::configuration, "invalid_session_keys");
+    }
 }
 
 std::string OfflineRequest::to_json() const {
@@ -2531,7 +2580,9 @@ std::string OfflineRequest::to_json() const {
 
 Error::Error(std::uint32_t status, ErrorKind kind, std::string code,
              std::string request_id)
-    : std::runtime_error("Orbit SDK operation failed"), status_(status), kind_(kind),
+    : std::runtime_error(code.empty() ? std::string("Orbit SDK operation failed")
+                                      : "Orbit SDK operation failed: " + code),
+      status_(status), kind_(kind),
       code_(std::move(code)), request_id_(std::move(request_id)) {}
 
 Cancellation::Cancellation() : state_(std::make_shared<detail::CancellationState>()) {}

@@ -203,6 +203,9 @@ public:
     std::string session_binding_mode;
     std::optional<AccountSession> customer;
     bool transient = false;
+    // A non-authoritative refresh failure that kept the credential; reported
+    // by access checks until a later refresh settles.
+    std::optional<Error> refresh_failure;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
     std::optional<std::string> update_available;
     // Keeps an app_version_unsupported answer while validation retries are paced.

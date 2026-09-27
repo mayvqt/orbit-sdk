@@ -119,7 +119,7 @@ void orbit_service_proof(orbit_client_state_t *c, orbit_writer_t *w) {
 int32_t orbit_service_begin(orbit_client_t *client, const orbit_operation_t *op,
                             orbit_client_state_t **out) {
   orbit_client_state_t *c;
-  if (!client || client->private_state.magic != 0x4f524243u)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   if (c->busy)

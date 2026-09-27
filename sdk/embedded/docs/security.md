@@ -14,8 +14,9 @@ and any pending operation ID/input digest. It never contains a raw licence key,
 password or restored access grant. The pending identity is committed before the
 activation/deactivation request. Verified returned authority is committed before
 access is granted. A malformed or lost mutation response preserves its retry
-identity; definitive denial durably clears authority. A failed durable write
-leaves access unavailable until the storage problem is resolved.
+identity. Only a verified denial or an invalid signed reply clears the saved
+credential; a failed connection denies access and retries later. A failed
+durable write leaves access unavailable until the storage problem is resolved.
 
 Normal boot validates an existing credential online. The client never restores a
 grant using process-local ticks after power loss. After a valid online result,
@@ -44,8 +45,9 @@ response body: that body reuses the request arena. Responses are bounded and
 redirects are disabled. The portable HTTP reader accepts content length, chunked
 or close-delimited responses, bounds headers, and rejects conflicting framing,
 compression, trailers and chunk extensions. The provider classifies genuine
-network timeouts/unavailability separately from TLS or malformed-data failures.
-Ports that cannot distinguish a TLS failure conservatively return untrusted.
+network timeouts, resets and short reads separately from TLS handshake or
+malformed-data failures. Ports that cannot distinguish a handshake failure
+return untrusted, which denies access without clearing the credential.
 
 The physical host bridge is a trusted transport boundary, not a secure protocol
 for an exposed network. Use a dedicated USB/UART byte stream without logs or

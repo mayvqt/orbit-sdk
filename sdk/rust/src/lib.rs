@@ -110,9 +110,16 @@ impl std::fmt::Display for Error {
         })
     }
 }
+/// Adds the stable code and any validated request ID to the message, so
+/// `main() -> Result<(), Box<dyn Error>>` reports them. Never includes server
+/// messages or caller input.
 impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+        write!(f, "{self} (code: {}", self.code())?;
+        if let Some(request_id) = self.request_id() {
+            write!(f, ", request ID: {request_id}")?;
+        }
+        f.write_str(")")
     }
 }
 impl std::error::Error for Error {}

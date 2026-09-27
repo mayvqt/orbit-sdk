@@ -1,5 +1,6 @@
 #include "storage_linux_internal.hpp"
 
+#include "json.hpp"
 #include "platform.hpp"
 
 #include <memory>
@@ -58,49 +59,6 @@ public:
 private:
     int value_ = -1;
 };
-
-bool valid_utf8(std::string_view value) {
-    std::size_t cursor = 0;
-    while (cursor < value.size()) {
-        const auto lead = static_cast<unsigned char>(value[cursor]);
-        if (lead <= 0x7f) {
-            ++cursor;
-            continue;
-        }
-        std::size_t width = 0;
-        std::uint32_t codepoint = 0;
-        if (lead >= 0xc2 && lead <= 0xdf) {
-            width = 2;
-            codepoint = lead & 0x1f;
-        } else if (lead >= 0xe0 && lead <= 0xef) {
-            width = 3;
-            codepoint = lead & 0x0f;
-        } else if (lead >= 0xf0 && lead <= 0xf4) {
-            width = 4;
-            codepoint = lead & 0x07;
-        } else {
-            return false;
-        }
-        if (width > value.size() - cursor) {
-            return false;
-        }
-        for (std::size_t i = 1; i < width; ++i) {
-            const auto continuation = static_cast<unsigned char>(value[cursor + i]);
-            if ((continuation & 0xc0) != 0x80) {
-                return false;
-            }
-            codepoint = (codepoint << 6) | (continuation & 0x3f);
-        }
-        if ((width == 2 && codepoint < 0x80) ||
-            (width == 3 && codepoint < 0x800) ||
-            (width == 4 && codepoint < 0x10000) ||
-            (codepoint >= 0xd800 && codepoint <= 0xdfff) || codepoint > 0x10ffff) {
-            return false;
-        }
-        cursor += width;
-    }
-    return true;
-}
 
 std::string normalize(std::string_view path) {
     if (path.empty() || path.front() != '/' ||

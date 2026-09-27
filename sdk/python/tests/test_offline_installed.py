@@ -79,6 +79,7 @@ class OfflineInstalledTests(unittest.TestCase):
             snapshot = client.import_offline_file(file)
             expiry = snapshot.expires_at
             self.assertEqual(snapshot.access.value, "offline")
+            self.assertTrue(snapshot.offline_file_mode)
             self.assertIsNone(snapshot.next_check_at)
             self.assertFalse(snapshot.reauthentication_required)
             self.assertTrue(client.require_access("export").has("export"))

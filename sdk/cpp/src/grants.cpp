@@ -26,7 +26,7 @@ void only_fields(const Json::Value& value,
 }
 
 const Json::Value& required(const Json::Value& value, const char* key) {
-    if (!value.isMember(key)) invalid();
+    if (!value.isObject() || !value.isMember(key)) invalid();
     return value[key];
 }
 
@@ -168,11 +168,13 @@ bool verify_signature(EVP_PKEY* key, std::string_view signing_input,
 }
 
 std::optional<std::string> optional_string(const Json::Value& value, const char* key) {
+    if (!value.isObject()) invalid();
     if (!value.isMember(key)) return std::nullopt;
     return string_value(value[key]);
 }
 
 std::optional<std::int64_t> optional_integer(const Json::Value& value, const char* key) {
+    if (!value.isObject()) invalid();
     if (!value.isMember(key) || value[key].isNull()) return std::nullopt;
     return integer_value(value[key]);
 }

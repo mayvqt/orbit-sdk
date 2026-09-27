@@ -575,7 +575,10 @@ mod native_tests {
             }
             let error = WindowsStorage::open(&directory.0, &config, &device).unwrap_err();
             assert_eq!(format!("{error}"), "Credential storage failed");
-            assert_eq!(format!("{error:?}"), "Credential storage failed");
+            assert_eq!(
+                format!("{error:?}"),
+                "Credential storage failed (code: storage)"
+            );
             assert!(fs::read(&path).unwrap() == original);
         }
         let (config, device) = scope();

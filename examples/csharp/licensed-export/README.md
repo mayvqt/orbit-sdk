@@ -1,35 +1,26 @@
 # C# licensing example
 
-This console app uses Orbit's installed client to authorize a sample export.
-Use .NET SDK 10.0.112 and the [C# SDK](../../../sdk/csharp/README.md).
+This console app uses the [C# SDK](../../../sdk/csharp/README.md) to authorize
+a sample export. It needs the .NET 10 SDK.
 
 Copy the public app key from Orbit's **Integration** page, starting with the
-**Test** environment:
+**Test** environment, then run it from the repository root:
 
 ```sh
 export ORBIT_APP_KEY='orbit_app_test_...'
 dotnet run --project examples/csharp/licensed-export
 ```
 
-The example asks for a licence key only when there is no activation. Enter
-`export` to run the protected sample. Licence and password input is visible in
-this demo; never put either in command-line arguments.
+The app asks for a licence key only when there is no activation; enter `export`
+to run the protected sample. Input is visible in this demo, so never use it
+with production passwords.
 
-The SDK saves this installation and validates it online after restart. Verified
-offline access is available only when the signed grant permits it. An optional
-`OrbitOptions.StatePath` can select a dedicated absolute state directory in
-application code.
+Other commands demonstrate:
 
-For Account or Both authentication, use `register`, confirm the email link, then
-`login`, `licences` and `select` before exporting. Other commands show claiming a
-licence, registration recovery, account logout and device deactivation. Local
-logout clears local access; only acknowledged deactivation releases a device
-slot.
-
-The SDK and example source are [MIT licensed](../../../sdk/LICENSE).
-
-For a policy with an `exports` usage limit, `metered-export` reserves one unit
-before printing the report. Supply a stable job ID and reuse it after an uncertain
-reply; a new ID is a new debit. `seat-end` releases floating access and `seat-start`
-resumes it. See [online operations](../../../sdk/csharp/ONLINE.md) for updates,
-resource allocations and guidance on authoritative backend metering.
+- `login`, `licences`, `more` and `select` for Account or Both authentication,
+  plus `register`, `resend`, `recover`, `email`, `claim` and `account-logout`.
+- `metered-export`, which reserves one unit of an `exports` usage limit with a
+  job ID you supply. Reuse that ID after an uncertain reply.
+- `seat-end` and `seat-start` for floating seats.
+- `status`, `logout` (clears local access) and `deactivate` (releases the
+  device slot).

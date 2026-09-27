@@ -55,7 +55,7 @@ int32_t orbit_client_init_extended(orbit_client_t *client,
       orbit_overlap(e, sizeof(*e), cfg->fingerprint_provider.data,
                     cfg->fingerprint_provider.length))
     return ORBIT_CLIENT_ARGUMENT;
-  if (client->private_state.magic == 0x4f524243u)
+  if (client->private_state.magic == ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_BUSY;
 #ifndef ORBIT_ENABLE_OFFLINE
   if (offline)

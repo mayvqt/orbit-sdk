@@ -749,6 +749,57 @@ class PersistentClientTests(unittest.TestCase):
         self.assertFalse(client._lifecycle_thread.is_alive())
         self.assertIsNone(client._storage._lease.fd)
 
+    def test_untrusted_validation_failure_keeps_the_activation_credential(self) -> None:
+        client = self.open(PersistentTransport())
+        client.activate("captive-portal-key")
+        client.close()
+        failing = PersistentTransport(validation_error=error("transport_security", "tls_failure"))
+        with self.assertRaises(OrbitError) as opened:
+            self.open(failing)
+        self.assertEqual(opened.exception.kind, "transport_security")
+        record = json.loads(Path(self.directory.name, "orbit-storage.bin").read_bytes())
+        self.assertIsNotNone(record["credential"])
+        self.assertIsNone(record["access"])
+        prompts: list[str] = []
+        restarted = self.open(PersistentTransport())
+        try:
+            snapshot = restarted.ensure_access("export", lambda: prompts.append("asked") or "other-key")
+            self.assertEqual(snapshot.access.value, "online")
+            self.assertEqual(prompts, [])
+            restarted.transport = failing
+            with self.assertRaises(OrbitError) as refreshed:
+                restarted.refresh()
+            self.assertEqual(refreshed.exception.kind, "transport_security")
+            self.assertIsNotNone(restarted._credential)
+            with self.assertRaises(OrbitError) as guarded:
+                restarted.ensure_access("export", lambda: prompts.append("asked") or "other-key")
+            self.assertEqual(guarded.exception.kind, "transport_security")
+            self.assertEqual(prompts, [])
+        finally:
+            restarted.close()
+
+    def test_background_worker_survives_an_orbit_error(self) -> None:
+        client = self.open(PersistentTransport(offline=True))
+        try:
+            client.activate("worker-key")
+            entered = threading.Event()
+            original = client._checkpoint_persistent_cache
+
+            def failing_checkpoint(*args, **kwargs):
+                if not entered.is_set():
+                    entered.set()
+                    raise error(STORAGE, "storage_failed")
+                return original(*args, **kwargs)
+
+            client._checkpoint_persistent_cache = failing_checkpoint
+            client._start_lifecycle()
+            self.assertTrue(entered.wait(2))
+            time.sleep(0.1)
+            self.assertTrue(client._lifecycle_thread.is_alive())
+        finally:
+            client.close()
+        self.assertFalse(client._lifecycle_thread.is_alive())
+
     def test_close_forces_high_water_checkpoint_before_releasing_lease(self) -> None:
         self._activate_offline()
         client = self.open(PersistentTransport(validation_error=error(TRANSIENT, "network_unavailable")))

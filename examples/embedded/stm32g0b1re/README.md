@@ -20,15 +20,12 @@ reinitialization and online validation.
 
 Build with `ORBIT_APP_KEY` set to the public key from the Orbit Integration page.
 The common example parses that one value into its static decoded-origin buffer
-before `orbit_client_init`. Call `orbit_board_start(&huart, firmware_flash_end)` after HAL initialization.
+before `orbit_client_init`. Call `orbit_board_start(&huart, firmware_flash_end)`
+after HAL initialization.
 Provision a key once with `orbit_example_activate`; call `orbit_example_tick`
 from your loop and `orbit_example_check` before each protected action.
 
-This port targets the STM32G0B1RE's 512 KiB flash and 144 KiB RAM. The host bridge
-supplies networking; the MCU does not have built-in Wi-Fi. The example
-builds with STM32CubeG0 1.6.3, Mbed TLS 3.6.6 and Arm GNU 14.3.1. Its
-29,268-byte flash image ends at `0x08007254`, below the reserved journal region
-at `0x0807f000`. The default profile uses 44,384 bytes of RAM, including a
-512-byte heap and 1 KiB stack reservation; the 8 KiB arena profile uses the same
-flash and 19,808 bytes of RAM. Add your Cube application's board and UART
-initialization, and size its runtime stack and heap for your firmware.
+This port targets the STM32G0B1RE's 512 KiB flash and 144 KiB RAM; the MCU has
+no built-in Wi-Fi, so the host bridge supplies networking. Add your Cube
+application's board and UART initialization, and size its runtime stack and heap
+on top of the [linked footprint](../../../sdk/embedded/docs/memory.md#linked-example-footprints).

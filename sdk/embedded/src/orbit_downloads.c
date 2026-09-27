@@ -194,7 +194,7 @@ int32_t orbit_client_check_for_updates(
   if (!out || installed > ORBIT_SAFE_INTEGER_MAX || !target(channel) ||
       !target(platform) || !target(architecture))
     return ORBIT_CLIENT_ARGUMENT;
-  if (!client || client->private_state.magic != 0x4f524243u)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   if (orbit_overlap(out, sizeof(*out), client, sizeof(*client)) ||
@@ -264,7 +264,7 @@ int32_t orbit_client_authorize_download(orbit_client_t *client,
   if (!out || !orbit_client_opaque(release_id, 1, 128) ||
       !orbit_client_opaque(artifact_id, 1, 128))
     return ORBIT_CLIENT_ARGUMENT;
-  if (!client || client->private_state.magic != 0x4f524243u)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   if (orbit_overlap(out, sizeof(*out), client, sizeof(*client)) ||

@@ -4,8 +4,8 @@ The protocol bounds are fixed: 16 KiB compact JWS, 32 KiB HTTP JSON/JWKS,
 8 signing keys, 64 entitlements, and 64 bytes per entitlement name. The client
 uses one caller-owned 8–32 KiB arena for a request, response and decoded payload in turn.
 Streaming JWKS import preserves that payload while refreshing an unknown key.
-The default profile preserves these protocol bounds. The explicit small-arena
-profile below rejects responses larger than its chosen buffer.
+The explicit small-arena profile rejects responses larger than its chosen
+buffer.
 
 | Caller-owned object | Bytes |
 | --- | ---: |
@@ -41,8 +41,7 @@ the actual state type and alignment; its members are not application API.
 
 ## Portable footprint
 
-Clang 22.1.8, `--target=arm-none-eabi -mcpu=cortex-m0plus -mthumb -Os
--ffreestanding -fno-builtin`, followed by a relocatable `ld.lld -r` link:
+Portable module sizes for Cortex-M0+ (`-Os`, Thumb):
 
 | Linked portable module | Read-only code/data | Writable globals |
 | --- | ---: | ---: |
@@ -50,26 +49,20 @@ Clang 22.1.8, `--target=arm-none-eabi -mcpu=cortex-m0plus -mthumb -Os
 | Full client, verifier, wire format, journal and app-key parser | 29,576 bytes | 0 |
 
 These are linked library modules, **not firmware images**. Compiler runtime
-helpers are added when your target toolchain links them. Crypto,
-networking, TLS, adapters, application strings, vector tables and startup code
-are excluded. Static archive file sizes are not flash-use estimates.
+helpers, crypto, networking, TLS, adapters, application strings, vector tables
+and startup code are additional. Static archive file sizes are not flash-use
+estimates.
 
-The bounded call-graph estimate from `-fstack-usage` is 1,412 bytes for standalone
-grant verification, 524 for standalone JWKS import, 240 for app-key parsing, and
-up to 3,716 for the full portable client (including the 16-level JSON recursion
-limit). Provider stack,
-TLS callbacks, board code, runtime helpers, interrupts and Rust callbacks are
-additional. Mutation preparation uses a separate stack frame so its record copy
-is released before network work. Measure actual stack and free heap on each
-firmware build, especially ESP8266; its TLS memory is a separate constraint.
+Conservative portable stack is 1,412 bytes for standalone grant verification,
+524 for standalone JWKS import, 240 for app-key parsing, and up to 3,716 for the
+full portable client (including the 16-level JSON recursion limit). Provider
+stack, TLS callbacks, board code, runtime helpers, interrupts and Rust callbacks
+are additional. Mutation preparation uses a separate stack frame so its record
+copy is released before network work. Check actual stack and free heap on each
+firmware build, especially ESP8266, where TLS memory is a separate constraint.
 
 The full client has no heap calls; platform TLS and crypto implementations may
 allocate internally.
-
-The linked x86-64 Linux example with GCC 16.2.1 `-Os` has 47,569 bytes of code
-and read-only data, 1,056 bytes of initialized data, and 42,320 bytes of BSS.
-Its dynamically linked OpenSSL/libcurl, process stack and runtime allocations
-are additional; this host measurement is not an MCU flash estimate.
 
 `ORBIT_CLIENT_ARENA_BYTES` controls the default application allocation, and can
 be set from 8192 through 32768 bytes. C callers may pass any actual runtime arena
@@ -77,23 +70,20 @@ capacity in that same range, independently of the compile-time default. Rust
 uses `Buffers::<8192>` or `Buffers::<32768>` to select a static size. The compact
 choice saves 24 KiB of transaction RAM; protocol and verification rules stay the
 same. Requests or responses that do not fit fail with a resource limit rather
-than being truncated. Choose the size for your policy's grant and measure TLS
+than being truncated. Choose the size for your policy's grant and check TLS
 handshake, stack and application heap on the actual board.
 
 The heapless app-key parser needs a caller-owned 384-byte origin buffer in C;
 its parsed application and environment IDs borrow the original key text. Rust
 stores the decoded origin inline in `AppKey` and borrows the IDs from the input.
 This setup memory is separate from the client buffer totals above.
-The verifier-only API keeps its independent published limits.
 
 ## Linked example footprints
 
-These are static linker figures for the example firmware. RAM headroom
-subtracts the linked static sections and the explicit minimum heap/stack
-reservations from the board or linker region; budget TLS heap and runtime stack
-within it. The Pico values include vectors and uninitialized data in the
-static RAM total. STM32 RAM headroom includes the linker's 512-byte minimum
-heap and 1 KiB minimum stack reservation.
+Static linker figures for the example firmware in bytes. RAM headroom subtracts
+the linked static sections and the linker's minimum heap/stack reservations
+(2 KiB each on Pico, 512-byte heap and 1 KiB stack on STM32); budget TLS heap
+and runtime stack within it.
 
 | Target/profile | `.text` | `.rodata` | `.data` | `.bss` | Flash remaining | Static RAM remaining |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -107,30 +97,35 @@ heap and 1 KiB minimum stack reservation.
 | STM32G0B1RE default | 26,872 | 2,052 | 136 | 42,712 | 490,924 / 508 KiB linker region | 103,072 / 144 KiB after minimum heap/stack |
 | STM32G0B1RE 8 KiB | 26,872 | 2,052 | 136 | 18,136 | 490,924 / 508 KiB linker region | 127,648 / 144 KiB after minimum heap/stack |
 
-Pico flash totals use the generated BIN size, including boot metadata, the load
-image for `.data` and 32 bytes of Pico 2 W output padding;
-Pico static RAM totals also include the runtime vector table and
-uninitialized data. Their linkers reserve 2 KiB each for heap and stack, which
-is subtracted from the displayed SRAM headroom. STM32 flash use is 29,268 bytes
-in each profile, including the 188-byte interrupt vector, alignment padding,
-exception index, init/fini arrays and the 136-byte `.data` load image. That
-image contains 56 bytes of RAM-function code copied to RAM at startup; its end
-is `0x08007254`, below the reserved journal region at `0x0807f000`. The ESP32
-IDF report gives 440,457 bytes
-of image sections (440,576-byte padded binary) for both profiles. The
-NodeMCU's code total is `.text` + `.text1` + `.irom0.text`.
+Pico flash totals include boot metadata and the `.data` load image; Pico static
+RAM includes the vector table and uninitialized data. STM32 flash use is 29,268
+bytes in each profile, ending below the reserved journal region at
+`0x0807f000`. ESP32's padded app binary is 440,576 bytes. The ESP8266 code total
+is `.text` + `.text1` + `.irom0.text`.
 
-The AArch64 Linux `orbit_pi` ELF is dynamically linked and has no fixed flash
-slot or per-process static RAM ceiling. `size` reports text/data/BSS of
-69,893/1,104/42,272 bytes with the default arena, and 69,893/1,104/17,696 bytes
+The dynamically linked AArch64 Linux `orbit_pi` example has text/data/BSS of
+69,893/1,104/42,272 bytes with the default arena and 69,893/1,104/17,696 bytes
 with 8 KiB, excluding shared libraries, process stack and TLS allocations.
 
-Build commands and linker budgets for each target are in the
-[board guide](boards.md).
+Build commands for each target are in the [board guide](boards.md).
+
+### Offline profile footprints
+
+Raw GNU `size` text/data/BSS bytes, excluding TLS runtime needs:
+
+| Target | Compact (4 KiB file) | Full (16 KiB file) |
+| --- | --- | --- |
+| Pico W | 238,752 / 0 / 37,980 | 238,792 / 0 / 58,460 |
+| Pico 2 W | 216,784 / 0 / 37,604 | 216,808 / 0 / 58,084 |
+| STM32G0B1RE | 42,672 / 0 / 25,144 | 42,704 / 0 / 45,624 |
+| ESP32 | 364,853 / 87,444 / 30,313 | 364,869 / 87,444 / 50,793 |
+
+On ESP8266, the compact profile uses 442,871 bytes of flash and 54,124 bytes of
+RAM; the full profile uses 442,887 and 74,604, leaving only **7,316 bytes** of
+the 81,920-byte static RAM budget for TLS, stack and application work.
 
 ## Optional profile buffers and storage
 
-Connected builds keep the table and 29,576-byte portable library above unchanged.
 Services and offline files are explicit compile features. On Cortex-M0+, the
 extended client is 7,024 bytes; its external extension is 248 bytes for services
 or 336 bytes with offline support. The same structs can be larger on a 64-bit
@@ -160,8 +155,7 @@ allocation. Download streaming separately needs at least 2,304 caller bytes.
 | Offline full | 54,136 | 0 | 3,884 |
 
 These whole-module figures include optional APIs even when a firmware linker
-can discard unused functions. The slight compact/full code difference comes
-from constant-size instruction selection. Offline slice import uses a 2,636-byte
+can discard unused functions. Offline slice import uses a 2,636-byte
 conservative portable stack, reader import 2,692, extended initialization 2,708,
 consume 2,140, update discovery 1,716 and stream 344. Provider/TLS/reader callbacks,
 interrupts and target runtime helpers remain additional.
@@ -177,8 +171,8 @@ each of two independent slots is rounded up to the port's erase unit:
 | ESP8266/Linux logical slot files | 4 / 8 KiB | 8 / 16 KiB | 20 / 40 KiB |
 
 ESP8266 LittleFS needs additional filesystem capacity and runtime overhead beyond
-its two logical slots. Linux uses one journal file containing two independent slots. Firmware linker/partition
-reservations must match `ORBIT_OFFLINE_PROFILE_FILE_BYTES`; the supported board
-examples provide explicit reservations. STM32 slots span
-independently erased pages. Pico slots erase each included sector. No offline
-profile changes the connected defaults or silently migrates existing storage.
+its two logical slots. Linux uses one journal file containing two independent
+slots. Firmware linker/partition reservations must match
+`ORBIT_OFFLINE_PROFILE_FILE_BYTES`; the supported board examples provide
+explicit reservations. STM32 slots span independently erased pages. Pico slots
+erase each included sector.

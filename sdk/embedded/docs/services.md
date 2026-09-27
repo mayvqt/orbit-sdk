@@ -3,11 +3,11 @@
 The default build keeps the small connected client. Enable `ORBIT_ENABLE_SERVICES`
 (CMake `-DORBIT_ENABLE_SERVICES=ON`, Rust feature `services`) for floating sessions,
 usage, resources and licensed downloads. Initialize once with the parsed app-key
-config, existing platform callbacks and one zero-initialized
-`orbit_client_extension_t`:
+config, your existing `orbit_client_services_t` callbacks and one
+zero-initialized `orbit_client_extension_t`:
 
 ```c
-orbit_client_init_extended(&client, &config, &platform, &extension,
+orbit_client_init_extended(&client, &config, &services, &extension,
     arena, sizeof(arena), scratch, sizeof(scratch), NULL);
 ```
 
@@ -120,7 +120,7 @@ static uint8_t transaction[ORBIT_OFFLINE_BUFFER_BYTES(4096)];
 orbit_offline_config_t offline = {
     &trusted_offline_keys, transaction, sizeof(transaction), 4096, app_key
 };
-orbit_client_init_extended(&client, &config, &platform, &extension,
+orbit_client_init_extended(&client, &config, &services, &extension,
     arena, sizeof(arena), scratch, sizeof(scratch), &offline);
 ```
 
@@ -149,8 +149,9 @@ access. Online service calls and deactivation return denial in that mode.
 Explicit key activation selects connected mode; `invalidate` durably denies
 local access while retaining rollback metadata. Offline time is checkpointed
 periodically and at close. Access checks read trusted time again after a
-checkpoint finishes, so a slow write cannot grant access past expiry. Call `clock_lost` when elapsed time across sleep is
-unreliable, and restore trusted UTC before access.
+checkpoint finishes, so a slow write cannot grant access past expiry. Call
+`clock_lost` when elapsed time across sleep is unreliable, and restore trusted
+UTC before access.
 
 The [profile geometry](memory.md#optional-profile-buffers-and-storage) must be
 reserved explicitly. Existing connected journal files are a different format:

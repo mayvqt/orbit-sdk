@@ -11,31 +11,9 @@ until configured.
 ## Footprint
 
 The connected SDK builds for every target below in both the default and 8 KiB
-arena profiles; the Rust wrapper builds for Cortex-M0+ and Cortex-M33. Figures
-are static linker sizes, not runtime heap or stack use.
-
-| Target/profile | Linked code and data (`text / rodata / data / bss`, bytes) | Flash headroom | Static RAM headroom |
-| --- | --- | --- | --- |
-| ESP32 default | 296,402 / 77,464 / 9,500 / 49,392 | 608,000 bytes in the 1 MiB app partition | 121,844 bytes DRAM; 74,269 bytes IRAM |
-| ESP32 8 KiB | 296,402 / 77,464 / 9,500 / 24,816 | 608,000 bytes in the 1 MiB app partition | 146,420 bytes DRAM; 74,269 bytes IRAM |
-| ESP8266 NodeMCU 8 KiB | 426,723 code / 3,304 / 1,496 / 43,448 | 612,941 bytes in the 1,044,464-byte app slot | 33,672 of 81,920 bytes |
-| Pico W default | 191,880 / 20,228 / 3,008 / 56,856 | 1,873,548 bytes after the 8 KiB journal reserve | 206,152 of 270,336 bytes after the 4 KiB linker heap/stack reserve |
-| Pico W 8 KiB | 191,880 / 20,228 / 3,008 / 32,280 | 1,873,548 bytes after the 8 KiB journal reserve | 230,728 of 270,336 bytes after the 4 KiB linker heap/stack reserve |
-| Pico 2 W default | 171,988 / 18,468 / 4,104 / 56,416 | 3,991,480 bytes after the 8 KiB journal reserve | 467,576 of 532,480 bytes after the 4 KiB linker heap/stack reserve |
-| Pico 2 W 8 KiB | 171,988 / 18,468 / 4,104 / 31,840 | 3,991,480 bytes after the 8 KiB journal reserve | 492,152 of 532,480 bytes after the 4 KiB linker heap/stack reserve |
-| STM32G0B1RE default | 26,872 / 2,052 / 136 / 42,712 | 490,924 bytes in the 508 KiB firmware region | 103,072 bytes after minimum heap/stack |
-| STM32G0B1RE 8 KiB | 26,872 / 2,052 / 136 / 18,136 | 490,924 bytes in the 508 KiB firmware region | 127,648 bytes after minimum heap/stack |
-
-Pico values include the `.data` load image, boot metadata, vectors and
-uninitialized data; RAM headroom subtracts the linker's 2 KiB heap and 2 KiB
-stack. STM32 values include the vector table, alignment padding, init/fini
-arrays, the `.data` load image (with 56 bytes of RAM-function code) and a
-512-byte heap and 1 KiB stack reservation. ESP32's padded app binary is 440,576
-bytes. The ESP8266 code value combines `.text`, `.text1` and `.irom0.text`.
-
-The Linux `orbit_pi` example for AArch64 uses 69,893/1,104/42,272 bytes
-(text/data/BSS) with the default arena and 69,893/1,104/17,696 bytes with 8 KiB,
-excluding shared libraries, stack and dynamic allocations.
+arena profiles; the Rust wrapper builds for Cortex-M0+ and Cortex-M33. Linked
+flash and static RAM figures for each example are in the
+[memory reference](memory.md#linked-example-footprints).
 
 ## Linux and Pi Zero 2 W
 
@@ -110,8 +88,7 @@ LittleFS without automatic formatting. Keep default BearSSL receive capacity
 unless the server actually negotiates smaller TLS fragments; reducing a buffer
 locally is not negotiation. The port uses trusted wall time for conservative
 elapsed tracking and denies access after rollback. ESP8266 is the tightest RAM
-target: the 8 KiB profile leaves 33,672 bytes of link-time RAM, so budget the TLS
-handshake heap within it.
+target; budget the TLS handshake heap within the remaining static RAM.
 
 ## Pico W and Pico 2 W: native Wi-Fi
 
@@ -176,31 +153,17 @@ standalone networking needs an external network module and a separately
 integrated authenticated TLS transport.
 
 The [STM32G0B1RE](https://www.st.com/en/microcontrollers-microprocessors/stm32g0b1re.html)
-has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. With the default
-profile, Orbit's flash image ends 29,268 bytes into the 508 KiB firmware region,
-leaving 490,924 bytes before the reserved journal region, and uses 44,384 bytes
-of RAM including a 512-byte heap and 1 KiB stack, leaving 103,072 bytes. The
-8 KiB profile uses 19,808 bytes of RAM, leaving 127,648. Size your firmware's
-runtime stack and heap on top of these figures.
+has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. Size your firmware's
+runtime stack and heap on top of the
+[linked footprint](memory.md#linked-example-footprints).
 
 ## Offline profile builds
 
 Every supported target also builds with the explicit compact (4096-byte file,
-8192-byte arena) and full (16384-byte file, 16384-byte arena) profiles:
-
-| Target | Compact `size` text/data/BSS bytes | Full `size` text/data/BSS bytes |
-| --- | --- | --- |
-| Pico W | 238,752 / 0 / 37,980 | 238,792 / 0 / 58,460 |
-| Pico 2 W | 216,784 / 0 / 37,604 | 216,808 / 0 / 58,084 |
-| STM32G0B1RE | 42,672 / 0 / 25,144 | 42,704 / 0 / 45,624 |
-| ESP32 | 364,853 / 87,444 / 30,313 | 364,869 / 87,444 / 50,793 |
-
-These are raw GNU `size` categories, distinct from the section-by-section
-connected table above, and do not include TLS runtime needs. On ESP8266, the
-compact profile uses 442,871 bytes of flash and 54,124 bytes of RAM; the full
-profile uses 442,887 and 74,604, leaving only **7,316 bytes** of the 81,920-byte
-static RAM budget for TLS, stack and application work. Use the compact profile
-on ESP8266 unless your complete firmware's runtime needs fit the full profile.
+8192-byte arena) and full (16384-byte file, 16384-byte arena) profiles. Their
+sizes are in the [memory reference](memory.md#offline-profile-footprints); on
+ESP8266, use the compact profile unless your complete firmware's runtime needs
+fit the full profile.
 
 Select a profile consistently in the library, adapter and application. CMake
 builds use `-DORBIT_ENABLE_OFFLINE=ON`,

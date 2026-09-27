@@ -199,12 +199,14 @@ async function makeClient(statePath, transport, { lifecycle = false } = {}) {
   return openClientForTesting(key, { statePath, machineBinding: false, transport, skipInitialRefresh: true, lifecycle });
 }
 
-async function waitUntil(predicate, label) {
-  for (let count = 0; count < 100; count++) {
-    if (predicate()) return;
+// Storage writes are real file I/O, so bound the wait by wall time rather than
+// event-loop turns; performance.now() and setImmediate are never mocked here.
+async function waitUntil(predicate, label, timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() > deadline) assert.fail(`timed out waiting for ${label}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.fail(`timed out waiting for ${label}`);
 }
 
 async function openWithFakeLifecycle(context, base, transport) {
@@ -486,9 +488,7 @@ test("expired seats are reacquired with a fresh ID and background renewal retrie
   const initialExpiry = first.session.expiresAt.getTime();
 
   context.mock.timers.tick(60_000);
-  for (let count = 0; count < 20 && !transport.requests.some((request) => request.route.endsWith("/renew")); count++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await waitUntil(() => client.snapshot().session?.sequence === 2, "first renewal");
   assert.equal(transport.requests.filter((request) => request.route.endsWith("/renew")).length, 1);
   assert.equal(transport.requests.find((request) => request.route.endsWith("/renew")).body.sequence, 2);
   assert.equal(client.snapshot().session.sequence, 2);
@@ -498,15 +498,12 @@ test("expired seats are reacquired with a fresh ID and background renewal retrie
   const renewExpiry = client.snapshot().session.expiresAt.getTime();
   transport.failRenew = 1;
   context.mock.timers.tick(60_000);
-  for (let count = 0; count < 20 && transport.requests.filter((request) => request.route.endsWith("/renew")).length < 2; count++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await waitUntil(() => transport.requests.filter((request) => request.route.endsWith("/renew")).length >= 2
+    && transport.renewInFlight === 0, "failed renewal");
   assert.equal(transport.requests.filter((request) => request.route.endsWith("/renew")).length, 2);
   assert.equal(client.snapshot().session.sequence, 2);
   context.mock.timers.tick(45_000);
-  for (let count = 0; count < 20 && transport.requests.filter((request) => request.route.endsWith("/renew")).length < 3; count++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await waitUntil(() => client.snapshot().session?.sequence === 3, "retried renewal");
   const renewals = transport.requests.filter((request) => request.route.endsWith("/renew"));
   assert.deepEqual(renewals.map((request) => request.body.sequence), [2, 3, 3]);
   assert.equal(client.snapshot().session.sessionId, renewId);
@@ -553,9 +550,7 @@ test("cancelling a start after its request begins cannot expose or persist a ses
   await transport.entered;
   controller.abort();
   await assert.rejects(activating, (error) => error.kind === ErrorKind.CANCELLED);
-  for (let count = 0; count < 20 && !transport.requests.some((request) => request.route.endsWith("/end")); count++) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await waitUntil(() => transport.requests.some((request) => request.route.endsWith("/end")), "abandoned session end");
   assert.equal(client.snapshot().access, "refresh_required");
   assert.equal(client.snapshot().session, null);
   const record = JSON.parse(await readFile(path.join(statePath, "orbit-storage.bin"), "utf8"));

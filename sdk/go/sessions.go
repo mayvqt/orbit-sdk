@@ -84,7 +84,7 @@ func (c *Client) sessionSnapshotLocked() Snapshot {
 	return snapshot
 }
 
-func sessionIDFromToken(token string) (string, error) {
+func sessionKeyIDFromToken(token string) (string, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return "", ErrInvalidResponse
@@ -131,7 +131,7 @@ func (c *Client) verifySessionReply(ctx context.Context, data json.RawMessage, s
 	if err != nil {
 		return nil, err
 	}
-	keyID, err := sessionIDFromToken(reply.Grant)
+	keyID, err := sessionKeyIDFromToken(reply.Grant)
 	if err != nil {
 		return nil, err
 	}

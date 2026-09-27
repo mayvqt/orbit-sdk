@@ -1,12 +1,12 @@
 import { randomBytes, createHash, randomInt } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { validateAppKey, canonicalScope, isOpaqueId } from "./app-key.mjs";
+import { validateAppKey, canonicalScope, isOpaqueId, validProvider } from "./app-key.mjs";
 import { configuredAppVersion, updateHint } from "./app-version.mjs";
 import { fail, ErrorKind, AppVersionUnsupportedError, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
 import * as online from "./online.mjs";
 import { downloadFile } from "./download-file.mjs";
 import { validEntitlements, parseJwks, verifyGrant } from "./grants.mjs";
-import { isInteger, isText, uniqueJson } from "./json.mjs";
+import { isInteger, isText, stableJson, uniqueJson } from "./json.mjs";
 import { makeOfflineRequest, parseOfflineKeys, verifyOfflineFile } from "./offline.mjs";
 import { parseSessionKeys, verifySessionGrant } from "./sessions.mjs";
 import { PrivateFileStore } from "./storage/private-files.mjs";
@@ -160,9 +160,6 @@ export class Client extends EventEmitter {
     this.#closing = null;
     this.#closeController = new AbortController();
     this.#active = new Set();
-    this.#background = new Set();
-    this.#pendingRegistrations = new Set();
-    this.#session = null;
     this.#keys = null;
     this.#offlineKeys = null;
     this.#lastCheckpoint = readElapsedNs();
@@ -200,7 +197,7 @@ export class Client extends EventEmitter {
       else access = "online";
       if (access === "online" || access === "offline") entitlements = this.#claims.entitlements;
     }
-    if (!this.#claims && state.credential) access = this.#transient ? "refresh_required" : "refresh_required";
+    if (!this.#claims && state.credential) access = "refresh_required";
     const remaining = this.#claims && now !== null && (access === "online" || access === "offline") && this.#claims.offline_allowed
       ? Math.max(0, this.#claims.exp - now) : 0;
     return freezeSnapshot({
@@ -1038,28 +1035,28 @@ export class Client extends EventEmitter {
     });
   }
 
-  checkForUpdate(installedReleaseNumber, { channel, target, signal } = {}) {
+  async checkForUpdate(installedReleaseNumber, { channel, target, signal } = {}) {
     const body = online.updateInput(installedReleaseNumber, { channel, target });
     return this.#online("updates", body, (v) => online.parseUpdate(v, body), signal);
   }
 
-  authorizeDownload(releaseId, artifactId, { signal } = {}) {
+  async authorizeDownload(releaseId, artifactId, { signal } = {}) {
     online.requireInput(releaseId, online.identifier);
     online.requireInput(artifactId, online.identifier);
     return this.#online("downloads/authorize", { release_id: releaseId, artifact_id: artifactId },
       (v) => online.parseAuthorization(v, releaseId, artifactId), signal);
   }
 
-  download(authorization, destination, { maxBytes, replace, signal } = {}) {
+  async download(authorization, destination, { maxBytes, replace, signal } = {}) {
     return this.#run(signal, (inner) => downloadFile(authorization, destination, { maxBytes, replace, signal: inner }));
   }
 
-  usage(name, { signal } = {}) {
+  async usage(name, { signal } = {}) {
     online.requireInput(name, online.limitName);
     return this.#online(`usage/${name}`, {}, (v) => online.parseCounter(v, name, true), signal);
   }
 
-  consume(name, units = 1, { idempotencyKey, signal } = {}) {
+  async consume(name, units = 1, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName);
     online.requireInput(units, (v) => online.integer(v, 1));
     const key = onlineOperationId(idempotencyKey);
@@ -1067,12 +1064,12 @@ export class Client extends EventEmitter {
       (v) => online.parseConsumption(v, name, key, units), signal, key);
   }
 
-  resources(name, { signal } = {}) {
+  async resources(name, { signal } = {}) {
     online.requireInput(name, online.limitName);
     return this.#online(`resources/${name}`, {}, (v) => online.parseCounter(v, name, false), signal);
   }
 
-  acquireResource(name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
+  async acquireResource(name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName);
     online.requireInput(resourceId, online.identifier);
     online.requireInput(units, (v) => online.integer(v, 1));
@@ -1081,7 +1078,7 @@ export class Client extends EventEmitter {
       (v) => online.parseAllocation(v, name, key, { resourceId, units }), signal, key);
   }
 
-  releaseResource(name, allocationId, { idempotencyKey, signal } = {}) {
+  async releaseResource(name, allocationId, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName);
     online.requireInput(allocationId, online.identifier);
     const key = onlineOperationId(idempotencyKey);
@@ -1171,7 +1168,7 @@ export class Client extends EventEmitter {
     return this.#accountPost(`${CLIENT_PREFIX}licence-claims`, {
       licence_key: licenceKey,
       idempotency_key: idempotencyKey ?? randomBytes(24).toString("base64url"),
-    }, true, signal, (v) => parseLicence(v));
+    }, true, signal, parseLicence);
   }
 
   async requestEmailChange(password, email, { signal } = {}) {
@@ -1777,7 +1774,6 @@ export const Access = Object.freeze({ ONLINE: "online", OFFLINE: "offline", REFR
 async function resolveBinding(key, options) {
   if (options.deviceBinding !== undefined && options.deviceBinding !== null) {
     const value = options.deviceBinding;
-    if (!(value instanceof DeviceBinding)) return new DeviceBinding(value.fingerprint, value.provider);
     return new DeviceBinding(value.fingerprint, value.provider);
   }
   if (options.machineBinding === false) return Object.freeze({ fingerprint: null, provider: null });
@@ -1974,10 +1970,6 @@ function checkFields(value, fields, optional = []) {
   return result;
 }
 
-function validProvider(value) {
-  return value === "machine_v1" || typeof value === "string" && /^custom:[a-z0-9_.-]{1,48}$/.test(value);
-}
-
 function validBearer(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
 }
@@ -2008,12 +2000,6 @@ function isString(value) {
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (isObject(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  return JSON.stringify(value);
 }
 
 function nextGeneration(value) {

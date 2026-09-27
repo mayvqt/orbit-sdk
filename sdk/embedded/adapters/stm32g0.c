@@ -10,8 +10,10 @@ static int32_t receive_bytes(void *p, uint8_t *b, uint32_t n) {
   orbit_stm32g0_t *c = p;
   while (n) {
     uint16_t m = n > 65535 ? 65535 : (uint16_t)n;
-    if (HAL_UART_Receive(c->uart, b, m, 30000) != HAL_OK)
-      return ORBIT_CLIENT_UNTRUSTED;
+    HAL_StatusTypeDef status = HAL_UART_Receive(c->uart, b, m, 30000);
+    if (status != HAL_OK)
+      return status == HAL_TIMEOUT ? ORBIT_CLIENT_TRANSIENT
+                                   : ORBIT_CLIENT_UNTRUSTED;
     b += m;
     n -= m;
   }
@@ -21,8 +23,11 @@ static int32_t send_bytes(void *p, const uint8_t *b, uint32_t n) {
   orbit_stm32g0_t *c = p;
   while (n) {
     uint16_t m = n > 65535 ? 65535 : (uint16_t)n;
-    if (HAL_UART_Transmit(c->uart, (uint8_t *)b, m, 30000) != HAL_OK)
-      return ORBIT_CLIENT_UNTRUSTED;
+    HAL_StatusTypeDef status =
+        HAL_UART_Transmit(c->uart, (uint8_t *)b, m, 30000);
+    if (status != HAL_OK)
+      return status == HAL_TIMEOUT ? ORBIT_CLIENT_TRANSIENT
+                                   : ORBIT_CLIENT_UNTRUSTED;
     b += m;
     n -= m;
   }

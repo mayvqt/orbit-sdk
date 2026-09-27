@@ -53,6 +53,7 @@ internal static class DownloadStreamTests
                 Require(await File.ReadAllTextAsync(path) == "abc");
                 Require(Directory.GetFiles(directory).Length == 1);
             }
+            await Failure(() => Authorization("/short").DownloadAsync(path, 3, replace: true), OrbitError.InvalidResponse);
             using var cancellation = new CancellationTokenSource();
             var pending = Authorization("/slow").DownloadAsync(path, 3, replace: true, cancellationToken: cancellation.Token);
             await fixture.Slow.Task.WaitAsync(TimeSpan.FromSeconds(5));

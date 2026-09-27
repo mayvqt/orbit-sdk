@@ -402,9 +402,15 @@ func (t *Transport) attempt(ctx context.Context, method string, endpoint *url.UR
 	return nil, 0, &Error{Kind: Denied, Code: failure.Code, RequestID: failure.RequestID}
 }
 
+// classifyTransport treats only concrete outage signals as transient. Any
+// failed name lookup is an outage: a machine without network or behind a
+// captive portal often reports the Orbit host as not found. TLS and
+// certificate failures are not transient.
 func classifyTransport(err error) error {
 	var timeout net.Error
-	if errors.As(err, &timeout) && timeout.Timeout() || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+	var lookup *net.DNSError
+	if errors.As(err, &timeout) && timeout.Timeout() || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.As(err, &lookup) {
 		return ErrTransient
 	}
 	return ErrTransportSecurity

@@ -90,5 +90,16 @@ internal static class OfflineFileTests
         }
         var exactBound = rawKeys.GetRawText() + new string(' ', OfflineKeys.MaximumFileBytes - Encoding.UTF8.GetByteCount(rawKeys.GetRawText()));
         _ = OfflineKeys.Parse(Encoding.UTF8.GetBytes(exactBound), app.Environment).Verify(original, expected);
+        // The environment defaults to the one named by the trusted key IDs.
+        var inferred = OfflineKeys.Parse(rawKeys.GetRawText());
+        if (inferred.Environment != app.Environment || inferred.Verify(original, expected).ContentDigest != first.ContentDigest)
+            throw new InvalidOperationException("Offline key environment inference failed");
+        var other = app.Environment == "test" ? "live" : "test";
+        try
+        {
+            _ = OfflineKeys.Parse(rawKeys.GetRawText(), other);
+            throw new InvalidOperationException("Offline keys accepted for another environment");
+        }
+        catch (OrbitException exception) when (exception.Error == OrbitError.InvalidResponse) { }
     }
 }

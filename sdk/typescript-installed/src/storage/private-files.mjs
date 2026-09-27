@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { scopeHash, canonicalScope } from "../app-key.mjs";
+import { scopeHash, canonicalScope, validProvider } from "../app-key.mjs";
 import { fail, ErrorKind } from "../errors.mjs";
 import { uniqueJson, isInteger } from "../json.mjs";
 import { parseJwks } from "../grants.mjs";
@@ -475,7 +475,7 @@ function validInstallation(value) {
   return exactKeys(value, ["id", "fingerprint", "fingerprint_provider"]) &&
     typeof value.id === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(value.id) &&
     (value.fingerprint === null && value.fingerprint_provider === null ||
-      typeof value.fingerprint === "string" && /^[0-9a-f]{64}$/.test(value.fingerprint) && validBindingProvider(value.fingerprint_provider));
+      typeof value.fingerprint === "string" && /^[0-9a-f]{64}$/.test(value.fingerprint) && validProvider(value.fingerprint_provider));
 }
 
 function validCredential(value) {
@@ -511,10 +511,6 @@ function validAccess(value) {
 function exactKeys(value, names) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
     Object.keys(value).length === names.length && names.every((name) => Object.hasOwn(value, name));
-}
-
-function validBindingProvider(value) {
-  return value === "machine_v1" || typeof value === "string" && /^custom:[a-z0-9_.-]{1,48}$/.test(value);
 }
 
 function checkedNextGeneration(value) {

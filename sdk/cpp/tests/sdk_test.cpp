@@ -405,6 +405,42 @@ void test_strict_bounded_json() {
                      ErrorKind::invalid_response);
     }
     require(parse_json("{\"value\":true}")["value"].asBool(), "strict parser rejected valid JSON");
+    const std::string deep = std::string(200, '[') + std::string(200, ']');
+    expect_error([&] { (void)parse_json(deep); }, ErrorKind::invalid_response);
+    const auto array = parse_json("[1]");
+    expect_error([&] { (void)GrantKeys::parse(array); }, ErrorKind::invalid_response);
+}
+
+std::string read_test_file(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    require(input.good(), "could not open test file");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void test_public_key_set_parsing() {
+    const auto offline_jwks = encode_json(parse_json(read_test_file(ORBIT_OFFLINE_VECTORS_PATH), 2 * 1024 * 1024)["jwks"]);
+    const auto session_jwks = encode_json(parse_json(read_test_file(ORBIT_SESSION_VECTORS_PATH), 4 * 1024 * 1024)["jwks"]);
+    require(orbit::OfflineKeys::parse(offline_jwks).environment() == "test",
+            "offline key environment was not inferred");
+    require(orbit::OfflineKeys::parse(offline_jwks, "test").environment() == "test",
+            "explicit offline key environment was not kept");
+    require(orbit::SessionKeys::parse(session_jwks).environment() == "test",
+            "session key environment was not inferred");
+    for (const auto* bad : {"{}", "{\"keys\":[]}", "[1]", "not json"}) {
+        const auto error = expect_error([&] { (void)orbit::OfflineKeys::parse(bad); },
+                                        ErrorKind::configuration);
+        require(error.code() == "invalid_offline_keys", "unexpected offline key error code");
+    }
+    const auto live = expect_error([&] { (void)orbit::OfflineKeys::parse(offline_jwks, "live"); },
+                                   ErrorKind::configuration);
+    require(live.code() == "invalid_offline_keys", "unexpected offline key environment error");
+    expect_error([&] { (void)orbit::OfflineKeys::parse(session_jwks); }, ErrorKind::configuration);
+    const auto session = expect_error([&] { (void)orbit::SessionKeys::parse(offline_jwks); },
+                                      ErrorKind::configuration);
+    require(session.code() == "invalid_session_keys", "unexpected session key error code");
+    require(std::string(Error(1, ErrorKind::denied, "licence_revoked", {}).what()) ==
+                "Orbit SDK operation failed: licence_revoked",
+            "error text omitted its code");
 }
 
 struct Gate {
@@ -506,6 +542,7 @@ struct ApiFixture {
     std::atomic_int validate_calls{0};
     std::atomic_int forced_jwks_failures{0};
     std::atomic_bool offline_refresh{false};
+    std::atomic_bool tls_failure_refresh{false};
     std::atomic_bool offline_activation{false};
     std::atomic_bool persistent_mode{false};
     std::atomic_bool malformed_activation{false};
@@ -696,6 +733,7 @@ struct ApiFixture {
             if (route.find("/api/client/v1/activations/") == 0 && route.find("/validate") != std::string_view::npos) {
                 ++validate_calls;
                 if (offline_refresh.load()) return HttpResponse{503, "{}", "0"};
+                if (tls_failure_refresh.load()) raise(ErrorKind::transport_security, "transport_security");
                 Json::Value input_value = parse_json(body);
                 {
                     std::lock_guard<std::mutex> lock(mutex);
@@ -1147,7 +1185,10 @@ void test_floating_session_failures_and_generation_fences(const Corpus &corpus) 
         state->local_logout();
         fixture.session_gate->release();
         worker.join();
-        require(result == static_cast<int>(ErrorKind::stale_response) &&
+        // The background worker may be the request held at the gate; this
+        // thread then observes the logout itself instead of a stale reply.
+        require((result == static_cast<int>(ErrorKind::stale_response) ||
+                 result == static_cast<int>(ErrorKind::reauthentication_required)) &&
                     state->snapshot().access == Access::denied,
                 "late session success or renewal denial must not cross logout "
                 "generation fencing");
@@ -3049,6 +3090,45 @@ void test_persistent_strict_outage_is_not_activation_required(const Corpus& corp
     std::filesystem::remove_all(path, ignored);
 }
 
+void test_persistent_transport_failure_keeps_activation(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    {
+        ApiFixture fixture(corpus.value);
+        auto client = persistent_client_for(fixture, path);
+        (void)client.activate("tls-failure-key");
+        client.close();
+    }
+    {
+        ApiFixture failing(corpus.value);
+        failing.persistent_mode = true;
+        failing.tls_failure_refresh = true;
+        auto client = persistent_client_for(failing, path);
+        expect_error([&] { (void)client.require_access("export"); }, ErrorKind::transport_security);
+        bool prompted = false;
+        expect_error([&] {
+            (void)client.ensure_access("export", [&]() -> std::optional<std::string> {
+                prompted = true;
+                return std::nullopt;
+            });
+        }, ErrorKind::transport_security);
+        require(!prompted && failing.activation_calls == 0,
+                "a transport failure must not ask for another licence key");
+        client.close();
+    }
+    {
+        ApiFixture recovered(corpus.value);
+        recovered.persistent_mode = true;
+        auto client = persistent_client_for(recovered, path);
+        (void)client.require_access("export");
+        require(recovered.activation_calls == 0,
+                "a transport failure must not discard the saved activation");
+        client.close();
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
 void test_persistent_close_discards_invalid_clock(const Corpus& corpus) {
     FakeClock clock;
     const auto path = persistent_test_path();
@@ -3351,6 +3431,7 @@ int main(int argc, char** argv) {
         const auto app_version_vectors = test_app_version_vectors();
         test_fingerprint_options();
         test_strict_bounded_json();
+        test_public_key_set_parsing();
         test_shared_grant_vectors(corpus);
         const auto session_vectors = test_shared_session_vectors();
         test_empty_explicit_activation_operation_ids(corpus);
@@ -3377,6 +3458,7 @@ int main(int argc, char** argv) {
 #endif
         test_persistent_close_discards_invalid_clock(corpus);
         test_persistent_strict_outage_is_not_activation_required(corpus);
+        test_persistent_transport_failure_keeps_activation(corpus);
         test_persistent_online_restart_and_offline_recovery(corpus);
         test_app_version_policy(corpus);
         test_installed_offline_file_lifecycle(corpus);

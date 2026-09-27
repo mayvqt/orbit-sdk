@@ -24,12 +24,12 @@ void require(bool condition, std::string_view message) {
 }
 
 template <class Call>
-void expect_error(Call&& call, ErrorKind expected) {
+Error expect_error(Call&& call, ErrorKind expected) {
     try {
         call();
     } catch (const Error& error) {
         require(error.kind() == expected, "request returned an unexpected Orbit error kind");
-        return;
+        return error;
     }
     throw std::runtime_error("request unexpectedly succeeded");
 }
@@ -115,6 +115,13 @@ void test_downloads(std::string_view origin, std::string_view ca_file) {
              {"/download/redirect/6", "/download/downgrade", "/download/encoded", "/download/length",
               "/download/oversize", "/download/short", "/download/wrong"})
             failure(route);
+        const auto missing = expect_error(
+            [&] {
+                detail::download_stream(authorization("/download/missing"), path, 3, true, ready, ca_file);
+            },
+            ErrorKind::invalid_response);
+        require(missing.code() == "download_http_error", "seller HTTP error was misreported");
+        intact();
         std::atomic_bool cancelled{false};
         std::thread cancel([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -153,6 +160,12 @@ void run(std::string_view scenario, std::string_view origin, std::string_view ca
         return;
     }
     if (scenario == "refused") {
+        const Transport transport(origin);
+        expect_error([&] { (void)transport.get("/api/client/v1/status", not_cancelled); },
+                     ErrorKind::transient);
+        return;
+    }
+    if (scenario == "unresolvable") {
         const Transport transport(origin);
         expect_error([&] { (void)transport.get("/api/client/v1/status", not_cancelled); },
                      ErrorKind::transient);

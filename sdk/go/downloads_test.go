@@ -2,6 +2,7 @@ package orbit
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -147,5 +148,22 @@ func TestDownloadVerifierRejectsUnsafeEndpoints(t *testing.T) {
 		if _, err := NewDownloadTicketVerifier(corpus.Expected.AppKey, endpoint, corpus.JWKS); err != nil {
 			t.Fatalf("rejected valid endpoint %q: %v", endpoint, err)
 		}
+	}
+}
+
+func TestDownloadVerifierErrorsNameTheRejectedInput(t *testing.T) {
+	corpus := readDownloadCorpus(t)
+	verifier, err := NewDownloadTicketVerifier(corpus.Expected.AppKey, corpus.Expected.Endpoint, corpus.JWKS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify("not-a-ticket"); !errors.Is(err, &Error{Kind: Denied, Code: "invalid_download_ticket"}) {
+		t.Fatalf("invalid ticket: %v", err)
+	}
+	if _, err := NewDownloadTicketVerifier(corpus.Expected.AppKey, "http://downloads.example.test", corpus.JWKS); !errors.Is(err, &Error{Kind: Configuration, Code: "invalid_download_endpoint"}) {
+		t.Fatalf("invalid endpoint: %v", err)
+	}
+	if _, err := NewDownloadTicketVerifier(corpus.Expected.AppKey, corpus.Expected.Endpoint, []byte(`{"keys":[]}`)); !errors.Is(err, &Error{Kind: Configuration, Code: "invalid_download_keys"}) || !errors.Is(err, ErrConfiguration) {
+		t.Fatalf("invalid keys: %v", err)
 	}
 }

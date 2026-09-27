@@ -2,294 +2,191 @@
 
 Start with [the quickstart](README.md) for normal installed applications.
 
-## Operations
+## Concurrency and cancellation
 
-`Client` has named synchronous methods for `snapshot`, `activate`,
-`activate_previous`, `refresh`, `require_access`, `ensure_access`, `deactivate`,
-`start_session`, `end_session`, `logout`, `register`, `resend_registration`, `login`, `account`,
-`owned_licences`, `claim_licence`, `activate_account`,
-`activate_account_previous`, `logout_account`, `request_email_change`,
-`request_password_recovery`, `customer_session_authorization`, `offline_request`,
-`import_offline_file`, `check_for_update`, `authorize_download`, `download`, `usage`,
-`consume`, `resources`, `acquire_resource`, and `release_resource`. Network methods accept an optional
-`cancellation=Cancellation.create()` keyword argument. Calls may run
-concurrently; activation, refresh, login, and session-authenticated account
-operations serialize when they change or depend on client state. Closing a
-client waits for active calls to return.
+`Client` methods are synchronous and thread-safe. Calls may run concurrently;
+activation, refresh, sign-in and session-authenticated account operations
+serialize when they change or depend on client state. Every network method
+accepts an optional `cancellation=` keyword:
 
-`register()` returns a frozen `RegistrationResult(accepted, expires_at, pending)`;
-`expires_at` is a timezone-aware `datetime`. Its opaque `pending` handle keeps
-resend proof in memory; use it only with `resend_registration()` and close it
-when finished. `login()` and `account()` return a frozen `Account`.
-`owned_licences()` returns an `OwnedLicencePage` whose items are frozen
-`OwnedLicence` values. Timestamps use UTC-aware `datetime`, durations use
-`timedelta`, and entitlement maps cannot be mutated. `offline_file_duration`
-is separate from the connected `offline_duration`; a zero file duration means
-issuance is disabled. Listing or claiming a licence does not grant access:
-activate the chosen licence and call
-`require_access()`. `logout_account()` requests remote revocation and clears
-local account state; `logout()` clears local activation and customer session
-state and schedules a bounded, best-effort release of any floating seat. It does
-not revoke the customer session remotely. `claim_licence(key)` generates a secure operation
-ID when omitted; pass an explicit ID to reuse it across retries.
+```python
+from orbit_sdk import Cancellation
 
-Installed key and account activations save their operation ID before sending.
-After a lost account-activation response, sign in again as the same customer
-and retry the same licence. The SDK recovers the original operation, including
-after restart or a failed login. The pending digest is bound to the verified
-customer ID; another customer cannot reuse it. Passwords and session tokens
-remain in memory. Explicit logout discards local recovery state.
+with Cancellation.create() as cancellation:
+    # Call cancellation.cancel() from another thread to stop the operation.
+    orbit.refresh(cancellation=cancellation)
+```
 
-Use `with` or call `close()` on clients, cancellation handles and pending
-registration handles. Finalizers are only a fallback for forgotten closes.
+`close()` stops background refresh, makes a bounded attempt to release a
+floating seat and waits for active calls to return. Use `with` or call `close()`
+on clients, cancellation handles and pending registration handles; finalizers
+are only a fallback.
 
-## Floating sessions
+## Activation retries and explicit IDs
 
-When a policy has a positive `concurrent_session_limit`, the activation
-response identifies the authenticated licence and indicates that a session is
-required. The SDK durably saves the activation credential before requesting a
-seat, then starts and renews a short online session automatically. `Snapshot.session`
-contains frozen `SessionMetadata(session_id, sequence, expires_at, refresh_after)`;
-the grant and session ID stay only in process memory. A restart reuses the
-activation credential but creates a fresh session. Seat-limit denial preserves
-the credential so another attempt does not ask for the key again.
+Installed key and account activations save a secure operation ID and an input
+digest before sending, never the raw key. After a lost reply, retry the same
+input within 24 hours and the SDK reuses the saved ID, including after a
+restart. For account activation, sign in again as the same customer first;
+another customer cannot reuse the pending operation. Explicit `logout()`
+discards it.
 
-Call `end_session()` when the application becomes idle to clear local authority
-and request release of the server seat. It disables automatic reacquisition
-until `start_session()` is called explicitly. `start_session()` returns the
-existing snapshot when the current seat is still valid. For an ordinary
-licence or offline-file installation, both methods are no-ops. A running
-floating client can finish its current signed interval during a network
-outage; it cannot extend that interval without Orbit, and it has no offline
-fallback after exact expiry. The client does not prompt for a new licence key
-for a seat denial, transient failure or expired session.
+Mutating methods accept an optional operation ID of 16–128 characters:
+`activate(key, idempotency_key)`, `activate_account(licence_id,
+idempotency_key)`, `claim_licence(key, idempotency_key)` and
+`deactivate(idempotency_key)`. `activate_previous()` and
+`activate_account_previous()` rebind a freshly authenticated installation using
+its previous credential. `deactivate()` clears local access and releases the
+device slot on the server.
 
-## Persistence and hosting
+## Customer accounts
 
-On Linux, `open()` stores a private record under
-`$XDG_STATE_HOME/orbit/<scope-hash>/` (or `~/.local/state/orbit/<scope-hash>/`).
-On macOS, it uses private files under
-`~/Library/Application Support/Orbit/<scope-hash>/`; this is not Keychain storage.
-On Windows, it uses the current user's `LOCALAPPDATA/Orbit/<scope-hash>/` with
-DPAPI and an explicit private ACL. New directories and files grant access only
-to the current user, SYSTEM and Administrators; an existing directory with
-foreign ownership or broader access is rejected without changing its ACL.
-Impersonating threads are unsupported; use a client under the service account.
-Set `state_path` to an absolute, dedicated private directory for a
-service or container, and mount that directory on persistent storage across
-restarts. Keep it owned by the service user and mode `0700` on Linux/macOS. A lease
-allows only one process to own an installation at a time; give concurrent
-workers separate installation state. `installation_in_use` means another client
-holds the lease; reuse that client or close it before opening the same directory.
-Do not delete lock files to bypass an active lease.
+`register(licence_key, username, email, password)` returns a frozen
+`RegistrationResult(accepted, expires_at, pending)`. The opaque `pending`
+handle keeps the resend proof in memory; pass it to `resend_registration()` and
+close it when finished. Confirmation does not sign the customer in.
+`request_password_recovery(email)` and `request_email_change(password,
+new_email)` return once Orbit accepts the request.
 
-The record can cache the original signed access grant and its verified public
-key. A restart rechecks those signatures, scope, expiry, and trusted-clock
-evidence; offline access ends at the grant's original deadline. It never turns
-the grant into a new or longer-lived one. Linux/macOS file permissions protect the
-record from other users, while Windows DPAPI protects its contents for the
-current user. Neither protects against someone who can control that user or
-modify the running process. Credentials and grants are not tamper-proof. Raw
-licence keys, passwords, customer sessions and registration resend proofs are
-not persisted.
+`login()` and `account()` return a frozen `Account`. `owned_licences(cursor)`
+returns one `OwnedLicencePage`; pass its `next_cursor` to fetch the next page.
+`OwnedLicence` values use UTC-aware `datetime`, `timedelta` durations and
+immutable maps. `offline_duration` is the connected grant's allowance;
+`offline_file_duration` is the long-term file limit, zero when disabled.
+`concurrent_session_limit` is separate from `device_limit`. `usage_limits` and
+`resource_limits` describe policy, not remaining capacity.
 
-## Advanced connection, storage and device identity
+`customer_session_authorization()` returns a redacted `SensitiveAuthorization`
+for your own trusted HTTPS backend, which must verify it online. Use it as a
+context manager or call `clear()` after use. `reveal()` returns a bytes copy
+that Python cannot reliably erase; keep it briefly and never log, persist or
+send it to another origin.
 
-`Client.open_with_storage(app_key, installation_id=...)` is available when the
-host manages the installation ID and storage policy itself. Keep its stable
-installation ID between runs; `installation_id_new()` creates one. Its default
-`StorageMode.MEMORY` forgets activation credentials at process exit.
+## Storage and clock guarantees
 
-Choose a storage mode when the host should remember an activation:
+`Client.open()` stores a private record under:
 
-* `StorageMode.MEMORY` keeps credentials in process memory.
+* Linux: `$XDG_STATE_HOME/orbit/<scope-hash>/` (or
+  `~/.local/state/orbit/<scope-hash>/`).
+* macOS: `~/Library/Application Support/Orbit/<scope-hash>/`.
+* Windows: `%LOCALAPPDATA%\Orbit\<scope-hash>\`, encrypted with current-user
+  DPAPI.
+
+New directories and files grant access only to the current user (on Windows,
+also SYSTEM and Administrators). An existing directory with foreign ownership
+or broader access is rejected without changing it. A `state_path` must be an
+absolute, dedicated directory owned by the service user, mode `0700` on Linux
+and macOS, on persistent storage. Windows impersonating threads are unsupported;
+run the client under the service account.
+
+A lease allows one process per installation. `installation_in_use` means
+another client holds it: reuse that client or close it first, and never delete
+lock files to bypass it. Give concurrent workers separate installations.
+Corrupt or missing established state is reported as a storage error, never
+silently replaced.
+
+The record caches the signed access grant and its public key. A restart
+rechecks the signature, scope, expiry and saved clock evidence; access never
+extends past the grant's original deadline. Sleep counts toward expiry, and a
+clock rollback requires online validation. File permissions and DPAPI protect
+the record from other users, not from someone controlling the same account or
+modifying the process. Keys, passwords, customer sessions and resend proofs are
+never persisted.
+
+On macOS the SDK reads `IOPlatformUUID` through IOKit, measures elapsed time
+with `mach_continuous_time`, synchronizes state files with `F_FULLFSYNC` and
+fails with a storage error on a filesystem that rejects it. This is private
+file storage, not Keychain encryption.
+
+## Machine binding
+
+`Client.open()` binds to the native `machine_v1` identity when it is available
+and sends no fingerprint when it is not; it never substitutes a random value.
+Pass `machine_binding=False` for cloned containers or VM images. To supply your
+own stable identity, pass `device_binding=DeviceBinding(fingerprint, provider)`
+with a 64-character lowercase hex fingerprint and a `machine_v1` or
+`custom:<name>` provider. `machine_fingerprint(application_id, environment_id,
+family, identity)` hashes a host-provided Linux, Windows or macOS identity;
+never send the raw identifier.
+
+When the current identity differs from the saved one, the SDK discards the saved
+credential and grant and creates a fresh installation ID. The machine must then
+activate within the licence's device limit.
+
+## Host-managed storage
+
+`Client.open_with_storage(app_key, installation_id=..., storage_mode=...,
+storage_path=...)` suits hosts that manage the installation ID and credential
+storage themselves. Keep the installation ID stable between runs;
+`installation_id_new()` creates one. It has no background refresh and never
+saves a grant.
+
+* `StorageMode.MEMORY` (default) forgets the credential at process exit.
 * `StorageMode.WINDOWS_DPAPI` uses current-user DPAPI on Windows.
-* `StorageMode.LINUX_SECRET_SERVICE` uses the current user's Secret Service on
-  Linux and requires an operational keyring and `/usr/bin/secret-tool`.
+* `StorageMode.LINUX_SECRET_SERVICE` uses the user's Secret Service and
+  requires an operational keyring and `/usr/bin/secret-tool`.
 
-Protected modes require an existing, dedicated private absolute directory in
-`storage_path`. Use one directory per issuer, application, environment and
-installation. The adapters validate file ownership, permissions, identity and platform
-requirements. Do not
-exchange, copy or share these storage files between SDKs. OS protection cannot
-prevent changes by someone controlling the user's account. These adapters do
-not persist customer sessions, passwords, raw licence keys, signed grants or
-resend proofs.
-
-`Client.open()` binds an installation to the supported native machine identity
-using provider `machine_v1` when it is available. If identity cannot be read,
-the client sends no fingerprint. Use `machine_binding=False` for cloned
-containers or virtual machine images with shared IDs. To supply a stable host
-identity, construct `DeviceBinding(fingerprint, provider)`; the fingerprint
-must be a 64-character lowercase hex value and the provider must be
-`machine_v1` or `custom:<name>`. `machine_fingerprint(...)` can hash a
-host-provided Linux, Windows or macOS identity. Never send the raw machine identifier
-to Orbit. If the current identity differs from the one saved with the
-installation, the SDK discards its saved credential and signed grant and
-creates a fresh installation ID. The new machine must activate within the
-licence's device limit before it can restore access.
+Protected modes need an existing, private, absolute `storage_path` dedicated to
+one application, environment and installation. Do not share these files between
+SDKs.
 
 ## Offline licence files
 
-The SDK exports a public installation request, verifies a signed offline file
-against a trusted offline-purpose JWKS and durably imports that file.
+The seller enables an offline-file duration on the policy, opens the licence's
+offline-file action, pastes the installation request and downloads the signed
+`.orbit` file. Import it on the same installation.
 
-Supply an offline-purpose JWKS from your application's trusted bundle through
-`offline_keys`. Never take verification keys from the licence file or an
-untrusted upload. On the disconnected machine, export its public request:
+Explicit online activation switches back to connected access, and `logout()`
+removes local access. Both keep the renewal sequence and clock floors, so an
+older file cannot undo a newer renewal. A failed online activation does not
+restore the previous file. Storage failures deny access, and an uncertain clock
+must be corrected before access resumes. Each restart verifies the saved file
+against the configured trusted keys, so ship new keys in a trusted application
+update before issuing files signed by them.
 
-```python
-import os
-from pathlib import Path
+## Floating sessions
 
-from orbit_sdk import Client
+The SDK saves the activation credential before requesting a seat. Session grants
+and IDs stay in process memory. `start_session()` returns the current snapshot
+when the seat is still valid. During an outage a running client can finish its
+current signed interval but cannot extend it, and there is no offline fallback
+after it expires. A crash or failed release leaves the old seat occupied until
+its interval ends.
 
-trusted_keys = Path("orbit-offline-keys.json").read_bytes()
-with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbit:
-    Path("installation-request.json").write_text(
-        orbit.offline_request().to_json(), encoding="utf-8"
-    )
-```
+## Downloads
 
-The request contains public configuration and the installation identity; it is
-not proof of ownership or authority. Transfer it to the seller's authenticated
-issuance workflow. The seller enables an offline-file duration on the policy,
-opens the licence's offline-file action, pastes the request and downloads the
-signed `.orbit` file. The file remains usable until its signed expiry even if
-the licence is later revoked. When you receive it, import it on that same
-installation:
+`check_for_update()` returns a frozen `Update` with `Release` and `Artifact`;
+`UpdateTarget` is required when the runtime platform is not recognized. The
+standalone `download_file(authorization, destination, max_bytes=...,
+replace=False, cancellation=...)` works without a client; an installed client's
+`download()` also stops when the client closes. Transfers have a five-minute
+deadline, use no ambient cookies, HTTP credentials or proxy settings, and stage
+the file privately beside the destination. Request a fresh authorization for a
+later attempt.
 
-```python
-import os
-from pathlib import Path
+## Seller download tickets
 
-from orbit_sdk import Client
+Construct one `DownloadTicketVerifier` from trusted configuration and reuse it;
+replace it when your keys rotate. It checks the exact endpoint audience,
+Test/Live scope, purpose, signature and deadline, and returns aware UTC
+`datetime` values. Invalid tickets raise `OrbitError` with code
+`invalid_download_ticket`. Read the token from the `Authorization: Bearer`
+header and never derive the endpoint or app key from the request or its `Host`
+header. Serve the file or return a short-lived storage URL; never forward the
+Orbit bearer to that redirect.
 
-trusted_keys = Path("orbit-offline-keys.json").read_bytes()
-with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbit:
-    orbit.import_offline_file(Path("licence.orbit").read_bytes())
-    orbit.require_access("export")
-    # Perform the protected export here.
-```
+## Errors
 
-Subsequent starts only need `open(..., offline_keys=...)` and `require_access()`;
-the signed file is saved in private installation storage. Valid offline access
-makes no HTTP requests, including background validation. The normal snapshot
-reports `AccessStatus.OFFLINE` and its absolute expiry. Missing features and
-expired files fail without prompting for an online key. Renew by importing a
-newer file; re-importing a still-valid file does not extend its term.
-
-Explicit online activation changes back to connected access. Logout removes local
-access. Both preserve renewal and clock high-water values, so an older file cannot
-undo a newer renewal. A failed online activation does not restore the previous
-offline authority. Storage failures deny access; uncertain clocks must be corrected
-before access can resume. Each restart verifies against your configured trusted
-keys, so distribute new keys through a trusted application/configuration update
-before using files signed by them.
-
-An offline machine cannot learn about a later server-side revocation until it
-reconnects or imports updated authority. Someone controlling the whole machine
-can restore old files and clocks or patch the program. Private storage, renewal
-sequences and fixed signed expiry do not promise protection against a complete
-machine snapshot rollback.
-
-## Seller download-ticket verification
-
-`DownloadTicketVerifier` validates a ticket locally using public Orbit keys. It
-does not retrieve the artifact. Configure the endpoint and app key on your
-backend; do not derive them from an incoming token or an untrusted `Host`
-header.
-
-```python
-from orbit_sdk import DownloadTicketVerifier
-
-
-def authorize_artifact(app_key, endpoint, public_jwks, bearer_token, artifacts):
-    verifier = DownloadTicketVerifier(app_key, endpoint, public_jwks)
-    ticket = verifier.verify(bearer_token)
-    artifact = artifacts.get(ticket.artifact_id)
-    if artifact is None or (
-        artifact["release_id"] != ticket.release_id
-        or artifact["sha256"] != ticket.sha256
-        or artifact["byte_length"] != ticket.byte_length
-    ):
-        raise PermissionError("Unknown or changed artifact")
-    return artifact
-```
-
-Here `artifacts` is your own trusted registry. Match the verified metadata before
-selecting a file or creating an expiring URL from your storage provider. Never
-turn a ticket's artifact ID directly into a filesystem path. In a running server,
-construct and reuse a verifier with your configured keys; replace it when your
-trusted key set rotates. It validates the exact endpoint audience, Test/Live scope,
-purpose, signature and deadline. Invalid tickets raise `OrbitError` with code
-`invalid_download_ticket`. Returned times are aware UTC `datetime` values.
-
-Read the token from the request's `Authorization: Bearer` header and never log
-it. Your backend should serve the file or return a short-lived storage URL; the
-client must not forward the Orbit bearer to that storage redirect. A ticket is
-replayable until its deadline, at most 120 seconds. A permanent public URL remains
-shareable and cannot provide subsequent licence enforcement.
-
-The [seller backend example](../../examples/python/seller-downloads/README.md)
-shows a protected endpoint backed by private S3-compatible storage.
-
-## Explicit online operations
-
-The [update and limit guide](README.md#updates-and-online-limits) covers the
-installed APIs. Results are frozen dataclasses: `Update`, `Release`, `Artifact`,
-`DownloadAuthorization`, `UsageCounter`, `UsageConsumption`, `ResourceCounter`
-and `ResourceAllocation`. `UpdateTarget` selects an explicit platform and
-architecture; unknown runtimes require it. Timestamps are aware UTC datetimes.
-`OwnedLicence.usage_limits` and `.resource_limits` are immutable maps of policy
-definitions and never represent an offline allowance of units.
-
-Every online method accepts `cancellation=`. Client `download()` combines it with
-client shutdown; standalone `download_file(authorization, destination,
-max_bytes=..., replace=False, cancellation=...)` uses the supplied cancellation.
-Transfers have a five-minute total deadline and use no ambient cookies, HTTP
-credentials or proxy configuration. Temporary files are created privately in
-the destination directory. A destination is exposed only after verification;
-replacement is opt-in. Closing, cancelling or a network failure does not leave
-an incomplete destination.
-
-Generated usage/resource IDs are retained for retries of that call and exposed
-on success, capacity denial and uncertain mutation failure. They are not saved
-as a job journal. Persist your own job ID before calling when restart-safe
-recovery is required. Retry the same normalized input and ID within Orbit's
-24-hour replay window. The SDK never turns an unknown outcome into local quota.
-
-## macOS
-
-The macOS bindings read `IOPlatformUUID` through IOKit and use
-`mach_continuous_time`, including sleep, for elapsed-time checks. Timebase
-resolution is cached; time is sampled for every decision. The SDK synchronizes
-regular state and lease files with `F_FULLFSYNC` and synchronizes the containing
-directory after replacement. A filesystem that rejects the required durability
-operation returns a storage error.
+`OrbitError` exposes `kind`, `code` and `request_id`; its text omits server
+messages and caller input. `NotActivatedError` and `FeatureUnavailableError`
+subclass it. `LimitReachedError` adds the validated `counter` and
+`requested_units`, and it and `MutationUncertainError` carry the
+`idempotency_key` needed to recover a write. Keep the error from the failed
+operation when correlating support requests.
 
 ## Access-check performance
 
 Reuse one open client per installation. A warm `require_access()` checks the
-current clock, storage generation and feature in local verified state, and
-contacts Orbit only when a refresh is due. Avoid opening a new client for every
-protected operation. On Linux x86-64 with Python 3.14, a warm check takes about
-24 µs, with no network request or storage write.
-
-## Errors and sensitive output
-
-`OrbitError` exposes `kind`, `code`, `request_id` and `status`. Its text
-omits server messages and caller inputs. Keep the error from the failed
-operation when correlating support requests.
-
-`LimitReachedError` additionally carries validated capacity details;
-`MutationUncertainError` carries the operation ID required to recover a write.
-These values are described under [explicit online operations](#explicit-online-operations).
-
-`customer_session_authorization()` returns a redacted
-`SensitiveAuthorization`. Reveal its bytes only to send the header to your own
-trusted HTTPS backend for online verification. Never log or persist it or send
-it to another origin. Use it as a context manager or call `clear()` after use.
-`reveal()` creates a caller-owned bytes copy that Python cannot reliably erase;
-keep that copy briefly. Local account metadata and offline activation grants do
-not prove customer identity.
+clock, storage generation and feature in local verified state and contacts
+Orbit only when a refresh is due. On Linux x86-64 it takes about 25 µs, with no
+network request or storage write.

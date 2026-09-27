@@ -51,7 +51,11 @@ def unique_json(data: bytes | bytearray | str) -> Any:
         except UnicodeDecodeError as exc:
             raise error(INVALID_RESPONSE, "invalid_json") from exc
     elif isinstance(data, str):
-        if not data or len(data.encode("utf-8", "strict")) > MAX_JSON_BYTES:
+        try:
+            size = len(data.encode("utf-8", "strict"))
+        except UnicodeError as exc:
+            raise error(INVALID_RESPONSE, "invalid_json") from exc
+        if not data or size > MAX_JSON_BYTES:
             raise error(INVALID_RESPONSE, "invalid_json")
         text = data
     else:

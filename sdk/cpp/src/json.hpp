@@ -13,5 +13,6 @@ bool json_has_top_level_member(std::string_view input, std::string_view member,
                                std::size_t limit = 65536);
 std::string encode_json(const Json::Value& value);
 std::int64_t json_int64(const Json::Value& value);
+bool valid_utf8(std::string_view text);
 
 } // namespace orbit::detail

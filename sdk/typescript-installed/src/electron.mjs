@@ -12,18 +12,15 @@ export async function openElectronClientForTesting(appKey, options = {}) {
 
 async function openElectronClientInternal(appKey, options, testMainProcess) {
   if (!options || typeof options !== "object" || Array.isArray(options) ||
-      Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null ||
-      Object.keys(options).some((name) => !["app", "safeStorage", "statePath", "machineBinding", "deviceBinding"].includes(name))) {
+      Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null) {
     throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");
   }
   const { app, safeStorage, ...clientOptions } = options;
+  validateClientOptions(clientOptions);
   if ((!testMainProcess && process.type !== "browser") || !app || typeof app.isReady !== "function" || !app.isReady() ||
       !safeStorage || typeof safeStorage.isAsyncEncryptionAvailable !== "function" ||
       typeof safeStorage.encryptStringAsync !== "function" || typeof safeStorage.decryptStringAsync !== "function") {
     throw fail(ErrorKind.STORAGE, "storage_unavailable");
-  }
-  try { validateClientOptions(clientOptions); } catch (error) {
-    throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");
   }
 
   try {

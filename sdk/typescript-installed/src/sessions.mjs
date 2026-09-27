@@ -1,6 +1,7 @@
 import { verify as verifySignature } from "node:crypto";
 import { fail, ErrorKind } from "./errors.mjs";
-import { decodeBase64Url, parseJwks, validEntitlements } from "./grants.mjs";
+import { validProvider } from "./app-key.mjs";
+import { decodeBase64Url, matches, parseJwks, validEntitlements } from "./grants.mjs";
 import { isInteger, isText, uniqueJson } from "./json.mjs";
 
 const MAX_BYTES = 16 * 1024;
@@ -122,14 +123,4 @@ export function verifySessionGrant(token, keys, expected) {
     if (error?.code === "invalid_session_grant") throw error;
     invalid("invalid_session_grant");
   }
-}
-
-function matches(value, type) {
-  if (type === "integer") return Number.isSafeInteger(value);
-  if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
-  return typeof value === type;
-}
-
-function validProvider(value) {
-  return value === "machine_v1" || typeof value === "string" && /^custom:[a-z0-9_.-]{1,48}$/.test(value);
 }

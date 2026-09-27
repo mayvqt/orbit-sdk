@@ -42,23 +42,34 @@ func (t DownloadTicket) TicketID() string     { return t.ticketID }
 func (t DownloadTicket) IssuedAt() time.Time  { return t.issuedAt }
 func (t DownloadTicket) ExpiresAt() time.Time { return t.expiresAt }
 
+var (
+	errInvalidDownloadEndpoint = &Error{Kind: Configuration, Code: "invalid_download_endpoint"}
+	errInvalidDownloadKeys     = &Error{Kind: Configuration, Code: "invalid_download_keys"}
+	errInvalidDownloadTicket   = &Error{Kind: Denied, Code: "invalid_download_ticket"}
+)
+
 // NewDownloadTicketVerifier copies and validates the configured public JWKS.
+// Invalid configuration returns an ErrConfiguration match whose Code names the
+// rejected input.
 func NewDownloadTicketVerifier(appKey, endpoint string, trustedJWKS []byte) (*DownloadTicketVerifier, error) {
 	app, err := ParseAppKey(appKey)
-	if err != nil || !validDownloadEndpoint(endpoint) {
-		return nil, ErrConfiguration
+	if err != nil {
+		return nil, err
+	}
+	if !validDownloadEndpoint(endpoint) {
+		return nil, errInvalidDownloadEndpoint
 	}
 	if len(trustedJWKS) == 0 || len(trustedJWKS) > 16*1024 || onlyFields(trustedJWKS, "keys") != nil {
-		return nil, ErrConfiguration
+		return nil, errInvalidDownloadKeys
 	}
 	keys, err := parseKeys(append([]byte(nil), trustedJWKS...))
 	if err != nil {
-		return nil, ErrConfiguration
+		return nil, errInvalidDownloadKeys
 	}
 	prefix := string(app.environment) + "-"
 	for kid := range keys {
 		if !opaque(kid) || !strings.HasPrefix(kid, prefix) || len(kid) == len(prefix) {
-			return nil, ErrConfiguration
+			return nil, errInvalidDownloadKeys
 		}
 	}
 	return &DownloadTicketVerifier{app: app, endpoint: endpoint, keys: keys}, nil
@@ -168,71 +179,72 @@ type downloadClaims struct {
 }
 
 // Verify checks the token using the current clock, or an optional explicit
-// instant for deterministic callers and tests. The verifier is immutable and
-// safe for concurrent use.
+// instant from a trusted application clock. Any invalid or expired ticket
+// returns an ErrDenied match with Code "invalid_download_ticket". The verifier
+// is immutable and safe for concurrent use.
 func (v *DownloadTicketVerifier) Verify(token string, at ...time.Time) (DownloadTicket, error) {
 	var zero DownloadTicket
 	if v == nil || len(at) > 1 {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	now := time.Now().UTC()
 	if len(at) == 1 {
 		now = at[0]
 	}
 	if now.IsZero() || now.Unix() < 0 || now.After(time.Unix(downloadMaxTime, 0)) {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	if len(token) == 0 || len(token) > 16*1024 || !isASCII(token) {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	headerBytes, err := canonicalBase64(parts[0])
 	if err != nil || onlyFields(headerBytes, "alg", "typ", "kid") != nil {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	var header downloadHeader
 	if decodeJSON(headerBytes, &header) != nil || header.Algorithm != "ES256" || header.Type != "orbit-download+jwt" || !opaque(header.KeyID) {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	key := v.keys[header.KeyID]
 	if key == nil {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	payload, err := canonicalBase64(parts[1])
 	if err != nil {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	signature, err := canonicalBase64(parts[2])
 	if err != nil || len(signature) != 64 {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	claimsValue, err := uniqueJSON(payload)
 	if err != nil {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	claimsObject, ok := claimsValue.(map[string]any)
 	if !ok || len(claimsObject) != 14 {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	for _, field := range []string{"ver", "iss", "aud", "sub", "jti", "iat", "nbf", "exp", "application_id", "environment_id", "release_id", "artifact_id", "sha256", "byte_length"} {
 		if _, present := claimsObject[field]; !present {
-			return zero, ErrInvalidResponse
+			return zero, errInvalidDownloadTicket
 		}
 	}
 	var claims downloadClaims
 	if decodeJSON(payload, &claims) != nil || claims.Version != 1 || !opaque(claims.Subject) || !opaque(claims.TicketID) || !opaque(claims.ApplicationID) || !opaque(claims.EnvironmentID) || !opaque(claims.ReleaseID) || !opaque(claims.ArtifactID) || !lowerHex(claims.SHA256, 64) || claims.IssuedAt < 0 || claims.IssuedAt > downloadMaxTime || claims.NotBefore != claims.IssuedAt || claims.ExpiresAt < 0 || claims.ExpiresAt > downloadMaxTime || claims.ByteLength < 1 || claims.ByteLength > 9007199254740991 {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	if claims.Issuer != v.app.issuer || claims.Audience != v.endpoint || claims.ApplicationID != v.app.applicationID || claims.EnvironmentID != v.app.environmentID || claims.ExpiresAt <= claims.IssuedAt || claims.ExpiresAt-claims.IssuedAt > 120 || time.Unix(claims.IssuedAt, 0).After(now.Add(30*time.Second)) || !time.Unix(claims.ExpiresAt, 0).After(now) {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	r, s := new(big.Int).SetBytes(signature[:32]), new(big.Int).SetBytes(signature[32:])
 	if !ecdsa.Verify(key, hash[:], r, s) {
-		return zero, ErrInvalidResponse
+		return zero, errInvalidDownloadTicket
 	}
 	return DownloadTicket{licenceID: claims.Subject, releaseID: claims.ReleaseID, artifactID: claims.ArtifactID, sha256: claims.SHA256, byteLength: claims.ByteLength, ticketID: claims.TicketID, issuedAt: time.Unix(claims.IssuedAt, 0).UTC(), expiresAt: time.Unix(claims.ExpiresAt, 0).UTC()}, nil
 }

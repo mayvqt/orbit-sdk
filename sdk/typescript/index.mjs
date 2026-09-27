@@ -360,56 +360,56 @@ export class OrbitBackendClient {
     return freezeLicence(value);
   }
 
-  checkForUpdate(licenceId, installedReleaseNumber, { channel, target, signal } = {}) {
+  async checkForUpdate(licenceId, installedReleaseNumber, { channel, target, signal } = {}) {
     const query = online.updateInput(installedReleaseNumber, { channel, target });
     return this.#onlineLicence(licenceId, "updates", "GET", undefined, (v) => online.parseUpdate(v, query), { query, signal });
   }
 
-  authorizeDownload(licenceId, releaseId, artifactId, { signal } = {}) {
+  async authorizeDownload(licenceId, releaseId, artifactId, { signal } = {}) {
     requireId(releaseId, "releaseId"); requireId(artifactId, "artifactId");
     return this.#onlineLicence(licenceId, "downloads/authorize", "POST", { release_id: releaseId, artifact_id: artifactId },
       (v) => online.parseAuthorization(v, releaseId, artifactId), { signal });
   }
 
-  usage(licenceId, name, { signal } = {}) {
+  async usage(licenceId, name, { signal } = {}) {
     online.requireInput(name, online.limitName);
     return this.#onlineLicence(licenceId, `usage/${name}`, "GET", undefined, (v) => online.parseCounter(v, name, true), { signal });
   }
 
-  consume(licenceId, name, units = 1, { idempotencyKey, signal } = {}) {
+  async consume(licenceId, name, units = 1, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName); online.requireInput(units, (v) => online.integer(v, 1));
     const key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineLicence(licenceId, `usage/${name}/consume`, "POST", { units, idempotency_key: key },
       (v) => online.parseConsumption(v, name, key, units), { signal, key });
   }
 
-  resources(licenceId, name, { signal } = {}) {
+  async resources(licenceId, name, { signal } = {}) {
     online.requireInput(name, online.limitName);
     return this.#onlineLicence(licenceId, `resources/${name}`, "GET", undefined, (v) => online.parseCounter(v, name, false), { signal });
   }
 
-  acquireResource(licenceId, name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
+  async acquireResource(licenceId, name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName); requireId(resourceId, "resourceId"); online.requireInput(units, (v) => online.integer(v, 1));
     const key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineLicence(licenceId, `resources/${name}/acquire`, "POST", { resource_id: resourceId, units, idempotency_key: key },
       (v) => online.parseAllocation(v, name, key, { resourceId, units }), { signal, key });
   }
 
-  releaseResource(licenceId, name, allocationId, { idempotencyKey, signal } = {}) {
+  async releaseResource(licenceId, name, allocationId, { idempotencyKey, signal } = {}) {
     online.requireInput(name, online.limitName); requireId(allocationId, "allocationId");
     const key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineLicence(licenceId, `resources/${name}/allocations/${allocationId}/release`, "POST", { idempotency_key: key },
       (v) => online.parseAllocation(v, name, key, { allocationId }), { signal, key });
   }
 
-  listResourceAllocations(licenceId, name, { state, after, limit, signal } = {}) {
+  async listResourceAllocations(licenceId, name, { state, after, limit, signal } = {}) {
     online.requireInput(name, online.limitName);
     const query = pageQuery({ after, limit });
     if (state !== undefined) query.state = online.requireInput(state, (v) => ["active", "released"].includes(v));
     return this.#onlineLicence(licenceId, `resources/${name}/allocations`, "GET", undefined, online.parseAllocationPage, { query, signal });
   }
 
-  listReleases({ channel, after, limit, signal } = {}) {
+  async listReleases({ channel, after, limit, signal } = {}) {
     const query = pageQuery({ after, limit });
     if (channel !== undefined) query.channel = online.requireInput(channel, online.targetName);
     return this.#onlineCall("/api/management/v1/releases", "GET", undefined, (v) => {
@@ -421,14 +421,14 @@ export class OrbitBackendClient {
     }, { query, signal });
   }
 
-  getRelease(releaseId, { signal } = {}) {
+  async getRelease(releaseId, { signal } = {}) {
     requireId(releaseId, "releaseId");
     return this.#onlineCall(`/api/management/v1/releases/${releaseId}`, "GET", undefined, (v) => {
       const result = online.parseRelease(v); if (result.id !== releaseId) online.invalid(); return result;
     }, { signal });
   }
 
-  createRelease(input, { idempotencyKey, signal } = {}) {
+  async createRelease(input, { idempotencyKey, signal } = {}) {
     const body = online.metadataInput(input), key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineCall("/api/management/v1/releases", "POST", { ...body, idempotency_key: key }, (v) => {
       const result = online.parseRelease(v);
@@ -437,7 +437,7 @@ export class OrbitBackendClient {
     }, { signal, key, status: 201 });
   }
 
-  updateRelease(releaseId, input, { idempotencyKey, signal } = {}) {
+  async updateRelease(releaseId, input, { idempotencyKey, signal } = {}) {
     requireId(releaseId, "releaseId");
     const body = online.metadataInput(input), key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineCall(`/api/management/v1/releases/${releaseId}`, "PATCH", { ...body, idempotency_key: key }, (v) => {
@@ -447,11 +447,11 @@ export class OrbitBackendClient {
     }, { signal, key });
   }
 
-  createArtifact(releaseId, input, options = {}) {
+  async createArtifact(releaseId, input, options = {}) {
     return this.#artifactMutation(releaseId, undefined, input, options);
   }
 
-  updateArtifact(releaseId, artifactId, input, options = {}) {
+  async updateArtifact(releaseId, artifactId, input, options = {}) {
     requireId(artifactId, "artifactId");
     return this.#artifactMutation(releaseId, artifactId, input, options);
   }
@@ -467,15 +467,15 @@ export class OrbitBackendClient {
       }, { signal, key, status: artifactId ? 200 : 201 });
   }
 
-  deleteArtifact(releaseId, artifactId, { idempotencyKey, signal } = {}) {
+  async deleteArtifact(releaseId, artifactId, { idempotencyKey, signal } = {}) {
     requireId(releaseId, "releaseId"); requireId(artifactId, "artifactId");
     const key = resolveIdempotencyKey(idempotencyKey);
     return this.#onlineCall(`/api/management/v1/releases/${releaseId}/artifacts/${artifactId}`, "DELETE", { idempotency_key: key },
       () => Object.freeze({ idempotencyKey: key }), { signal, key, status: 204 });
   }
 
-  publishRelease(releaseId, options = {}) { return this.#publish(releaseId, true, options); }
-  unpublishRelease(releaseId, options = {}) { return this.#publish(releaseId, false, options); }
+  async publishRelease(releaseId, options = {}) { return this.#publish(releaseId, true, options); }
+  async unpublishRelease(releaseId, options = {}) { return this.#publish(releaseId, false, options); }
   #publish(releaseId, publish, { idempotencyKey, signal }) {
     requireId(releaseId, "releaseId");
     const key = resolveIdempotencyKey(idempotencyKey);

@@ -27,10 +27,6 @@ class OrbitError(RuntimeError):
         return str(self)
 
 
-def fail(kind: str, code: str, request_id: str | None = None) -> OrbitError:
-    return OrbitError(kind, code, request_id)
-
-
 CONFIGURATION = "configuration"
 CANCELLED = "cancelled"
 TRANSIENT = "transient"
@@ -41,15 +37,10 @@ REAUTHENTICATION_REQUIRED = "reauthentication_required"
 STALE_RESPONSE = "stale_response"
 STORAGE = "storage"
 CLOCK_UNCERTAIN = "clock_uncertain"
-INTERNAL = "internal"
 
 
 def error(kind: str, code: str, request_id: str | None = None) -> OrbitError:
     return OrbitError(kind, code, request_id)
-
-
-def is_error(value: BaseException | None, kind: str, code: str | None = None) -> bool:
-    return isinstance(value, OrbitError) and value.kind == kind and (code is None or value.code == code)
 
 
 class NotActivatedError(OrbitError):

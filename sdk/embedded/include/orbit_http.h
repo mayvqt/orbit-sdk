@@ -6,9 +6,9 @@ extern "C" {
 #endif
 /* A synchronous authenticated TLS connection. connect must verify the CA chain,
  * hostname and certificate dates using trusted UTC. All operations have finite
- * deadlines; read returns 1..capacity bytes or zero at orderly EOF. Only
- * genuine network unavailability/timeouts return TRANSIENT. One owner, no
- * reentry. */
+ * deadlines; read returns 1..capacity bytes or zero at orderly EOF. Network
+ * unavailability, timeouts and resets return TRANSIENT; certificate and
+ * handshake failures return UNTRUSTED. One owner, no reentry. */
 typedef struct orbit_tls_stream {
   void *context;
   int32_t (*connect)(void *, const char *hostname, uint16_t port);

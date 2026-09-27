@@ -25,7 +25,7 @@ def download_update(orbit: Client, installed_number: int, destination: Path) -> 
     if update is None:
         return None
     authorization: DownloadAuthorization = orbit.authorize_download(update.release.id, update.artifact.id)
-    return Path(orbit.download(authorization, destination, max_bytes=200_000_000))
+    return orbit.download(authorization, destination, max_bytes=200_000_000)
 
 
 def track_project(orbit: Client, project_id: str, job_id: str) -> ResourceAllocation:

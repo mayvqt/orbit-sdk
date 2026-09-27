@@ -4,6 +4,8 @@
 #include "orbit_internal.h"
 #include "orbit_json.h"
 
+#define ORBIT_CLIENT_MAGIC 0x4f524243u
+
 typedef struct orbit_writer {
     uint8_t *bytes;
     uint32_t length, capacity;

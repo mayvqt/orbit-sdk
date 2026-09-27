@@ -436,6 +436,33 @@ test("overlapping logins allow only the newest response to establish a session",
   assert.equal(client.account().username, "second_user");
 });
 
+test("claimLicence returns an immutable owned licence", async (context) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return context.skip("POSIX private-file storage runtime only");
+  const base = await mkdtemp(path.join(os.tmpdir(), "orbit-js-claim-"));
+  let client;
+  context.after(async () => { await client?.close().catch(() => {}); await rm(base, { recursive: true, force: true }); });
+  const transport = {
+    async post(route, body) {
+      if (route.endsWith("/sessions")) return Buffer.from(JSON.stringify(loginReply("customer-1", "claim_user")));
+      if (!route.endsWith("/licence-claims") || body.licence_key !== keyText) throw new Error("unexpected request");
+      return Buffer.from(JSON.stringify({
+        id: "licence-1", policy_name: "Pro", state: "unused", expiry_mode: "perpetual", first_used_at: null,
+        expires_at: null, duration_seconds: null, device_limit: 2, concurrent_session_limit: 0, hwid_locked: false,
+        offline_allowed: false, offline_seconds: 0, offline_file_seconds: 0, entitlements: { export: true },
+        usage_limits: {}, resource_limits: {},
+      }));
+    },
+  };
+  client = await openClientForTesting(key, { statePath: path.join(base, "state"), machineBinding: false, transport, lifecycle: false });
+  await client.login("claim_user", "correct horse battery staple");
+  const licence = await client.claimLicence(keyText);
+  assert.ok(Object.isFrozen(licence));
+  assert.equal(licence.policyName, "Pro");
+  assert.equal(licence.deviceLimit, 2);
+  assert.equal(licence.entitlements.export, true);
+  assert.equal(Object.hasOwn(licence, "policy_name"), false);
+});
+
 test("continuous and wall clocks advance together across a simulated suspend", async (context) => {
   if (process.platform !== "linux" && process.platform !== "darwin") return context.skip("POSIX private-file storage runtime only");
   const base = await mkdtemp(path.join(os.tmpdir(), "orbit-js-simulated-suspend-"));

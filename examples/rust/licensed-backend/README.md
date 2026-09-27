@@ -1,7 +1,5 @@
 # Protect your API with Orbit
 
-This Orbit-authored example is available under the [MIT licence](../../../sdk/LICENSE).
-
 This Rust example checks an Orbit customer session and licence before allowing
 an operation on your server. Orbit still handles sign-in and licensing. Any of
 the Rust, Go or C# clients can call it after customer login and licence activation.
@@ -33,9 +31,9 @@ On a Unix host, create a file readable only by its owner (`chmod 600`) containin
 }
 ```
 
-Replace the synthetic values locally. Keep the file outside Git, container
-images and public client bundles. The example checks private Unix file
-permissions and rejects symlinks, oversized files and unknown fields. From this repository’s root, run:
+Keep the file outside Git, container images and public client bundles. The
+example rejects files with broader permissions, symlinks, oversized files and
+unknown fields. From the repository root, run:
 
 ```sh
 cargo build --locked -p orbit-licensed-backend
@@ -75,9 +73,8 @@ HTTPS backend's** `/export`, with JSON containing `licence_id` and `activation_i
 from the selected activation. Disable redirects on that HTTP client. Do not put
 the header in a URL, log it or save it. Do not send it to arbitrary third parties:
 it carries the full authority of the current Orbit customer login session.
-The opaque proof object redacts normal formatting; extracting its header is an
-explicit secret-handling operation. Previously copied proofs still require
-online validation, even after the local SDK has cleared its account.
+The proof object redacts normal formatting; copied headers stay valid until
+the customer session ends, even after the local SDK clears its account.
 
 The backend sends the token only to its fixed Orbit origin:
 
@@ -93,8 +90,6 @@ responses and redirects fail closed; there is no offline fallback or cached
 identity decision. Responses use `Cache-Control: no-store`, and no request body,
 Authorization header or management credential is logged by the example.
 
-Customer sessions normally last 12 hours; activation credentials can outlive
-them. This backend always requires a currently valid customer login session.
-Verification is a decision for the current request, not a promise that a session
-or licence cannot change immediately afterward. Sensitive transactions in your
-own application still need their own resource authorization and concurrency rules.
+This backend always requires a currently valid customer session, even though
+activation credentials can outlive it. Each decision covers only the current
+request; your own transactions still need their own resource authorization.

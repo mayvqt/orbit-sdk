@@ -53,6 +53,8 @@ test("Electron async storage durably rewrites rotated key data", async (context)
   const options = {
     app: { isReady: () => true }, safeStorage: storage,
     statePath: path.join(base, "state"), machineBinding: false,
+    offlineKeys: { keys: [{ kty: "EC", crv: "P-256", alg: "ES256", use: "sig", kid: "offline-test-electron",
+      x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU", y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0" }] },
   };
   client = await openElectronClientForTesting("orbit_app_test_aHR0cHM6Ly9sb2NhbGhvc3Q.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g", options);
   const installation = client.installationId;

@@ -24,6 +24,7 @@ internal static class SecurityTests
             ("secret helper bounds private pipes and terminates failed children", SecretServiceTests.HelperAsync),
             ("clock rejects rollback and accounts for elapsed time", ClockAnchorsAsync),
             ("transient retry deadlines stay within randomized bounds", RetryDeadlineRangeAsync),
+            ("name resolution failure is transient, TLS failure is not", TransportClassificationAsync),
             ("delayed login cannot restore logged-out account", DelayedLoginAsync),
             ("delayed activation cannot restore logged-out access", DelayedActivationAsync),
             ("delayed validation cannot restore logged-out access", DelayedValidationAsync),
@@ -141,6 +142,24 @@ internal static class SecurityTests
         Require(!Clock.TryConvertMachToTimeSpanTicks(1, 0, 1, out _));
         Require(!Clock.TryConvertMachToTimeSpanTicks(1, 1, 0, out _));
         Require(!Clock.TryConvertMachToTimeSpanTicks(ulong.MaxValue, uint.MaxValue, 1, out _));
+        return Task.CompletedTask;
+    }
+
+    private static Task TransportClassificationAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        static OrbitError Classify(Exception error) => Transport.ClassifyTransport(error).Error;
+        Require(Classify(new HttpRequestException(HttpRequestError.NameResolutionError, null,
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.TryAgain))) == OrbitError.Transient);
+        Require(Classify(new HttpRequestException(HttpRequestError.NameResolutionError, null,
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.HostNotFound))) == OrbitError.Transient);
+        Require(Classify(new HttpRequestException(HttpRequestError.NameResolutionError, null, null)) == OrbitError.Transient);
+        Require(Classify(new HttpRequestException(HttpRequestError.Unknown, null,
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.HostNotFound))) == OrbitError.Transient);
+        Require(Classify(new HttpRequestException(HttpRequestError.Unknown, null,
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.AccessDenied))) == OrbitError.TransportSecurity);
+        Require(Classify(new HttpRequestException(HttpRequestError.SecureConnectionError, null,
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.TryAgain))) == OrbitError.TransportSecurity);
         return Task.CompletedTask;
     }
 

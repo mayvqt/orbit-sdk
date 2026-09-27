@@ -96,7 +96,8 @@ public sealed partial class OrbitClient
 
     public async Task<Account> LoginAsync(string username, string password, CancellationToken cancellationToken = default)
     {
-        if (username.Length is < 1 or > 128 || password.Length > 256) throw new OrbitException(OrbitError.Configuration);
+        if (username is not { Length: >= 1 and <= 128 } || password is not { Length: <= 256 })
+            throw new OrbitException(OrbitError.Configuration);
         var expected = Generation();
         await EnterSerialAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -201,7 +202,7 @@ public sealed partial class OrbitClient
 
     public Task<OwnedLicence> ClaimLicenceAsync(string licenceKey, string? idempotencyKey = null, CancellationToken cancellationToken = default)
     {
-        if (licenceKey.Length is < 1 or > 256 || idempotencyKey != null && !JsonWire.OperationId(idempotencyKey))
+        if (licenceKey is not { Length: >= 1 and <= 256 } || idempotencyKey != null && !JsonWire.OperationId(idempotencyKey))
             throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
         body["licence_key"] = licenceKey;
@@ -211,7 +212,8 @@ public sealed partial class OrbitClient
 
     public async Task RequestEmailChangeAsync(string password, string email, CancellationToken cancellationToken = default)
     {
-        if (password.Length > 256 || email.Length > 254) throw new OrbitException(OrbitError.Configuration);
+        if (password is not { Length: <= 256 } || email is not { Length: <= 254 })
+            throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
         body["password"] = password;
         body["email"] = email;
@@ -220,8 +222,9 @@ public sealed partial class OrbitClient
 
     public async Task<RegistrationResult> RegisterAsync(Registration registration, CancellationToken cancellationToken = default)
     {
-        if (registration.LicenceKey.Length is < 1 or > 256 || registration.Username.Length > 128 ||
-            registration.Email.Length > 254 || registration.Password.Length > 256 ||
+        ArgumentNullException.ThrowIfNull(registration);
+        if (registration.LicenceKey is not { Length: >= 1 and <= 256 } || registration.Username is not { Length: <= 128 } ||
+            registration.Email is not { Length: <= 254 } || registration.Password is not { Length: <= 256 } ||
             registration.Password.EnumerateRunes().Count() < 8) throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
         body["licence_key"] = registration.LicenceKey;
@@ -240,6 +243,7 @@ public sealed partial class OrbitClient
 
     public async Task ResendRegistrationAsync(RegistrationResult pending, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(pending);
         if (pending.ApplicationId != config.ApplicationId || pending.EnvironmentId != config.EnvironmentId)
             throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
@@ -250,7 +254,7 @@ public sealed partial class OrbitClient
 
     public async Task RequestPasswordRecoveryAsync(string email, CancellationToken cancellationToken = default)
     {
-        if (email.Length > 254) throw new OrbitException(OrbitError.Configuration);
+        if (email is not { Length: <= 254 }) throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
         body["email"] = email;
         _ = Accepted(await transport.PostAsync("/api/client/v1/password-recovery", body, false, cancellationToken).ConfigureAwait(false)

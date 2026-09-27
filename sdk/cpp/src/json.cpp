@@ -7,7 +7,6 @@
 #include <cmath>
 
 namespace orbit::detail {
-namespace {
 
 bool valid_utf8(std::string_view text) {
     std::size_t i = 0;
@@ -48,6 +47,8 @@ bool valid_utf8(std::string_view text) {
     return true;
 }
 
+namespace {
+
 void configure_reader(Json::CharReaderBuilder& builder, bool reject_duplicates) {
     builder["allowComments"] = false;
     builder["allowTrailingCommas"] = false;
@@ -87,7 +88,12 @@ bool parse_with_duplicate_policy(std::string_view input, std::size_t limit,
     configure_reader(builder, reject_duplicates);
     std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     std::string errors;
-    return reader->parse(input.data(), input.data() + input.size(), &result, &errors);
+    try {
+        return reader->parse(input.data(), input.data() + input.size(), &result, &errors);
+    } catch (const Json::Exception&) {
+        // JsonCpp throws rather than failing when input exceeds stackLimit.
+        return false;
+    }
 }
 
 } // namespace

@@ -383,7 +383,7 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
     }
 #endif
     set_option(handle.value, CURLOPT_NOSIGNAL, 1L);
-    set_option(handle.value, CURLOPT_CONNECTTIMEOUT_MS, std::min(5000L, timeout_ms));
+    set_option(handle.value, CURLOPT_CONNECTTIMEOUT_MS, std::min(3000L, timeout_ms));
     set_option(handle.value, CURLOPT_TIMEOUT_MS, timeout_ms);
     set_option(handle.value, CURLOPT_ERRORBUFFER, error);
     set_option(handle.value, CURLOPT_WRITEFUNCTION, body_callback);
@@ -393,7 +393,7 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
     set_option(handle.value, CURLOPT_XFERINFOFUNCTION, progress_callback);
     set_option(handle.value, CURLOPT_XFERINFODATA, &cancelled);
     set_option(handle.value, CURLOPT_NOPROGRESS, 0L);
-    set_option(handle.value, CURLOPT_USERAGENT, "Orbit-Cpp-SDK/0.2.0");
+    set_option(handle.value, CURLOPT_USERAGENT, "Orbit-Cpp-SDK/" ORBIT_SDK_VERSION);
     HeaderList headers;
     headers.add("Accept: application/json");
     headers.add("Orbit-Client: " + client_header());
@@ -420,7 +420,10 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
     if (result != CURLE_OK) {
         long os_error = 0;
         (void)curl_easy_getinfo(handle.value, CURLINFO_OS_ERRNO, &os_error);
-        if (result == CURLE_OPERATION_TIMEDOUT || transient_os_error(os_error)) {
+        // Resolution and TCP connect failures precede TLS, so they are outages
+        // (for example no network), never certificate or protocol failures.
+        if (result == CURLE_OPERATION_TIMEDOUT || result == CURLE_COULDNT_RESOLVE_HOST ||
+            result == CURLE_COULDNT_CONNECT || transient_os_error(os_error)) {
             raise(ErrorKind::transient, "service_unavailable");
         }
         if (result == CURLE_GOT_NOTHING || result == CURLE_PARTIAL_FILE) {

@@ -19,9 +19,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = run(&client).await;
     let closed = client.close().await;
-    if let Err(error) = &result {
-        eprintln!("{error}");
-    }
     result?;
     closed?;
     Ok(())

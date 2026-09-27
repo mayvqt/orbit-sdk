@@ -231,7 +231,10 @@ mod tests {
             !std::path::Path::new("/proc").join(pid.to_string()).exists(),
             "Synthetic helper was not reaped"
         );
-        assert_eq!(format!("{error:?}"), "Credential storage failed");
+        assert_eq!(
+            format!("{error:?}"),
+            "Credential storage failed (code: storage)"
+        );
         assert_eq!(format!("{error}"), "Credential storage failed");
     }
 }

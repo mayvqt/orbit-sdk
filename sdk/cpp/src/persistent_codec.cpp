@@ -188,7 +188,8 @@ Json::Value decode(const Config& config, std::string_view provider,
     } catch (...) {
         corrupt();
     }
-    const auto format = record.isMember("format") && record["format"].type() == Json::intValue
+    const auto format = record.isObject() && record.isMember("format") &&
+            record["format"].type() == Json::intValue && record["format"].isInt()
         ? record["format"].asInt() : 0;
     const bool fields_ok = format == 2
         ? exact(record, {"sdk", "format", "provider", "scope", "installation",

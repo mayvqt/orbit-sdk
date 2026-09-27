@@ -67,7 +67,11 @@ impl std::fmt::Display for MutationError {
 }
 impl std::fmt::Debug for MutationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+        write!(
+            f,
+            "{self} (operation ID: {}, uncertain: {}, cause: {:?})",
+            self.operation_id, self.uncertain, self.cause
+        )
     }
 }
 impl std::error::Error for MutationError {
