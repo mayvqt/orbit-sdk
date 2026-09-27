@@ -1121,9 +1121,9 @@ class Client:
         return result
 
     def logout(self) -> None:
-        """Clear saved activation and customer session state locally (no
-        network request). See ``logout_account`` to also revoke the customer
-        session on the server."""
+        """Clear local activation and customer session state and schedule a
+        bounded, best-effort floating-seat release. Use ``logout_account`` to
+        revoke the customer session on the server."""
         with self._operation():
             self._sync_storage()
             self._invalidate(clear_account=True)
