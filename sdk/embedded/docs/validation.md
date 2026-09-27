@@ -1,86 +1,128 @@
 # Validation
 
-Run from the SDK root with installed CMake, Python, OpenSSL 3, libcurl and a C11
-compiler. Configure and test both the default and compact SDK defaults:
+Run from the SDK root with CMake, Python, a C11 compiler, OpenSSL 3 and libcurl.
+The connected, services, compact-file and full-file configurations are separate
+builds so their feature definitions and storage geometries stay consistent:
 
 ```sh
 cmake -S sdk/embedded -B build/embedded -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_FLAGS_RELEASE=-Os -DORBIT_BUILD_POSIX=ON
 cmake --build build/embedded
 ctest --test-dir build/embedded --output-on-failure
-cmake -S sdk/embedded -B build/embedded-compact -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS_RELEASE=-Os -DORBIT_BUILD_POSIX=ON \
+
+cmake -S sdk/embedded -B build/embedded-services -DORBIT_BUILD_POSIX=ON \
+  -DORBIT_ENABLE_SERVICES=ON
+cmake --build build/embedded-services
+ctest --test-dir build/embedded-services --output-on-failure
+
+cmake -S sdk/embedded -B build/embedded-offline -DORBIT_BUILD_POSIX=ON \
+  -DORBIT_ENABLE_OFFLINE=ON -DORBIT_OFFLINE_PROFILE_FILE_BYTES=4096 \
   -DORBIT_CLIENT_ARENA_BYTES=8192
-cmake --build build/embedded-compact
-ctest --test-dir build/embedded-compact --output-on-failure
-cargo test --manifest-path sdk/embedded/Cargo.toml --offline
-cargo check --manifest-path sdk/embedded/Cargo.toml --offline --features external-c
-cargo package --manifest-path sdk/embedded/Cargo.toml --offline --locked
-python3 sdk/embedded/tests/measure_arm.py --output /tmp/orbit-arm-size
+cmake --build build/embedded-offline
+ctest --test-dir build/embedded-offline --output-on-failure
+
+cmake -S sdk/embedded -B build/embedded-offline-full -DORBIT_BUILD_POSIX=ON \
+  -DORBIT_ENABLE_OFFLINE=ON -DORBIT_OFFLINE_PROFILE_FILE_BYTES=16384 \
+  -DORBIT_CLIENT_ARENA_BYTES=16384
+cmake --build build/embedded-offline-full
+ctest --test-dir build/embedded-offline-full --output-on-failure
 ```
 
-The seven CTest suites cover all 27 shared app-key vectors (4 accepted / 23
-rejected), all 104 signed grant vectors (12 accepted / 92 rejected), strict
-parser/bounds and payload binding, lifecycle/retry/clock/storage faults including
-optional machine binding, HTTP framing across chunks, Linux storage
-ownership/corruption and host-bridge time/entropy framing. Rust checks match the
-real C layout, parse an app key, exercise default and compact buffers and
-callback drop/restart, and compile-fail attempts to reuse buffers or drop an
-AppKey while its client is active.
+The connected build passes seven suites: 27 app-key vectors, 104 grant vectors,
+strict parser/bounds, lifecycle/retry/clock/storage, transport framing, Linux
+storage and bridge-host framing. Services adds 288 shared session/file signature
+cases, typed response/lifecycle tests and verified streaming tests. Offline adds
+all journal interruption points and profile bounds, for eleven suites in total.
 
-The crate archive includes the C core, required headers, Rust wrapper and MIT
-licence. Package verification and the four Rust unit tests plus two compile-fail
-documentation tests pass from an extracted standalone archive on Linux. This
-checks local packaging. Use `--allow-dirty`
-only when deliberately packaging uncommitted source for validation.
+The extended cases cover credential-before-seat persistence, transient versus
+terminal renewal failure, exact session expiry, retry ID reuse, bounded retry
+scheduling, end during initial activation/renewal and credential recovery, ordinary no-ops, authoritative
+counter arithmetic and HTTP status, safe capacity denials, missing update fields,
+target mismatch, expired download tickets, output/input alias rejection, length/hash/encoding/redirect failures,
+cancellation and preservation of an existing download destination. File cases
+cover exact 4096/16384-byte signed input, one-byte overflow, sequence and clock
+rollback, restart revalidation, mode isolation, failed atomic storage and bounded
+reader cancellation/malformed-input recovery, cancellation during verification,
+and access expiry crossed by a blocking checkpoint. Journal tests simulate every
+full/partial erase, program and sync interruption at all four slot geometries.
 
-For v0.4.0, the same seven CTest executables were cross-built and
-all passed under QEMU AArch64 11.1.1 with a Debian trixie arm64 sysroot, both
-with the default and 8 KiB C arena. The Linux example and bridge host also
-linked for AArch64. The Rust wrapper and its C build script passed `cargo check`
-for `thumbv6m-none-eabi` (Cortex-M0+) and `thumbv8m.main-none-eabi`
-(Cortex-M33), with both arena sizes. These checks establish compile/link and
-portable emulation only; no board was flashed or run.
-
-With both Rust targets installed and Arm GNU Embedded tools on `PATH`, reproduce
-the wrapper checks from the SDK root with:
-
-```sh
-export ORBIT_CC=arm-none-eabi-gcc ORBIT_AR=arm-none-eabi-ar
-ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
-  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
-  --target thumbv6m-none-eabi
-ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
-  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
-  --target thumbv6m-none-eabi
-ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=32768' \
-  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
-  --target thumbv8m.main-none-eabi
-ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb -DORBIT_CLIENT_ARENA_BYTES=8192' \
-  cargo check --locked --offline --manifest-path sdk/embedded/Cargo.toml \
-  --target thumbv8m.main-none-eabi
-```
-
-The maintained STM32 link-only harness is under
-[`examples/embedded/stm32g0b1re/validation`](../../../examples/embedded/stm32g0b1re/validation).
-It links the current common example, parser, HAL adapter, startup, and Mbed TLS
-crypto provider for both arena sizes. Its entry point does not initialize or
-exercise the UART.
-
-ASan/UBSan validation uses:
+Run the same full-file configuration with sanitizers:
 
 ```sh
 cmake -S sdk/embedded -B build/embedded-sanitize -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_BUILD_TYPE=Debug -DORBIT_BUILD_POSIX=ON \
-  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+  -DCMAKE_BUILD_TYPE=Debug -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_OFFLINE=ON \
+  -DORBIT_OFFLINE_PROFILE_FILE_BYTES=16384 \
+  -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
 cmake --build build/embedded-sanitize
-UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/embedded-sanitize --output-on-failure
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build/embedded-sanitize --output-on-failure
 ```
 
-For v0.4.0, the app-key parser and client lifecycle suites were rerun
-under ASan/UBSan with
-`ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/embedded-sanitize -R 'app_key|client_lifecycle' --output-on-failure`.
-Full-suite sanitizer evidence predates v0.4.0. Leak detection was
-disabled because LeakSanitizer cannot run under the traced sandbox.
-The portable core itself has no heap. Board-specific builds/runs are separately listed in
-[board requirements](boards.md), and are not implied by host or M0+ object tests.
+All eleven suites pass under ASan/UBSan. Leak detection is disabled because the
+traced execution environment does not support LeakSanitizer. Portable SDK code
+has no allocator calls. The streaming tests exercise callback contracts and
+staging with a real incremental SHA-256 provider; board-specific TLS handshakes
+and physical flash power loss need target validation.
+
+## Rust and standalone consumption
+
+The wrapper uses installed C and Rust tools and has no Cargo dependencies. Check
+each feature set with `cargo test` and strict Clippy:
+
+```sh
+cargo test --manifest-path sdk/embedded/Cargo.toml --offline --locked
+cargo test --manifest-path sdk/embedded/Cargo.toml --offline --locked --features services
+cargo test --manifest-path sdk/embedded/Cargo.toml --offline --locked --features offline
+cargo test --manifest-path sdk/embedded/Cargo.toml --offline --locked --features offline-full
+cargo clippy --manifest-path sdk/embedded/Cargo.toml --offline --locked \
+  --all-targets --features offline-full -- -D warnings
+cargo fmt --manifest-path sdk/embedded/Cargo.toml -- --check
+cargo check --manifest-path sdk/embedded/Cargo.toml --offline --locked --features external-c
+```
+
+Default Rust checks include four unit tests and two compile-fail borrow tests.
+Services builds add ABI checks for typed results and callbacks plus owned
+selection/cancellation tests (six unit tests). Offline builds also check that
+the complete transaction pointer spans both metadata and file fields (seven
+unit tests). The pointer derives from the whole `repr(C)` object. Miri dynamic
+validation is unavailable in the installed stable toolchain. Default, services, offline and offline-full
+also pass checks for Cortex-M0+ and Cortex-M33 with matching C compilation:
+
+```sh
+export ORBIT_CC=arm-none-eabi-gcc ORBIT_AR=arm-none-eabi-ar
+ORBIT_CFLAGS='-mcpu=cortex-m0plus -mthumb' \
+  cargo check --manifest-path sdk/embedded/Cargo.toml --offline --locked \
+  --target thumbv6m-none-eabi --features offline-full
+ORBIT_CFLAGS='-mcpu=cortex-m33 -mthumb' \
+  cargo check --manifest-path sdk/embedded/Cargo.toml --offline --locked \
+  --target thumbv8m.main-none-eabi --features offline-full
+```
+
+The crate archive contains its C sources, headers, wrapper and licence. Local
+archive verification and tests from an extracted archive cover both default and
+full-file features without sibling repository directories. CMake install/export
+checks also build an isolated consumer against `Orbit::EmbeddedClient`,
+`Orbit::EmbeddedTransport` and `Orbit::EmbeddedPosix`. Source-only CMake builds use
+`-DBUILD_TESTING=OFF`; repository tests consume the shared contract corpora.
+
+## Footprint and boards
+
+```sh
+python3 sdk/embedded/tests/measure_arm.py --profile connected --output /tmp/orbit-arm-connected
+python3 sdk/embedded/tests/measure_arm.py --profile services --output /tmp/orbit-arm-services
+python3 sdk/embedded/tests/measure_arm.py --profile offline-compact --output /tmp/orbit-arm-compact
+python3 sdk/embedded/tests/measure_arm.py --profile offline-full --output /tmp/orbit-arm-full
+```
+
+The [memory guide](memory.md) distinguishes whole portable modules, explicit
+caller buffers and conservative stack from board TLS/crypto/runtime overhead.
+Connected measurements remain unchanged. Every profile has zero writable
+portable globals.
+
+ESP32, ESP8266, Pico W, Pico 2 W, STM32G0B1RE and Pi AArch64 compile/link both
+file profiles with their explicit storage reservations. AArch64 QEMU runs all
+eleven portable suites in each profile. The [board guide](boards.md) records
+commands, toolchains, actual linker sizes and limits. Physical boards are not
+flashed or executed; STM32's validation entry point does not initialize UART.
+The full ESP8266 profile leaves very little static RAM for dynamic TLS and needs
+an actual firmware memory budget before connected use.

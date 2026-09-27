@@ -3,6 +3,14 @@
 #include "orbit_internal.h"
 
 #include <stddef.h>
+#ifdef ORBIT_ENABLE_SERVICES
+#include "orbit_signed.h"
+#define EXTRA_ARGS , const orbit_signed_expected_t *extra, orbit_signed_claims_t *details
+#define EXTRA_PASS , extra, details
+#else
+#define EXTRA_ARGS
+#define EXTRA_PASS
+#endif
 
 #define DECODED_SEGMENT_BYTES ORBIT_JSON_DECODED_SEGMENT_BYTES
 
@@ -166,9 +174,12 @@ static int32_t parse_entitlements(parser_t *parser, orbit_grant_claims_t *claims
 #define REQUIRED_CLAIMS (((1u << 12) - 1u) | SEEN_POLICY | SEEN_ENTITLEMENTS | SEEN_REFRESH | SEEN_OFFLINE)
 
 static int32_t parse_claims_json(parser_t *parser, orbit_grant_claims_t *claims,
-                                 char binding[16], uint32_t *binding_length) {
+                                 char binding[16], uint32_t *binding_length EXTRA_ARGS) {
     uint32_t base, seen = 0u;
     int first, present;
+#ifdef ORBIT_ENABLE_SERVICES
+    uint32_t version_seen = 0, sequence_seen = 0, session_seen = 0;
+#endif
     json_span_t key;
     if (object_open(parser, 0u, &base, &first) != ORBIT_GRANT_STATUS_OK) return parser->status;
     for (;;) {
@@ -241,13 +252,53 @@ static int32_t parse_claims_json(parser_t *parser, orbit_grant_claims_t *claims,
         } else if (span_equals_ascii(parser->data, key, "licence_expires_at", 18u)) {
             bit = SEEN_LICENCE_EXP;
             if (parse_optional_integer(parser, &claims->licence_expires_at, &claims->has_licence_expiry) != ORBIT_GRANT_STATUS_OK) return parser->status;
-        } else {
+        }
+#ifdef ORBIT_ENABLE_SERVICES
+        else if (extra && extra->purpose == ORBIT_SIGNED_OFFLINE && span_equals_ascii(parser->data,key,"ver",3)) {
+            int64_t value; version_seen = 1;
+            if (parse_required_integer(parser,&value) || value != 1) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+        } else if (extra && span_equals_ascii(parser->data,key,extra->purpose == ORBIT_SIGNED_OFFLINE ? "sequence" : "session_sequence",extra->purpose == ORBIT_SIGNED_OFFLINE ? 8 : 16)) {
+            int64_t value; sequence_seen = 1;
+            if (parse_required_integer(parser,&value) || value < 1 || value > INT64_C(9007199254740991)) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+            details->sequence = (uint64_t)value;
+        } else if (extra && extra->purpose == ORBIT_SIGNED_SESSION && span_equals_ascii(parser->data,key,"session_id",10)) {
+            session_seen = 1;
+            if (parse_required_string(parser,claims,&details->session_id)) return parser->status;
+        }
+#endif
+        else {
+#ifdef ORBIT_ENABLE_SERVICES
+            if (extra) {
+                static const char *const known[] = {"iss","aud","sub","jti","iat","nbf","exp","application_id","environment_id","activation_id","installation_id","binding_mode","fingerprint","fingerprint_provider","policy_version","entitlements","refresh_after","offline_allowed","licence_expires_at","session_id","session_sequence"};
+                uint8_t decoded[64]; uint32_t n,i,j;
+                if (extra->purpose == ORBIT_SIGNED_OFFLINE) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+                if (!decode_span(parser->data,key,decoded,sizeof(decoded),&n,1)) {
+                    for (i=0;i<n;++i) if (decoded[i]>='A'&&decoded[i]<='Z') decoded[i]+='a'-'A';
+                    for (i=0;i<sizeof(known)/sizeof(known[0]);++i) {
+                        for (j=0;known[i][j];++j) {}
+                        if (n==j && bytes_equal(decoded,(const uint8_t *)known[i],n)) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+                    }
+                }
+            }
+#endif
             if (skip_value(parser, 1u) != ORBIT_GRANT_STATUS_OK) return parser->status;
         }
         seen |= bit;
     }
     parser->member_count = base;
+    #ifdef ORBIT_ENABLE_SERVICES
+    if (extra && extra->purpose == ORBIT_SIGNED_OFFLINE) {
+        uint32_t required = REQUIRED_CLAIMS & ~(SEEN_REFRESH | SEEN_OFFLINE);
+        if ((seen & required) != required || (seen & (SEEN_REFRESH | SEEN_OFFLINE)) || !version_seen || !sequence_seen ||
+            ((seen & SEEN_LICENCE_EXP) && !claims->has_licence_expiry)) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+        claims->refresh_after = claims->expires_at; claims->offline_allowed = 1;
+    } else {
+        if (extra && (!sequence_seen || !session_seen)) return fail(parser,ORBIT_GRANT_STATUS_INVALID_GRANT);
+#endif
     if ((seen & REQUIRED_CLAIMS) != REQUIRED_CLAIMS) return fail(parser, ORBIT_GRANT_STATUS_INVALID_GRANT);
+#ifdef ORBIT_ENABLE_SERVICES
+    }
+#endif
     return finish_json(parser);
 }
 
@@ -291,15 +342,22 @@ static int text_equals_bytes(const uint8_t *arena, const orbit_grant_claims_t *c
 }
 
 static int audience_matches(const uint8_t *arena, const orbit_grant_claims_t *claims,
-                            const orbit_grant_expected_t *expected) {
+                            const orbit_grant_expected_t *expected EXTRA_ARGS) {
+#ifdef ORBIT_ENABLE_SERVICES
+    const char *prefix = extra ? (extra->purpose == ORBIT_SIGNED_OFFLINE ? "orbit-offline:" : "orbit-session:") : "orbit:";
+    const uint32_t prefix_length = extra ? 14u : 6u;
+    (void)details;
+#else
+    const char *prefix = "orbit:";
     const uint32_t prefix_length = 6u;
+#endif
     uint64_t wanted = (uint64_t)prefix_length + expected->application_id.length + 1u + expected->environment_id.length;
     const uint8_t *actual;
     uint32_t at = 0u;
     if (wanted > UINT32_MAX || claims->audience.length != (uint32_t)wanted ||
         (uint32_t)claims->audience.offset + claims->audience.length > claims->arena_length) return 0;
     actual = arena + claims->audience.offset;
-    if (!bytes_equal(actual, (const uint8_t *)"orbit:", prefix_length)) return 0;
+    if (!bytes_equal(actual, (const uint8_t *)prefix, prefix_length)) return 0;
     at += prefix_length;
     if (!bytes_equal(actual + at, expected->application_id.data, expected->application_id.length)) return 0;
     at += expected->application_id.length;
@@ -315,20 +373,32 @@ static int64_t saturated_add(int64_t value, int64_t delta) {
 
 static int claims_match_context(const uint8_t *arena, const orbit_grant_claims_t *claims,
                                 const orbit_grant_expected_t *expected,
-                                const char *binding, uint32_t binding_length) {
+                                const char *binding, uint32_t binding_length EXTRA_ARGS) {
     const int64_t issued = claims->issued_at;
-    const int64_t allowance = claims->offline_allowed ? 86400 : 300;
+    const int64_t allowance =
+#ifdef ORBIT_ENABLE_SERVICES
+      extra ? (extra->purpose == ORBIT_SIGNED_OFFLINE ? INT64_C(31622400) : 120) :
+#endif
+      claims->offline_allowed ? 86400 : 300;
     const int persistent_offline = !expected->has_credential_expiry && claims->offline_allowed;
     const int64_t refresh_minimum = persistent_offline ? 675 : 45;
     const int64_t refresh_maximum = persistent_offline ? 1125 : 75;
     if (!text_equals_bytes(arena, claims, claims->issuer, expected->issuer.data, expected->issuer.length) ||
-        !audience_matches(arena, claims, expected) || !text_equals_bytes(arena, claims, claims->application_id, expected->application_id.data, expected->application_id.length) ||
+        !audience_matches(arena, claims, expected EXTRA_PASS) || !text_equals_bytes(arena, claims, claims->application_id, expected->application_id.data, expected->application_id.length) ||
         !text_equals_bytes(arena, claims, claims->environment_id, expected->environment_id.data, expected->environment_id.length) ||
-        !text_equals_bytes(arena, claims, claims->activation_id, expected->activation_id.data, expected->activation_id.length) ||
+        (
+#ifdef ORBIT_ENABLE_SERVICES
+        !(extra && extra->purpose == ORBIT_SIGNED_OFFLINE) &&
+#endif
+        !text_equals_bytes(arena, claims, claims->activation_id, expected->activation_id.data, expected->activation_id.length)) ||
         !text_equals_bytes(arena, claims, claims->installation_id, expected->installation_id.data, expected->installation_id.length)) return 0;
     if (claims->subject.length == 0u || claims->subject.length > 128u || claims->token_id.length == 0u || claims->token_id.length > 128u) return 0;
     if (expected->has_licence_id && !text_equals_bytes(arena, claims, claims->subject, expected->licence_id.data, expected->licence_id.length)) return 0;
-    if (expected->has_fingerprint) {
+    if (expected->has_fingerprint
+#ifdef ORBIT_ENABLE_SERVICES
+        && !(extra && (extra->purpose==ORBIT_SIGNED_OFFLINE || extra->allow_unbound_fingerprint) && binding_length==4 && bytes_equal((const uint8_t *)binding,(const uint8_t *)"none",4))
+#endif
+    ) {
         if (binding_length != 4u || !bytes_equal((const uint8_t *)binding, (const uint8_t *)"hwid", 4u) ||
             !claims->fingerprint_present || !claims->fingerprint_provider_present ||
             !claims->has_fingerprint || !claims->has_fingerprint_provider ||
@@ -337,16 +407,45 @@ static int claims_match_context(const uint8_t *arena, const orbit_grant_claims_t
     } else if (binding_length != 4u || !bytes_equal((const uint8_t *)binding, (const uint8_t *)"none", 4u) ||
                claims->fingerprint_present || claims->fingerprint_provider_present ||
                claims->has_fingerprint || claims->has_fingerprint_provider) return 0;
-    if (claims->has_licence_expiry != expected->has_licence_expiry ||
-        (claims->has_licence_expiry && claims->licence_expires_at != expected->licence_expires_at)) return 0;
+    if (
+#ifdef ORBIT_ENABLE_SERVICES
+        !(extra && extra->purpose == ORBIT_SIGNED_OFFLINE) && (
+#endif
+        claims->has_licence_expiry != expected->has_licence_expiry ||
+        (claims->has_licence_expiry && claims->licence_expires_at != expected->licence_expires_at)
+#ifdef ORBIT_ENABLE_SERVICES
+        )
+#endif
+        ) return 0;
     if (issued < 0 || claims->not_before != issued ||
-        saturated_add(issued, 30) < expected->received_unix_seconds ||
+        (
+#ifdef ORBIT_ENABLE_SERVICES
+        !extra &&
+#endif
+        saturated_add(issued, 30) < expected->received_unix_seconds) ||
         saturated_add(issued, -30) > expected->received_unix_seconds ||
         claims->expires_at <= expected->received_unix_seconds ||
         claims->expires_at <= expected->current_unix_seconds ||
         claims->expires_at <= issued || claims->expires_at > saturated_add(issued, allowance)) return 0;
     if (expected->has_credential_expiry && claims->expires_at > expected->credential_expires_at) return 0;
     if (claims->has_licence_expiry && claims->expires_at > claims->licence_expires_at) return 0;
+    #ifdef ORBIT_ENABLE_SERVICES
+    if (extra) {
+        const orbit_grant_text_t ids[] = {claims->subject,claims->token_id,claims->activation_id,claims->installation_id};
+        uint32_t i,j;
+        if (issued > INT64_C(253402300799) || claims->expires_at > INT64_C(253402300799) || claims->licence_expires_at > INT64_C(253402300799)) return 0;
+        for (i=0;i<4;++i) {
+            if (!ids[i].length || ids[i].length > 128) return 0;
+            for (j=0;j<ids[i].length;++j) {
+                uint8_t v=arena[ids[i].offset+j];
+                if (!((v>='a'&&v<='z')||(v>='A'&&v<='Z')||(v>='0'&&v<='9')||v=='_'||v=='-')) return 0;
+            }
+        }
+        if (extra->purpose == ORBIT_SIGNED_OFFLINE) return details->sequence >= extra->sequence;
+        if (claims->offline_allowed || details->sequence != extra->sequence ||
+            !text_equals_bytes(arena,claims,details->session_id,extra->session_id.data,extra->session_id.length)) return 0;
+    }
+#endif
     if (claims->refresh_after <= issued || claims->refresh_after > claims->expires_at ||
         claims->refresh_after > saturated_add(issued, refresh_maximum) ||
         (claims->refresh_after < saturated_add(issued, refresh_minimum) && claims->refresh_after != claims->expires_at)) return 0;
@@ -361,10 +460,10 @@ static int32_t unescape_text(uint8_t *arena, orbit_grant_text_t *text) {
     return status;
 }
 
-int32_t orbit_grant_verify(uint8_t *arena, uint32_t arena_length,
+static int32_t verify(uint8_t *arena, uint32_t arena_length,
     const orbit_grant_pending_t *pending, const orbit_grant_keyset_t *keys,
     const orbit_grant_expected_t *expected, const orbit_grant_crypto_t *crypto,
-    void *scratch, uint32_t scratch_length, orbit_grant_claims_t *claims) {
+    void *scratch, uint32_t scratch_length, orbit_grant_claims_t *claims EXTRA_ARGS) {
     uint32_t i, j;
     const void *objects[7] = {arena, pending, keys, expected, crypto, scratch, claims};
     uint32_t sizes[7] = {arena_length, sizeof(*pending), sizeof(*keys), sizeof(*expected),
@@ -376,6 +475,9 @@ int32_t orbit_grant_verify(uint8_t *arena, uint32_t arena_length,
     const orbit_grant_key_t *key = NULL;
     orbit_grant_text_t *texts[11];
     uint8_t payload_digest[32];
+#ifdef ORBIT_ENABLE_SERVICES
+    if (extra) { sizes[3] = sizeof(*extra); sizes[6] = sizeof(*details); }
+#endif
     /* Reject overlaps before any output write or input read. */
     for (i = 0u; i < 7u; ++i) for (j = i + 1u; j < 7u; ++j)
         if (orbit_overlap(objects[i], sizes[i], objects[j], sizes[j])) return status;
@@ -386,15 +488,30 @@ int32_t orbit_grant_verify(uint8_t *arena, uint32_t arena_length,
         for (i = 0u; i < 8u; ++i) {
             if (orbit_overlap(slices[i].data, slices[i].length, arena, arena_length) ||
                 orbit_overlap(slices[i].data, slices[i].length, scratch, scratch_length) ||
-                orbit_overlap(slices[i].data, slices[i].length, claims, sizeof(*claims))) return status;
+                orbit_overlap(slices[i].data, slices[i].length, claims, sizes[6])) return status;
         }
     }
-    if (claims != NULL) bytes_zero(claims, sizeof(*claims));
+#ifdef ORBIT_ENABLE_SERVICES
+    if (extra && (orbit_overlap(extra->session_id.data, extra->session_id.length, arena, arena_length) ||
+                  orbit_overlap(extra->session_id.data, extra->session_id.length, scratch, scratch_length) ||
+                  orbit_overlap(extra->session_id.data, extra->session_id.length, claims, sizes[6]))) return status;
+#endif
+    if (claims != NULL) bytes_zero(claims, sizes[6]);
     if (arena == NULL || pending == NULL || keys == NULL || expected == NULL || claims == NULL ||
         scratch == NULL || scratch_length < ORBIT_GRANT_WORKSPACE_BYTES || !orbit_crypto_valid(crypto) ||
-        pending->prepared != 1u || pending->payload_length == 0u || pending->payload_length > arena_length ||
+        pending->prepared != (1u
+#ifdef ORBIT_ENABLE_SERVICES
+        + (extra ? extra->purpose : 0u)
+#endif
+        ) || pending->payload_length == 0u || pending->payload_length > arena_length ||
         pending->payload_length > DECODED_SEGMENT_BYTES || pending->kid_length == 0u || pending->kid_length > 128u ||
         keys->count == 0u || keys->count > ORBIT_GRANT_MAX_KEYS || !valid_expected(expected)) return status;
+#ifdef ORBIT_ENABLE_SERVICES
+    if (extra) {
+        status = orbit_signed_keys_valid(keys, extra->purpose, extra->environment_kind, crypto);
+        if (status) return status;
+    }
+#endif
     for (i = 0u; i < keys->count; ++i) {
         if (keys->keys[i].kid_length == 0u || keys->keys[i].kid_length > 128u) return status;
         if (keys->keys[i].kid_length == pending->kid_length &&
@@ -409,7 +526,7 @@ int32_t orbit_grant_verify(uint8_t *arena, uint32_t arena_length,
         return ORBIT_GRANT_STATUS_CRYPTO_FAILURE;
     parser_init(&parser, arena, pending->payload_length, (uint8_t *)scratch);
     bytes_zero(binding, sizeof(binding));
-    if (parse_claims_json(&parser, claims, binding, &binding_length) != 0) { status = parser.status; goto failed; }
+    if (parse_claims_json(&parser, claims, binding, &binding_length EXTRA_PASS) != 0) { status = parser.status; goto failed; }
     /* Duplicate comparisons are finished before any raw JSON span changes. */
     texts[0] = &claims->issuer; texts[1] = &claims->audience; texts[2] = &claims->subject;
     texts[3] = &claims->token_id; texts[4] = &claims->application_id; texts[5] = &claims->environment_id;
@@ -423,8 +540,13 @@ int32_t orbit_grant_verify(uint8_t *arena, uint32_t arena_length,
         status = unescape_text(arena, &claims->entitlements[i].name);
         if (status != 0) goto failed;
     }
+    #ifdef ORBIT_ENABLE_SERVICES
+    if (extra && extra->purpose == ORBIT_SIGNED_SESSION) {
+        status = unescape_text(arena,&details->session_id); if (status) goto failed;
+    }
+#endif
     claims->arena_length = pending->payload_length;
-    if (!claims_match_context(arena, claims, expected, binding, binding_length)) {
+    if (!claims_match_context(arena, claims, expected, binding, binding_length EXTRA_PASS)) {
         status = ORBIT_GRANT_STATUS_INVALID_GRANT; goto failed;
     }
     return 0;
@@ -432,3 +554,33 @@ failed:
     bytes_zero(claims, sizeof(*claims));
     return status;
 }
+
+int32_t orbit_grant_verify(uint8_t *arena, uint32_t length, const orbit_grant_pending_t *pending, const orbit_grant_keyset_t *keys, const orbit_grant_expected_t *expected, const orbit_grant_crypto_t *crypto, void *scratch, uint32_t scratch_length, orbit_grant_claims_t *claims) {
+ return verify(arena,length,pending,keys,expected,crypto,scratch,scratch_length,claims
+#ifdef ORBIT_ENABLE_SERVICES
+ ,NULL,NULL
+#endif
+ );
+}
+#ifdef ORBIT_ENABLE_SERVICES
+int32_t orbit_signed_keys_valid(const orbit_grant_keyset_t *keys, uint8_t purpose, uint8_t environment, const orbit_grant_crypto_t *crypto) {
+ const char *prefix; uint32_t n,i,j,k;
+ if (!keys || !orbit_crypto_valid(crypto) || !keys->count || keys->count>8 || (environment!=1 && environment!=2) || (purpose!=1 && purpose!=2)) return ORBIT_GRANT_STATUS_INVALID_ARGUMENT;
+ prefix = purpose==2 ? (environment==1 ? "offline-test-" : "offline-live-") : (environment==1 ? "test-" : "live-");
+ n = purpose==2 ? 13 : 5;
+ for (i=0;i<keys->count;++i) {
+  const orbit_grant_key_t *key=&keys->keys[i];
+  if (key->kid_length<=n || key->kid_length>128 || !bytes_equal(key->kid,(const uint8_t *)prefix,n) || crypto->validate_p256(crypto->context,key->x,key->y)) return ORBIT_GRANT_STATUS_INVALID_GRANT;
+  for (j=0;j<key->kid_length;++j) { uint8_t c=key->kid[j]; if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-')) return ORBIT_GRANT_STATUS_INVALID_GRANT; }
+  for (k=0;k<i;++k) if (key->kid_length==keys->keys[k].kid_length && bytes_equal(key->kid,keys->keys[k].kid,key->kid_length)) return ORBIT_GRANT_STATUS_INVALID_GRANT;
+ }
+ return 0;
+}
+int32_t orbit_signed_verify(uint8_t *arena,uint32_t length,const orbit_grant_pending_t *pending,const orbit_grant_keyset_t *keys,const orbit_signed_expected_t *expected,const orbit_grant_crypto_t *crypto,void *scratch,uint32_t scratch_length,orbit_signed_claims_t *claims) {
+ if (!expected || !claims || expected->scope.current_unix_seconds > INT64_C(253402300799) || (expected->purpose!=1 && expected->purpose!=2) ||
+     orbit_overlap(claims,sizeof(*claims),arena,length) || orbit_overlap(claims,sizeof(*claims),scratch,scratch_length) ||
+     orbit_overlap(claims,sizeof(*claims),expected,sizeof(*expected))) return ORBIT_GRANT_STATUS_INVALID_ARGUMENT;
+ if (expected->purpose==1 && (expected->session_id.length<16 || expected->session_id.length>128 || !expected->session_id.data || !expected->sequence || expected->sequence>UINT64_C(9007199254740991))) return ORBIT_GRANT_STATUS_INVALID_ARGUMENT;
+ return verify(arena,length,pending,keys,&expected->scope,crypto,scratch,scratch_length,&claims->access,expected,claims);
+}
+#endif

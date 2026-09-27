@@ -1,5 +1,6 @@
 #ifndef ORBIT_EMBEDDED_H
 #define ORBIT_EMBEDDED_H
+#include "orbit_profile.h"
 
 #include <stdint.h>
 

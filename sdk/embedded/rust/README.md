@@ -40,7 +40,8 @@ Both sizes include the same 6,960-byte client state and 2,048-byte parser
 scratch. Stable caller-owned storage is recommended when the firmware stack is
 smaller than either buffer. Exclusive borrows prevent moving or reusing buffers,
 platform state or parsed origin while a client is active; dropping the client
-wipes its volatile state without revoking persistent authority. Use
+wipes its volatile state without revoking the persistent activation. With services
+enabled, drop also attempts bounded seat release and an offline clock checkpoint. Use
 `deactivate` or `invalidate` explicitly.
 
 Host builds use the installed `cc` and `ar`. For cross compilation, set `ORBIT_CC`
@@ -55,3 +56,47 @@ also passes `cargo check` for `thumbv6m-none-eabi` and
 `thumbv8m.main-none-eabi`, including the matching C cross-build script. These
 checks do not link a board application or establish target firmware operation;
 see the [embedded validation record](../docs/validation.md).
+
+## Optional services and files
+
+Enable `features = ["services"]` and allocate `ServiceBuffers::new()`. Then use
+`Client::open(&mut buffers, &mut platform, &app, &mut services)` with the same
+public app key. `start_session`, `end_session`, `session`, `usage`, `consume`,
+`resources`, `acquire_resource`, `release_resource`, `check_for_updates` and
+`authorize_download` expose typed results. `close` reports a release/checkpoint
+error before clearing the client. `Operation` accepts an optional stable ID and
+cancellation closure; preserve `MutationError::operation_id()` when its
+`uncertain` flag is set. Reads and warm guards do not mutate counters or seats.
+
+For files, select `offline` (4096 bytes) or `offline-full` (16384 bytes):
+
+```rust
+use orbit_embedded::{AppKey, Buffers, Client, OfflineBuffers};
+
+let app = AppKey::parse(ORBIT_APP_KEY)?;
+let mut buffers = Buffers::<8192>::new();
+let mut files = OfflineBuffers::<4096>::new();
+let mut client = Client::open_offline(
+    &mut buffers, &mut platform, &app, &mut files, trusted_offline_jwks, None,
+)?;
+client.import_offline_file(signed_file)?;
+client.require_access("export")?;
+```
+
+Use `Buffers::<16384>` or larger with the full profile. Place large buffers in
+stable caller-owned storage appropriate for the board, rather than a small task
+stack. `import_offline_reader` takes a bounded read closure and optional
+`Operation`; it reuses `OfflineBuffers` transaction storage and needs no second
+file-sized input allocation. `offline_request` writes into caller output.
+
+File mode requires trusted UTC after restart and offline-purpose keys supplied
+through a trusted product configuration path. It never silently switches to
+network access. `external-c` builds must link C compiled with matching
+`ORBIT_ENABLE_SERVICES`, `ORBIT_ENABLE_OFFLINE` and file-profile definitions.
+
+`DownloadIo` supplies verified TLS, finite reads, incremental SHA-256 and atomic
+staging for the application's destination medium. Metadata borrows the client;
+make an owned artifact `selection()` before calling `authorize_download`, then
+call the authorization's `stream`. Streams have an explicit maximum size and
+replacement choice. There is no automatic installation. Full callback and
+storage requirements are in the [services guide](../docs/services.md).

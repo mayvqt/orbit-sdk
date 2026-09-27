@@ -15,6 +15,7 @@ include = [
     "LICENSE",
     "README.md",
     "rust/README.md",
+    "docs/**",
     "rust/src/**",
     "include/**",
     "src/**",
@@ -26,6 +27,9 @@ path = "rust/src/lib.rs"
 [features]
 default = []
 external-c = []
+services = []
+offline = ["services"]
+offline-full = ["offline"]
 
 [profile.release]
 panic = "abort"

@@ -2,11 +2,12 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 _Min_Heap_Size = 0x200;
 _Min_Stack_Size = 0x400;
+ORBIT_SLOT_BYTES = DEFINED(ORBIT_JOURNAL_SLOT_BYTES) ? ORBIT_JOURNAL_SLOT_BYTES : 2048;
 MEMORY
 {
   RAM (xrw) : ORIGIN = 0x20000000, LENGTH = 144K
-  /* Last two 2 KiB pages are reserved for the authority journal. */
-  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 508K
+  /* Connected: two2KiB slots; offline profile sets the explicit reservation. */
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K - 2 * ORBIT_SLOT_BYTES
 }
 SECTIONS
 {

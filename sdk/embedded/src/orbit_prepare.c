@@ -1,5 +1,8 @@
 #include "orbit_internal.h"
 #include "orbit_json.h"
+#ifdef ORBIT_ENABLE_SERVICES
+#include "orbit_signed.h"
+#endif
 
 static int base64_value(uint8_t c) {
     if (c >= 'A' && c <= 'Z')
@@ -39,8 +42,12 @@ int32_t orbit_base64url_decode(const uint8_t *input, uint32_t input_length, uint
     return ORBIT_GRANT_STATUS_OK;
 }
 
-int32_t orbit_grant_prepare(uint8_t *token, uint32_t token_length,
-                            const orbit_grant_crypto_t *crypto, orbit_grant_pending_t *pending) {
+static int32_t prepare(uint8_t *token, uint32_t token_length,
+                            const orbit_grant_crypto_t *crypto, orbit_grant_pending_t *pending
+#ifdef ORBIT_ENABLE_SERVICES
+, uint8_t purpose
+#endif
+) {
     uint32_t first = UINT32_MAX, second = UINT32_MAX, i, length, base, header_length;
     uint32_t seen = 0u;
     int32_t status = ORBIT_GRANT_STATUS_INVALID_GRANT;
@@ -110,8 +117,16 @@ int32_t orbit_grant_prepare(uint8_t *token, uint32_t token_length,
         seen |= bit;
         if (bit == 1u && !orbit_json_span_equals_ascii(token, value, "ES256", 5))
             goto invalid;
-        if (bit == 2u && !orbit_json_span_equals_ascii(token, value, "orbit-access+jwt", 16))
-            goto invalid;
+        if (bit == 2u) {
+#ifdef ORBIT_ENABLE_SERVICES
+            const char *type = purpose == ORBIT_SIGNED_SESSION ? "orbit-session+jwt" :
+                               purpose == ORBIT_SIGNED_OFFLINE ? "orbit-offline+jwt" : "orbit-access+jwt";
+            uint32_t type_length = purpose ? 17u : 16u;
+            if (!orbit_json_span_equals_ascii(token,value,type,type_length)) goto invalid;
+#else
+            if (!orbit_json_span_equals_ascii(token,value,"orbit-access+jwt",16)) goto invalid;
+#endif
+        }
         if (bit == 4u) {
             if (orbit_json_decode_span(token, value, pending->kid, 128u, &length, 1) != 0 ||
                 length == 0u)
@@ -131,6 +146,9 @@ int32_t orbit_grant_prepare(uint8_t *token, uint32_t token_length,
         goto failed;
     }
     pending->prepared = 1u;
+#ifdef ORBIT_ENABLE_SERVICES
+    pending->prepared += purpose;
+#endif
     return 0;
 invalid:
     status = ORBIT_GRANT_STATUS_INVALID_GRANT;
@@ -138,3 +156,25 @@ failed:
     orbit_zero(pending, sizeof(*pending));
     return status;
 }
+
+int32_t orbit_grant_prepare(uint8_t *token, uint32_t length, const orbit_grant_crypto_t *crypto, orbit_grant_pending_t *pending) {
+ return prepare(token,length,crypto,pending
+#ifdef ORBIT_ENABLE_SERVICES
+ ,0
+#endif
+ );
+}
+#ifdef ORBIT_ENABLE_SERVICES
+int32_t orbit_signed_prepare(uint8_t *token, uint32_t length, const orbit_grant_crypto_t *crypto, uint8_t purpose, orbit_grant_pending_t *pending) {
+ if (purpose != ORBIT_SIGNED_SESSION && purpose != ORBIT_SIGNED_OFFLINE) return ORBIT_GRANT_STATUS_INVALID_ARGUMENT;
+ if (orbit_overlap(token,length,pending,sizeof(*pending)) || orbit_overlap(token,length,crypto,sizeof(*crypto)) || orbit_overlap(pending,sizeof(*pending),crypto,sizeof(*crypto))) return ORBIT_GRANT_STATUS_INVALID_ARGUMENT;
+ if (purpose == ORBIT_SIGNED_OFFLINE && token) {
+  uint32_t start=0, end=length,i;
+  while (start<end && (token[start]==32 || (token[start]>=9 && token[start]<=13))) ++start;
+  while (end>start && (token[end-1]==32 || (token[end-1]>=9 && token[end-1]<=13))) --end;
+  for (i=start;i<end;++i) token[i-start]=token[i];
+  length=end-start;
+ }
+ return prepare(token,length,crypto,pending,purpose);
+}
+#endif

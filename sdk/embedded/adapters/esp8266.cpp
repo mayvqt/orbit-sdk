@@ -1,8 +1,11 @@
+#define ORBIT_PORT_SLOT_BYTES ORBIT_PROFILE_SLOT_BYTES(4096u)
 #include "orbit_esp8266.hpp"
 #include <time.h>
 extern "C" {
 #include <user_interface.h>
 }
+static_assert(ORBIT_PORT_SLOT_BYTES % 4096u == 0 && ORBIT_PORT_SLOT_BYTES >= ORBIT_PROFILE_RECORD_BYTES + 64u,"journal profile geometry");
+
 static int32_t now(void *p, int64_t *u, uint64_t *t) {
   auto *b = static_cast<orbit_esp8266 *>(p);
   time_t v = time(nullptr);
@@ -75,12 +78,14 @@ static const char *path(uint8_t s) {
 }
 static int32_t read_slot(void *, uint8_t s, uint32_t o, uint8_t *b,
                          uint32_t n) {
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o)
+    return ORBIT_CLIENT_STORAGE;
   if (!LittleFS.exists(path(s))) {
     memset(b, 255, n);
     return 0;
   }
   File f = LittleFS.open(path(s), "r");
-  if (!f || f.size() != 4096 || !f.seek(o, SeekSet))
+  if (!f || f.size() != ORBIT_PORT_SLOT_BYTES || !f.seek(o, SeekSet))
     return ORBIT_CLIENT_STORAGE;
   int read_count = f.read(b, n);
   if (read_count < 0 || static_cast<uint32_t>(read_count) != n)
@@ -88,12 +93,14 @@ static int32_t read_slot(void *, uint8_t s, uint32_t o, uint8_t *b,
   return 0;
 }
 static int32_t erase_slot(void *, uint8_t s) {
+  if (s > 1)
+    return ORBIT_CLIENT_STORAGE;
   File f = LittleFS.open(path(s), "w");
   uint8_t b[64];
   memset(b, 255, sizeof(b));
   if (!f)
     return ORBIT_CLIENT_STORAGE;
-  for (unsigned i = 0; i < 4096 / sizeof(b); ++i)
+  for (unsigned i = 0; i < ORBIT_PORT_SLOT_BYTES / sizeof(b); ++i)
     if (f.write(b, sizeof(b)) != sizeof(b))
       return ORBIT_CLIENT_STORAGE;
   f.flush();
@@ -103,8 +110,12 @@ static int32_t erase_slot(void *, uint8_t s) {
 }
 static int32_t program_slot(void *, uint8_t s, uint32_t o, const uint8_t *b,
                             uint32_t n) {
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o ||
+      o % 16 || n % 16)
+    return ORBIT_CLIENT_STORAGE;
   File f = LittleFS.open(path(s), "r+");
-  if (!f || f.size() != 4096 || !f.seek(o, SeekSet) || f.write(b, n) != n)
+  if (!f || f.size() != ORBIT_PORT_SLOT_BYTES || !f.seek(o, SeekSet) ||
+      f.write(b, n) != n)
     return ORBIT_CLIENT_STORAGE;
   f.flush();
   int error = f.getWriteError();
@@ -123,7 +134,7 @@ int32_t orbit_esp8266_open(orbit_esp8266 *b, BearSSL::X509List *roots,
   b->platform.entropy = entropy;
   b->platform.crypto = *orbit_bearssl_crypto();
   b->platform.tls = {b, connect_tls, write_tls, read_tls, close_tls};
-  b->platform.journal = {b,          4096,         read_slot,
-                         erase_slot, program_slot, sync_slot};
+  b->platform.journal = {b,          ORBIT_PORT_SLOT_BYTES, read_slot,
+                         erase_slot, program_slot,          sync_slot};
   return orbit_platform_services(&b->platform, s);
 }

@@ -2,12 +2,17 @@
 //! One owner, no allocation or background work. Construct [`Client`] with
 //! caller-owned [`Buffers`], a [`Platform`], and borrowed configuration strings.
 //! Call `tick` regularly, `activate` once when needed, and `require_access`
-//! immediately before a protected operation. A reboot always validates online.
+//! immediately before a protected operation. Connected mode validates online
+//! after reboot; explicit offline-file mode revalidates its stored signed file.
 //!
 //! The platform sends the complete request before returning its response status;
 //! subsequent response reads may reuse the request memory in the C client.
 //! No platform method may retain borrowed arguments or reenter this client.
 use core::{ffi::c_void, marker::PhantomData};
+#[cfg(feature = "services")]
+mod services;
+#[cfg(feature = "services")]
+pub use services::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error(i32);
@@ -32,6 +37,9 @@ impl Error {
     pub const PENDING: Self = Self(17);
     pub const RESOURCE_LIMIT: Self = Self(19);
     pub const NOT_FOUND: Self = Self(20);
+    pub const CANCELLED: Self = Self(23);
+    pub const CAPACITY: Self = Self(24);
+    pub const SESSION_REQUIRED: Self = Self(25);
 }
 fn check(n: i32) -> Result<(), Error> {
     if n == 0 {
@@ -83,7 +91,11 @@ pub struct Config<'a> {
     pub fingerprint_provider: &'a str,
 }
 #[repr(C, align(8))]
-struct State([u8; 6960]);
+struct State([u8; CLIENT_STATE_BYTES]);
+#[cfg(not(feature = "services"))]
+const CLIENT_STATE_BYTES: usize = 6960;
+#[cfg(feature = "services")]
+const CLIENT_STATE_BYTES: usize = 6976;
 pub const ARENA_MIN_BYTES: usize = 8192;
 pub const ARENA_MAX_BYTES: usize = 32768;
 /// Place in a static or another stable caller-owned allocation. The default
@@ -97,7 +109,7 @@ pub struct Buffers<const ARENA_BYTES: usize = 32768> {
 impl<const ARENA_BYTES: usize> Buffers<ARENA_BYTES> {
     pub const fn new() -> Self {
         Self {
-            state: State([0; 6960]),
+            state: State([0; CLIENT_STATE_BYTES]),
             arena: [0; ARENA_BYTES],
             scratch: [0; 2048],
         }
@@ -182,6 +194,8 @@ impl<'a, P: Platform> Client<'a, P> {
             environment: Slice::str(config.environment_id)?,
             fingerprint: Slice::str(config.fingerprint)?,
             provider: Slice::str(config.fingerprint_provider)?,
+            #[cfg(feature = "services")]
+            environment_kind: 0,
         };
         let p = platform as *mut P as *mut c_void;
         let services = Services {
@@ -253,6 +267,8 @@ pub enum Environment {
 /// inline; the application and environment IDs borrow the original key text.
 /// Keep this value alive while a client uses its `config()` view.
 pub struct AppKey<'a> {
+    #[cfg(feature = "offline")]
+    original: &'a str,
     origin: [u8; 384],
     origin_length: usize,
     application_id: &'a str,
@@ -279,6 +295,8 @@ impl<'a> AppKey<'a> {
         }
         let is_test = value.trim().starts_with("orbit_app_test_");
         Ok(Self {
+            #[cfg(feature = "offline")]
+            original: value,
             origin,
             origin_length,
             application_id: app,
@@ -289,6 +307,10 @@ impl<'a> AppKey<'a> {
                 Environment::Live
             },
         })
+    }
+    #[cfg(feature = "offline")]
+    pub fn as_str(&self) -> &'a str {
+        self.original
     }
     pub fn api_origin(&self) -> &str {
         // The C parser validates UTF-8 and only writes this slice on success.
@@ -315,7 +337,7 @@ impl<'a> AppKey<'a> {
     }
 }
 
-unsafe fn borrowed_str<'a>(value: &'a str, slice: Slice) -> Result<&'a str, Error> {
+unsafe fn borrowed_str(value: &str, slice: Slice) -> Result<&str, Error> {
     let start = value.as_ptr() as usize;
     let end = start.checked_add(value.len()).ok_or(Error::UNTRUSTED)?;
     let part = slice.data as usize;
@@ -333,7 +355,14 @@ unsafe fn borrowed_str<'a>(value: &'a str, slice: Slice) -> Result<&'a str, Erro
 }
 impl<P: Platform> Drop for Client<'_, P> {
     fn drop(&mut self) {
-        unsafe { orbit_client_destroy(self.state) }
+        #[cfg(feature = "services")]
+        unsafe {
+            let _ = services::orbit_client_close(self.state, core::ptr::null());
+        }
+        #[cfg(not(feature = "services"))]
+        unsafe {
+            orbit_client_destroy(self.state)
+        }
     }
 }
 
@@ -366,6 +395,8 @@ impl RawConfig {
             environment: empty,
             fingerprint: empty,
             provider: empty,
+            #[cfg(feature = "services")]
+            environment_kind: 0,
         }
     }
 }
@@ -377,6 +408,8 @@ struct RawConfig {
     environment: Slice,
     fingerprint: Slice,
     provider: Slice,
+    #[cfg(feature = "services")]
+    environment_kind: u8,
 }
 #[repr(C)]
 struct RawRequest {
@@ -548,6 +581,7 @@ extern "C" {
     fn orbit_client_deactivate(c: *mut State) -> i32;
     fn orbit_client_invalidate(c: *mut State) -> i32;
     fn orbit_client_clock_lost(c: *mut State) -> i32;
+    #[cfg(not(feature = "services"))]
     fn orbit_client_destroy(c: *mut State);
 }
 
@@ -573,10 +607,16 @@ mod tests {
         for (index, value) in expected.into_iter().enumerate() {
             assert_eq!(unsafe { orbit_rust_layout(index as u32) }, value);
         }
-        assert_eq!(core::mem::size_of::<State>(), 6960);
+        assert_eq!(core::mem::size_of::<State>(), CLIENT_STATE_BYTES);
         assert_eq!(core::mem::align_of::<State>(), 8);
-        assert_eq!(core::mem::size_of::<Buffers<32768>>(), 41776);
-        assert_eq!(core::mem::size_of::<Buffers<8192>>(), 17200);
+        assert_eq!(
+            core::mem::size_of::<Buffers<32768>>(),
+            CLIENT_STATE_BYTES + 32768 + 2048
+        );
+        assert_eq!(
+            core::mem::size_of::<Buffers<8192>>(),
+            CLIENT_STATE_BYTES + 8192 + 2048
+        );
         assert_eq!(core::mem::size_of::<Snapshot>(), 40);
         assert_eq!(
             core::mem::size_of::<Crypto>(),

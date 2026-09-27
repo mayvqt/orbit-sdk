@@ -8,7 +8,7 @@ through its own UI, and gates actions with the access helper. The examples do
 not embed or persist licence keys. Board hooks default to unavailable access
 until configured.
 
-The v0.4.0 SDK has been cross-compiled and linked for all supported
+The connected SDK is cross-compiled and linked for all supported
 examples below. Seven portable CTest suites passed under AArch64 QEMU in both
 the default and 8 KiB arena profiles; the Rust wrapper passed Cortex-M0+ and
 Cortex-M33 target checks. No firmware has been flashed or run on physical
@@ -257,3 +257,58 @@ profile uses 19,808 bytes, leaving 127,648. The 136-byte `.data` includes the
 link-only entry point does not
 initialize UART or establish runtime stack, heap or power-loss behaviour; those
 checks still require board firmware and hardware.
+
+## Offline profile builds
+
+Every supported target also compiles and links with the explicit compact
+(4096-byte file, 8192-byte arena) and full (16384-byte file, 16384-byte arena)
+profiles. Both profiles pass all eleven portable suites under AArch64 QEMU.
+These are compile/link and emulation checks; no physical board execution or
+on-device TLS/stack/power-loss measurements are claimed.
+
+| Target | Compact `size` text/data/BSS bytes | Full `size` text/data/BSS bytes |
+| --- | --- | --- |
+| Pico W | 238,752 / 0 / 37,980 | 238,792 / 0 / 58,460 |
+| Pico 2 W | 216,784 / 0 / 37,604 | 216,808 / 0 / 58,084 |
+| STM32G0B1RE link harness | 42,672 / 0 / 25,144 | 42,704 / 0 / 45,624 |
+| ESP32 | 364,853 / 87,444 / 30,313 | 364,869 / 87,444 / 50,793 |
+
+These are raw GNU `size` categories, distinct from the section-by-section
+connected table above. They are not TLS runtime budgets. ESP8266's PlatformIO
+report gives compact flash/RAM 442,871/54,124 bytes and full 442,887/74,604 bytes.
+The full profile leaves only **7,316 bytes** of the 81,920-byte static RAM budget
+before dynamic TLS, stack and application work. Its successful link does not
+establish usable connected TLS operation; use compact or measure and reduce the
+complete firmware's runtime needs before enabling full on this board.
+
+Select a profile consistently in the library, adapter and application. CMake
+builds use `-DORBIT_ENABLE_OFFLINE=ON`,
+`-DORBIT_OFFLINE_PROFILE_FILE_BYTES=4096` (or `16384`) and
+`-DORBIT_CLIENT_ARENA_BYTES=8192` (or `16384`). Trusted offline-purpose keys come
+from `orbit_board_offline_keys`; its default denies initialization until supplied.
+A valid file is checked locally against the app key, installation and UTC.
+
+- **ESP32:** use `SDKCONFIG_DEFAULTS=.../sdkconfig.offline-compact` or
+  `sdkconfig.offline-full`. These select explicit encrypted journal partitions of
+  16 or 40 KiB through `partitions-offline-compact.csv` and
+  `partitions-offline-full.csv`. Keep the matching file-profile build definition.
+- **ESP8266:** `pio run -d examples/embedded/esp8266 -e offline_compact` or
+  `-e offline_full` selects both the file bound and arena. LittleFS contains two
+  8 or 20 KiB logical slot files and needs filesystem overhead in addition. An
+  existing incompatible journal is rejected; it is never autoformatted.
+- **Pico W/Pico 2 W:** pass the CMake flags above and choose `PICO_BOARD=pico_w`
+  or `pico2_w`. The linker reserves 16 or 40 KiB at the end of the physical
+  2 MiB/4 MiB flash and asserts that the firmware ends before it.
+- **STM32G0B1RE:** the supplied validation CMake passes the slot size into the
+  linker script. Compact reserves the final 12 KiB (two 6 KiB slots); full
+  reserves 36 KiB (two 18 KiB slots). Each slot stays within one bank and erases
+  its own 2 KiB pages. The harness remains a link test with no UART setup; its
+  newlib syscall stubs and linker warnings do not imply a runtime validation.
+- **Linux/Pi AArch64:** pass the same CMake flags. One journal file contains two slots using 16 or
+  40 KiB in total. File locking and atomic journal semantics remain required.
+
+Trusted UTC is required again after reboot. The host bridge is a trusted physical
+transport for STM32 clock/entropy and HTTPS; it is not a replacement for an
+untrusted network's end-to-end licensing verification. Download destination
+streaming is application-owned, using the verified TLS/staging callback contract
+in the [services guide](services.md).

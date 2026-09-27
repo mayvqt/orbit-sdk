@@ -1,6 +1,7 @@
 #ifndef ORBIT_CLIENT_H
 #define ORBIT_CLIENT_H
 #include "orbit_embedded.h"
+#include "orbit_profile.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,7 +18,11 @@ extern "C" {
     ORBIT_CLIENT_ARENA_BYTES > ORBIT_CLIENT_ARENA_MAX_BYTES
 #error "ORBIT_CLIENT_ARENA_BYTES must be between 8192 and 32768"
 #endif
+#ifdef ORBIT_ENABLE_SERVICES
+#define ORBIT_CLIENT_STORAGE_BYTES 6976u
+#else
 #define ORBIT_CLIENT_STORAGE_BYTES 6960u
+#endif
 #define ORBIT_CLIENT_RECORD_BYTES 1024u
 #define ORBIT_CLIENT_OK ((int32_t)0)
 #define ORBIT_CLIENT_ARGUMENT ((int32_t)10)
@@ -47,6 +52,9 @@ typedef struct orbit_client_config {
   orbit_embedded_slice_t environment_id;
   orbit_embedded_slice_t fingerprint; /* empty for an unbound policy */
   orbit_embedded_slice_t fingerprint_provider;
+#ifdef ORBIT_ENABLE_SERVICES
+  uint8_t environment_kind; /* Set by orbit_app_key_parse: Test=1, Live=2. */
+#endif
 } orbit_client_config_t;
 
 typedef struct orbit_http_request {

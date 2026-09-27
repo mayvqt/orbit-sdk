@@ -69,7 +69,11 @@ static int32_t header(orbit_journal_t *j, uint8_t slot, slot_header_t *out) {
     if (bytes[i] != 255u)
       out->pending = 1u;
   if (out->generation == 0u || out->generation == UINT64_MAX ||
-      out->length < 16u || out->length > ORBIT_CLIENT_RECORD_BYTES)
+      out->length < 16u || out->length > ORBIT_PROFILE_RECORD_BYTES
+#ifdef ORBIT_ENABLE_OFFLINE
+      || out->length > j->slot_bytes - 64u
+#endif
+      )
     return ORBIT_CLIENT_STORAGE;
   return 0;
 }
@@ -123,7 +127,11 @@ int32_t orbit_journal_commit(void *context, uint64_t expected,
   uint32_t i, at, n;
   int32_t status;
   if (!valid(j) || record == NULL || length < 16u ||
-      length > ORBIT_CLIENT_RECORD_BYTES || expected >= UINT64_MAX - 1u ||
+      length > ORBIT_PROFILE_RECORD_BYTES ||
+#ifdef ORBIT_ENABLE_OFFLINE
+      length > j->slot_bytes - 64u ||
+#endif
+      expected >= UINT64_MAX - 1u ||
       !orbit_equal(record, "ORBITMC1", 8u) ||
       get64(record + 8u) != expected + 1u)
     return ORBIT_CLIENT_ARGUMENT;

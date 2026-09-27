@@ -250,7 +250,10 @@ static int dns_valid(const uint8_t *bytes, uint32_t length) {
   return 1;
 }
 
-static int origin_valid(const uint8_t *origin, uint32_t length) {
+#ifndef ORBIT_ENABLE_SERVICES
+static
+#endif
+int orbit_https_origin_valid(const uint8_t *origin, uint32_t length) {
   uint32_t authority, host_end, i;
   if (origin == NULL || length < 9u || length > ORBIT_APP_KEY_ORIGIN_MAX_BYTES ||
       !orbit_json_valid_utf8_no_nul(origin, length) ||
@@ -375,10 +378,13 @@ int32_t orbit_app_key_parse(orbit_embedded_slice_t app_key,
                                        ? origin_capacity
                                        : ORBIT_APP_KEY_ORIGIN_MAX_BYTES,
                                    &origin_length);
-  if (decoded != ORBIT_GRANT_STATUS_OK || !origin_valid(origin_buffer, origin_length))
+  if (decoded != ORBIT_GRANT_STATUS_OK || !orbit_https_origin_valid(origin_buffer, origin_length))
     return fail(origin_buffer, origin_capacity, config);
   config->api_origin = (orbit_embedded_slice_t){origin_buffer, origin_length};
   config->issuer = config->api_origin;
+#ifdef ORBIT_ENABLE_SERVICES
+  config->environment_kind = key[10] == 't' ? 1u : 2u;
+#endif
   config->application_id = (orbit_embedded_slice_t){key + first + 1u, id1_length};
   config->environment_id = (orbit_embedded_slice_t){key + second + 1u, id2_length};
   return ORBIT_CLIENT_OK;

@@ -132,3 +132,60 @@ free RAM were not measured.
 Toolchains, linker budgets, and reproduction commands are listed in the
 [board guide](boards.md). None of these figures establishes a physical-board
 run.
+
+## Optional profile buffers and storage
+
+Connected builds keep the table and 29,576-byte portable library above unchanged.
+Services and offline files are explicit compile features. On Cortex-M0+, the
+extended client is 6,976 bytes; its external extension is 248 bytes for services
+or 336 bytes with offline support. The same structs can be larger on a 64-bit
+host. Allocate by `sizeof`, using the same feature definitions as the library.
+
+| C profile | Arena | External extension | Combined file/metadata buffer | Total caller buffers |
+| --- | ---: | ---: | ---: | ---: |
+| Connected compact | 8,192 | 0 | 0 | 17,200 |
+| Services compact | 8,192 | 248 | 0 | 17,464 |
+| Offline compact, 4 KiB file | 8,192 | 336 | 5,120 | 22,672 |
+| Offline full, 16 KiB file | 16,384 | 336 | 17,408 | 43,152 |
+
+Totals include client state and 2,048-byte scratch. Offline trust needs an
+additional 1,545-byte keyset, which C may retain in immutable storage; app-key
+storage, result objects, TLS, crypto, application state and stack are separate.
+The Rust wrapper reserves 288/392 bytes for its extension so the same safe type
+fits supported 32- and 64-bit ABIs. `OfflineBuffers` also owns its imported
+1,545-byte keyset. Its buffers are explicit caller allocations. Reader import
+uses the combined transaction buffer without another file-sized copy or heap
+allocation. Download streaming separately needs at least 2,304 caller bytes.
+
+| Profile | Portable code/read-only data | Writable globals | Conservative guard stack |
+| --- | ---: | ---: | ---: |
+| Connected | 29,576 | 0 | 3,716 |
+| Services | 48,547 | 0 | 3,884 |
+| Offline compact | 54,140 | 0 | 3,884 |
+| Offline full | 54,136 | 0 | 3,884 |
+
+These whole-module figures include optional APIs even when a firmware linker
+can discard unused functions. The slight compact/full code difference comes
+from constant-size instruction selection. Offline slice import uses a 2,636-byte
+conservative portable stack, reader import 2,692, extended initialization 2,708,
+consume 2,140, update discovery 1,716 and stream 344. Provider/TLS/reader callbacks,
+interrupts and target runtime helpers remain additional. Reproduce each row with
+`tests/measure_arm.py --profile connected|services|offline-compact|offline-full`
+and a distinct `--output` directory.
+
+The connected record remains 1,024 bytes. Offline records reserve 1,024 bytes of
+metadata plus the exact selected file bound. The journal adds a 64-byte header;
+each of two independent slots is rounded up to the port's erase unit:
+
+| Port geometry | Connected: each slot / total | 4 KiB file: each slot / total | 16 KiB file: each slot / total |
+| --- | ---: | ---: | ---: |
+| STM32, 2 KiB erase pages | 2 / 4 KiB | 6 / 12 KiB | 18 / 36 KiB |
+| ESP32/Pico, 4 KiB erase sectors | 4 / 8 KiB | 8 / 16 KiB | 20 / 40 KiB |
+| ESP8266/Linux logical slot files | 4 / 8 KiB | 8 / 16 KiB | 20 / 40 KiB |
+
+ESP8266 LittleFS needs additional filesystem capacity and runtime overhead beyond
+its two logical slots. Linux uses one journal file containing two independent slots. Firmware linker/partition
+reservations must match `ORBIT_OFFLINE_PROFILE_FILE_BYTES`; the supported board
+examples provide explicit reservations and compile/link checks. STM32 slots span
+independently erased pages. Pico slots erase each included sector. No offline
+profile changes the connected defaults or silently migrates existing storage.

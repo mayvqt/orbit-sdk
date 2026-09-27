@@ -1,9 +1,10 @@
+#define ORBIT_PORT_SLOT_BYTES ORBIT_PROFILE_SLOT_BYTES(4096u)
 #include "hardware/flash.h"
 #include "hardware/regs/addressmap.h"
 #include "lwip/dns.h"
 #include "lwip/pbuf.h"
-#include "mbedtls/ssl.h"
 #include "mbedtls/platform_time.h"
+#include "mbedtls/ssl.h"
 #include "mbedtls/version.h"
 #include "orbit_pico.h"
 #include "pico/cyw43_arch.h"
@@ -19,9 +20,12 @@
 #if !defined(MBEDTLS_HAVE_TIME_DATE) || !defined(MBEDTLS_ENTROPY_HARDWARE_ALT)
 #error "Enable trusted certificate time and the board entropy callback"
 #endif
+_Static_assert(ORBIT_PORT_SLOT_BYTES % 4096u == 0 && ORBIT_PORT_SLOT_BYTES >= ORBIT_PROFILE_RECORD_BYTES + 64u,"journal profile geometry");
+
 static orbit_pico_t *owner;
 extern uint8_t __flash_binary_end;
-#if MBEDTLS_VERSION_NUMBER >= 0x03000000 && defined(MBEDTLS_PLATFORM_MS_TIME_ALT)
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000 &&                                    \
+    defined(MBEDTLS_PLATFORM_MS_TIME_ALT)
 mbedtls_ms_time_t mbedtls_ms_time(void) {
   return (mbedtls_ms_time_t)(time_us_64() / 1000u);
 }
@@ -220,24 +224,35 @@ static void program_flash(void *p) {
 static int32_t read_slot(void *p, uint8_t s, uint32_t o, uint8_t *b,
                          uint32_t n) {
   orbit_pico_t *c = p;
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o)
+    return ORBIT_CLIENT_STORAGE;
   memcpy(b,
-         (const void *)(uintptr_t)(XIP_BASE + c->flash_offset + s * 4096 + o),
+         (const void *)(uintptr_t)(XIP_BASE + c->flash_offset +
+                                   s * ORBIT_PORT_SLOT_BYTES + o),
          n);
   return 0;
 }
 static int32_t erase_slot(void *p, uint8_t s) {
   orbit_pico_t *c = p;
-  flash_op_t o = {c->flash_offset + s * 4096, NULL};
-  return flash_safe_execute(erase_flash, &o, 1000) == PICO_OK
-             ? 0
-             : ORBIT_CLIENT_STORAGE;
+  uint32_t at;
+  if (s > 1)
+    return ORBIT_CLIENT_STORAGE;
+  for (at = 0; at < ORBIT_PORT_SLOT_BYTES; at += FLASH_SECTOR_SIZE) {
+    flash_op_t op = {c->flash_offset + s * ORBIT_PORT_SLOT_BYTES + at, NULL};
+    if (flash_safe_execute(erase_flash, &op, 1000) != PICO_OK)
+      return ORBIT_CLIENT_STORAGE;
+  }
+  return 0;
 }
 static int32_t program_slot(void *p, uint8_t s, uint32_t offset,
                             const uint8_t *b, uint32_t n) {
   orbit_pico_t *c = p;
   uint8_t page[FLASH_PAGE_SIZE];
+  if (s > 1 || offset > ORBIT_PORT_SLOT_BYTES ||
+      n > ORBIT_PORT_SLOT_BYTES - offset || offset % 16 || n % 16)
+    return ORBIT_CLIENT_STORAGE;
   while (n) {
-    uint32_t address = c->flash_offset + s * 4096 + offset,
+    uint32_t address = c->flash_offset + s * ORBIT_PORT_SLOT_BYTES + offset,
              at = address % FLASH_PAGE_SIZE, m = FLASH_PAGE_SIZE - at;
     if (m > n)
       m = n;
@@ -267,7 +282,8 @@ int32_t orbit_pico_open(orbit_pico_t *b, const uint8_t *ca, uint32_t ca_length,
                         int32_t (*entropy_fn)(void *, uint8_t *, uint32_t),
                         orbit_client_services_t *s) {
   if (!b || owner || !ca || !ca_length || !clock_fn || !entropy_fn || !s ||
-      offset % FLASH_SECTOR_SIZE || offset > PICO_FLASH_SIZE_BYTES - 8192 ||
+      offset % FLASH_SECTOR_SIZE ||
+      offset > PICO_FLASH_SIZE_BYTES - 2u * ORBIT_PORT_SLOT_BYTES ||
       XIP_BASE + offset < (uintptr_t)&__flash_binary_end)
     return ORBIT_CLIENT_ARGUMENT;
   memset(b, 0, sizeof(*b));
@@ -284,7 +300,7 @@ int32_t orbit_pico_open(orbit_pico_t *b, const uint8_t *ca, uint32_t ca_length,
   }
   b->platform.tls =
       (orbit_tls_stream_t){b, connect_tls, write_tls, read_tls, close_tls};
-  b->platform.journal = (orbit_journal_t){b,          4096,         read_slot,
-                                          erase_slot, program_slot, sync_slot};
+  b->platform.journal = (orbit_journal_t){
+      b, ORBIT_PORT_SLOT_BYTES, read_slot, erase_slot, program_slot, sync_slot};
   return orbit_platform_services(&b->platform, s);
 }

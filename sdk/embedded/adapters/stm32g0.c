@@ -1,8 +1,11 @@
+#define ORBIT_PORT_SLOT_BYTES ORBIT_PROFILE_SLOT_BYTES(2048u)
 #include "orbit_stm32g0.h"
 #include <string.h>
 #if !defined(STM32G0B1xx)
 #error "This flash geometry is for STM32G0B1RE (512 KiB dual-bank flash)"
 #endif
+_Static_assert(ORBIT_PORT_SLOT_BYTES % 2048u == 0 && ORBIT_PORT_SLOT_BYTES >= ORBIT_PROFILE_RECORD_BYTES + 64u,"journal profile geometry");
+
 static int32_t receive_bytes(void *p, uint8_t *b, uint32_t n) {
   orbit_stm32g0_t *c = p;
   while (n) {
@@ -28,6 +31,8 @@ static int32_t send_bytes(void *p, const uint8_t *b, uint32_t n) {
 static int32_t read_slot(void *p, uint8_t s, uint32_t o, uint8_t *b,
                          uint32_t n) {
   orbit_stm32g0_t *c = p;
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o)
+    return ORBIT_CLIENT_STORAGE;
   memcpy(b, (const void *)(uintptr_t)(c->addresses[s] + o), n);
   return 0;
 }
@@ -35,10 +40,12 @@ static int32_t erase_slot(void *p, uint8_t s) {
   orbit_stm32g0_t *c = p;
   FLASH_EraseInitTypeDef e = {0};
   uint32_t error;
+  if (s > 1)
+    return ORBIT_CLIENT_STORAGE;
   e.TypeErase = FLASH_TYPEERASE_PAGES;
   e.Banks = c->banks[s];
   e.Page = c->pages[s];
-  e.NbPages = 1;
+  e.NbPages = ORBIT_PORT_SLOT_BYTES / 2048u;
   if (HAL_FLASH_Unlock() != HAL_OK)
     return ORBIT_CLIENT_STORAGE;
   HAL_StatusTypeDef result = HAL_FLASHEx_Erase(&e, &error);
@@ -49,6 +56,9 @@ static int32_t program_slot(void *p, uint8_t s, uint32_t o, const uint8_t *b,
                             uint32_t n) {
   orbit_stm32g0_t *c = p;
   int32_t result = 0;
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o ||
+      o % 16 || n % 16)
+    return ORBIT_CLIENT_STORAGE;
   if (HAL_FLASH_Unlock() != HAL_OK)
     return ORBIT_CLIENT_STORAGE;
   for (uint32_t i = 0; i < n; i += 8) {
@@ -74,9 +84,14 @@ int32_t orbit_stm32g0_open(orbit_stm32g0_t *c, UART_HandleTypeDef *uart,
                            orbit_grant_crypto_t crypto,
                            orbit_client_services_t *s) {
   if (!c || !uart || !s || a == b || a % 2048 || b % 2048 || a < FLASH_BASE ||
-      b < FLASH_BASE || a > FLASH_BASE + 512u * 1024u - 2048 ||
-      b > FLASH_BASE + 512u * 1024u - 2048 || a < firmware_end ||
-      b < firmware_end)
+      b < FLASH_BASE || a > FLASH_BASE + 512u * 1024u - ORBIT_PORT_SLOT_BYTES ||
+      b > FLASH_BASE + 512u * 1024u - ORBIT_PORT_SLOT_BYTES ||
+      a < firmware_end || b < firmware_end ||
+      !(a + ORBIT_PORT_SLOT_BYTES <= b || b + ORBIT_PORT_SLOT_BYTES <= a) ||
+      ((a - FLASH_BASE) % (256u * 1024u)) + ORBIT_PORT_SLOT_BYTES >
+          256u * 1024u ||
+      ((b - FLASH_BASE) % (256u * 1024u)) + ORBIT_PORT_SLOT_BYTES >
+          256u * 1024u)
     return ORBIT_CLIENT_ARGUMENT;
   memset(c, 0, sizeof(*c));
   c->uart = uart;
@@ -87,8 +102,8 @@ int32_t orbit_stm32g0_open(orbit_stm32g0_t *c, UART_HandleTypeDef *uart,
     c->banks[i] = relative >= 256u * 1024u ? FLASH_BANK_2 : FLASH_BANK_1;
     c->pages[i] = (relative % (256u * 1024u)) / 2048;
   }
-  c->journal = (orbit_journal_t){c,          2048,         read_slot,
-                                 erase_slot, program_slot, sync_slot};
+  c->journal = (orbit_journal_t){c,          ORBIT_PORT_SLOT_BYTES, read_slot,
+                                 erase_slot, program_slot,          sync_slot};
   c->bridge.io_context = c;
   c->bridge.read = receive_bytes;
   c->bridge.write = send_bytes;

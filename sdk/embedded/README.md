@@ -14,14 +14,10 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-The v0.4.0 examples have been cross-compiled and linked for the
-ESP32, ESP8266/NodeMCU, Pico W, Pico 2 W, STM32G0B1RE, and Linux/Pi AArch64
-examples. The default and 8 KiB arena profiles were linked for ESP32, both Pico
-boards, STM32, and Pi. All seven portable CTest suites pass under AArch64 QEMU
-for both arena profiles, and the Rust wrapper checks for Cortex-M0+ and
-Cortex-M33. No firmware was flashed or run on physical hardware. Image sizes,
-budget headroom, exact toolchains, and commands are in the
-[board guide](docs/boards.md).
+All six targets have connected and explicit offline-profile compile/link checks.
+The compact and full offline profiles also pass eleven portable CTest suites
+under AArch64 QEMU. Physical firmware execution is not covered. Exact resource
+costs, storage reservations and toolchains are in the [board guide](docs/boards.md).
 
 ## Configure and activate
 
@@ -80,6 +76,15 @@ The [common example](../../examples/embedded/common/client.c) shows these calls.
 The tiny client focuses on key activation. Customer registration and sign-in use
 the [native HTTP API](../../examples/http/README.md).
 
+## Optional licensed services
+
+Enable `ORBIT_ENABLE_SERVICES` and initialize with one caller-owned extension for
+floating sessions, typed usage/resource APIs, update discovery and verified
+streaming downloads. Enable `ORBIT_ENABLE_OFFLINE` separately for trusted
+long-term licence files with a 4096- or 16384-byte profile. Connected defaults
+retain their original memory and storage footprint. The [services guide](docs/services.md)
+shows setup, retries, cancellation, file import and port callback requirements.
+
 ## Rust
 
 Add a path dependency on `sdk/embedded` and implement its `Platform` trait
@@ -93,8 +98,8 @@ client is alive. See [Rust setup](rust/README.md).
 
 Use authenticated HTTPS, a trusted UTC source, elapsed time including sleep, a
 CSPRNG and exclusive durable storage. Configuration and callback contexts must
-outlive the client. Calls are synchronous and serialized; callbacks cannot
-reenter. Call `orbit_client_clock_lost` if sleep/resume makes elapsed time
+outlive the client. Calls are synchronous and serialized; the services guide documents the narrow
+local end-session fence allowed during a transport callback. Call `orbit_client_clock_lost` if sleep/resume makes elapsed time
 uncertain. Keep credentials out of logs and protect their storage on the device.
 
 The default client reserves **41,776 bytes** for state, 32 KiB transaction arena
@@ -104,13 +109,9 @@ arena rejects any request or response that does not fit. Measured portable
 Cortex-M0+ client stack is conservatively **3,716 bytes** (app-key parsing adds
 at most **240 bytes**);
 crypto, TLS, board libraries, runtime helpers and interrupts are additional.
-The current STM32G0B1RE link-only harness uses 44,384 bytes of RAM in the default
-profile and 19,808 bytes with the compact arena, including its minimum heap and
-stack reservation. It occupies 29,268 bytes of the 508 KiB firmware region in
-both sizes. This validates cross-compilation and static linker fit; it does not
-measure runtime stack or heap after board initialization. The
-[board guide](docs/boards.md) records the current per-target measurements and
-hardware limits.
+The [board guide](docs/boards.md) records per-target measurements and hardware
+limits. Optional services add caller-owned state; long-term files also require an
+explicit file buffer and larger journal reservations.
 
 The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
 use. The [security and storage reference](docs/security.md) covers lifecycle and

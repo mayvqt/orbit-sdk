@@ -18,3 +18,16 @@ idf_component_register(SRCS main.c ../../common/client.c
 target_compile_definitions(${COMPONENT_LIB} PRIVATE ORBIT_APP_KEY=\"${ORBIT_APP_KEY}\")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     ORBIT_CLIENT_ARENA_BYTES=${ORBIT_CLIENT_ARENA_BYTES})
+
+if(ORBIT_ENABLE_OFFLINE)
+ set(ORBIT_ENABLE_SERVICES ON)
+ if(NOT DEFINED ORBIT_OFFLINE_PROFILE_FILE_BYTES)
+  set(ORBIT_OFFLINE_PROFILE_FILE_BYTES 4096)
+ endif()
+ target_compile_definitions(${COMPONENT_LIB} PRIVATE ORBIT_ENABLE_OFFLINE=1 ORBIT_OFFLINE_PROFILE_FILE_BYTES=${ORBIT_OFFLINE_PROFILE_FILE_BYTES})
+ target_sources(${COMPONENT_LIB} PRIVATE ${ORBIT_DIR}/src/orbit_offline.c)
+endif()
+if(ORBIT_ENABLE_SERVICES)
+ target_compile_definitions(${COMPONENT_LIB} PRIVATE ORBIT_ENABLE_SERVICES=1)
+ target_sources(${COMPONENT_LIB} PRIVATE ${ORBIT_DIR}/src/orbit_services_codec.c ${ORBIT_DIR}/src/orbit_limits.c ${ORBIT_DIR}/src/orbit_downloads.c ${ORBIT_DIR}/src/orbit_extensions.c ${ORBIT_DIR}/src/orbit_sessions.c)
+endif()

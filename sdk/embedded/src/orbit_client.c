@@ -26,7 +26,15 @@ static void wipe(void *p, uint32_t n) {
   while (n--)
     *b++ = 0u;
 }
-static void clear_access(orbit_client_state_t *c) {
+#ifdef ORBIT_ENABLE_SERVICES
+#define clear_access orbit_client_clear_access
+#define clock_now orbit_client_clock
+#define fetch_keys orbit_client_fetch_keys
+#define ORBIT_INTERNAL
+#else
+#define ORBIT_INTERNAL static
+#endif
+ORBIT_INTERNAL void clear_access(orbit_client_state_t *c) {
   orbit_zero(&c->active, sizeof(c->active));
   c->anchored = 0u;
   c->transient = 0u;
@@ -81,6 +89,12 @@ static int32_t save(orbit_client_state_t *c, orbit_record_t *next) {
 }
 static int32_t terminal(orbit_client_state_t *c, int32_t error) {
   orbit_record_t next;
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension) {
+    c->extension->session.active = 0;
+    c->extension->policy_known = 0;
+  }
+#endif
   clear_access(c);
   (void)advance(c);
   if (c->record.credential_length == 0u && c->record.pending_kind == 0u)
@@ -92,8 +106,8 @@ static int32_t terminal(orbit_client_state_t *c, int32_t error) {
   wipe(&next, sizeof(next));
   return error;
 }
-static int32_t clock_now(orbit_client_state_t *c, int64_t *now,
-                         uint64_t *ticks) {
+ORBIT_INTERNAL int32_t clock_now(orbit_client_state_t *c, int64_t *now,
+                                 uint64_t *ticks) {
   int64_t wall;
   if (c->services.clock(c->services.context, &wall, ticks) != 0 || wall < 0 ||
       (c->last_wall >= 0 &&
@@ -366,7 +380,8 @@ static int32_t receive_keys(void *context, const uint8_t *bytes,
     return sink->error = ORBIT_CLIENT_UNTRUSTED;
   return 0;
 }
-static int32_t fetch_keys(orbit_client_state_t *c, uint64_t generation) {
+ORBIT_INTERNAL int32_t fetch_keys(orbit_client_state_t *c,
+                                  uint64_t generation) {
   uint8_t path[384];
   uint16_t http = 0u;
   int32_t status;
@@ -442,8 +457,8 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     static const uint8_t hwid_mode[] = "hwid";
     static const uint8_t none_mode[] = "none";
     is_hwid = decode_equal(c->arena, reply.binding, slice(hwid_mode, 4u));
-    const int is_none = decode_equal(c->arena, reply.binding,
-                                    slice(none_mode, 4u));
+    const int is_none =
+        decode_equal(c->arena, reply.binding, slice(none_mode, 4u));
     if ((!is_hwid && !is_none) ||
         (is_hwid && c->config.fingerprint.length == 0u) ||
         reply.has_provider != (c->config.fingerprint_provider.length != 0u) ||
@@ -453,7 +468,11 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
       goto done;
     }
   }
-  if (reply.grant.length == 0u ||
+  if ((reply.grant.length == 0u
+#ifdef ORBIT_ENABLE_SERVICES
+       && !reply.session_required
+#endif
+       ) ||
       !decode_equal(
           c->arena, reply.installation,
           slice(c->record.installation, c->record.installation_length)) ||
@@ -490,6 +509,42 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     next.has_expiry = 0u;
     next.credential_expiry = 0;
   }
+#ifdef ORBIT_ENABLE_SERVICES
+  if (reply.session_required) {
+    orbit_client_extension_t *e = c->extension;
+    if (!e ||
+        orbit_json_decode_span(c->arena, reply.licence, next.licence,
+                               sizeof(next.licence), &length, 1) ||
+        !orbit_client_opaque(slice(next.licence, length), 1, 128) ||
+        (operation == 0 &&
+         (length != c->record.licence_length ||
+          !orbit_equal(next.licence, c->record.licence, length)))) {
+      result = ORBIT_CLIENT_UNTRUSTED;
+      goto done;
+    }
+    next.licence_length = (uint8_t)length;
+    if (operation == 1) {
+      next.pending_kind = 0;
+      next.pending_created = 0;
+      orbit_zero(next.pending_id, sizeof(next.pending_id));
+      orbit_zero(next.pending_digest, sizeof(next.pending_digest));
+      result = save(c, &next);
+      if (result)
+        goto done;
+    }
+    clear_access(c);
+    e->policy_known = 1;
+    e->session.required = 1;
+    e->has_licence_expiry = reply.has_licence_expiry;
+    e->licence_expires_at = reply.licence_expiry;
+    result = 0;
+    goto done;
+  }
+  if (c->extension) {
+    c->extension->policy_known = 1;
+    c->extension->session.required = 0;
+  }
+#endif
   orbit_zero(&expected, sizeof(expected));
   expected.issuer = c->config.issuer;
   expected.application_id = c->config.application_id;
@@ -499,8 +554,8 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   expected.has_fingerprint = (uint8_t)is_hwid;
   expected.has_fingerprint_provider = (uint8_t)is_hwid;
   expected.fingerprint = is_hwid ? c->config.fingerprint : slice(NULL, 0u);
-  expected.fingerprint_provider = is_hwid ? c->config.fingerprint_provider
-                                          : slice(NULL, 0u);
+  expected.fingerprint_provider =
+      is_hwid ? c->config.fingerprint_provider : slice(NULL, 0u);
   expected.has_credential_expiry = next.has_expiry;
   expected.credential_expires_at = next.credential_expiry;
   expected.has_licence_expiry = reply.has_licence_expiry;
@@ -574,6 +629,9 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
     result = ORBIT_CLIENT_STALE;
     goto done;
   }
+#ifdef ORBIT_ENABLE_SERVICES
+  orbit_client_apply_claims(c, &claims, reply.server_time, started);
+#else
   orbit_zero(&c->active, sizeof(c->active));
   used = 0u;
   for (i = 0; i < claims.entitlement_count; ++i) {
@@ -597,6 +655,7 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   c->transient = 0u;
   c->retry_ticks = 0u;
   c->active.valid = 1u;
+#endif
   result = 0;
 done:
   wipe(&next, sizeof(next));
@@ -635,10 +694,23 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
   request.post = 1u;
   result = c->services.exchange(c->services.context, &request, &http,
                                 receive_response, &sink);
-  if (c->generation != generation)
+  if (c->generation != generation) {
+#ifdef ORBIT_ENABLE_SERVICES
+    /* End may fence an initial activation while its response is in flight.
+     * Retain a fully validated credential so explicit start can resume without
+     * asking for the licence key again. This path never restores access. */
+    if (operation == 1u && c->extension && !c->extension->session.automatic &&
+        c->record.pending_kind == 1u && !c->failed && result == 0 &&
+        sink.error == 0 && http == 200u) {
+      result = accept(c, sink.length, operation, c->generation, started);
+      clear_access(c);
+      c->extension->session.active = 0;
+    }
+#endif
     return result == ORBIT_CLIENT_STORAGE || result == ORBIT_CLIENT_CLOCK
                ? result
                : ORBIT_CLIENT_STALE;
+  }
   if (sink.error)
     result = sink.error;
   if (operation == 2u && result == 0 && http == 204u) {
@@ -765,11 +837,27 @@ int32_t orbit_client_activate(orbit_client_t *client,
     return ORBIT_CLIENT_BUSY;
   if (c->record.pending_kind == 2u)
     return ORBIT_CLIENT_PENDING;
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension) {
+    orbit_zero(&c->extension->session, sizeof(c->extension->session));
+    c->extension->session.automatic = 1;
+    c->extension->policy_known = 0;
+#ifdef ORBIT_ENABLE_OFFLINE
+    c->extension->offline_mode = 0;
+#endif
+    clear_access(c);
+  }
+#endif
   c->busy = 1u;
   result = prepare_activation(c, key);
   if (result == 0)
     result = perform(c, 1u, key);
-  return finish_operation(c, result);
+  result = finish_operation(c, result);
+#ifdef ORBIT_ENABLE_SERVICES
+  if (!result && c->extension && c->extension->session.required)
+    result = orbit_extended_tick(client);
+#endif
+  return result;
 }
 int32_t orbit_client_tick(orbit_client_t *client) {
   orbit_client_state_t *c = state(client);
@@ -782,6 +870,16 @@ int32_t orbit_client_tick(orbit_client_t *client) {
     return ORBIT_CLIENT_STORAGE;
   if (c->busy)
     return ORBIT_CLIENT_BUSY;
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension) {
+#ifdef ORBIT_ENABLE_OFFLINE
+    if (c->extension->offline_mode)
+      return orbit_extended_tick(client);
+#endif
+    if (c->extension->policy_known && c->extension->session.required)
+      return orbit_extended_tick(client);
+  }
+#endif
   if (c->record.pending_kind)
     return ORBIT_CLIENT_PENDING;
   if (c->record.credential_length == 0u)
@@ -801,7 +899,12 @@ int32_t orbit_client_tick(orbit_client_t *client) {
     goto done;
   }
   result = perform(c, 0u, slice(NULL, 0u));
-  return finish_operation(c, result);
+  result = finish_operation(c, result);
+#ifdef ORBIT_ENABLE_SERVICES
+  if (!result && c->extension && c->extension->session.required)
+    result = orbit_extended_tick(client);
+#endif
+  return result;
 done:
   c->busy = 0u;
   return result;
@@ -823,6 +926,10 @@ int32_t orbit_client_snapshot(orbit_client_t *client,
   if (c->failed)
     return ORBIT_CLIENT_STORAGE;
   out->activation_required = (uint8_t)(c->record.credential_length == 0u);
+#ifdef ORBIT_ENABLE_OFFLINE
+  if (c->extension && c->extension->offline_mode)
+    out->activation_required = 0;
+#endif
   out->pending = c->record.pending_kind;
   out->has_credential_expiry = c->record.has_expiry;
   out->credential_expires_at = c->record.credential_expiry;
@@ -838,6 +945,28 @@ int32_t orbit_client_snapshot(orbit_client_t *client,
   out->allowed = (uint8_t)(!c->record.pending_kind && c->active.valid &&
                            now < c->active.expires &&
                            (now < c->active.refresh || out->offline));
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension && c->extension->policy_known &&
+      c->extension->session.required)
+    out->allowed = (uint8_t)(c->active.valid && c->extension->session.active &&
+                             now < c->active.expires);
+#ifdef ORBIT_ENABLE_OFFLINE
+  if (c->extension && c->extension->offline_mode) {
+    out->offline = 1;
+    out->allowed = 0;
+    c->busy = 1;
+    result = orbit_offline_checkpoint(c, now, 0);
+    if (!result)
+      result = clock_now(c, &now, &ticks);
+    c->busy = 0;
+    if (result)
+      return result;
+    out->allowed =
+        (uint8_t)(!c->failed && c->active.valid && now < c->active.expires &&
+                  now >= c->extension->offline_floor);
+  }
+#endif
+#endif
   return 0;
 }
 int32_t orbit_client_require_access(orbit_client_t *client,
@@ -849,12 +978,17 @@ int32_t orbit_client_require_access(orbit_client_t *client,
   if (c == NULL || name.data == NULL || name.length == 0u ||
       name.length > 64u ||
       orbit_overlap(name.data, name.length, client, sizeof(*client)) ||
-      orbit_overlap(name.data, name.length, c->arena,
-                    c->arena_capacity) ||
+      orbit_overlap(name.data, name.length, c->arena, c->arena_capacity) ||
       orbit_overlap(name.data, name.length, c->scratch,
                     ORBIT_GRANT_WORKSPACE_BYTES))
     return ORBIT_CLIENT_ARGUMENT;
-  result = orbit_client_tick(client);
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension && c->extension->policy_known &&
+      c->extension->session.required)
+    result = 0;
+  else
+#endif
+    result = orbit_client_tick(client);
   if (result != 0 && result != ORBIT_CLIENT_TRANSIENT)
     return result;
   result = orbit_client_snapshot(client, &snapshot);
@@ -901,6 +1035,10 @@ int32_t orbit_client_deactivate(orbit_client_t *client) {
     return ORBIT_CLIENT_STORAGE;
   if (c->busy)
     return ORBIT_CLIENT_BUSY;
+#ifdef ORBIT_ENABLE_OFFLINE
+  if (c->extension && c->extension->offline_mode)
+    return ORBIT_CLIENT_DENIED;
+#endif
   clear_access(c);
   result = advance(c);
   if (result != 0)
@@ -926,6 +1064,26 @@ int32_t orbit_client_invalidate(orbit_client_t *client) {
     clear_access(c);
     return ORBIT_CLIENT_STORAGE;
   }
+#ifdef ORBIT_ENABLE_SERVICES
+  if (c->extension) {
+    orbit_zero(&c->extension->session, sizeof(c->extension->session));
+    c->extension->session.automatic = 0;
+    c->extension->policy_known = 0;
+#ifdef ORBIT_ENABLE_OFFLINE
+    if (c->extension->offline_mode) {
+      int64_t now;
+      uint64_t ticks;
+      result = clock_now(c, &now, &ticks);
+      if (result)
+        return result;
+      c->extension->offline_mode = 0;
+      result = orbit_offline_checkpoint(c, now, 1);
+      if (result)
+        return result;
+    }
+#endif
+  }
+#endif
   c->busy = 1u;
   result = terminal(c, 0);
   c->busy = 0u;
@@ -951,3 +1109,33 @@ void orbit_client_destroy(orbit_client_t *client) {
   wipe(c->scratch, ORBIT_GRANT_WORKSPACE_BYTES);
   wipe(client, sizeof(*client));
 }
+
+#ifdef ORBIT_ENABLE_SERVICES
+void orbit_client_apply_claims(orbit_client_state_t *c,
+                               const orbit_grant_claims_t *claims,
+                               int64_t server_time, uint64_t started) {
+  orbit_zero(&c->active, sizeof(c->active));
+  uint32_t i, used = 0u;
+  for (i = 0; i < claims->entitlement_count; ++i) {
+    c->active.names[i].offset = (uint16_t)used;
+    c->active.names[i].length = claims->entitlements[i].name.length;
+    orbit_copy(c->active.pool + used,
+               c->arena + claims->entitlements[i].name.offset,
+               claims->entitlements[i].name.length);
+    used += claims->entitlements[i].name.length;
+  }
+  orbit_copy(c->active.enabled, claims->entitlement_enabled,
+             sizeof(c->active.enabled));
+  c->active.count = claims->entitlement_count;
+  c->active.expires = claims->expires_at;
+  c->active.refresh = claims->refresh_after;
+  c->active.policy = claims->policy_version;
+  c->active.offline_allowed = claims->offline_allowed;
+  c->anchor_server = server_time;
+  c->anchor_ticks = started;
+  c->anchored = 1u;
+  c->transient = 0u;
+  c->retry_ticks = 0u;
+  c->active.valid = 1u;
+}
+#endif

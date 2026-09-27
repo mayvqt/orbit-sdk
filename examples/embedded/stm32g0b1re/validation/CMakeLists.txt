@@ -72,3 +72,8 @@ target_link_options(orbit_stm32g0b1re_validation.elf PRIVATE
     -T${CMAKE_CURRENT_LIST_DIR}/orbit_stm32g0b1re.ld)
 target_link_libraries(orbit_stm32g0b1re_validation.elf PRIVATE
     orbit_embedded_transport orbit_embedded_client mbedcrypto)
+
+if(ORBIT_ENABLE_OFFLINE)
+ math(EXPR ORBIT_JOURNAL_SLOT_BYTES "((64 + 1024 + ${ORBIT_OFFLINE_PROFILE_FILE_BYTES} + 2047) / 2048) * 2048")
+ target_link_options(orbit_stm32g0b1re_validation.elf PRIVATE -Wl,--defsym=ORBIT_JOURNAL_SLOT_BYTES=${ORBIT_JOURNAL_SLOT_BYTES})
+endif()

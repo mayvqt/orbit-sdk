@@ -24,9 +24,37 @@ fn main() {
     let ar = env::var("ORBIT_AR").unwrap_or_else(|_| "ar".into());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let mut objects = Vec::new();
-    for name in [
+    let services = env::var_os("CARGO_FEATURE_SERVICES").is_some();
+    let offline = env::var_os("CARGO_FEATURE_OFFLINE").is_some();
+    let full = env::var_os("CARGO_FEATURE_OFFLINE_FULL").is_some();
+    let mut profile = Vec::new();
+    if services {
+        profile.push("-DORBIT_ENABLE_SERVICES=1");
+    }
+    if offline {
+        profile.push("-DORBIT_ENABLE_OFFLINE=1");
+        profile.push(if full {
+            "-DORBIT_OFFLINE_PROFILE_FILE_BYTES=16384"
+        } else {
+            "-DORBIT_OFFLINE_PROFILE_FILE_BYTES=4096"
+        });
+    }
+    let mut sources = vec![
         "grant", "json", "prepare", "jwks", "client", "wire", "storage", "app_key",
-    ] {
+    ];
+    if services {
+        sources.extend([
+            "services_codec",
+            "limits",
+            "downloads",
+            "extensions",
+            "sessions",
+        ]);
+    }
+    if offline {
+        sources.push("offline");
+    }
+    for name in sources {
         let src = format!("src/orbit_{name}.c");
         println!("cargo:rerun-if-changed={src}");
         let object = out.join(format!("{name}.o"));
@@ -45,6 +73,7 @@ fn main() {
         if let Ok(flags) = env::var("ORBIT_CFLAGS") {
             cmd.args(flags.split_whitespace());
         }
+        cmd.args(&profile);
         run(&mut cmd);
         objects.push(object);
     }
@@ -64,6 +93,7 @@ fn main() {
     if let Ok(flags) = env::var("ORBIT_CFLAGS") {
         cmd.args(flags.split_whitespace());
     }
+    cmd.args(&profile);
     run(&mut cmd);
     objects.push(object);
     println!("cargo:rerun-if-changed=rust/src/layout.c");
