@@ -101,4 +101,6 @@ public sealed record OrbitOptions
     public Fingerprint? Fingerprint { get; init; }
     /// <summary>Trusted offline-purpose public keys. These keys are never read from an imported file.</summary>
     public OfflineKeys? OfflineKeys { get; init; }
+    /// <summary>Trusted connected-purpose public keys for floating-session grants.</summary>
+    public SessionKeys? SessionKeys { get; init; }
 }

@@ -1,4 +1,5 @@
 #include "core.hpp"
+#include "online.hpp"
 
 #include "error.hpp"
 
@@ -44,6 +45,11 @@ bool opaque(std::string_view value) {
 }
 
 bool bearer(std::string_view value) { return value.size() == 43 && opaque(value); }
+
+bool same_credential(const Credential &left, const Credential &right) {
+    return left.activation_id == right.activation_id && left.licence_id == right.licence_id &&
+           left.bearer == right.bearer && left.expires_at == right.expires_at;
+}
 
 bool valid_provider(std::string_view value) {
     if (value == "machine_v1") return true;
@@ -323,6 +329,9 @@ Json::Value owned_licence(const Json::Value& input) {
     output["offline_seconds"] = static_cast<Json::Int64>(offline_seconds);
     output["offline_file_seconds"] = static_cast<Json::Int64>(offline_file_seconds);
     output["entitlements"] = std::move(entitlement_output);
+    for (const auto *field : {"usage_limits", "resource_limits", "concurrent_session_limit"})
+        if (input.isMember(field))
+            output[field] = input[field];
     return output;
 }
 
@@ -413,6 +422,16 @@ void ClientState::clear_access_locked() {
     claims.reset();
     anchor.reset();
     offline.reset();
+    session_required = false;
+    session_profile_known = false;
+    session_disabled = false;
+    session_grant.reset();
+    session_anchor.reset();
+    pending_session_id.reset();
+    pending_renewal_sequence.reset();
+    session_retry_deadline.reset();
+    session_licence_expiry.reset();
+    session_binding_mode.clear();
     transient = false;
     retry_deadline.reset();
 }
@@ -565,6 +584,36 @@ std::string ClientState::account_path(std::string_view path,
     result.reauthentication_required = !credential.has_value();
     if (credential && credential->expires_at) {
         result.credential_expires_at = ::orbit::Timestamp(std::chrono::seconds(*credential->expires_at));
+    }
+    if (session_required) {
+        result.offline_allowed = false;
+        result.reauthentication_required =
+            credential && credential->expires_at &&
+            *credential->expires_at <= capture_clock().wall_seconds + 86400;
+        if (!session_grant || !session_anchor)
+            return result;
+        std::int64_t now = 0;
+        try {
+            now = session_anchor->now();
+        } catch (const Error &error) {
+            if (!tolerate_clock_error || error.kind() != ErrorKind::clock_uncertain)
+                throw;
+            session_grant.reset();
+            session_anchor.reset();
+            pending_renewal_sequence.reset();
+            advance_generation_locked();
+            return result;
+        }
+        result.expires_at = ::orbit::Timestamp(std::chrono::seconds(session_grant->expires_at));
+        result.next_check_at =
+            ::orbit::Timestamp(std::chrono::seconds(session_grant->refresh_after));
+        result.session =
+            ::orbit::Snapshot::Session{session_grant->session_id, session_grant->sequence};
+        result.access =
+            session_grant->expires_at <= now ? ::orbit::Access::expired : ::orbit::Access::online;
+        if (result.access == ::orbit::Access::online)
+            result.entitlements = session_grant->entitlements;
+        return result;
     }
     if (!claims || !anchor) {
         if (credential && credential->expires_at) {
@@ -882,43 +931,84 @@ void ClientState::restore_offline() {
     raise(ErrorKind::internal, "offline_import_failed");
 }
 
-std::pair<Credential, GrantClaims> ClientState::verify_reply(
-    const Json::Value& reply, const std::optional<Credential>& previous,
-    std::optional<std::string_view> expected_licence, ClockStart start,
-    const std::atomic_bool& cancelled, ClockAnchor& out_anchor) {
+ClientState::VerifiedActivation
+ClientState::verify_reply(const Json::Value &reply, const std::optional<Credential> &previous,
+                          std::optional<std::string_view> expected_licence, ClockStart start,
+                          const std::atomic_bool &cancelled, ClockAnchor &out_anchor) {
     const auto activation_id = text(required(reply, "activation_id"));
     const auto installation_id = text(required(reply, "installation_id"));
     const auto credential_value = optional_string(reply, "credential");
-    const auto& expiry_value = required(reply, "credential_expires_at");
+    const auto &expiry_value = required(reply, "credential_expires_at");
     std::optional<std::int64_t> expiry;
     if (!expiry_value.isNull()) {
-        if (!expiry_value.isString()) invalid_response();
+        if (!expiry_value.isString())
+            invalid_response();
         expiry = timestamp(expiry_value.asString());
     }
-    const auto grant = optional_string(reply, "grant");
+    const auto session_flag = reply.isMember("session_required");
+    if (session_flag &&
+        (!reply["session_required"].isBool() || !reply["session_required"].asBool()))
+        invalid_response();
+    const bool requires_session = session_flag;
+    const auto &grant_value = required(reply, "grant");
+    std::optional<std::string> grant;
+    if (requires_session) {
+        if (!grant_value.isNull())
+            invalid_response();
+    } else {
+        if (!grant_value.isString())
+            invalid_response();
+        grant = grant_value.asString();
+    }
+    const auto reply_licence = optional_string(reply, "licence_id");
     const auto server_text = text(required(reply, "server_time"));
     const auto binding = text(required(reply, "binding_mode"));
     const auto fingerprint_provider = optional_string(reply, "fingerprint_provider");
     const auto licence_expiry_text = optional_string(reply, "licence_expires_at");
     const auto secret_replay_expired = boolean(required(reply, "secret_replay_expired"));
-    if (secret_replay_expired) raise(ErrorKind::reauthentication_required, "reauthentication_required");
-    const auto configured_fingerprint = config.fingerprint
-        ? std::optional<std::string_view>(config.fingerprint->value) : std::nullopt;
-    const auto configured_provider = config.fingerprint
-        ? std::optional<std::string_view>(config.fingerprint->provider) : std::nullopt;
+    if (secret_replay_expired)
+        raise(ErrorKind::reauthentication_required, "reauthentication_required");
+    const auto configured_fingerprint =
+        config.fingerprint ? std::optional<std::string_view>(config.fingerprint->value)
+                           : std::nullopt;
+    const auto configured_provider =
+        config.fingerprint ? std::optional<std::string_view>(config.fingerprint->provider)
+                           : std::nullopt;
     if (!opaque(activation_id) || installation_id != *config.installation_id ||
-        fingerprint_provider != (configured_provider ? std::optional<std::string>(*configured_provider) : std::nullopt) ||
-        (configured_fingerprint ? (binding != "none" && binding != "hwid") : binding != "none")) invalid_response();
+        fingerprint_provider != (configured_provider
+                                     ? std::optional<std::string>(*configured_provider)
+                                     : std::nullopt) ||
+        (configured_fingerprint ? (binding != "none" && binding != "hwid") : binding != "none"))
+        invalid_response();
 
     const auto server_time = timestamp(server_text);
     out_anchor = ClockAnchor{server_time, start.elapsed_nanoseconds, start.wall_seconds};
     auto now = out_anchor.now();
-    if ((!persistent && !expiry) || (persistent && !previous && expiry)) invalid_response();
-    if (expiry && (*expiry <= now || *expiry > now + 30 * 86400)) invalid_response();
-    if (previous && (activation_id != previous->activation_id || expiry != previous->expires_at || credential_value)) {
+    if ((!persistent && !expiry) || (persistent && !previous && expiry))
+        invalid_response();
+    if (expiry && (*expiry <= now || *expiry > now + 30 * 86400))
+        invalid_response();
+    if (previous && (activation_id != previous->activation_id || expiry != previous->expires_at ||
+                     credential_value)) {
         invalid_response();
     }
-    if (!grant) invalid_response();
+    auto licence_expiry = licence_expiry_text
+                              ? std::optional<std::int64_t>(timestamp(*licence_expiry_text))
+                              : std::nullopt;
+    auto bearer_value =
+        credential_value ? *credential_value : (previous ? previous->bearer : std::string{});
+    if (!bearer(bearer_value))
+        invalid_response();
+    if (requires_session) {
+        if (!reply_licence || !opaque(*reply_licence) ||
+            (expected_licence && *reply_licence != *expected_licence) ||
+            (previous && *reply_licence != previous->licence_id))
+            invalid_response();
+        Credential saved{activation_id, *reply_licence, std::move(bearer_value), expiry};
+        return {std::move(saved), std::nullopt, out_anchor, true, licence_expiry, binding};
+    }
+    if (!grant)
+        invalid_response();
     const auto kid = grant_kid(*grant);
     bool known = false;
     {
@@ -930,7 +1020,8 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         const auto path = "/.well-known/orbit-jwks.json?application_id=" + config.application_id +
                           "&environment_id=" + config.environment_id;
         auto jwks = transport.get(path, cancelled);
-        if (!jwks) invalid_response();
+        if (!jwks)
+            invalid_response();
         auto refreshed = GrantKeys::parse(*jwks);
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -938,15 +1029,16 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
             known = keys.contains(*grant);
         }
     }
-    if (!known) invalid_response();
-    auto licence_expiry = licence_expiry_text
-        ? std::optional<std::int64_t>(timestamp(*licence_expiry_text)) : std::nullopt;
+    if (!known)
+        invalid_response();
     now = out_anchor.now();
     GrantExpected expected{
         config.issuer,
         config.application_id,
         config.environment_id,
-        expected_licence ? expected_licence : (previous ? std::optional<std::string_view>(previous->licence_id) : std::nullopt),
+        expected_licence
+            ? expected_licence
+            : (previous ? std::optional<std::string_view>(previous->licence_id) : std::nullopt),
         activation_id,
         *config.installation_id,
         configured_fingerprint,
@@ -962,11 +1054,9 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         std::lock_guard<std::mutex> lock(mutex);
         verified = keys.verify(*grant, expected);
     }
-    auto bearer_value = credential_value ? *credential_value : (previous ? previous->bearer : std::string{});
-    if (!bearer(bearer_value)) invalid_response();
     Credential saved{activation_id, verified.subject, std::move(bearer_value), expiry};
     (void)kid;
-    return {std::move(saved), std::move(verified)};
+    return {std::move(saved), std::move(verified), out_anchor, false, licence_expiry, binding};
 }
 
 ::orbit::Snapshot ClientState::accept_reply(
@@ -974,7 +1064,7 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     std::uint64_t request_generation,
     const std::optional<Credential>& previous, std::optional<std::string_view> expected_licence,
     ClockStart start, const std::atomic_bool& cancelled, bool mutation) {
-    std::optional<std::pair<Credential, GrantClaims>> accepted;
+    std::optional<VerifiedActivation> accepted;
     std::optional<ClockAnchor> accepted_anchor;
     std::optional<Error> failure;
     const bool verifying = reply.has_value();
@@ -983,9 +1073,10 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     } else if (reply) {
         try {
             ClockAnchor request_anchor;
-            accepted.emplace(verify_reply(*reply, previous, expected_licence, start, cancelled, request_anchor));
+            accepted.emplace(
+                verify_reply(*reply, previous, expected_licence, start, cancelled, request_anchor));
             accepted_anchor = request_anchor;
-        } catch (const Error& error) {
+        } catch (const Error &error) {
             failure.emplace(error);
         }
     } else {
@@ -1000,22 +1091,42 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         if (persistent) {
             auto candidate = persistent_record;
             candidate["generation"] = static_cast<Json::UInt64>(current_generation);
-            candidate["credential"] = credential_json(accepted->first);
-            candidate["access"] = persistent_access_cache(
-                *reply, accepted->second, keys, start);
+            candidate["credential"] = credential_json(accepted->credential);
+            candidate["access"] =
+                accepted->session_required
+                    ? Json::Value(Json::nullValue)
+                    : persistent_access_cache(*reply, *accepted->claims, keys, start);
             if (mutation) candidate["pending_activation"] = null_value();
             commit_persistent_locked(std::move(candidate));
         } else {
             try {
-                storage->save(storage_version, credential_json(accepted->first));
+                storage->save(storage_version, credential_json(accepted->credential));
             } catch (...) {
                 clear_all_locked();
                 throw;
             }
         }
-        credential = accepted->first;
-        claims = accepted->second;
+        credential = accepted->credential;
+        claims = accepted->claims;
         anchor = accepted_anchor;
+        const bool profile_changed = session_required != accepted->session_required ||
+                                     (session_required && accepted->session_required &&
+                                      (session_licence_expiry != accepted->licence_expires_at ||
+                                       session_binding_mode != accepted->binding_mode));
+        if (!accepted->session_required || profile_changed) {
+            session_grant.reset();
+            session_anchor.reset();
+            pending_session_id.reset();
+            pending_renewal_sequence.reset();
+            session_retry_deadline.reset();
+            if (!accepted->session_required)
+                session_disabled = false;
+        }
+        session_required = accepted->session_required;
+        session_profile_known = true;
+        session_licence_expiry =
+            accepted->session_required ? accepted->licence_expires_at : std::nullopt;
+        session_binding_mode = accepted->session_required ? accepted->binding_mode : std::string{};
         transient = false;
         retry_deadline.reset();
         if (persistent) last_checkpoint = std::chrono::steady_clock::now();
@@ -1166,6 +1277,16 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
             }
             invalidate_locked();
         }
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+        session_retry_deadline.reset();
+        session_profile_known = false;
+        session_required = false;
+        session_disabled = false;
+        session_licence_expiry.reset();
+        session_binding_mode.clear();
         request_generation = current_generation;
     }
     Json::Value input(Json::objectValue);
@@ -1192,47 +1313,444 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         return accept_reply(std::nullopt, &error, request_generation,
                             std::nullopt, account_licence, start, cancelled, true);
     }
-    return accept_reply(response, nullptr, request_generation, std::nullopt,
-                        account_licence, start, cancelled, true);
+    auto accepted_snapshot = accept_reply(response, nullptr, request_generation, std::nullopt,
+                                          account_licence, start, cancelled, true);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (session_required && !session_disabled) {
+            // The activation credential was durably committed by accept_reply
+            // before the first seat request is allowed to leave this process.
+        } else
+            return accepted_snapshot;
+    }
+    return start_session_serialized(cancelled, false);
 }
 
-::orbit::Snapshot ClientState::refresh(const std::atomic_bool& cancelled, bool if_needed) {
+SessionGrant ClientState::verify_session_reply(const Json::Value &reply,
+                                               std::string_view session_id, std::int64_t sequence,
+                                               const Credential &saved, ClockStart start,
+                                               ClockAnchor &out_anchor,
+                                               const std::atomic_bool &cancelled) {
+    std::optional<std::int64_t> licence_expiry;
+    std::string binding_mode;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        licence_expiry = session_licence_expiry;
+        binding_mode = session_binding_mode;
+    }
+    if (!reply.isObject() || reply.size() != 5 || !reply.isMember("session_id") ||
+        !reply.isMember("sequence") || !reply.isMember("expires_at") ||
+        !reply.isMember("server_time") || !reply.isMember("grant"))
+        invalid_response();
+    const auto response_session = text(required(reply, "session_id"));
+    const auto response_sequence = integer(required(reply, "sequence"));
+    const auto expires = timestamp(text(required(reply, "expires_at")));
+    out_anchor = ClockAnchor{timestamp(text(required(reply, "server_time"))),
+                             start.elapsed_nanoseconds, start.wall_seconds};
+    const auto grant_token = text(required(reply, "grant"));
+    if (response_session != session_id || response_sequence != sequence ||
+        !opaque(response_session) || response_session.size() < 16 || sequence < 1 ||
+        sequence > 9007199254740991LL)
+        invalid_response();
+
+    auto trusted = config.session_keys;
+    bool known = false;
+    if (trusted)
+        known = trusted->contains(grant_token);
+    if (!known) {
+        throw_if_cancelled(cancelled);
+        const auto path = "/.well-known/orbit-jwks.json?application_id=" + config.application_id +
+                          "&environment_id=" + config.environment_id;
+        auto jwks = transport.get(path, cancelled);
+        if (!jwks)
+            invalid_response();
+        auto refreshed = SessionKeys::parse(*jwks, config.environment);
+        known = refreshed.contains(grant_token);
+        if (!known)
+            invalid_response();
+        config.session_keys = std::make_shared<const SessionKeys>(std::move(refreshed));
+        trusted = config.session_keys;
+    }
+    if (!trusted)
+        invalid_response();
+    const auto configured_fingerprint =
+        config.fingerprint ? std::optional<std::string_view>(config.fingerprint->value)
+                           : std::nullopt;
+    const auto configured_provider =
+        config.fingerprint ? std::optional<std::string_view>(config.fingerprint->provider)
+                           : std::nullopt;
+    GrantExpected expected{
+        config.issuer,          config.application_id,
+        config.environment_id,  std::string_view(saved.licence_id),
+        saved.activation_id,    *config.installation_id,
+        configured_fingerprint, configured_provider,
+        saved.expires_at,       licence_expiry,
+        out_anchor.now(),       true,
+        binding_mode,
+    };
+    SessionExpected session_expected{expected, session_id, sequence};
+    auto verified = trusted->verify(grant_token, session_expected);
+    if (verified.expires_at != expires || verified.binding_mode != binding_mode)
+        invalid_response();
+    return verified;
+}
+
+::orbit::Snapshot ClientState::start_session_serialized(const std::atomic_bool &cancelled,
+                                                        bool explicit_start) {
+    Credential saved;
+    std::uint64_t request_generation = 0;
+    std::string session_id;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        throw_if_cancelled(cancelled);
+        if (offline)
+            return snapshot_locked(true);
+        if (!session_required)
+            return snapshot_locked(true);
+        if (session_disabled && !explicit_start)
+            raise(ErrorKind::denied, "session_explicitly_ended");
+        if (explicit_start)
+            session_disabled = false;
+        if (!credential)
+            raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        if (session_grant && session_anchor) {
+            const auto now = session_anchor->now();
+            if (now < session_grant->expires_at)
+                return snapshot_locked(true);
+            session_grant.reset();
+            session_anchor.reset();
+            pending_renewal_sequence.reset();
+        }
+        if (!pending_session_id)
+            pending_session_id = new_installation_id();
+        session_id = *pending_session_id;
+        saved = *credential;
+        request_generation = current_generation;
+    }
+    Json::Value input = credential_body(saved);
+    input["session_id"] = session_id;
+    const auto path = "/api/client/v1/activations/" + saved.activation_id + "/sessions";
+    const auto start = capture_clock();
+    bool sent = false;
+    try {
+        sent = true;
+        const auto response = transport.post(path, input, true, cancelled);
+        if (!response)
+            invalid_response();
+        ClockAnchor response_anchor;
+        auto verified = verify_session_reply(*response, session_id, 1, saved, start,
+                                             response_anchor, cancelled);
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        if (current_generation != request_generation || !credential ||
+            !same_credential(*credential, saved) || !session_required || session_disabled ||
+            !pending_session_id || *pending_session_id != session_id)
+            raise(ErrorKind::stale_response, "stale_response");
+        throw_if_cancelled(cancelled);
+        session_grant = std::move(verified);
+        session_anchor = response_anchor;
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+        session_retry_deadline.reset();
+        wake_worker();
+        return snapshot_locked(true);
+    } catch (const Error &error) {
+        if (sent &&
+            (error.kind() == ErrorKind::cancelled || error.kind() == ErrorKind::stale_response)) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (pending_session_id && *pending_session_id == session_id)
+                    pending_session_id.reset();
+            }
+            std::atomic_bool cleanup_cancelled{false};
+            try {
+                const auto path = "/api/client/v1/activations/" + saved.activation_id +
+                                  "/sessions/" + session_id + "/end";
+                (void)transport.post(path, credential_body(saved), false, cleanup_cancelled);
+            } catch (...) {
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (current_generation != request_generation || !credential ||
+                !same_credential(*credential, saved) || !session_required || !pending_session_id ||
+                *pending_session_id != session_id)
+                raise(ErrorKind::stale_response, "stale_response");
+            if (error.kind() == ErrorKind::transient ||
+                (error.kind() == ErrorKind::denied &&
+                 error.code() == "concurrent_session_limit_reached")) {
+                session_retry_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(15 + std::rand() % 30);
+                wake_worker();
+            } else if (error.kind() == ErrorKind::denied) {
+                // A definite denial such as an expired ID or sequence conflict
+                // makes that unacknowledged start key unusable. Capacity denial
+                // above remains safely retryable with the same key.
+                pending_session_id.reset();
+            } else if (error.kind() == ErrorKind::invalid_response) {
+                session_grant.reset();
+                session_anchor.reset();
+                pending_renewal_sequence.reset();
+            }
+        }
+        throw;
+    }
+}
+
+::orbit::Snapshot ClientState::advance_session_serialized(const std::atomic_bool &cancelled) {
+    bool start_new = false;
+    Credential saved;
+    SessionGrant current;
+    ClockAnchor current_anchor;
+    std::int64_t sequence = 0;
+    std::uint64_t request_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        throw_if_cancelled(cancelled);
+        if (offline || !session_required || session_disabled)
+            return snapshot_locked(true);
+        if (!credential)
+            raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        if (session_retry_deadline && std::chrono::steady_clock::now() < *session_retry_deadline)
+            return snapshot_locked(true);
+        saved = *credential;
+        request_generation = current_generation;
+        if (!session_grant || !session_anchor)
+            start_new = true;
+        else {
+            current = *session_grant;
+            current_anchor = *session_anchor;
+            const auto now = current_anchor.now();
+            if (now >= current.expires_at) {
+                session_grant.reset();
+                session_anchor.reset();
+                pending_renewal_sequence.reset();
+                pending_session_id.reset();
+                start_new = true;
+            } else if (now < current.refresh_after) {
+                return snapshot_locked(true);
+            } else {
+                if (!pending_renewal_sequence) {
+                    if (current.sequence >= 9007199254740991LL)
+                        raise(ErrorKind::denied, "session_sequence_exhausted");
+                    pending_renewal_sequence = current.sequence + 1;
+                }
+                sequence = *pending_renewal_sequence;
+            }
+        }
+    }
+    if (start_new)
+        return start_session_serialized(cancelled, false);
+    Json::Value input = credential_body(saved);
+    input["sequence"] = static_cast<Json::Int64>(sequence);
+    const auto path = "/api/client/v1/activations/" + saved.activation_id + "/sessions/" +
+                      current.session_id + "/renew";
+    const auto start = capture_clock();
+    try {
+        const auto response = transport.post(path, input, true, cancelled);
+        if (!response)
+            invalid_response();
+        ClockAnchor response_anchor;
+        auto verified = verify_session_reply(*response, current.session_id, sequence, saved, start,
+                                             response_anchor, cancelled);
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        if (current_generation != request_generation || !credential ||
+            !same_credential(*credential, saved) || !session_required || session_disabled ||
+            !session_grant || session_grant->session_id != current.session_id ||
+            session_grant->sequence != current.sequence)
+            raise(ErrorKind::stale_response, "stale_response");
+        throw_if_cancelled(cancelled);
+        session_grant = std::move(verified);
+        session_anchor = response_anchor;
+        pending_renewal_sequence.reset();
+        session_retry_deadline.reset();
+        wake_worker();
+        return snapshot_locked(true);
+    } catch (const Error &error) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (current_generation != request_generation || !credential ||
+            !same_credential(*credential, saved) || !session_required || session_disabled ||
+            !session_grant || session_grant->session_id != current.session_id ||
+            session_grant->sequence != current.sequence)
+            raise(ErrorKind::stale_response, "stale_response");
+        if (error.kind() == ErrorKind::transient) {
+            session_retry_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(15 + std::rand() % 30);
+            wake_worker();
+            const auto current_snapshot = snapshot_locked(true);
+            if (current_snapshot.access == ::orbit::Access::online)
+                return current_snapshot;
+        } else if (error.kind() == ErrorKind::denied ||
+                   error.kind() == ErrorKind::invalid_response) {
+            session_grant.reset();
+            session_anchor.reset();
+            pending_renewal_sequence.reset();
+        }
+        throw;
+    }
+}
+
+::orbit::Snapshot ClientState::start_session(const std::atomic_bool &cancelled) {
+    ClientOperation call(*this);
+    bool known = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        if (offline)
+            return snapshot_locked(true);
+        if (!credential)
+            raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        known = session_profile_known;
+    }
+    if (!known)
+        (void)refresh(cancelled, false);
+    auto serial_lock = lock_serial(cancelled);
+    return start_session_serialized(cancelled, true);
+}
+
+::orbit::Snapshot ClientState::end_session(const std::atomic_bool &cancelled) {
+    ClientOperation call(*this);
+    bool known = false;
+    Credential saved;
+    std::string session_id;
+    std::uint64_t request_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        if (offline || (session_profile_known && !session_required))
+            return snapshot_locked(true);
+        throw_if_cancelled(cancelled);
+        if (!credential) {
+            session_disabled = true;
+            advance_generation_locked();
+            return snapshot_locked(true);
+        }
+        known = session_profile_known;
+        saved = *credential;
+        session_disabled = true;
+        if (session_grant)
+            session_id = session_grant->session_id;
+        else if (pending_session_id)
+            session_id = *pending_session_id;
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+        session_retry_deadline.reset();
+        advance_generation_locked();
+        request_generation = current_generation;
+    }
+    if (!known) {
+        (void)refresh(cancelled, false, false);
+        std::lock_guard<std::mutex> lock(mutex);
+        request_generation = current_generation;
+    }
+    auto serial_lock = lock_serial(cancelled);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sync_storage_locked();
+        if (current_generation != request_generation)
+            raise(ErrorKind::stale_response, "stale_response");
+        if (offline || !session_required)
+            return snapshot_locked(true);
+    }
+    if (!session_id.empty()) {
+        const auto path = "/api/client/v1/activations/" + saved.activation_id + "/sessions/" +
+                          session_id + "/end";
+        try {
+            const auto response = transport.post(path, credential_body(saved), false, cancelled);
+            if (response)
+                invalid_response();
+            std::lock_guard<std::mutex> lock(mutex);
+            if (current_generation != request_generation)
+                raise(ErrorKind::stale_response, "stale_response");
+            throw_if_cancelled(cancelled);
+        } catch (...) {
+            // The local snapshot stays cleared even when release is uncertain.
+            throw;
+        }
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    return snapshot_locked(true);
+}
+
+::orbit::Snapshot ClientState::refresh(const std::atomic_bool &cancelled, bool if_needed,
+                                       bool acquire_session) {
     ClientOperation call(*this);
     const auto before_serial = generation();
     auto serial_lock = lock_serial(cancelled);
     Credential saved;
     std::uint64_t request_generation = 0;
+    bool floating_profile = false;
     {
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
-        if (current_generation != before_serial) raise(ErrorKind::stale_response, "stale_response");
+        if (current_generation != before_serial)
+            raise(ErrorKind::stale_response, "stale_response");
         throw_if_cancelled(cancelled);
         if (if_needed) {
             const auto current = snapshot_locked(true);
-            if (current.offline_file_mode) return current;
+            if (current.offline_file_mode)
+                return current;
+            if (session_required) {
+                if (session_disabled)
+                    return current;
+                const bool due = !session_retry_deadline ||
+                                 std::chrono::steady_clock::now() >= *session_retry_deadline;
+                if (!due)
+                    return current;
+                if (session_grant && session_anchor &&
+                    session_anchor->now() < session_grant->refresh_after)
+                    return current;
+                floating_profile = true;
+            }
             const bool refreshable = current.access == ::orbit::Access::refresh_required ||
-                current.access == ::orbit::Access::expired || current.access == ::orbit::Access::offline;
+                                     current.access == ::orbit::Access::expired ||
+                                     current.access == ::orbit::Access::offline;
             const bool due = !retry_deadline || std::chrono::steady_clock::now() >= *retry_deadline;
-            if (!refreshable || !due) return current;
+            if (!session_required && (!refreshable || !due))
+                return current;
         }
-        if (offline) return snapshot_locked(true);
-        if (!credential) raise(ErrorKind::reauthentication_required, "reauthentication_required");
-        saved = *credential;
-        request_generation = current_generation;
+        if (offline)
+            return snapshot_locked(true);
+        if (!credential)
+            raise(ErrorKind::reauthentication_required, "reauthentication_required");
+        if (session_profile_known && session_required)
+            floating_profile = true;
+        if (floating_profile) {
+            // The serialized session transition below never validates the
+            // activation credential on every access check.
+        } else {
+            saved = *credential;
+            request_generation = current_generation;
+        }
     }
+    if (floating_profile)
+        return advance_session_serialized(cancelled);
     const auto input = credential_body(saved);
     const auto path = "/api/client/v1/activations/" + saved.activation_id + "/validate";
     const ClockStart start = capture_clock();
     std::optional<Json::Value> response;
     try {
         response = transport.post(path, input, true, cancelled);
-    } catch (const Error& error) {
-        if (error.kind() == ErrorKind::stale_response || error.kind() == ErrorKind::cancelled) throw;
-        return accept_reply(std::nullopt, &error, request_generation, saved,
-                            std::nullopt, start, cancelled);
+    } catch (const Error &error) {
+        if (error.kind() == ErrorKind::stale_response || error.kind() == ErrorKind::cancelled)
+            throw;
+        return accept_reply(std::nullopt, &error, request_generation, saved, std::nullopt, start,
+                            cancelled);
     }
-    return accept_reply(response, nullptr, request_generation, saved,
-                        std::nullopt, start, cancelled);
+    auto accepted_snapshot =
+        accept_reply(response, nullptr, request_generation, saved, std::nullopt, start, cancelled);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!session_required || session_disabled)
+            return accepted_snapshot;
+    }
+    if (!acquire_session)
+        return accepted_snapshot;
+    return start_session_serialized(cancelled, false);
 }
 
 ::orbit::Snapshot ClientState::require_access(std::string_view feature, const std::atomic_bool& cancelled) {
@@ -1244,7 +1762,7 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
         std::lock_guard<std::mutex> lock(mutex);
         sync_storage_locked();
         throw_if_cancelled(cancelled);
-        const auto current = snapshot_locked(true);
+        auto current = snapshot_locked(true);
         if (current.offline_file_mode) {
             if (current.access == ::orbit::Access::expired)
                 raise(ErrorKind::denied, "offline_file_expired");
@@ -1254,11 +1772,17 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
             return current;
         }
         if (current.access == ::orbit::Access::online) {
-            if (!current.has_feature(feature)) {
+            throw_if_cancelled(cancelled);
+            current = snapshot_locked(true);
+            throw_if_cancelled(cancelled);
+            if (current.access == ::orbit::Access::online && !current.has_feature(feature)) {
                 raise(ErrorKind::feature_unavailable, "feature_unavailable");
             }
-            return current;
+            if (current.access == ::orbit::Access::online)
+                return current;
         }
+        if (session_required && session_disabled)
+            raise(ErrorKind::denied, "session_explicitly_ended");
         refreshable = current.access == ::orbit::Access::refresh_required ||
             current.access == ::orbit::Access::expired || current.access == ::orbit::Access::offline;
     }
@@ -1274,6 +1798,13 @@ std::pair<Credential, GrantClaims> ClientState::verify_reply(
     throw_if_cancelled(cancelled);
     const auto current = snapshot_locked(true);
     if (current.access != ::orbit::Access::online && current.access != ::orbit::Access::offline) {
+        if (session_required) {
+            if (session_disabled)
+                raise(ErrorKind::denied, "session_explicitly_ended");
+            if (transient)
+                raise(ErrorKind::transient, "session_unavailable");
+            raise(ErrorKind::denied, "session_access_unavailable");
+        }
         if (credential && transient) raise(ErrorKind::transient, "network_unavailable");
         raise(ErrorKind::not_activated, "access_unavailable");
     }
@@ -1739,6 +2270,8 @@ void set_test_clock(TestClock clock) {
 }
 #endif
 
+std::int64_t online_timestamp(std::string_view value) { return timestamp(value); }
+
 const std::atomic_bool& cancellation_flag(const ::orbit::Cancellation* cancellation,
                                           const std::atomic_bool& fallback) {
     if (cancellation && cancellation->state_) return cancellation->state_->cancelled;
@@ -1790,6 +2323,14 @@ namespace {
     output.offline_allowed = boolean(required(value, "offline_allowed"));
     output.offline_duration = std::chrono::seconds(offline_seconds);
     output.offline_file_duration = std::chrono::seconds(offline_file_seconds);
+    output.usage_limits = usage_definitions(value);
+    output.resource_limits = resource_definitions(value);
+    if (value.isMember("concurrent_session_limit")) {
+        const auto concurrent = json_int64(value["concurrent_session_limit"]);
+        if (concurrent < 0 || concurrent > 65535)
+            invalid_response();
+        output.concurrent_session_limit = static_cast<std::int32_t>(concurrent);
+    }
     const auto& entitlements = required(value, "entitlements");
     if (!entitlements.isObject() || entitlements.size() > 64) invalid_response();
     for (const auto& name : entitlements.getMemberNames()) {
@@ -1933,6 +2474,12 @@ OfflineKeys OfflineKeys::parse(std::string_view jwks_json, std::string_view envi
                        std::string(environment));
 }
 
+SessionKeys SessionKeys::parse(std::string_view jwks_json, std::string_view environment) {
+    auto keys = detail::SessionKeys::parse_jwks(jwks_json, environment);
+    return SessionKeys(std::make_shared<const detail::SessionKeys>(std::move(keys)),
+                       std::string(environment));
+}
+
 std::string OfflineRequest::to_json() const {
     Json::Value value(Json::objectValue);
     value["format"] = "orbit-offline-request";
@@ -2001,12 +2548,18 @@ Client Client::open(const AppKey& app_key, Options options) {
     config.api_origin = app_key.api_origin();
     config.application_id = app_key.application_id();
     config.environment_id = app_key.environment_id();
+    config.environment = app_key.environment();
     config.issuer = app_key.issuer();
     config.public_app_key = app_key.public_key();
     if (options.offline_keys) {
         if (options.offline_keys->environment() != app_key.environment())
             detail::raise(ErrorKind::configuration, "invalid_offline_keys");
         config.offline_keys = options.offline_keys->keys_;
+    }
+    if (options.session_keys) {
+        if (options.session_keys->environment() != app_key.environment())
+            detail::raise(ErrorKind::configuration, "invalid_session_keys");
+        config.session_keys = options.session_keys->keys_;
     }
     config.fingerprint = detail::resolve_fingerprint(app_key, options);
     (void)detail::capture_clock();
@@ -2081,6 +2634,16 @@ Snapshot Client::activate_previous(std::string_view licence_key,
 Snapshot Client::refresh(const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
     return require_state(state_).refresh(detail::cancellation_flag(cancellation, inactive));
+}
+
+Snapshot Client::start_session(const Cancellation *cancellation) const {
+    std::atomic_bool inactive{false};
+    return require_state(state_).start_session(detail::cancellation_flag(cancellation, inactive));
+}
+
+Snapshot Client::end_session(const Cancellation *cancellation) const {
+    std::atomic_bool inactive{false};
+    return require_state(state_).end_session(detail::cancellation_flag(cancellation, inactive));
 }
 
 Snapshot Client::require_access(std::string_view feature, const Cancellation* cancellation) const {

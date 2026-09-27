@@ -275,6 +275,21 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             });
         }
     }
+    internal void CommitFloating(long version, StoredCredential credential, JsonElement response)
+    {
+        lock (gate)
+        {
+            Match(version);
+            if (Record.PendingActivation != null && JsonWire.Field(response, "credential").ValueKind == JsonValueKind.Null)
+                throw new OrbitException(OrbitError.Storage, "pending_activation");
+            Write(Record with
+            {
+                Credential = Saved(credential),
+                Access = null,
+                PendingActivation = null
+            });
+        }
+    }
     internal void Checkpoint(long server, long wall)
     {
         lock (gate)

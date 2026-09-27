@@ -11,7 +11,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 #endif
 
-internal static class InstalledTests
+internal static partial class InstalledTests
 {
     internal static async Task<int> RunAsync()
     {
@@ -19,6 +19,15 @@ internal static class InstalledTests
         (string Name, Func<Task> Run)[] cases =
         [
             ("persistent activation and online restart",OnlineRestart),
+            ("explicit online meters validate replay and uncertain IDs", OnlineOperations),
+            ("updates select only the requested target", UpdateOperations),
+            ("floating lifecycle acquires renews releases and restarts without cached session authority", FloatingLifecycle),
+            ("floating denial clears authority while transient outage keeps only the signed interval", SessionFailures),
+            ("ordinary and offline start and end are no-ops", SessionNoOps),
+            ("blocked session replies cannot cross end logout close or cancellation", SessionFences),
+            ("unknown floating profile end suppresses acquisition", UnknownSessionEnd),
+            ("end fences an initial activation before credentials arrive", EndDuringInitialActivation),
+            ("floating worker renews before expiry and bounds denial retries", SessionWorker),
             ("offline file import restart renewal expiry and retained sequence floor", OfflineFiles),
             ("offline time anchor survives account and online transitions", OfflineTransitionFloors),
             ("offline durable import fences cancellation and expiry", OfflineDurableFences),
@@ -188,7 +197,16 @@ internal static class InstalledTests
         }
         internal string Path => System.IO.Path.Combine(Root, "state");
         internal readonly LoopbackServer Server;
-        internal int Mode, Activations, Validations;
+        internal int Mode, Activations, Validations, SessionStarts, SessionRenewals, SessionEnds;
+        internal bool Floating, FailFirstSessionStart, FailFirstSessionRenewal;
+        internal bool DenySessionStart, DenySessionRenewal;
+        internal int SessionRenewalFailures;
+        internal TaskCompletionSource? SessionReceived, SessionRelease;
+        internal long? ClockNow;
+        internal readonly List<string> SessionIds = [];
+        internal readonly List<long> RenewalSequences = [];
+        private readonly Dictionary<string, long> sessionSequences = new(StringComparer.Ordinal);
+        internal Func<FixtureRequest, FixtureReply?>? OnlineResponse;
         internal bool LoginDenied;
         internal bool Offline = true;
         internal long? FiniteExpiry;
@@ -197,7 +215,9 @@ internal static class InstalledTests
         internal TaskCompletionSource? Received, Release;
         private readonly ECDsa signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         private readonly ECDsa offlineSigner = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        private readonly ECDsa sessionSigner = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         internal OfflineKeys TrustedOfflineKeys { get; }
+        internal SessionKeys TrustedSessionKeys { get; }
         internal string OfflineJwks { get; }
         internal Fixture()
         {
@@ -209,6 +229,13 @@ internal static class InstalledTests
                     x = JsonWire.EncodeBase64(publicKey.X!), y = JsonWire.EncodeBase64(publicKey.Y!) } }
             });
             TrustedOfflineKeys = OfflineKeys.Parse(OfflineJwks, "test");
+            var sessionPublic = sessionSigner.ExportParameters(false).Q;
+            var sessionJwks = JsonSerializer.Serialize(new
+            {
+                keys = new[] { new { kty = "EC", crv = "P-256", alg = "ES256", use = "sig", kid = "test-session-fixture",
+                    x = JsonWire.EncodeBase64(sessionPublic.X!), y = JsonWire.EncodeBase64(sessionPublic.Y!) } }
+            });
+            TrustedSessionKeys = SessionKeys.Parse(sessionJwks, "test");
         }
         internal string Issuer => Server.Origin;
         internal InstalledScope Scope => new(Server.Origin, Issuer, "app", "test");
@@ -225,6 +252,7 @@ internal static class InstalledTests
                 StatePath = statePath ?? Path,
                 DisableMachineBinding = disableMachineBinding,
                 OfflineKeys = withOfflineKeys ? TrustedOfflineKeys : null,
+                SessionKeys = TrustedSessionKeys,
                 Fingerprint = fingerprint == null ? null : new Fingerprint(fingerprint, provider!)
             });
         }
@@ -251,6 +279,7 @@ internal static class InstalledTests
         internal async Task Activate(OrbitClient client) => Require((await client.ActivateAsync("synthetic-key")).Access == Access.Online);
         private async Task<FixtureReply> Respond(FixtureRequest request, CancellationToken cancellationToken)
         {
+            if (OnlineResponse?.Invoke(request) is { } online) return online;
             if (request.Method == "DELETE" && request.Path.StartsWith("/api/client/v1/sessions/current?", StringComparison.Ordinal))
                 return new(204, string.Empty);
             if (request.Path.StartsWith("/.well-known/", StringComparison.Ordinal))
@@ -259,6 +288,70 @@ internal static class InstalledTests
                 return new(200, JsonSerializer.Serialize(new
                 {
                     keys = new[] { new { kty = "EC", crv = "P-256", alg = "ES256", use = "sig", kid = "installed", x = JsonWire.EncodeBase64(key.Q.X!), y = JsonWire.EncodeBase64(key.Q.Y!) } }
+                }));
+            }
+            if (request.Path.StartsWith("/api/client/v1/activations/activation/sessions", StringComparison.Ordinal))
+            {
+                var sessionBody = JsonNode.Parse(request.Body)!.AsObject();
+                if (request.Path.EndsWith("/end", StringComparison.Ordinal))
+                {
+                    SessionEnds++;
+                    return new(204, string.Empty);
+                }
+                var isStart = request.Path.EndsWith("/sessions", StringComparison.Ordinal);
+                if (SessionReceived != null)
+                {
+                    SessionReceived.TrySetResult();
+                    await SessionRelease!.Task.WaitAsync(cancellationToken);
+                }
+                var pathParts = request.Path.Split('/');
+                var sessionId = isStart ? sessionBody["session_id"]!.GetValue<string>() : pathParts[^2];
+                var sequence = isStart ? 1 : sessionBody["sequence"]!.GetValue<long>();
+                if (isStart) SessionStarts++; else SessionRenewals++;
+                if (isStart) SessionIds.Add(sessionId);
+                else RenewalSequences.Add(sequence);
+                if (isStart && DenySessionStart)
+                    return new(409, "{\"error\":{\"code\":\"session_sequence_conflict\",\"message\":\"Stale session ID\",\"request_id\":\"fixture\"}}");
+                if (!isStart && DenySessionRenewal)
+                    return new(403, "{\"error\":{\"code\":\"session_ended\",\"message\":\"Session ended\",\"request_id\":\"fixture\"}}");
+                if (!isStart && SessionRenewalFailures > 0)
+                {
+                    SessionRenewalFailures--;
+                    return new(503, "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"Unavailable\",\"request_id\":\"fixture\"}}");
+                }
+                if (isStart && FailFirstSessionStart)
+                {
+                    FailFirstSessionStart = false;
+                    return new(503, "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"Unavailable\",\"request_id\":\"fixture\"}}");
+                }
+                if (!isStart && FailFirstSessionRenewal)
+                {
+                    FailFirstSessionRenewal = false;
+                    sessionSequences[sessionId] = sequence;
+                    return new(503, "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"Unavailable\",\"request_id\":\"fixture\"}}");
+                }
+                sessionSequences[sessionId] = sequence;
+                var sessionNow = ClockNow ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                var claims = new
+                {
+                    iss = Issuer, aud = "orbit-session:app:test", sub = "licence", jti = "session-token",
+                    iat = sessionNow, nbf = sessionNow, exp = sessionNow + 120, application_id = "app", environment_id = "test",
+                    activation_id = "activation", installation_id = sessionBody["installation_id"]!.GetValue<string>(),
+                    binding_mode = "none", policy_version = 1, entitlements = new { export = true },
+                    refresh_after = sessionNow + 60, offline_allowed = false, session_id = sessionId,
+                    session_sequence = sequence
+                };
+                var sessionHeader = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(new
+                    { alg = "ES256", typ = "orbit-session+jwt", kid = "test-session-fixture" }));
+                var sessionPayload = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(claims));
+                var signed = sessionHeader + "." + sessionPayload;
+                var sessionSignature = sessionSigner.SignData(Encoding.ASCII.GetBytes(signed), HashAlgorithmName.SHA256,
+                    DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
+                return new(200, JsonSerializer.Serialize(new
+                {
+                    session_id = sessionId, sequence, expires_at = DateTimeOffset.FromUnixTimeSeconds(sessionNow + 120).ToString("O"),
+                    server_time = DateTimeOffset.FromUnixTimeSeconds(sessionNow).ToString("O"),
+                    grant = signed + "." + JsonWire.EncodeBase64(sessionSignature)
                 }));
             }
             if (request.Path == "/api/client/v1/sessions")
@@ -298,7 +391,7 @@ internal static class InstalledTests
                 return new(403, "{\"error\":{\"code\":\"licence_revoked\",\"message\":\"Denied\",\"request_id\":\"fixture\"}}");
             if (Mode == 3)
                 return new(200, "{\"malformed\":true}");
-            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var now = ClockNow ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var id = body["installation_id"]!.GetValue<string>();
             var header = JsonWire.EncodeBase64(JsonSerializer.SerializeToUtf8Bytes(new
             {
@@ -344,6 +437,12 @@ internal static class InstalledTests
                 licence_expires_at = (string?)null,
                 secret_replay_expired = false
             })!.AsObject();
+            if (Floating)
+            {
+                response["grant"] = null;
+                response["session_required"] = true;
+                response["licence_id"] = "licence";
+            }
             if (Mode == 4)
                 response.Remove("credential_expires_at");
             if (Mode == 5)
@@ -372,9 +471,241 @@ internal static class InstalledTests
             await Server.DisposeAsync();
             signer.Dispose();
             offlineSigner.Dispose();
+            sessionSigner.Dispose();
             Directory.Delete(Root, true);
         }
     }
+    private static async Task FloatingLifecycle()
+    {
+        var wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var elapsed = TimeSpan.TicksPerSecond * 10;
+        Clock.SetTestClock(() => new ClockStart(elapsed, wall));
+        try
+        {
+            await using var f = new Fixture { Floating = true, FailFirstSessionStart = true, ClockNow = wall };
+            var client = await f.Open();
+            var first = await client.ActivateAsync("synthetic-key");
+            Require(first.Access == Access.Online && first.Session is { Sequence: 1 });
+            var saved = f.Record();
+            Require(saved.Credential != null && saved.Access == null,
+                "activation credential must be durable before the floating seat is acquired");
+            var originalId = first.Session!.Id;
+            Require(f.SessionStarts == 2 && f.SessionIds.Count >= 2 &&
+                f.SessionIds[0] == originalId && f.SessionIds[1] == originalId,
+                "uncertain start retry must reuse the same session ID");
+            var reused = await client.StartSessionAsync();
+            Require(reused.Session?.Id == originalId && f.SessionStarts == 2,
+                "start_session must reuse a still-valid seat");
+
+            elapsed += 61 * TimeSpan.TicksPerSecond;
+            wall += 61;
+            f.ClockNow = wall;
+            f.FailFirstSessionRenewal = true;
+            var renewed = await client.RefreshAsync();
+            Require(renewed.Session is { Sequence: 2 } && f.SessionRenewals == 2 &&
+                f.RenewalSequences[0] == 2 && f.RenewalSequences[1] == 2,
+                "uncertain renewal must retry one sequence and advance only after acceptance");
+            Require(f.Record().Access == null, "session grants must never enter the persistent access cache");
+
+            var ended = await client.EndSessionAsync();
+            Require(ended.Session == null && f.SessionEnds == 1,
+                "end_session must remove local authority and release the current seat");
+            await Expect(OrbitError.Denied, () => client.RequireAccessAsync("export"), "session_explicitly_ended");
+            Require(f.SessionStarts == 2, "guards must not reacquire after explicit end");
+            var resumed = await client.StartSessionAsync();
+            Require(resumed.Session is { Sequence: 1 } && resumed.Session.Id != originalId && f.SessionStarts == 3,
+                "explicit start must use a fresh ID after release");
+            await client.DisposeAsync();
+
+            var restarted = await f.Open();
+            var postRestart = restarted.Snapshot();
+            Require(postRestart.Session is { Sequence: 1 } && postRestart.Session.Id != resumed.Session!.Id &&
+                f.Record().Access == null,
+                "restart must validate the stored credential and acquire a fresh, nonrestored session");
+            await restarted.DisposeAsync();
+        }
+        finally { Clock.SetTestClock(null); }
+    }
+
+    private static async Task SessionFailures()
+    {
+        var wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var elapsed = 10 * TimeSpan.TicksPerSecond;
+        Clock.SetTestClock(() => new ClockStart(elapsed, wall));
+        try
+        {
+            await using (var f = new Fixture { Floating = true, ClockNow = wall })
+            await using (var client = await f.Open())
+            {
+                var initial = await client.ActivateAsync("synthetic-key");
+                var id = initial.Session!.Id;
+                elapsed += 61 * TimeSpan.TicksPerSecond;
+                wall += 61;
+                f.ClockNow = wall;
+                f.SessionRenewalFailures = 3;
+                var outage = await client.RefreshAsync();
+                Require(outage.Access == Access.Online && outage.Session?.Id == id && outage.Session.Sequence == 1 &&
+                    f.SessionRenewals == 3,
+                    "a transient renewal outage must preserve only the exact still-valid signed session interval");
+
+                f.DenySessionStart = true;
+                elapsed += 59 * TimeSpan.TicksPerSecond;
+                wall += 59;
+                f.ClockNow = wall;
+                f.DenySessionStart = true;
+                Require(client.Snapshot().Access != Access.Online,
+                    "the signed session must be expired at its exact deadline after an outage");
+                await Expect(OrbitError.Denied, () => client.RequireAccessAsync("export"));
+                Require(client.Snapshot().Session == null && client.Snapshot().Access != Access.Online,
+                    "a final warm guard must not return access after the signed deadline");
+                await Expect(OrbitError.Denied, () => client.StartSessionAsync(), "session_sequence_conflict");
+                var firstDeadId = f.SessionIds[^1];
+                await Expect(OrbitError.Denied, () => client.StartSessionAsync(), "session_sequence_conflict");
+                Require(f.SessionIds[^1] != firstDeadId,
+                    "an authoritative dead-ID conflict must generate a new start ID for a later explicit retry");
+            }
+
+            wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            elapsed = 20 * TimeSpan.TicksPerSecond;
+            await using (var f = new Fixture { Floating = true, ClockNow = wall, DenySessionRenewal = true })
+            await using (var client = await f.Open())
+            {
+                await client.ActivateAsync("synthetic-key");
+                elapsed += 61 * TimeSpan.TicksPerSecond;
+                wall += 61;
+                f.ClockNow = wall;
+                f.DenySessionStart = true;
+                try { await client.RefreshAsync(); }
+                catch (OrbitException error) when (error.Error == OrbitError.Denied) { }
+                Require(client.Snapshot().Session == null && client.Snapshot().Access != Access.Online,
+                    "an authoritative renewal denial must clear the current access grant");
+                await Expect(OrbitError.Denied, () => client.RequireAccessAsync("export"));
+            }
+        }
+        finally { Clock.SetTestClock(null); }
+    }
+
+    private static async Task SessionWorker()
+    {
+        var wall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var elapsed = 10 * TimeSpan.TicksPerSecond;
+        Clock.SetTestClock(() => new ClockStart(elapsed, wall));
+        try
+        {
+            await using var f = new Fixture { Floating = true, ClockNow = wall };
+            await using var client = await f.Open();
+            await client.ActivateAsync("synthetic-key");
+            elapsed += 60 * TimeSpan.TicksPerSecond; wall += 60; f.ClockNow = wall;
+            // Wake the existing worker without performing a refresh operation.
+            var lifetime = (InstalledLifetime)typeof(OrbitClient).GetField("lifetime", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+            lifetime.Signal();
+            for (var attempt = 0; attempt < 300 && client.Snapshot().Session?.Sequence != 2; attempt++) await Task.Delay(10);
+            Require(client.Snapshot().Session?.Sequence == 2 && f.SessionRenewals == 1,
+                "automatic worker must renew a still-valid session at refresh_after");
+            f.DenySessionRenewal = true; f.DenySessionStart = true;
+            elapsed += 60 * TimeSpan.TicksPerSecond; wall += 60; f.ClockNow = wall;
+            lifetime.Signal();
+            for (var attempt = 0; attempt < 300 && client.Snapshot().Session != null; attempt++) await Task.Delay(10);
+            Require(client.Snapshot().Access != Access.Online && client.Snapshot().Session == null);
+            var requests = f.SessionStarts + f.SessionRenewals;
+            await Task.Delay(150);
+            Require(f.SessionStarts + f.SessionRenewals == requests, "terminal renewal denial must not spin the worker");
+            var prompts = 0;
+            await Expect(OrbitError.Denied, () => client.EnsureAccessAsync("export", _ =>
+            { prompts++; return ValueTask.FromResult<string?>("must-not-prompt"); }));
+            Require(prompts == 0);
+        }
+        finally { Clock.SetTestClock(null); }
+    }
+
+    private static async Task UnknownSessionEnd()
+    {
+        await using var f = new Fixture { Floating = true };
+        await using var client = await f.Open();
+        await client.ActivateAsync("synthetic-key");
+        typeof(OrbitClient).GetField("sessionProfileKnown", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(client, false);
+        typeof(OrbitClient).GetField("sessionRequired", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(client, false);
+        var starts = f.SessionStarts;
+        await client.EndSessionAsync();
+        await Expect(OrbitError.Denied, () => client.RequireAccessAsync("export"));
+        Require(f.SessionStarts == starts, "ending an unknown floating policy must suppress acquisition before metadata validation");
+    }
+
+    private static async Task EndDuringInitialActivation()
+    {
+        await using var f = new Fixture { Floating = true, Mode = 6,
+            Received = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            Release = new(TaskCreationOptions.RunContinuationsAsynchronously) };
+        await using var client = await f.Open();
+        var activation = client.ActivateAsync("synthetic-key");
+        await f.Received.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        try { Require((await client.EndSessionAsync()).Access != Access.Online); }
+        finally { f.Release.TrySetResult(); }
+        await Expect(OrbitError.StaleResponse, () => activation);
+        Require(client.Snapshot().Access != Access.Online && f.SessionStarts == 0,
+            "late activation must not undo the newer end intent");
+        f.Mode = 0;
+        await client.ActivateAsync("synthetic-key");
+        Require(client.Snapshot().Access == Access.Online && f.SessionStarts == 1,
+            "a later explicit activation may intentionally restore access");
+    }
+
+    private static async Task SessionFences()
+    {
+        foreach (var action in new[] { "end", "logout", "close", "cancel" })
+        foreach (var denied in new[] { false, true })
+        {
+            await using var f = new Fixture { Floating = true };
+            await using var client = await f.Open();
+            await client.ActivateAsync("synthetic-key");
+            await client.EndSessionAsync();
+            f.SessionReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            f.SessionRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var cancellation = new CancellationTokenSource();
+            var start = client.StartSessionAsync(cancellation.Token);
+            await f.SessionReceived.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            f.DenySessionStart = denied;
+            Task transition = Task.CompletedTask;
+            if (action == "end") transition = client.EndSessionAsync();
+            if (action == "logout") client.Logout();
+            if (action == "close") transition = client.DisposeAsync().AsTask();
+            if (action == "cancel") cancellation.Cancel();
+            f.SessionRelease.TrySetResult();
+            try { await start; throw new InvalidOperationException("blocked start restored authority"); }
+            catch (OrbitException) { }
+            await transition;
+            if (action != "close") Require(client.Snapshot().Access != Access.Online);
+        }
+    }
+
+    private static async Task SessionNoOps()
+    {
+        await using (var ordinary = new Fixture())
+        await using (var client = await ordinary.Open())
+        {
+            await ordinary.Activate(client);
+            var starts = ordinary.SessionStarts;
+            var start = await client.StartSessionAsync();
+            var end = await client.EndSessionAsync();
+            Require(start.Access == Access.Online && end.Access == Access.Online &&
+                ordinary.SessionStarts == starts && ordinary.SessionEnds == 0,
+                "ordinary licences must not issue session requests");
+        }
+
+        await using (var offlineFixture = new Fixture())
+        await using (var client = await offlineFixture.Open())
+        {
+            var installation = client.CreateOfflineRequest().InstallationId;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var file = offlineFixture.SignOffline(installation, 1, "session_noop_offline", now, now + 120);
+            var imported = client.ImportOfflineFile(file);
+            var starts = offlineFixture.SessionStarts;
+            Require((await client.StartSessionAsync()).OfflineFileMode &&
+                (await client.EndSessionAsync()).OfflineFileMode && offlineFixture.SessionStarts == starts,
+                "offline-file mode must not start or release a connected session");
+        }
+    }
+
     private static async Task OnlineRestart()
     {
         await using var f = new Fixture();

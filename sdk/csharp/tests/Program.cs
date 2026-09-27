@@ -32,6 +32,8 @@ if (args is ["--native-protection"])
     }
 }
 
+if (args is ["--download-stream"]) return await DownloadStreamTests.RunAsync();
+
 if (args is ["--installed"]) return await InstalledTests.RunAsync();
 
 if (args is ["--benchmark-access"]) return await InstalledTests.RunBenchmarkAsync();

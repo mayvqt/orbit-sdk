@@ -23,3 +23,10 @@ export ORBIT_APP_KEY='orbit_app_test_…'
 
 The optional `--smoke` mode opens a temporary installation and makes no network
 request.
+
+For a policy with an `exports` usage limit, run
+`./build/cpp/orbit-cpp-licensed-export --metered-export export_job_000001`.
+The example reserves one unit before printing a report. Reuse that job ID when a
+reply is uncertain; a new ID is a new debit. See the
+[online operations guide](../../sdk/cpp/online.md) for resource tracking, direct
+updates and authoritative backend metering.

@@ -3,6 +3,7 @@
 #include "grants.hpp"
 #include "installed_storage.hpp"
 #include "offline.hpp"
+#include "session_grants.hpp"
 #include "persistent_codec.hpp"
 #include "platform.hpp"
 #include "transport.hpp"
@@ -47,11 +48,13 @@ struct Config {
     std::string api_origin;
     std::string application_id;
     std::string environment_id;
+    std::string environment;
     std::string issuer;
     std::optional<std::string> installation_id;
     std::optional<Fingerprint> fingerprint;
     std::optional<std::string> public_app_key;
     std::shared_ptr<const OfflineKeys> offline_keys;
+    std::shared_ptr<const SessionKeys> session_keys;
     Storage storage;
 };
 
@@ -131,7 +134,10 @@ public:
                                std::optional<std::string_view> previous,
                                const std::atomic_bool& cancelled,
                                std::optional<std::string_view> account_licence = std::nullopt);
-    ::orbit::Snapshot refresh(const std::atomic_bool& cancelled, bool if_needed = false);
+    ::orbit::Snapshot refresh(const std::atomic_bool& cancelled, bool if_needed = false,
+                              bool acquire_session = true);
+    ::orbit::Snapshot start_session(const std::atomic_bool& cancelled);
+    ::orbit::Snapshot end_session(const std::atomic_bool& cancelled);
     ::orbit::Snapshot require_access(std::string_view feature, const std::atomic_bool& cancelled);
     void deactivate(std::string_view idempotency_key, const std::atomic_bool& cancelled);
     void local_logout();
@@ -154,6 +160,8 @@ public:
                                    const std::atomic_bool& cancelled);
     std::string customer_session_authorization();
 
+    Json::Value online_operation(std::string_view route, Json::Value extra,
+                                 const std::atomic_bool& cancelled);
     std::uint64_t generation();
     void sync_storage_locked();
     void persist_record_locked();
@@ -182,6 +190,16 @@ public:
     std::optional<ClockAnchor> anchor;
     std::optional<OfflineRuntime> offline;
     std::optional<OfflineClockState> offline_clock;
+    bool session_required = false;
+    bool session_profile_known = false;
+    bool session_disabled = false;
+    std::optional<SessionGrant> session_grant;
+    std::optional<ClockAnchor> session_anchor;
+    std::optional<std::string> pending_session_id;
+    std::optional<std::int64_t> pending_renewal_sequence;
+    std::optional<std::chrono::steady_clock::time_point> session_retry_deadline;
+    std::optional<std::int64_t> session_licence_expiry;
+    std::string session_binding_mode;
     std::optional<AccountSession> customer;
     bool transient = false;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
@@ -215,7 +233,15 @@ private:
     ::orbit::Snapshot offline_snapshot_locked();
     void checkpoint_offline_locked(bool force);
     void checkpoint_offline_before_transition_locked();
-    std::pair<Credential, GrantClaims> verify_reply(
+    struct VerifiedActivation {
+        Credential credential;
+        std::optional<GrantClaims> claims;
+        ClockAnchor anchor;
+        bool session_required = false;
+        std::optional<std::int64_t> licence_expires_at;
+        std::string binding_mode;
+    };
+    VerifiedActivation verify_reply(
         const Json::Value& reply, const std::optional<Credential>& previous,
         std::optional<std::string_view> expected_licence, ClockStart start,
         const std::atomic_bool& cancelled, ClockAnchor& out_anchor);
@@ -226,6 +252,12 @@ private:
                                    std::optional<std::string_view> expected_licence,
                                    ClockStart start,
                                    const std::atomic_bool& cancelled, bool mutation = false);
+    ::orbit::Snapshot start_session_serialized(const std::atomic_bool& cancelled, bool explicit_start);
+    ::orbit::Snapshot advance_session_serialized(const std::atomic_bool& cancelled);
+    SessionGrant verify_session_reply(const Json::Value& reply, std::string_view session_id,
+                                      std::int64_t sequence, const Credential& saved,
+                                      ClockStart start, ClockAnchor& out_anchor,
+                                      const std::atomic_bool& cancelled);
     void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();

@@ -10,6 +10,13 @@ public enum OrbitError
 public sealed class OrbitException : Exception
 {
     public OrbitError Error { get; }
+    /// <summary>Reuse this ID when a mutation's outcome is uncertain.</summary>
+    public string? OperationId { get; internal set; }
+    public UsageCounter? UsageCounter { get; internal set; }
+    public ResourceCounter? ResourceCounter { get; internal set; }
+    public long? RequestedUnits { get; internal set; }
+    internal System.Text.Json.JsonElement? WireError { get; init; }
+    internal int HttpStatus { get; init; }
     public string? Code { get; }
     /// <summary>Validated server correlation reference; absent for local failures.</summary>
     public string? RequestId { get; }

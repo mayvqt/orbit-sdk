@@ -9,8 +9,9 @@
 
 int main(int argc, char** argv) {
     const bool smoke = argc == 2 && std::string_view(argv[1]) == "--smoke";
-    if (!smoke && argc != 1) {
-        std::cerr << "Usage: orbit-cpp-licensed-export [--smoke]\n";
+    const bool metered = argc == 3 && std::string_view(argv[1]) == "--metered-export";
+    if (!smoke && !metered && argc != 1) {
+        std::cerr << "Usage: orbit-cpp-licensed-export [--smoke | --metered-export JOB_ID]\n";
         return 2;
     }
 
@@ -57,12 +58,20 @@ int main(int argc, char** argv) {
             });
             if (access.has_feature("export"))
                 std::cout << "Licensed export is ready.\n";
+            if (metered) {
+                const auto debit = client.consume("exports", 1, argv[2]);
+                std::cout << "Report: rows=3, total=42. Exports remaining: " << debit.counter.remaining << '\n';
+            }
             client.close();
         } catch (const orbit::Error&) {
             client.close();
             throw;
         }
         return 0;
+    } catch (const orbit::OperationError& error) {
+        std::cerr << "Metering failed (" << error.code() << "). Resume this job with operation ID: "
+                  << error.operation_id() << '\n';
+        return 1;
     } catch (const orbit::Error& error) {
         std::cerr << error.what() << " (kind=" << static_cast<std::uint32_t>(error.kind())
                   << ", code=" << error.code();

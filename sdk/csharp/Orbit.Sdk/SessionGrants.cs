@@ -6,7 +6,7 @@ namespace Orbit.Sdk;
 internal sealed record SessionExpected(GrantExpected Grant, string SessionId, long Sequence);
 
 internal sealed record SessionGrant(string SessionId, long Sequence, string LicenceId, string ActivationId,
-    string InstallationId, string TokenId, long IssuedAt, long ExpiresAt, long RefreshAfter, long? LicenceExpiresAt,
+    string InstallationId, string BindingMode, string TokenId, long IssuedAt, long ExpiresAt, long RefreshAfter, long? LicenceExpiresAt,
     int PolicyVersion, IReadOnlyDictionary<string, bool> Entitlements)
 {
     public override string ToString() => "SessionGrant(<redacted>)";
@@ -14,7 +14,7 @@ internal sealed record SessionGrant(string SessionId, long Sequence, string Lice
 
 // Session acquisition, generation fencing and renewal are integrated separately.
 // A verified session grant must never be persisted as restorable access.
-internal sealed class SessionKeys
+public sealed class SessionKeys
 {
     private const int MaximumBytes = 16384;
     private const long MaximumTime = 253402300799;
@@ -29,9 +29,14 @@ internal sealed class SessionKeys
     private static readonly HashSet<string> FoldedFields = new(KnownFields, StringComparer.OrdinalIgnoreCase);
     private readonly GrantKeys keys;
 
-    private SessionKeys(GrantKeys keys) => this.keys = keys;
+    private SessionKeys(GrantKeys keys, string environment) { this.keys = keys; Environment = environment; }
 
-    internal static SessionKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
+    public string Environment { get; }
+
+    public static SessionKeys Parse(string json, string environment) =>
+        Parse(Encoding.UTF8.GetBytes(json), environment);
+
+    public static SessionKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
     {
         if (bytes.Length > MaximumBytes) throw InvalidKeys();
         try { return Parse(JsonWire.Parse(bytes), environment); }
@@ -53,10 +58,21 @@ internal sealed class SessionKeys
                 if (!JsonWire.Opaque(kid) || !kid.StartsWith(prefix, StringComparison.Ordinal) || kid.Length == prefix.Length)
                     throw InvalidKeys();
             }
-            return new SessionKeys(keys);
+            return new SessionKeys(keys, environment);
         }
         catch (Exception error) when (error is OrbitException or ArgumentException or InvalidOperationException)
         { throw InvalidKeys(); }
+    }
+
+    internal bool Contains(string token)
+    {
+        try
+        {
+            var claims = keys.VerifySessionSignature(token);
+            _ = claims;
+            return true;
+        }
+        catch (OrbitException) { return false; }
     }
 
     internal SessionGrant Verify(string token, SessionExpected expected)
@@ -113,7 +129,7 @@ internal sealed class SessionKeys
             licenceExpiry is < 0 or > MaximumTime || licenceExpiry != context.LicenceExpiresAt || expiry > licenceExpiry ||
             refresh <= issued || refresh > expiry || refresh > issued + 75 || (refresh < issued + 45 && refresh != expiry))
             throw InvalidGrant();
-        return new SessionGrant(session, sequence, licence, context.ActivationId, context.Device.InstallationId,
+        return new SessionGrant(session, sequence, licence, context.ActivationId, context.Device.InstallationId, binding,
             JsonWire.String(claims, "jti"), issued, expiry, refresh, licenceExpiry, (int)policy,
             JsonWire.Entitlements(JsonWire.Field(claims, "entitlements")));
     }

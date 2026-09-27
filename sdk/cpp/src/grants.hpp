@@ -55,6 +55,7 @@ class GrantKeys {
 public:
     static GrantKeys parse(const Json::Value& jwks);
     bool contains(std::string_view token) const;
+    bool contains_session(std::string_view token) const;
     std::size_t size() const noexcept { return keys_.size(); }
     Json::Value jwks_for(std::string_view token) const;
     GrantClaims verify(std::string_view token, const GrantExpected& expected) const;
@@ -65,6 +66,7 @@ public:
     SignedOfflinePayload verify_offline_signature(std::string_view token) const;
     // Signature/purpose validation only. DownloadTicketVerifier checks claims.
     Json::Value verify_download_signature(std::string_view token) const;
+    Json::Value verify_session_signature(std::string_view token) const;
 
 private:
     std::map<std::string, std::shared_ptr<EVP_PKEY>> keys_;

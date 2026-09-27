@@ -67,6 +67,7 @@ internal sealed class LoopbackServer : IAsyncDisposable
                 catch (IOException) { }
             }
             catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
+            catch (EndOfStreamException) { } // A cancelled request may close before its headers arrive.
         }
     }
 

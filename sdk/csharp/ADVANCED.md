@@ -204,3 +204,6 @@ After timing, a separate 500-guard/500-snapshot verification pass observed
 1,000 storage-version reads. The timed loops had zero writes and no increase
 from the two setup HTTP requests. These are local measurements, not
 cross-platform performance guarantees; Windows and macOS were not measured.
+
+See [online operations](ONLINE.md) for floating seats, verified update downloads,
+usage reservation and persistent resource allocation.

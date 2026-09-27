@@ -71,7 +71,13 @@ ctest --test-dir build/cpp-tests --output-on-failure
 ```
 
 The native suite loads shared app-key, connected-grant, offline-file and download
-ticket vectors. TLS tests use Python 3 and the repository's synthetic certificates.
+ticket vectors and all 184 shared session-grant vectors. Installed lifecycle
+checks cover floating acquisition, renewal, expiry, denials and generation fences.
+The online-operation cases exercise generated retry IDs, bounded capacity errors,
+released resource replay and target-specific updates. TLS tests use Python 3 and
+the repository's synthetic certificates. Direct streams check certificate trust,
+five redirects, bearer/cookie stripping, identity encoding, bounded streaming,
+length/digest failures, cancellation and atomic destination preservation.
 
 macOS build and native-runtime validation should be performed on macOS x64 and
 arm64 with the installed CMake, Apple SDK, libcurl, OpenSSL and JsonCpp:
@@ -198,3 +204,6 @@ snapshot path. After timing, a separate 500-guard/500-snapshot verification
 pass observed 1,000 successful lease checks. The timed loops had zero writes
 and no increase from the two setup HTTP requests. These are local measurements,
 not cross-platform performance guarantees; Windows and macOS were not measured.
+
+See [online operations](online.md) for floating seats, verified update downloads,
+usage reservation and persistent resource allocation.

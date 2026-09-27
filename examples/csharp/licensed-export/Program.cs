@@ -1,7 +1,7 @@
 using Orbit.Sdk;
 using System.Text.Json;
 
-const string commands = "Commands: activate, login, licences, more, select, claim, register, resend, recover, email, account-logout, status, export, deactivate, logout, quit";
+const string commands = "Commands: activate, login, licences, more, select, claim, register, resend, recover, email, account-logout, status, export, metered-export, seat-end, seat-start, deactivate, logout, quit";
 var appKey = Environment.GetEnvironmentVariable("ORBIT_APP_KEY");
 if (string.IsNullOrWhiteSpace(appKey))
 {
@@ -142,6 +142,22 @@ try
                         }
                         catch (OrbitException error) { Console.WriteLine($"Export denied: {error.Message}"); PrintSupport(client, error, Console.Out); }
                         break;
+                    case "metered-export":
+                        {
+                            var jobId = Prompt("Stable export job ID (16–128 letters, digits, _ or -): ");
+                            await client.RequireAccessAsync("export", lifetime.Token);
+                            var debit = await client.ConsumeAsync("exports", 1, jobId, lifetime.Token);
+                            Console.WriteLine($"Report: rows=3, total=42. Exports remaining: {debit.Counter.Remaining}");
+                            break;
+                        }
+                    case "seat-end":
+                        await client.EndSessionAsync(lifetime.Token);
+                        Console.WriteLine("Floating access ended locally.");
+                        break;
+                    case "seat-start":
+                        await client.StartSessionAsync(lifetime.Token);
+                        Console.WriteLine("Session started or existing ordinary access retained.");
+                        break;
                     case "deactivate":
                         try
                         {
@@ -192,5 +208,8 @@ static string PasswordPrompt()
     return Console.ReadLine() ?? "";
 }
 
-static void PrintSupport(OrbitClient client, OrbitException error, TextWriter output) =>
+static void PrintSupport(OrbitClient client, OrbitException error, TextWriter output)
+{
     output.WriteLine("Support summary: " + JsonSerializer.Serialize(client.SupportSummary(error)));
+    if (error.OperationId != null) output.WriteLine($"Resume the same job with operation ID: {error.OperationId}");
+}

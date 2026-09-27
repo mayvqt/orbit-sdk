@@ -27,3 +27,9 @@ logout clears local access; only acknowledged deactivation releases a device
 slot.
 
 The SDK and example source are [MIT licensed](../../../sdk/LICENSE).
+
+For a policy with an `exports` usage limit, `metered-export` reserves one unit
+before printing the report. Supply a stable job ID and reuse it after an uncertain
+reply; a new ID is a new debit. `seat-end` releases floating access and `seat-start`
+resumes it. See [online operations](../../../sdk/csharp/ONLINE.md) for updates,
+resource allocations and guidance on authoritative backend metering.

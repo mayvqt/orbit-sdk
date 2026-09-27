@@ -52,8 +52,24 @@ All 184 shared cases check exact process/session sequence, scope and machine
 binding, short expiry, refresh timing, retry intervals, key purpose and encodings.
 Additional checks cover owned bounded keys, immutable/redacted metadata,
 concurrent verification and rejection by ordinary, offline and download verifiers.
-This corpus tests signed-grant verification; session lifecycle and seat accounting
-require integration tests.
+The installed suite also checks acquisition, renewal, exact expiry, transient and
+terminal failures, unknown-policy end, worker retry bounds and blocked replies
+racing end, logout, close and cancellation. Server-side seat accounting is tested
+by the service integration suite.
+
+## Direct download streams
+
+```sh
+dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --download-stream
+```
+
+A private loopback TLS fixture exercises trusted/untrusted certificates, the
+five-redirect bound, bearer and cookie stripping on same-origin redirects,
+identity encoding, declared and streaming limits, truncated/wrong-hash bytes,
+atomic replacement, cancellation, stalled-body deadlines and temporary-file cleanup. No public host or
+storage account is used. The installed suite checks typed online counters,
+malformed capacity denials, lost-reply retry IDs, released-allocation replay and
+update target isolation. These fixtures do not replace server database tests.
 
 ## Security and lifecycle
 

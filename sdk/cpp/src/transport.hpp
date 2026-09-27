@@ -1,6 +1,7 @@
 #pragma once
 
 #include "json.hpp"
+#include "orbit_sdk.hpp"
 
 #include <atomic>
 #include <functional>
@@ -11,6 +12,13 @@
 #include <utility>
 
 namespace orbit::detail {
+
+struct WireError : Error {
+    WireError(std::uint32_t status, ErrorKind kind, std::string code,
+              std::string request_id, Json::Value value)
+        : Error(status, kind, std::move(code), std::move(request_id)), detail(std::move(value)) {}
+    Json::Value detail;
+};
 
 struct HttpResponse {
     long status = 0;
@@ -53,7 +61,7 @@ public:
                                              const std::atomic_bool& cancelled) const;
     std::optional<Json::Value> post(std::string_view path, const Json::Value& body,
                                     bool retry_safe,
-                                    const std::atomic_bool& cancelled) const;
+                                    const std::atomic_bool& cancelled, long expected_status = 0) const;
 
 #ifdef ORBIT_SDK_TESTING
     Transport(std::string origin, TestHandler handler);
@@ -64,7 +72,7 @@ private:
     std::optional<Json::Value> request(std::string_view method, std::string_view path,
                                        std::string_view body, std::string_view bearer,
                                        bool retry_safe,
-                                       const std::atomic_bool& cancelled) const;
+                                       const std::atomic_bool& cancelled, long expected_status = 0) const;
     std::string endpoint(std::string_view path) const;
     HttpResponse attempt(std::string_view method, std::string_view url,
                          std::string_view body, std::string_view bearer,

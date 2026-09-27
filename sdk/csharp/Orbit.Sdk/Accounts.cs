@@ -9,6 +9,11 @@ public sealed record OwnedLicence(string Id, string PolicyName, string State, st
     bool OfflineAllowed, TimeSpan OfflineDuration, IReadOnlyDictionary<string, bool> Entitlements)
 {
     public TimeSpan OfflineFileDuration { get; init; }
+    public int ConcurrentSessionLimit { get; init; }
+    public IReadOnlyDictionary<string, UsageLimit> UsageLimits { get; init; } =
+        new System.Collections.ObjectModel.ReadOnlyDictionary<string, UsageLimit>(new Dictionary<string, UsageLimit>());
+    public IReadOnlyDictionary<string, ResourceLimit> ResourceLimits { get; init; } =
+        new System.Collections.ObjectModel.ReadOnlyDictionary<string, ResourceLimit>(new Dictionary<string, ResourceLimit>());
 }
 public sealed record OwnedLicencePage(IReadOnlyList<OwnedLicence> Items, string? NextCursor);
 
@@ -333,6 +338,8 @@ public sealed partial class OrbitClient
             offlineSeconds is < 0 or > 86400 ||
             offlineFileSeconds != 0 && (offlineFileSeconds is < 86400 or > 31622400))
             throw JsonWire.Invalid();
+        var concurrent = value.TryGetProperty("concurrent_session_limit", out _) ? JsonWire.Integer(value, "concurrent_session_limit") : 0;
+        if (concurrent is < 0 or > 65535) throw JsonWire.Invalid();
         var firstUsed = JsonWire.OptionalString(value, "first_used_at");
         var expires = JsonWire.OptionalString(value, "expires_at");
         var duration = JsonWire.OptionalInteger(value, "duration_seconds");
@@ -344,6 +351,11 @@ public sealed partial class OrbitClient
             duration == null ? null : TimeSpan.FromTicks(duration.Value * TimeSpan.TicksPerSecond), (int)deviceLimit,
             JsonWire.Boolean(value, "hwid_locked"), JsonWire.Boolean(value, "offline_allowed"), TimeSpan.FromSeconds(offlineSeconds),
             JsonWire.Entitlements(JsonWire.Field(value, "entitlements")))
-        { OfflineFileDuration = TimeSpan.FromSeconds(offlineFileSeconds) };
+        {
+            OfflineFileDuration = TimeSpan.FromSeconds(offlineFileSeconds),
+            ConcurrentSessionLimit = (int)concurrent,
+            UsageLimits = OnlineWire.Definitions(value, "usage_limits", OnlineWire.UsageDefinition),
+            ResourceLimits = OnlineWire.Definitions(value, "resource_limits", OnlineWire.ResourceDefinition)
+        };
     }
 }

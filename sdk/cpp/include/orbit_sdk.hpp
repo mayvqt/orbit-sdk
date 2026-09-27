@@ -21,6 +21,7 @@ namespace detail {
 struct Config;
 class ClientState;
 class OfflineKeys;
+class SessionKeys;
 struct PendingRegistrationState;
 #ifdef ORBIT_SDK_TESTING
 ::orbit::Client make_test_client_from_state(std::shared_ptr<ClientState> state);
@@ -63,24 +64,72 @@ private:
     std::string request_id_;
 };
 
+using Timestamp = std::chrono::time_point<std::chrono::system_clock, std::chrono::seconds>;
+enum class UsagePeriod { day, month, lifetime };
+struct UsageLimit { std::int64_t limit = 0; UsagePeriod period = UsagePeriod::lifetime; std::optional<std::string> required_feature; };
+struct ResourceLimit {
+    std::int64_t limit = 0;
+    std::optional<std::string> required_feature;
+};
+struct ResourceCounter {
+    std::string name;
+    std::int64_t limit = 0, used = 0, remaining = 0;
+};
+struct UsageCounter : ResourceCounter {
+    UsagePeriod period = UsagePeriod::lifetime;
+    std::optional<Timestamp> period_started_at, resets_at;
+};
+struct UsageConsumption {
+    UsageCounter counter;
+    std::string idempotency_key;
+    std::int64_t consumed_units = 0;
+};
+enum class AllocationState { active, released };
+struct ResourceAllocation {
+    ResourceCounter counter;
+    std::string allocation_id, resource_id;
+    std::int64_t units = 0;
+    AllocationState state = AllocationState::active;
+    std::string idempotency_key;
+};
+class OperationError : public Error {
+  public:
+    OperationError(const Error &error, std::string operation_id,
+                   std::optional<UsageCounter> usage = std::nullopt,
+                   std::optional<ResourceCounter> resource = std::nullopt,
+                   std::optional<std::int64_t> requested_units = std::nullopt)
+        : Error(error), operation_id_(std::move(operation_id)), usage_(std::move(usage)),
+          resource_(std::move(resource)), requested_units_(requested_units) {}
+    const std::string &operation_id() const noexcept { return operation_id_; }
+    const std::optional<UsageCounter> &usage_counter() const noexcept { return usage_; }
+    const std::optional<ResourceCounter> &resource_counter() const noexcept { return resource_; }
+    const std::optional<std::int64_t>& requested_units() const noexcept { return requested_units_; }
+
+  private:
+    std::string operation_id_;
+    std::optional<UsageCounter> usage_;
+    std::optional<ResourceCounter> resource_;
+    std::optional<std::int64_t> requested_units_;
+};
+
 struct Fingerprint {
     std::string value;
     std::string provider;
 };
 
 class AppKey {
-public:
+  public:
     static AppKey parse(std::string_view value);
-    const std::string& api_origin() const noexcept { return api_origin_; }
-    const std::string& issuer() const noexcept { return issuer_; }
-    const std::string& application_id() const noexcept { return application_id_; }
-    const std::string& environment_id() const noexcept { return environment_id_; }
-    const std::string& environment() const noexcept { return environment_; }
+    const std::string &api_origin() const noexcept { return api_origin_; }
+    const std::string &issuer() const noexcept { return issuer_; }
+    const std::string &application_id() const noexcept { return application_id_; }
+    const std::string &environment_id() const noexcept { return environment_id_; }
+    const std::string &environment() const noexcept { return environment_; }
     std::string public_key() const;
 
-private:
-    AppKey(std::string api_origin, std::string application_id,
-           std::string environment_id, std::string environment);
+  private:
+    AppKey(std::string api_origin, std::string application_id, std::string environment_id,
+           std::string environment);
     std::string api_origin_;
     std::string issuer_;
     std::string application_id_;
@@ -90,7 +139,7 @@ private:
 
 /// Trusted public keys for signed offline files. This contains no private key material.
 class OfflineKeys {
-public:
+  public:
     static OfflineKeys parse(std::string_view jwks_json, std::string_view environment);
     const std::string& environment() const noexcept { return environment_; }
 
@@ -102,16 +151,31 @@ private:
     friend class Client;
 };
 
+/// Trusted public connected-purpose keys used to verify floating-session grants.
+class SessionKeys {
+public:
+    static SessionKeys parse(std::string_view jwks_json, std::string_view environment);
+    const std::string& environment() const noexcept { return environment_; }
+
+private:
+    SessionKeys(std::shared_ptr<const detail::SessionKeys> keys, std::string environment)
+        : keys_(std::move(keys)), environment_(std::move(environment)) {}
+    std::shared_ptr<const detail::SessionKeys> keys_;
+    std::string environment_;
+    friend class Client;
+};
+
 struct Options {
     std::optional<std::string> state_directory;
     bool disable_machine_binding = false;
     std::optional<Fingerprint> fingerprint;
     std::optional<OfflineKeys> offline_keys;
+    std::optional<SessionKeys> session_keys;
 };
 
 enum class Access : std::uint32_t { denied, online, offline, refresh_required, expired };
 
-using Timestamp = std::chrono::time_point<std::chrono::system_clock, std::chrono::seconds>;
+
 
 // Verified metadata. Match it to the seller's artifact registry before delivery.
 struct DownloadTicket {
@@ -143,6 +207,40 @@ private:
     std::shared_ptr<const State> state_;
 };
 
+struct UpdateTarget {
+    std::string platform, architecture;
+    static UpdateTarget runtime();
+};
+enum class DeliveryMode { public_url, protected_endpoint };
+struct ReleaseArtifact {
+    std::string id, release_id;
+    UpdateTarget target;
+    std::string filename;
+    std::int64_t byte_length = 0;
+    std::string sha256;
+    DeliveryMode delivery_mode = DeliveryMode::public_url;
+    std::string url;
+    std::optional<std::string> required_feature;
+};
+struct Release {
+    std::string id, channel, version, notes;
+    std::int64_t release_number = 0;
+    Timestamp created_at, published_at;
+    std::vector<ReleaseArtifact> artifacts;
+};
+struct AvailableUpdate {
+    Release release;
+    ReleaseArtifact artifact;
+};
+struct DownloadAuthorization {
+    ReleaseArtifact artifact;
+    std::optional<std::string> ticket;
+    std::optional<Timestamp> expires_at;
+    // Streams verified bytes to an explicit path. Never executes or unpacks them.
+    void download(std::string_view destination, std::int64_t maximum_bytes, bool replace = false,
+                  const Cancellation *cancellation = nullptr) const;
+};
+
 struct Snapshot {
     Access access = Access::denied;
     std::map<std::string, bool> entitlements;
@@ -154,6 +252,11 @@ struct Snapshot {
     std::chrono::seconds remaining_offline{0};
     std::int32_t policy_version = 0;
     bool offline_file_mode = false;
+    struct Session {
+        std::string id;
+        std::int64_t sequence = 0;
+    };
+    std::optional<Session> session;
 
     bool has_feature(std::string_view feature) const;
 };
@@ -193,6 +296,9 @@ struct OwnedLicence {
     bool offline_allowed = false;
     std::chrono::seconds offline_duration{0};
     std::chrono::seconds offline_file_duration{0};
+    std::int32_t concurrent_session_limit = 0;
+    std::map<std::string, UsageLimit> usage_limits;
+    std::map<std::string, ResourceLimit> resource_limits;
     std::map<std::string, bool> entitlements;
 };
 
@@ -268,34 +374,52 @@ public:
 
     const std::string& installation_id() const noexcept;
 
-    Snapshot snapshot(const Cancellation* cancellation = nullptr) const;
+    Snapshot snapshot(const Cancellation *cancellation = nullptr) const;
     OfflineRequest offline_request() const;
-    Snapshot import_offline_file(std::string_view file,
-                                 const Cancellation* cancellation = nullptr) const;
+    Snapshot import_offline_file(std::string_view file, const Cancellation *cancellation = nullptr) const;
     Snapshot activate(std::string_view licence_key,
                       std::optional<std::string_view> idempotency_key = std::nullopt,
-                      const Cancellation* cancellation = nullptr) const;
-    Snapshot activate(std::string_view licence_key, const Cancellation* cancellation) const;
-    Snapshot activate_previous(
-        std::string_view licence_key,
-        std::optional<std::string_view> previous_credential,
-        std::optional<std::string_view> idempotency_key = std::nullopt,
-        const Cancellation* cancellation = nullptr) const;
-    Snapshot refresh(const Cancellation* cancellation = nullptr) const;
-    Snapshot require_access(std::string_view feature,
-                            const Cancellation* cancellation = nullptr) const;
+                      const Cancellation *cancellation = nullptr) const;
+    Snapshot activate(std::string_view licence_key, const Cancellation *cancellation) const;
+    Snapshot activate_previous(std::string_view licence_key,
+                               std::optional<std::string_view> previous_credential,
+                               std::optional<std::string_view> idempotency_key = std::nullopt,
+                               const Cancellation *cancellation = nullptr) const;
+    Snapshot refresh(const Cancellation *cancellation = nullptr) const;
+    Snapshot start_session(const Cancellation *cancellation = nullptr) const;
+    Snapshot end_session(const Cancellation *cancellation = nullptr) const;
+    Snapshot require_access(std::string_view feature, const Cancellation *cancellation = nullptr) const;
     Snapshot ensure_access(std::string_view feature,
-                           const std::function<std::optional<std::string>()>& ask_for_key,
-                           const Cancellation* cancellation = nullptr) const;
+                           const std::function<std::optional<std::string>()> &ask_for_key,
+                           const Cancellation *cancellation = nullptr) const;
     void deactivate(std::optional<std::string_view> idempotency_key = std::nullopt,
-                    const Cancellation* cancellation = nullptr) const;
+                    const Cancellation *cancellation = nullptr) const;
     void logout() const;
     void close() const;
 
-    RegistrationResult register_customer(
-        std::string_view licence_key, std::string_view username,
-        std::string_view email, std::string_view password,
-        const Cancellation* cancellation = nullptr) const;
+    std::optional<AvailableUpdate> check_for_update(std::int64_t installed_release_number,
+                                                    std::string_view channel = "stable",
+                                                    std::optional<UpdateTarget> target = std::nullopt,
+                                                    const Cancellation *cancellation = nullptr) const;
+    DownloadAuthorization authorize_download(std::string_view release_id, std::string_view artifact_id,
+                                             const Cancellation *cancellation = nullptr) const;
+
+    UsageCounter usage(std::string_view name, const Cancellation *cancellation = nullptr) const;
+    UsageConsumption consume(std::string_view name, std::int64_t units = 1,
+                             std::optional<std::string_view> idempotency_key = std::nullopt,
+                             const Cancellation *cancellation = nullptr) const;
+    ResourceCounter resources(std::string_view name, const Cancellation *cancellation = nullptr) const;
+    ResourceAllocation acquire_resource(std::string_view name, std::string_view resource_id,
+                                        std::int64_t units = 1,
+                                        std::optional<std::string_view> idempotency_key = std::nullopt,
+                                        const Cancellation *cancellation = nullptr) const;
+    ResourceAllocation release_resource(std::string_view name, std::string_view allocation_id,
+                                        std::optional<std::string_view> idempotency_key = std::nullopt,
+                                        const Cancellation *cancellation = nullptr) const;
+
+    RegistrationResult register_customer(std::string_view licence_key, std::string_view username,
+                                         std::string_view email, std::string_view password,
+                                         const Cancellation *cancellation = nullptr) const;
     void resend_registration(const PendingRegistration& pending,
                              const Cancellation* cancellation = nullptr) const;
     Account login(std::string_view username, std::string_view password,

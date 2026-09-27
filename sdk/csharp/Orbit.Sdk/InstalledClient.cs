@@ -6,7 +6,8 @@ namespace Orbit.Sdk;
 /// <summary>Test-only/internal representation derived from an app key.</summary>
 internal sealed record AppConfig(string ApiOrigin, string ApplicationId, string EnvironmentId, string Issuer,
     string? StatePath = null, string? Fingerprint = null, string? FingerprintProvider = null,
-    OfflineKeys? OfflineKeys = null, string? PublicAppKey = null, AppKey? ParsedAppKey = null);
+    OfflineKeys? OfflineKeys = null, SessionKeys? SessionKeys = null,
+    string? PublicAppKey = null, AppKey? ParsedAppKey = null);
 
 internal sealed class InstalledLifetime
 {
@@ -72,8 +73,11 @@ public sealed partial class OrbitClient : IAsyncDisposable
         var fingerprint = ResolveFingerprint(key, options);
         if (options.OfflineKeys != null && options.OfflineKeys.Environment != key.Environment)
             throw new OrbitException(OrbitError.Configuration, "invalid_offline_keys");
+        if (options.SessionKeys != null && options.SessionKeys.Environment != key.Environment)
+            throw new OrbitException(OrbitError.Configuration, "invalid_session_keys");
         return new AppConfig(key.ApiOrigin, key.ApplicationId, key.EnvironmentId, key.Issuer,
-            options.StatePath, fingerprint?.Value, fingerprint?.Provider, options.OfflineKeys, key.PublicKey(), key);
+            options.StatePath, fingerprint?.Value, fingerprint?.Provider, options.OfflineKeys,
+            options.SessionKeys, key.PublicKey(), key);
     }
     internal static Fingerprint? ResolveFingerprint(AppKey key, OrbitOptions? options)
     {
@@ -141,7 +145,9 @@ public sealed partial class OrbitClient : IAsyncDisposable
                 lifetime = new InstalledLifetime(),
                 offlineKeys = app.OfflineKeys,
                 publicAppKey = app.PublicAppKey,
-                offlineAppKey = app.ParsedAppKey
+                offlineAppKey = app.ParsedAppKey,
+                sessionKeys = app.SessionKeys,
+                environmentName = app.ParsedAppKey?.Environment
             };
             transport.InstallationCancellation = client.lifetime.Cancellation.Token;
             if (record.PendingActivation != null)
@@ -468,6 +474,7 @@ public sealed partial class OrbitClient : IAsyncDisposable
         if (!weak.TryGetTarget(out var client))
             return TimeSpan.MinValue;
         bool due;
+        long expectedGeneration;
         lock (client.gate)
         {
             try
@@ -484,7 +491,21 @@ public sealed partial class OrbitClient : IAsyncDisposable
             if (client.installed?.Record.PendingActivation != null)
                 return Timeout.InfiniteTimeSpan;
             var snapshot = client.SnapshotLocked();
-            due = client.credential != null && (snapshot.Access is Access.RefreshRequired or Access.Expired or Access.Offline) && client.RetryDueLocked();
+            var sessionDue = false;
+            if (!client.offlineFileMode && client.sessionRequired && !client.sessionDisabled && client.credential != null)
+            {
+                try
+                {
+                    sessionDue = client.sessionRetryElapsedTicks == 0 ||
+                        Clock.ElapsedTicks() >= client.sessionRetryElapsedTicks;
+                    if (sessionDue && client.sessionGrant != null && client.sessionAnchor != null)
+                        sessionDue = client.sessionAnchor.Now() >= client.sessionGrant.RefreshAfter;
+                }
+                catch (OrbitException) { sessionDue = true; }
+            }
+            expectedGeneration = client.generation;
+            due = sessionDue || client.credential != null && !client.sessionRequired &&
+                (snapshot.Access is Access.RefreshRequired or Access.Expired or Access.Offline) && client.RetryDueLocked();
         }
         if (due)
         {
@@ -492,7 +513,22 @@ public sealed partial class OrbitClient : IAsyncDisposable
             {
                 await client.RefreshIfDueAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (OrbitException) { }
+            catch (OrbitException)
+            {
+                lock (client.gate)
+                {
+                    if (client.generation == expectedGeneration && client.sessionRequired && !client.sessionDisabled)
+                    {
+                        try
+                        {
+                            client.sessionRetryElapsedTicks = Math.Max(client.sessionRetryElapsedTicks,
+                                checked(Clock.ElapsedTicks() + 30 * TimeSpan.TicksPerSecond));
+                        }
+                        catch (Exception error) when (error is OrbitException or OverflowException)
+                        { client.sessionRetryElapsedTicks = long.MaxValue; }
+                    }
+                }
+            }
         }
         lock (client.gate)
         {
@@ -506,6 +542,22 @@ public sealed partial class OrbitClient : IAsyncDisposable
             if (client.credential == null)
                 return Timeout.InfiniteTimeSpan;
             var nowTicks = Clock.ElapsedTicks();
+            if (client.sessionRequired)
+            {
+                if (client.sessionDisabled) return Timeout.InfiniteTimeSpan;
+                if (client.sessionRetryElapsedTicks > nowTicks)
+                    return TimeSpan.FromTicks(Math.Clamp(client.sessionRetryElapsedTicks - nowTicks,
+                        TimeSpan.TicksPerMillisecond * 10, TimeSpan.TicksPerMinute));
+                if (client.sessionGrant == null || client.sessionAnchor == null)
+                    return TimeSpan.FromMilliseconds(10);
+                try
+                {
+                    var until = checked((client.sessionGrant.RefreshAfter - client.sessionAnchor.Now()) * TimeSpan.TicksPerSecond);
+                    return TimeSpan.FromTicks(Math.Clamp(until, TimeSpan.TicksPerMillisecond * 10, TimeSpan.TicksPerMinute));
+                }
+                catch (OrbitException) { return TimeSpan.FromMilliseconds(10); }
+                catch (OverflowException) { return TimeSpan.FromMilliseconds(10); }
+            }
             if (client.nextRetryElapsedTicks == long.MaxValue)
                 client.nextRetryElapsedTicks = checked(nowTicks + 30 * TimeSpan.TicksPerSecond);
             var ticks = client.nextRetryElapsedTicks > nowTicks ? client.nextRetryElapsedTicks - nowTicks : TimeSpan.TicksPerSecond;
@@ -545,8 +597,16 @@ public sealed partial class OrbitClient : IAsyncDisposable
         await serial.WaitAsync().ConfigureAwait(false);
         try
         {
+            StoredCredential? releaseCredential;
+            string? releaseId;
             lock (gate)
             {
+                releaseCredential = credential;
+                releaseId = sessionGrant?.SessionId ?? pendingSessionId;
+                sessionGrant = null;
+                sessionAnchor = null;
+                pendingSessionId = null;
+                pendingRenewalSequence = null;
                 try
                 {
                     CheckpointInstalled(true);
@@ -554,6 +614,17 @@ public sealed partial class OrbitClient : IAsyncDisposable
                 catch (Exception error) { failure ??= error; }
                 disposed = 1;
                 Clear();
+            }
+            if (releaseCredential != null && releaseId != null)
+            {
+                transport.InstallationCancellation = null;
+                try
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await transport.PostAsync($"/api/client/v1/activations/{releaseCredential.ActivationId}/sessions/{releaseId}/end",
+                        CredentialBody(releaseCredential), false, timeout.Token).ConfigureAwait(false);
+                }
+                catch { }
             }
         }
         finally { serial.Release(); }

@@ -107,12 +107,12 @@ public sealed class DownloadTicketVerifier
             DateTimeOffset.FromUnixTimeSeconds(issued), DateTimeOffset.FromUnixTimeSeconds(expiry));
     }
 
-    private static void ValidateEndpoint(string endpoint)
+    internal static void ValidateEndpoint(string endpoint, bool allowQuery = false)
     {
         try
         {
             if (endpoint == null || endpoint.Length is < 1 or > 2048 || !endpoint.StartsWith("https://", StringComparison.Ordinal) ||
-                endpoint.Any(c => !char.IsAscii(c) || c <= 32 || c == 127 || "\\?#<>\"{}|^`".Contains(c))) throw InvalidEndpoint();
+                endpoint.Any(c => !char.IsAscii(c) || c <= 32 || c == 127 || "\\#<>\"{}|^`".Contains(c) || (!allowQuery && c == '?'))) throw InvalidEndpoint();
             for (var index = 0; index < endpoint.Length; index++)
             {
                 if (endpoint[index] != '%') continue;
@@ -120,7 +120,7 @@ public sealed class DownloadTicketVerifier
                     throw InvalidEndpoint();
                 index += 2;
             }
-            var pathStart = endpoint.IndexOf('/', 8);
+            var pathStart = endpoint.IndexOfAny(['/', '?'], 8);
             var authority = pathStart < 0 ? endpoint[8..] : endpoint[8..pathStart];
             if (authority.Length == 0 || authority.Contains('@') || authority.Contains('%')) throw InvalidEndpoint();
             string host;

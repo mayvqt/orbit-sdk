@@ -39,9 +39,11 @@ endif()
 set(ORBIT_SDK_SOURCES
     src/core.cpp
     src/downloads.cpp
+    src/download_stream.cpp
     src/grants.cpp
     src/installed_storage.cpp
     src/json.cpp
+    src/online.cpp
     src/offline.cpp
     src/persistent_codec.cpp
     src/platform.cpp
@@ -54,6 +56,7 @@ set(ORBIT_SDK_SOURCES
     src/storage_linux_installed.cpp
     src/storage_macos_installed.cpp
     src/storage_windows.cpp
+    src/session_grants.cpp
     src/transport.cpp
 )
 
@@ -118,6 +121,7 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
         ORBIT_GRANT_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/grants.json"
         ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json"
+        ORBIT_SESSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/session-grants.json"
         ORBIT_GRANT_PRIVATE_KEY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/es256-test-private.pem"
     )
     if(MSVC)

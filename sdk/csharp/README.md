@@ -81,6 +81,16 @@ results use native C# types, including `DateTimeOffset` and `TimeSpan` values.
 The [console example](../../examples/csharp/licensed-export/README.md) also
 shows registration, recovery and account logout.
 
+## Floating seats, updates and metering
+
+Floating policies acquire and renew their session automatically. Use
+`EndSessionAsync` to stop seat use and `StartSessionAsync` to resume it.
+`CheckForUpdateAsync` discovers the newest eligible release for your runtime;
+`AuthorizeDownloadAsync` and `DownloadAsync` authorize and verify a direct download.
+`UsageAsync`, `ConsumeAsync`, `ResourcesAsync`, `AcquireResourceAsync` and
+`ReleaseResourceAsync` expose typed online counters and allocations. See the
+[online operations guide](ONLINE.md) for copy-ready examples and retry rules.
+
 ## Long-term offline files
 
 For products with an enabled `offline_file_seconds` policy, configure the

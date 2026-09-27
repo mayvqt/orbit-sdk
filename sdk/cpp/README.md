@@ -72,6 +72,15 @@ Customer accounts are separate from Orbit dashboard accounts. When account
 authentication is enabled, call `login`, inspect `owned_licences`, then use
 `activate_account` and `require_access`. Login alone grants no licensed access.
 
+## Floating seats, updates and metering
+
+Floating policies acquire and renew sessions automatically. Use `end_session()`
+to stop seat use and `start_session()` to resume it. `check_for_update()` discovers
+the newest eligible runtime release; `authorize_download()` and the result's
+`download()` authorize and verify a direct transfer. `usage()`, `consume()`,
+`resources()`, `acquire_resource()` and `release_resource()` return typed counters
+and allocations. See [online operations](online.md) for examples and retry rules.
+
 ## Long-term offline files
 
 When a licence policy enables `offline_file_seconds`, configure the trusted

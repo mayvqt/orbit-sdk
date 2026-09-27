@@ -4,13 +4,14 @@
 #include "storage_windows.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <fstream>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -34,6 +35,20 @@ namespace {
 
 using namespace orbit;
 using namespace orbit::detail;
+
+std::string timestamp_for_test(std::int64_t seconds) {
+    const auto value = static_cast<std::time_t>(seconds);
+    std::tm broken_down{};
+#if defined(_WIN32)
+    gmtime_s(&broken_down, &value);
+#else
+    gmtime_r(&value, &broken_down);
+#endif
+    char buffer[32]{};
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &broken_down) == 0)
+        throw std::runtime_error("test timestamp formatting failed");
+    return buffer;
+}
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -324,6 +339,55 @@ void test_shared_grant_vectors(const Corpus& corpus) {
     expect_error([&] { (void)keys.verify(strict_token, wrong_mode); }, ErrorKind::invalid_response);
 }
 
+std::size_t test_shared_session_vectors() {
+    std::ifstream input(ORBIT_SESSION_VECTORS_PATH, std::ios::binary);
+    require(input.good(), "shared session vector file is unavailable");
+    const auto corpus =
+        parse_json(std::string((std::istreambuf_iterator<char>(input)), {}), 4 * 1024 * 1024);
+    require(corpus["format_version"].asInt() == 1 && corpus["cases"].isArray() &&
+                corpus["cases"].size() == 184,
+            "shared session corpus must contain all 184 vectors");
+    const auto &context = corpus["expected"];
+    auto base = vector_expected(context);
+    const auto session_id = text(context, "session_id");
+    const auto sequence = context["sequence"].asInt64();
+    std::size_t passed = 0;
+    for (const auto &item : corpus["cases"]) {
+        auto expected_context = context;
+        if (item.isMember("expected"))
+            for (const auto &name : item["expected"].getMemberNames())
+                expected_context[name] = item["expected"][name];
+        const auto jwks = item.isMember("jwks") ? item["jwks"] : corpus["jwks"];
+        auto grant = vector_expected(expected_context);
+        grant.allow_unbound_fingerprint = expected_context["allow_unbound_fingerprint"].asBool();
+        const auto expected_session =
+            item.isMember("expected") && item["expected"].isMember("session_id")
+                ? text(item["expected"], "session_id")
+                : session_id;
+        const auto expected_sequence =
+            item.isMember("expected") && item["expected"].isMember("sequence")
+                ? item["expected"]["sequence"].asInt64()
+                : sequence;
+        bool accepted = false;
+        try {
+            const auto keys =
+                orbit::detail::SessionKeys::parse(jwks, text(expected_context, "key_environment"));
+            (void)keys.verify(text(item, "token"),
+                              SessionExpected{grant, expected_session, expected_sequence});
+            accepted = true;
+        } catch (const Error &error) {
+            require(error.kind() == ErrorKind::invalid_response ||
+                        error.kind() == ErrorKind::configuration,
+                    "session vector failed with non-validation error");
+        }
+        require(accepted == item["valid"].asBool(),
+                "session vector mismatch: " + text(item, "name"));
+        ++passed;
+    }
+    require(!base.issuer.empty(), "session vectors omitted the trusted issuer");
+    return passed;
+}
+
 void test_strict_bounded_json() {
     for (const std::string bad : {
              "{\"a\":1,\"a\":2}", "/*comment*/{}", "{\"a\":1,}", "{} {}", "{\"a\":NaN}",
@@ -425,6 +489,7 @@ Config config() {
     value.api_origin = "https://example.test";
     value.application_id = "app";
     value.environment_id = "test";
+    value.environment = "test";
     value.issuer = "https://orbit.example.test";
     value.installation_id = "installation_123456";
     return value;
@@ -449,12 +514,27 @@ struct ApiFixture {
     std::atomic_bool far_future_metadata{false};
     std::atomic<std::int64_t> offline_file_seconds{86400};
     std::atomic_bool omit_offline_file_seconds{false};
+    std::atomic_int omit_limit_map{0};
     std::atomic_bool activation_response_lost{false};
+    std::atomic_bool floating_session{false};
+    std::atomic_bool fail_first_session_start{false};
+    std::atomic_bool fail_first_session_renewal{false};
+    std::atomic_int session_renew_failures{0};
+    std::atomic_bool deny_session_renewal{false};
+    std::atomic_bool deny_session_start{false};
+    std::atomic_int session_start_calls{0};
+    std::atomic_int session_renew_calls{0};
+    std::atomic_int session_end_calls{0};
+    std::vector<std::string> session_ids;
+    std::vector<std::int64_t> session_sequences;
+    std::function<void()> before_session_start;
     std::atomic_bool login_denied{false};
     std::string last_activation_idempotency;
     std::string last_previous_credential;
     std::shared_ptr<Gate> activation_gate;
+    std::shared_ptr<Gate> jwks_gate;
     std::shared_ptr<Gate> sessions_gate;
+    std::shared_ptr<Gate> session_gate;
     std::shared_ptr<Gate> logout_gate;
     std::shared_ptr<Gate> deactivation_gate;
     std::shared_ptr<Gate> registration_gate;
@@ -476,6 +556,8 @@ struct ApiFixture {
             const auto route = url.substr(std::string_view("https://example.test").size());
             if (route.find("/.well-known/orbit-jwks.json") == 0) {
                 ++jwks_calls;
+                if (jwks_gate)
+                    jwks_gate->block();
                 auto failing = forced_jwks_failures.load();
                 while (failing > 0 && !forced_jwks_failures.compare_exchange_weak(failing, failing - 1)) {}
                 if (failing > 0) return HttpResponse{503, "{}", "0"};
@@ -489,6 +571,88 @@ struct ApiFixture {
                         R"({"error":{"code":"activation_revoked","message":"Revoked","request_id":"deactivate_1"}})", {}};
                 }
                 return HttpResponse{204, {}, {}};
+            }
+            if (route.find("/api/client/v1/activations/activation/sessions") == 0) {
+                const auto input = parse_json(body);
+                if (route.find("/end") != std::string_view::npos) {
+                    ++session_end_calls;
+                    return HttpResponse{204, {}, {}};
+                }
+                constexpr std::string_view start_suffix = "/sessions";
+                const bool start = route.size() >= start_suffix.size() &&
+                                   route.substr(route.size() - start_suffix.size()) == start_suffix;
+                const auto id = start ? input["session_id"].asString() : [&] {
+                    const auto start_pos = route.find("/sessions/") + 10;
+                    const auto slash = route.find('/', start_pos);
+                    return std::string(route.substr(start_pos, slash - start_pos));
+                }();
+                const auto sequence = start ? std::int64_t{1} : input["sequence"].asInt64();
+                if (start) {
+                    if (before_session_start)
+                        before_session_start();
+                    ++session_start_calls;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_ids.push_back(id);
+                } else {
+                    ++session_renew_calls;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_sequences.push_back(sequence);
+                }
+                if (session_gate)
+                    session_gate->block();
+                if (start && deny_session_start.load())
+                    return HttpResponse{
+                        409,
+                        R"({"error":{"code":"session_sequence_conflict","message":"Stale session ID","request_id":"session_conflict_1"}})",
+                        {}};
+                if (start && fail_first_session_start.exchange(false))
+                    return HttpResponse{503, "{}", {}};
+                if (!start && fail_first_session_renewal.exchange(false))
+                    return HttpResponse{503, "{}", {}};
+                if (!start && deny_session_renewal.load())
+                    return HttpResponse{
+                        403,
+                        R"({"error":{"code":"session_ended","message":"Ended","request_id":"session_end_1"}})",
+                        {}};
+                if (!start) {
+                    auto failures = session_renew_failures.load();
+                    while (failures > 0 &&
+                           !session_renew_failures.compare_exchange_weak(failures, failures - 1)) {
+                    }
+                    if (failures > 0)
+                        return HttpResponse{503, "{}", {}};
+                }
+                const auto now = capture_clock().wall_seconds;
+                Json::Value claims(Json::objectValue);
+                claims["iss"] = "https://orbit.example.test";
+                claims["aud"] = "orbit-session:app:test";
+                claims["sub"] = "licence";
+                claims["jti"] = "session_token";
+                claims["iat"] = static_cast<Json::Int64>(now);
+                claims["nbf"] = static_cast<Json::Int64>(now);
+                claims["exp"] = static_cast<Json::Int64>(now + 120);
+                claims["application_id"] = "app";
+                claims["environment_id"] = "test";
+                claims["activation_id"] = "activation";
+                claims["installation_id"] = input["installation_id"];
+                claims["binding_mode"] = "none";
+                claims["policy_version"] = 1;
+                claims["entitlements"]["export"] = true;
+                claims["refresh_after"] = static_cast<Json::Int64>(now + 60);
+                claims["offline_allowed"] = false;
+                claims["session_id"] = id;
+                claims["session_sequence"] = static_cast<Json::Int64>(sequence);
+                const auto token = sign_test_token(claims, "orbit-session+jwt", "test-key");
+                Json::Value response(Json::objectValue);
+                response["session_id"] = id;
+                response["sequence"] = static_cast<Json::Int64>(sequence);
+                response["expires_at"] = "2027-01-15T08:02:00Z";
+                response["server_time"] = "2027-01-15T08:00:00Z";
+                // The test clock's epoch is the signed server timestamp.
+                response["expires_at"] = timestamp_for_test(now + 120);
+                response["server_time"] = timestamp_for_test(now);
+                response["grant"] = token;
+                return HttpResponse{200, encode_json(response), {}};
             }
             if (route == "/api/client/v1/activations") {
                 if (activation_gate) activation_gate->block();
@@ -511,6 +675,11 @@ struct ApiFixture {
                 if (malformed_activation.load()) return HttpResponse{200, R"({"bad":true})", {}};
                 auto reply = activation_reply(corpus, offline_activation.load(), installation,
                     persistent_mode.load() && !finite_persistent_response.load());
+                if (floating_session.load()) {
+                    reply["grant"] = Json::Value(Json::nullValue);
+                    reply["session_required"] = true;
+                    reply["licence_id"] = "licence";
+                }
                 if (missing_expiry.load()) reply.removeMember("credential_expires_at");
                 if (pre_epoch_server_time.load()) reply["server_time"] = "1969-12-31T23:59:59Z";
                 return HttpResponse{200, encode_json(reply), {}};
@@ -520,8 +689,14 @@ struct ApiFixture {
                 if (offline_refresh.load()) return HttpResponse{503, "{}", "0"};
                 Json::Value input_value = parse_json(body);
                 const auto installation = input_value["installation_id"].asString();
-                return HttpResponse{200, encode_json(activation_reply(
-                    corpus, offline_activation.load(), installation, persistent_mode.load(), false)), {}};
+                auto reply = activation_reply(corpus, offline_activation.load(), installation,
+                                              persistent_mode.load(), false);
+                if (floating_session.load()) {
+                    reply["grant"] = Json::Value(Json::nullValue);
+                    reply["session_required"] = true;
+                    reply["licence_id"] = "licence";
+                }
+                return HttpResponse{200, encode_json(reply), {}};
             }
             if (route == "/api/client/v1/sessions") {
                 if (sessions_gate) sessions_gate->block();
@@ -569,6 +744,8 @@ struct ApiFixture {
                 page["items"] = Json::Value(Json::arrayValue);
                 auto licence = ApiFixture::sample_licence(far_future_metadata.load(), offline_file_seconds.load());
                 if (omit_offline_file_seconds.load()) licence.removeMember("offline_file_seconds");
+                if (omit_limit_map.load())
+                    licence.removeMember(omit_limit_map == 1 ? "usage_limits" : "resource_limits");
                 page["items"].append(std::move(licence));
                 page["next_cursor"] = "cursor_2";
                 return HttpResponse{200, encode_json(page), {}};
@@ -608,6 +785,8 @@ struct ApiFixture {
         licence["offline_allowed"] = true;
         licence["offline_seconds"] = 3600;
         licence["offline_file_seconds"] = static_cast<Json::Int64>(file_seconds);
+        licence["usage_limits"] = Json::Value(Json::objectValue);
+        licence["resource_limits"] = Json::Value(Json::objectValue);
         licence["entitlements"] = Json::Value(Json::objectValue);
         licence["entitlements"]["export"] = true;
         return licence;
@@ -631,14 +810,410 @@ Client persistent_client_for(ApiFixture& fixture, const std::string& path,
     auto setup = config();
     setup.installation_id.reset();
     setup.fingerprint = std::move(fingerprint);
+    if (fixture.floating_session.load()) {
+        setup.session_keys = std::make_shared<const orbit::detail::SessionKeys>(
+            orbit::detail::SessionKeys::parse(fixture.corpus["jwks"], "test"));
+    }
     auto storage = open_installed_storage(setup, path);
     return make_test_installed_client(setup,
         Transport("https://example.test", fixture.handler()), std::move(storage));
 }
 
-std::string offline_file(const AppKey& app_key, std::string_view installation,
-                         std::int64_t sequence, std::string_view issuance,
-                         std::int64_t issued, std::int64_t expires, bool export_feature = true) {
+struct SessionTestClock {
+    std::atomic<std::int64_t> elapsed{100'000'000'000LL};
+    std::atomic<std::int64_t> wall{1'700'000'000};
+    SessionTestClock() {
+        set_test_clock([this] { return std::make_pair(elapsed.load(), wall.load()); });
+    }
+    ~SessionTestClock() { set_test_clock({}); }
+    void advance(std::int64_t seconds) {
+        elapsed.fetch_add(seconds * 1'000'000'000LL);
+        wall.fetch_add(seconds);
+    }
+};
+
+void test_installed_floating_session_lifecycle(const Corpus &corpus) {
+    SessionTestClock clock;
+    const auto path = persistent_test_path();
+    auto setup = config();
+    setup.installation_id.reset();
+    setup.session_keys = std::make_shared<const orbit::detail::SessionKeys>(
+        orbit::detail::SessionKeys::parse(corpus.jwks, "test"));
+    ApiFixture fixture(corpus.value);
+    fixture.floating_session = true;
+    fixture.fail_first_session_start = true;
+    auto storage = open_installed_storage(setup, path);
+    fixture.before_session_start = [&] {
+        const auto bytes = storage->load();
+        require(bytes.has_value(), "floating credential must be saved before session acquisition");
+        const auto record = persistent_codec::decode(setup, storage->provider(), *bytes);
+        require(!record["credential"].isNull() && record["access"].isNull(),
+                "floating activation must persist credential without cached access "
+                "before seat request");
+    };
+    auto client =
+        open_installed_state(setup, Transport("https://example.test", fixture.handler()), storage);
+    std::atomic_bool cancelled{false};
+    try {
+        const auto activated =
+            client->activate("floating-key", "floating-operation-123", std::nullopt, cancelled);
+        require(activated.access == Access::online && activated.session &&
+                    activated.session->sequence == 1 && fixture.session_start_calls == 2,
+                "activation must acquire a floating seat and retry an uncertain "
+                "start with the same ID");
+        {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            require(fixture.session_ids.size() == 2 &&
+                        fixture.session_ids[0] == fixture.session_ids[1],
+                    "a lost session start acknowledgement must reuse its ID");
+        }
+        const auto requests_before = [&] {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            return fixture.requests.size();
+        }();
+        require(
+            client->require_access("export", cancelled).session->sequence == 1 &&
+                client->start_session(cancelled).session->sequence == 1 &&
+                requests_before ==
+                    [&] {
+                        std::lock_guard<std::mutex> lock(fixture.mutex);
+                        return fixture.requests.size();
+                    }(),
+            "warm guards and repeated start must reuse a valid seat without HTTP");
+
+        clock.advance(60);
+        const auto renewed = client->refresh(cancelled);
+        require(renewed.access == Access::online && renewed.session &&
+                    renewed.session->sequence == 2 && fixture.session_renew_calls == 1,
+                "floating refresh must renew exactly the next sequence");
+        {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            require(fixture.session_sequences == std::vector<std::int64_t>{2},
+                    "renewal must use the last accepted sequence plus one");
+        }
+
+        const auto starts_before_end = fixture.session_start_calls.load();
+        const auto ended = client->end_session(cancelled);
+        require(!ended.session && ended.access != Access::online && fixture.session_end_calls == 1,
+                "end_session must clear local authority and release the server seat");
+        expect_error([&] { (void)client->require_access("export", cancelled); }, ErrorKind::denied);
+        require(fixture.session_start_calls == starts_before_end,
+                "a guard after explicit end must not reacquire automatically");
+        const auto restarted = client->start_session(cancelled);
+        require(restarted.access == Access::online && restarted.session &&
+                    restarted.session->sequence == 1 &&
+                    fixture.session_start_calls == starts_before_end + 1,
+                "explicit start must acquire a fresh session after end");
+        const auto prior_id = restarted.session->id;
+        client->close();
+        client.reset();
+        fixture.before_session_start = {};
+        storage.reset();
+
+        ApiFixture reopened(corpus.value);
+        reopened.floating_session = true;
+        reopened.persistent_mode = true;
+        auto next_storage = open_installed_storage(setup, path);
+        auto reopened_client = open_installed_state(
+            setup, Transport("https://example.test", reopened.handler()), next_storage);
+        try {
+            const auto after_restart = reopened_client->snapshot();
+            require(after_restart.access == Access::online && after_restart.session &&
+                        after_restart.session->sequence == 1 &&
+                        after_restart.session->id != prior_id && reopened.session_start_calls == 1,
+                    "restart must validate the saved credential and acquire a fresh "
+                    "non-restored session");
+            reopened_client->close();
+            reopened_client.reset();
+        } catch (...) {
+            reopened_client->close();
+            reopened_client.reset();
+            throw;
+        }
+    } catch (...) {
+        if (client) {
+            client->close();
+            client.reset();
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+        throw;
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
+void test_floating_session_failures_and_generation_fences(const Corpus &corpus) {
+    SessionTestClock clock;
+    auto make_state = [&](ApiFixture &fixture, const std::string &path) {
+        auto setup = config();
+        setup.installation_id.reset();
+        setup.session_keys = std::make_shared<const orbit::detail::SessionKeys>(
+            orbit::detail::SessionKeys::parse(corpus.jwks, "test"));
+        fixture.floating_session = true;
+        return open_installed_state(setup, Transport("https://example.test", fixture.handler()),
+                                    open_installed_storage(setup, path));
+    };
+
+    {
+        const auto path = persistent_test_path();
+        ApiFixture fixture(corpus.value);
+        auto state = make_state(fixture, path);
+        std::atomic_bool cancelled{false};
+        std::atomic_int result{-1};
+        fixture.activation_gate = std::make_shared<Gate>();
+        std::thread activation([&] {
+            try {
+                (void)state->activate("floating-key", "initial-end-operation", std::nullopt,
+                                      cancelled);
+            } catch (const Error &error) {
+                result = static_cast<int>(error.kind());
+            }
+        });
+        fixture.activation_gate->wait_until_entered();
+        (void)state->end_session(cancelled);
+        fixture.activation_gate->release();
+        activation.join();
+        require(result == static_cast<int>(ErrorKind::stale_response) &&
+                    state->snapshot().access != Access::online && fixture.session_start_calls == 0,
+                "late initial activation must not undo end_session");
+        fixture.activation_gate.reset();
+        (void)state->activate("floating-key", "initial-end-operation", std::nullopt, cancelled);
+        require(state->snapshot().access == Access::online,
+                "later explicit activation must restore access");
+        const auto previous_session = state->snapshot().session->id;
+        (void)state->activate("replacement-key", "replacement-operation", std::nullopt, cancelled);
+        require(state->snapshot().session && state->snapshot().session->id != previous_session,
+                "replacement activation must never inherit the old session grant");
+
+        (void)state->end_session(cancelled);
+        reset_access_benchmark_metrics();
+        set_access_benchmark_invalidation_counting(true);
+        state->wake_worker();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const auto ended_checks = access_benchmark_invalidation_checks();
+        set_access_benchmark_invalidation_counting(false);
+        require(ended_checks < 20, "explicitly ended session must not spin the worker");
+        (void)state->start_session(cancelled);
+
+        fixture.jwks_gate = std::make_shared<Gate>();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->config.session_keys.reset();
+        }
+        clock.advance(60);
+        result = -1;
+        std::thread renewal([&] {
+            try {
+                (void)state->refresh(cancelled);
+            } catch (const Error &error) {
+                result = static_cast<int>(error.kind());
+            }
+        });
+        fixture.jwks_gate->wait_until_entered();
+        state->local_logout();
+        fixture.jwks_gate->release();
+        renewal.join();
+        require(result == static_cast<int>(ErrorKind::stale_response) &&
+                    state->snapshot().access == Access::denied,
+                "verification after blocked JWKS must use a fenced immutable profile");
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+
+    {
+        const auto path = persistent_test_path();
+        ApiFixture outage(corpus.value);
+        auto state = make_state(outage, path);
+        std::atomic_bool cancelled{false};
+        (void)state->activate("floating-key", "outage-operation-123", std::nullopt, cancelled);
+        const auto initial = state->snapshot();
+        clock.advance(60);
+        outage.session_renew_failures = 3;
+        const auto retained = state->refresh(cancelled);
+        require(retained.access == Access::online && retained.session &&
+                    retained.session->id == initial.session->id &&
+                    retained.session->sequence == 1 && outage.session_renew_calls == 3,
+                "a transient outage may retain only the still-valid signed interval");
+        clock.advance(60);
+        require(state->snapshot().access == Access::expired,
+                "session authority must expire exactly at the signed deadline");
+        expect_error([&] { (void)state->require_access("export", cancelled); }, ErrorKind::denied);
+        require(state->snapshot().access == Access::expired,
+                "expired session guards cannot return success while a retry is "
+                "delayed");
+        outage.deny_session_start = true;
+        expect_error([&] { (void)state->start_session(cancelled); }, ErrorKind::denied);
+        std::string first_dead_id;
+        {
+            std::lock_guard<std::mutex> lock(outage.mutex);
+            first_dead_id = outage.session_ids.back();
+        }
+        expect_error([&] { (void)state->start_session(cancelled); }, ErrorKind::denied);
+        {
+            std::lock_guard<std::mutex> lock(outage.mutex);
+            require(outage.session_ids.back() != first_dead_id,
+                    "a definitive sequence conflict must not pin retries to one dead "
+                    "session ID");
+        }
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+
+    {
+        const auto path = persistent_test_path();
+        ApiFixture denied(corpus.value);
+        auto state = make_state(denied, path);
+        std::atomic_bool cancelled{false};
+        (void)state->activate("floating-key", "denial-operation-123", std::nullopt, cancelled);
+        denied.deny_session_renewal = true;
+        denied.deny_session_start = true;
+        clock.advance(60);
+        try {
+            (void)state->refresh(cancelled);
+        } catch (const Error &error) {
+            require(error.kind() == ErrorKind::denied,
+                    "session renewal denial had the wrong error kind");
+        }
+        require(!state->snapshot().session && state->snapshot().access != Access::online,
+                "an authoritative renewal denial must immediately clear current "
+                "local authority");
+        int prompts = 0;
+        expect_error(
+            [&] {
+                (void)state->require_access("export", cancelled);
+                // The public prompt API is exercised below with the same denied path.
+            },
+            ErrorKind::denied);
+        auto public_client = make_test_client_from_state(state);
+        expect_error(
+            [&] {
+                (void)public_client.ensure_access("export", [&]() -> std::optional<std::string> {
+                    ++prompts;
+                    return "must-not-prompt";
+                });
+            },
+            ErrorKind::denied);
+        require(prompts == 0, "floating renewal denial must never prompt for a licence key");
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+
+    for (const bool denied_reply : {false, true}) {
+        const auto path = persistent_test_path();
+        ApiFixture fixture(corpus.value);
+        auto state = make_state(fixture, path);
+        std::atomic_bool cancelled{false};
+        (void)state->activate("floating-key", "fence-operation-123", std::nullopt, cancelled);
+        clock.advance(60);
+        fixture.session_gate = std::make_shared<Gate>();
+        std::atomic_int result{-1};
+        std::thread worker([&] {
+            try {
+                (void)state->refresh(cancelled);
+            } catch (const Error &error) {
+                result.store(static_cast<int>(error.kind()));
+            }
+        });
+        fixture.session_gate->wait_until_entered();
+        if (denied_reply)
+            fixture.deny_session_renewal = true;
+        state->local_logout();
+        fixture.session_gate->release();
+        worker.join();
+        require(result == static_cast<int>(ErrorKind::stale_response) &&
+                    state->snapshot().access == Access::denied,
+                "late session success or renewal denial must not cross logout "
+                "generation fencing");
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+    for (const auto action : {"end", "close", "cancel"}) {
+        for (const bool denied_reply : {false, true}) {
+            const auto path = persistent_test_path();
+            ApiFixture fixture(corpus.value);
+            auto state = make_state(fixture, path);
+            std::atomic_bool cancelled{false}, ready{false};
+            (void)state->activate("floating-key", "start-fence-operation", std::nullopt, ready);
+            (void)state->end_session(ready);
+            fixture.session_gate = std::make_shared<Gate>();
+            std::atomic_bool accepted{false};
+            std::thread request([&] {
+                try {
+                    (void)state->start_session(cancelled);
+                    accepted = true;
+                } catch (const Error &) {
+                }
+            });
+            fixture.session_gate->wait_until_entered();
+            fixture.deny_session_start = denied_reply;
+            const auto generation_before = state->generation();
+            std::thread transition;
+            if (std::string_view(action) == "end") {
+                transition = std::thread([&] {
+                    try {
+                        (void)state->end_session(ready);
+                    } catch (const Error &) {
+                    }
+                });
+                for (unsigned attempt = 0;
+                     attempt < 1000 && state->generation() == generation_before; ++attempt)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else if (std::string_view(action) == "close") {
+                transition = std::thread([&] { state->close(); });
+                for (unsigned attempt = 0; attempt < 1000 && !state->owner_cancelled->load();
+                     ++attempt)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else
+                cancelled = true;
+            fixture.session_gate->release();
+            request.join();
+            if (transition.joinable())
+                transition.join();
+            require(!accepted, "blocked session start crossed end, close or cancellation");
+            if (std::string_view(action) != "close")
+                require(state->snapshot().access != Access::online,
+                        "blocked reply restored authority");
+            state->close();
+            state.reset();
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    }
+    {
+        const auto path = persistent_test_path();
+        ApiFixture fixture(corpus.value);
+        auto state = make_state(fixture, path);
+        std::atomic_bool ready{false};
+        (void)state->activate("floating-key", "unknown-end-operation", std::nullopt, ready);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->session_profile_known = false;
+            state->session_required = false;
+        }
+        const auto starts = fixture.session_start_calls.load();
+        (void)state->end_session(ready);
+        expect_error([&] { (void)state->require_access("export", ready); }, ErrorKind::denied);
+        require(fixture.session_start_calls == starts,
+                "unknown-policy end acquired a floating session");
+        state->close();
+        state.reset();
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+}
+
+std::string offline_file(const AppKey &app_key, std::string_view installation,
+                         std::int64_t sequence, std::string_view issuance, std::int64_t issued,
+                         std::int64_t expires, bool export_feature = true) {
     Json::Value claims(Json::objectValue);
     claims["ver"] = 1;
     claims["iss"] = app_key.issuer();
@@ -660,14 +1235,142 @@ std::string offline_file(const AppKey& app_key, std::string_view installation,
     return sign_test_token(claims, "orbit-offline+jwt", "offline-test-fixture");
 }
 
+void test_online_meters_and_updates(const Corpus &corpus) {
+    ApiFixture fixture(corpus.value);
+    auto base = fixture.handler();
+    int mode = 0, calls = 0;
+    std::string operation;
+    auto artifact = parse_json(
+        R"({"id":"artifact","release_id":"release","platform":"linux","architecture":"x64","filename":"app.bin","byte_length":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","delivery_mode":"public","url":"https://download.example.test/file","required_feature":null})");
+    auto handler = [&](std::string_view method, std::string_view url, std::string_view bearer,
+                       std::string_view body, const CancellationView &cancelled) -> HttpResponse {
+        const auto input = body.empty() ? Json::Value{} : parse_json(body);
+        if (url.find("/usage/") != std::string_view::npos) {
+            require(input["credential"].isString() && input["installation_id"].isString(),
+                    "missing activation proof");
+            ++calls;
+            const auto id = input["idempotency_key"].asString();
+            if (operation.empty())
+                operation = id;
+            require(id == operation, "mutation transport retries changed operation ID");
+            if (mode == 0 && calls == 1)
+                return {503, "{}", {}};
+            auto counter = parse_json(
+                R"({"name":"exports","period":"lifetime","limit":5,"used":2,"remaining":3,"period_started_at":null,"resets_at":null})");
+            if ((mode >= 1 && mode <= 3) || mode == 9) {
+                if (mode != 9) {
+                    counter["used"] = 4;
+                    counter["remaining"] = 1;
+                }
+                if (mode == 2)
+                    counter["remaining"] = 5;
+                auto error = parse_json(
+                    R"({"error":{"code":"usage_limit_reached","message":"Limit","request_id":"fixture"}})");
+                error["error"]["counter"] = counter;
+                error["error"]["requested_units"] = 2;
+                error["error"]["idempotency_key"] = mode == 3 ? "different_operation" : id;
+                return {409, encode_json(error), {}};
+            }
+            counter["idempotency_key"] = id;
+            counter["consumed_units"] = 2;
+            if (mode == 4)
+                counter["used"] = Json::Int64(9007199254740992LL);
+            if (mode == 8) {
+                counter["used"] = 0;
+                counter["remaining"] = 5;
+            }
+            return {200, encode_json(counter), {}};
+        }
+        if (url.find("/resources/") != std::string_view::npos) {
+            auto result = parse_json(
+                R"({"name":"projects","limit":5,"used":1,"remaining":4,"allocation_id":"allocation_one","resource_id":"project_one","units":1,"state":"released"})");
+            result["idempotency_key"] = input["idempotency_key"];
+            if (mode == 10) {
+                result["state"] = "active";
+                result["used"] = 0;
+                result["remaining"] = 5;
+            }
+            return {200, encode_json(result), {}};
+        }
+        if (url.find("/updates") != std::string_view::npos) {
+            require(input["channel"] == "stable", "update channel must default to stable");
+            if (mode == 6)
+                return {200, R"({"release":null,"artifact":null})", {}};
+            auto release = parse_json(
+                R"({"id":"release","channel":"stable","version":"1.2","notes":"Changes","release_number":2,"state":"published","created_at":"2026-09-27T00:00:00.123456Z","published_at":"2026-09-27T00:00:00Z","artifacts":[]})");
+            release["artifacts"].append(artifact);
+            if (mode == 7)
+                release["artifacts"].append(artifact);
+            Json::Value result(Json::objectValue);
+            result["release"] = release;
+            result["artifact"] = artifact;
+            return {200, encode_json(result), {}};
+        }
+        if (url.find("/downloads/authorize") != std::string_view::npos) {
+            Json::Value result(Json::objectValue);
+            result["artifact"] = artifact;
+            result["ticket"] = Json::nullValue;
+            result["expires_at"] = Json::nullValue;
+            return {200, encode_json(result), {}};
+        }
+        return base(method, url, bearer, body, cancelled);
+    };
+    auto client =
+        make_test_client(config(), Transport("https://example.test", handler), fixture.storage);
+    (void)client.activate("synthetic-key");
+    auto consumed = client.consume("exports", 2);
+    require(calls == 2 && consumed.counter.used == 2 && consumed.idempotency_key == operation,
+            "lost response retry must keep typed consumption and original ID");
+    for (const auto test_mode : {1, 2, 3, 4, 8, 9}) {
+        mode = test_mode;
+        try {
+            (void)client.consume("exports", 2, operation);
+            throw std::runtime_error("invalid consume accepted");
+        } catch (const OperationError &error) {
+            require(error.operation_id() == operation &&
+                        error.kind() ==
+                            (mode == 1 ? ErrorKind::denied : ErrorKind::invalid_response),
+                    "uncertain mutation lost ID");
+            require(mode == 1 ? error.usage_counter() && error.usage_counter()->remaining == 1
+                              : !error.usage_counter(),
+                    "unvalidated capacity denial escaped");
+        }
+    }
+    mode = 0;
+    auto allocated = client.acquire_resource("projects", "project_one");
+    require(allocated.state == AllocationState::released && allocated.counter.used == 1,
+            "acquire replay must retain released allocation and current counter");
+    require(client.release_resource("projects", allocated.allocation_id).state ==
+                AllocationState::released,
+            "release must return a released allocation");
+    expect_error([&] { (void)client.consume("exports", 0); }, ErrorKind::configuration);
+    mode = 10;
+    expect_error([&] { (void)client.acquire_resource("projects", "project_one"); },
+                 ErrorKind::invalid_response);
+    mode = 5;
+    auto update = client.check_for_update(1, "stable", UpdateTarget{"linux", "x64"});
+    require(update && update->release.release_number == 2 && update->release.artifacts.size() == 1,
+            "update must expose one exact target");
+    require(!client.authorize_download("release", "artifact").ticket,
+            "public download must not have a ticket");
+    mode = 6;
+    require(!client.check_for_update(1), "empty update must be optional");
+    mode = 7;
+    expect_error([&] { (void)client.check_for_update(1, "stable", UpdateTarget{"linux", "x64"}); },
+                 ErrorKind::invalid_response);
+    mode = 5;
+    expect_error(
+        [&] { (void)client.check_for_update(1, "stable", UpdateTarget{"linux", "arm64"}); },
+        ErrorKind::invalid_response);
+    client.close();
+}
+
 struct FakeClock {
     std::atomic<std::int64_t> elapsed{100'000'000'000LL};
     std::atomic<std::int64_t> wall{1'700'000'000};
     FakeClock() {
         auto self = this;
-        set_test_clock([self] {
-            return std::make_pair(self->elapsed.load(), self->wall.load());
-        });
+        set_test_clock([self] { return std::make_pair(self->elapsed.load(), self->wall.load()); });
     }
     ~FakeClock() { set_test_clock({}); }
     void advance(std::int64_t seconds) {
@@ -676,10 +1379,9 @@ struct FakeClock {
     }
 };
 
-template <class Predicate>
-bool wait_for_condition(Predicate predicate);
+template <class Predicate> bool wait_for_condition(Predicate predicate);
 
-void test_installed_offline_file_lifecycle(const Corpus& corpus) {
+void test_installed_offline_file_lifecycle(const Corpus &corpus) {
     std::ifstream offline_input(ORBIT_OFFLINE_VECTORS_PATH, std::ios::binary);
     require(offline_input.good(), "offline test vector file is unavailable");
     const std::string offline_bytes((std::istreambuf_iterator<char>(offline_input)), {});
@@ -687,25 +1389,29 @@ void test_installed_offline_file_lifecycle(const Corpus& corpus) {
     const auto trusted = std::make_shared<const orbit::detail::OfflineKeys>(
         orbit::detail::OfflineKeys::parse(offline_corpus["jwks"], "test"));
     const auto app_key = AppKey::parse(
-        "orbit_app_test_" + base64url_encode(
-            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
-            std::string_view("https://orbit.example.test").size()) + ".app.test");
+        "orbit_app_test_" +
+        base64url_encode(reinterpret_cast<const unsigned char *>("https://orbit.example.test"),
+                         std::string_view("https://orbit.example.test").size()) +
+        ".app.test");
     require(app_key.public_key() ==
-        "orbit_app_test_" + base64url_encode(
-            reinterpret_cast<const unsigned char*>("https://orbit.example.test"),
-            std::string_view("https://orbit.example.test").size()) + ".app.test",
-        "public app-key serialization must round trip exactly");
+                "orbit_app_test_" +
+                    base64url_encode(
+                        reinterpret_cast<const unsigned char *>("https://orbit.example.test"),
+                        std::string_view("https://orbit.example.test").size()) +
+                    ".app.test",
+            "public app-key serialization must round trip exactly");
 
     constexpr std::int64_t issued = 1800000000;
     std::atomic<std::int64_t> elapsed{1000000000};
     std::atomic<std::int64_t> wall{issued};
     set_test_clock([&] { return std::pair{elapsed.load(), wall.load()}; });
     const auto path = persistent_test_path();
-    auto make_client = [&](ApiFixture& fixture, bool include_keys = true) {
+    auto make_client = [&](ApiFixture &fixture, bool include_keys = true) {
         auto setup = config();
         setup.installation_id.reset();
         setup.public_app_key = app_key.public_key();
-        if (include_keys) setup.offline_keys = trusted;
+        if (include_keys)
+            setup.offline_keys = trusted;
         auto storage = open_installed_storage(setup, path);
         return make_test_installed_client(setup,
             Transport("https://example.test", fixture.handler()), std::move(storage));
@@ -728,36 +1434,43 @@ void test_installed_offline_file_lifecycle(const Corpus& corpus) {
             const auto request = client.offline_request();
             installation = request.installation_id;
             const auto request_json = parse_json(request.to_json());
-            require(request_json["format"] == "orbit-offline-request" && request_json["version"] == 1 &&
-                    request_json["app_key"] == app_key.public_key() &&
-                    request_json["installation_id"] == installation &&
-                    request_json["fingerprint"].isNull() && request_json["fingerprint_provider"].isNull(),
-                "offline request must serialize stable scope and null binding fields");
+            require(request_json["format"] == "orbit-offline-request" &&
+                        request_json["version"] == 1 &&
+                        request_json["app_key"] == app_key.public_key() &&
+                        request_json["installation_id"] == installation &&
+                        request_json["fingerprint"].isNull() &&
+                        request_json["fingerprint_provider"].isNull(),
+                    "offline request must serialize stable scope and null binding "
+                    "fields");
             first = offline_file(app_key, installation, 1, "offline_issue_1", issued, issued + 120);
             const auto imported = client.import_offline_file(" \t" + first + "\n");
             require(imported.access == Access::offline && imported.offline_file_mode &&
-                    imported.has_feature("export") && imported.expires_at &&
-                    imported.expires_at->time_since_epoch().count() == issued + 120,
+                        imported.has_feature("export") && imported.expires_at &&
+                        imported.expires_at->time_since_epoch().count() == issued + 120,
                     "offline file import must expose only signed typed metadata");
             require(client.require_access("export").access == Access::offline,
                     "offline file must authorize its signed feature without HTTP");
             auto missing = expect_error([&] { (void)client.require_access("missing"); },
                                         ErrorKind::feature_unavailable);
-            require(missing.code() == "feature_unavailable", "offline feature denial lost its typed code");
+            require(missing.code() == "feature_unavailable",
+                    "offline feature denial lost its typed code");
             require(fixture.requests.empty(), "offline file request/guard made an HTTP request");
-            const auto conflict = offline_file(app_key, installation, 1,
-                "offline_issue_conflict", issued, issued + 120, false);
+            const auto conflict = offline_file(app_key, installation, 1, "offline_issue_conflict",
+                                               issued, issued + 120, false);
             const auto sequence_error = expect_error(
                 [&] { (void)client.import_offline_file(conflict); }, ErrorKind::denied);
-            require(sequence_error.code() == "offline_sequence", "equal-sequence conflict was not rejected");
+            require(sequence_error.code() == "offline_sequence",
+                    "equal-sequence conflict was not rejected");
             require(client.import_offline_file(first).access == Access::offline,
                     "exact equal-sequence reimport should be idempotent");
             elapsed.fetch_add(500000000);
             (void)client.import_offline_file(first);
             elapsed.fetch_add(500000000);
-            require(client.import_offline_file(first).remaining_offline == std::chrono::seconds(119),
+            require(client.import_offline_file(first).remaining_offline ==
+                        std::chrono::seconds(119),
                     "reimport must count fractional elapsed time exactly once");
-            require(client.import_offline_file(first).remaining_offline == std::chrono::seconds(119),
+            require(client.import_offline_file(first).remaining_offline ==
+                        std::chrono::seconds(119),
                     "reimport without elapsed time must not move the deadline");
             Cancellation cancelled;
             cancelled.cancel();
@@ -768,15 +1481,17 @@ void test_installed_offline_file_lifecycle(const Corpus& corpus) {
             client.close();
             const auto saved = inspect_record();
             require(saved["format"] == 3 && saved["offline"]["jws"] == first &&
-                    saved["offline"]["sequence"] == 1 && saved["credential"].isNull() &&
-                    saved["access"].isNull() && saved["pending_activation"].isNull(),
-                "offline import must durably store one authority without online access");
+                        saved["offline"]["sequence"] == 1 && saved["credential"].isNull() &&
+                        saved["access"].isNull() && saved["pending_activation"].isNull(),
+                    "offline import must durably store one authority without online "
+                    "access");
         }
         {
             ApiFixture missing_keys(corpus.value);
             expect_error([&] { (void)make_client(missing_keys, false); }, ErrorKind::configuration);
             require(missing_keys.requests.empty() && inspect_record()["offline"]["jws"] == first,
-                    "missing trusted keys must preserve an active signed file without HTTP");
+                    "missing trusted keys must preserve an active signed file "
+                    "without HTTP");
         }
         wall.store(issued + 121);
         elapsed.store(2000000000);
@@ -785,49 +1500,60 @@ void test_installed_offline_file_lifecycle(const Corpus& corpus) {
             auto client = make_client(restarted);
             const auto expired = client.snapshot();
             require(expired.access == Access::expired && expired.offline_file_mode &&
-                    expired.expires_at && expired.expires_at->time_since_epoch().count() == issued + 120,
+                        expired.expires_at &&
+                        expired.expires_at->time_since_epoch().count() == issued + 120,
                     "restart downtime must count toward absolute file expiry");
-            const auto expired_error = expect_error([&] { (void)client.require_access("export"); },
-                                                   ErrorKind::denied);
+            const auto expired_error =
+                expect_error([&] { (void)client.require_access("export"); }, ErrorKind::denied);
             int prompts = 0;
-            expect_error([&] {
-                (void)client.ensure_access("export", [&]() -> std::optional<std::string> {
-                    ++prompts;
-                    return "unexpected-key";
-                });
-            }, ErrorKind::denied);
+            expect_error(
+                [&] {
+                    (void)client.ensure_access("export", [&]() -> std::optional<std::string> {
+                        ++prompts;
+                        return "unexpected-key";
+                    });
+                },
+                ErrorKind::denied);
             require(expired_error.code() == "offline_file_expired" && restarted.requests.empty(),
                     "expired file must not prompt or validate online");
             require(prompts == 0, "expired file access must never prompt for an activation key");
             const auto renewal_issued = wall.load() + 2;
-            renewed = offline_file(app_key, installation, 2, "offline_issue_2",
-                                   renewal_issued, renewal_issued + 240);
-            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(240) &&
-                    restarted.requests.empty(),
-                    "future-skewed renewal must advance the original anchor only to the signed time floor");
-            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(240),
-                    "repeating a future-skewed renewal without elapsed time must not move its deadline");
+            renewed = offline_file(app_key, installation, 2, "offline_issue_2", renewal_issued,
+                                   renewal_issued + 240);
+            require(client.import_offline_file(renewed).remaining_offline ==
+                            std::chrono::seconds(240) &&
+                        restarted.requests.empty(),
+                    "future-skewed renewal must advance the original anchor only to "
+                    "the signed time floor");
+            require(client.import_offline_file(renewed).remaining_offline ==
+                        std::chrono::seconds(240),
+                    "repeating a future-skewed renewal without elapsed time must not "
+                    "move its deadline");
             elapsed.fetch_add(4000000000LL);
             wall.fetch_add(4);
-            require(client.import_offline_file(renewed).remaining_offline == std::chrono::seconds(236),
+            require(client.import_offline_file(renewed).remaining_offline ==
+                        std::chrono::seconds(236),
                     "a renewed file must count whole elapsed seconds exactly once");
-            expect_error([&] { (void)client.import_offline_file(first); }, ErrorKind::invalid_response);
+            expect_error([&] { (void)client.import_offline_file(first); },
+                         ErrorKind::invalid_response);
             wall.store(issued + 200);
             elapsed.store(81000000000LL);
             client.logout();
-            require(client.snapshot().access == Access::denied, "logout retained offline authority");
+            require(client.snapshot().access == Access::denied,
+                    "logout retained offline authority");
             elapsed.fetch_add(121000000000LL);
-            const auto frozen_clock = expect_error(
-                [&] { (void)client.import_offline_file(first); }, ErrorKind::clock_uncertain);
+            const auto frozen_clock = expect_error([&] { (void)client.import_offline_file(first); },
+                                                   ErrorKind::clock_uncertain);
             require(frozen_clock.code() == "clock_uncertain" && restarted.requests.empty(),
-                    "offline anchor and floors must survive logout without accepting a frozen-wall replay");
+                    "offline anchor and floors must survive logout without accepting "
+                    "a frozen-wall replay");
             client.close();
         }
         const auto after_logout = inspect_record();
         require(after_logout["format"] == 3 && after_logout["offline"]["jws"].isNull() &&
-                after_logout["offline"]["sequence"] == 2 &&
-                after_logout["offline"]["time_high_water"].asInt64() >= issued + 200 &&
-                after_logout["offline"]["wall_high_water"].asInt64() >= issued + 200,
+                    after_logout["offline"]["sequence"] == 2 &&
+                    after_logout["offline"]["time_high_water"].asInt64() >= issued + 200 &&
+                    after_logout["offline"]["wall_high_water"].asInt64() >= issued + 200,
                 "logout must clear authority while retaining renewal and clock floors");
     } catch (...) {
         set_test_clock({});
@@ -1203,6 +1929,13 @@ void test_owned_licence_offline_file_policy_bounds(const Corpus& corpus) {
     }
     fixture.omit_offline_file_seconds = true;
     expect_error([&] { (void)client.owned_licences(); }, ErrorKind::invalid_response);
+    fixture.omit_offline_file_seconds = false;
+    fixture.offline_file_seconds = 0;
+    for (const int field : {1, 2}) {
+        fixture.omit_limit_map = field;
+        (void)client.login("alice", "password");
+        expect_error([&] { (void)client.owned_licences(); }, ErrorKind::invalid_response);
+    }
 }
 
 void test_public_timestamp_seconds_range() {
@@ -2503,6 +3236,7 @@ int main(int argc, char** argv) {
         test_fingerprint_options();
         test_strict_bounded_json();
         test_shared_grant_vectors(corpus);
+        const auto session_vectors = test_shared_session_vectors();
         test_empty_explicit_activation_operation_ids(corpus);
         test_transport_retry_errors_and_cancellation();
         test_activation_accounts_and_proofs(corpus);
@@ -2529,6 +3263,9 @@ int main(int argc, char** argv) {
         test_persistent_strict_outage_is_not_activation_required(corpus);
         test_persistent_online_restart_and_offline_recovery(corpus);
         test_installed_offline_file_lifecycle(corpus);
+        test_installed_floating_session_lifecycle(corpus);
+        test_online_meters_and_updates(corpus);
+        test_floating_session_failures_and_generation_fences(corpus);
         test_offline_transition_floors(corpus);
         test_offline_identity_change_clears_file(corpus);
         test_offline_activation_logout_race(corpus);
@@ -2539,7 +3276,9 @@ int main(int argc, char** argv) {
         test_jwks_recovery_and_offline_clock(corpus);
         test_logout_generation_fences_late_responses(corpus);
         std::cout << "C++ SDK tests passed (" << app_key_vectors
-                  << " app-key vectors, 104 grant vectors, fingerprint options, strict JSON, transport, access, account and race cases).\n";
+                  << " app-key vectors, 104 grant vectors, " << session_vectors
+                  << " session vectors, fingerprint options, strict JSON, "
+                     "transport, access, account and race cases).\n";
         return 0;
     } catch (const Error& error) {
         std::cerr << "C++ SDK error kind=" << static_cast<unsigned>(error.kind())

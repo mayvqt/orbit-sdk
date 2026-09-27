@@ -34,6 +34,8 @@ internal sealed record OrbitSetup(string ApiOrigin, string ApplicationId, string
 
 public enum Access { Denied, Online, Offline, RefreshRequired, Expired }
 
+public sealed record SessionInfo(string Id, long Sequence);
+
 /// <summary>Informational state. Call RequireAccessAsync immediately before each protected operation.</summary>
 public sealed record Snapshot(
     Access Access,
@@ -47,6 +49,7 @@ public sealed record Snapshot(
 {
     public int? PolicyVersion { get; init; }
     public bool OfflineFileMode { get; init; }
+    public SessionInfo? Session { get; init; }
     public bool HasFeature(string feature) => Entitlements.TryGetValue(feature, out var enabled) && enabled;
     internal static readonly IReadOnlyDictionary<string, bool> EmptyEntitlements =
         new ReadOnlyDictionary<string, bool>(new Dictionary<string, bool>());

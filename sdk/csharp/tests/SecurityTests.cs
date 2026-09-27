@@ -1307,6 +1307,7 @@ internal static class SecurityTests
     {
         long seconds = 0;
         var omit = false;
+        string? omitMap = null;
         await using var server = new LoopbackServer((request, _) =>
         {
             if (request.Path == "/api/client/v1/sessions") return Task.FromResult(LoginReply);
@@ -1318,9 +1319,12 @@ internal static class SecurityTests
                     ["expiry_mode"] = "never", ["first_used_at"] = null, ["expires_at"] = null,
                     ["duration_seconds"] = null, ["device_limit"] = 1, ["hwid_locked"] = false,
                     ["offline_allowed"] = false, ["offline_seconds"] = 0,
+                    ["usage_limits"] = new Dictionary<string, object>(),
+                    ["resource_limits"] = new Dictionary<string, object>(),
                     ["entitlements"] = new Dictionary<string, bool> { ["export"] = true }
                 };
                 if (!omit) licence["offline_file_seconds"] = seconds;
+                if (omitMap != null) licence.Remove(omitMap);
                 return Task.FromResult(new FixtureReply(200, JsonSerializer.Serialize(new
                 {
                     items = new[] { licence }, next_cursor = (string?)null
@@ -1348,6 +1352,15 @@ internal static class SecurityTests
         await ExpectAsync(OrbitError.InvalidResponse,
             () => client.OwnedLicencesAsync(cancellationToken: cancellationToken));
         Require(server.RequestCount == 13);
+        omit = false;
+        seconds = 0;
+        foreach (var field in new[] { "usage_limits", "resource_limits" })
+        {
+            omitMap = field;
+            await client.LoginAsync("alice", "synthetic password", cancellationToken);
+            await ExpectAsync(OrbitError.InvalidResponse,
+                () => client.OwnedLicencesAsync(cancellationToken: cancellationToken));
+        }
     }
 
     private static async Task RedirectsAsync(CancellationToken cancellationToken)

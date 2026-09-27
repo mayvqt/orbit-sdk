@@ -38,18 +38,18 @@ void validate_port(std::string_view port) {
     if (value == 0) invalid_endpoint();
 }
 
-void validate_endpoint(std::string_view endpoint) {
+void validate_endpoint(std::string_view endpoint, bool allow_query = false) {
     try {
         if (endpoint.empty() || endpoint.size() > 2048 || endpoint.substr(0, 8) != "https://" ||
-            std::any_of(endpoint.begin(), endpoint.end(), [](unsigned char c) {
-                return c <= 32 || c >= 127 || std::string_view("\\?#<>\"{}|^`").find(c) != std::string_view::npos;
+            std::any_of(endpoint.begin(), endpoint.end(), [allow_query](unsigned char c) {
+                return c <= 32 || c >= 127 || std::string_view("\\#<>\"{}|^`").find(c) != std::string_view::npos || (!allow_query && c == '?');
             })) invalid_endpoint();
         for (std::size_t i = 0; i < endpoint.size(); ++i) {
             if (endpoint[i] != '%') continue;
             if (i + 2 >= endpoint.size() || !hex(endpoint[i + 1]) || !hex(endpoint[i + 2])) invalid_endpoint();
             i += 2;
         }
-        const auto path_start = endpoint.find('/', 8);
+        const auto path_start = endpoint.find_first_of("/?", 8);
         const auto authority = endpoint.substr(8, path_start == std::string_view::npos
             ? endpoint.size() - 8 : path_start - 8);
         if (authority.empty() || authority.find('@') != std::string_view::npos ||
@@ -94,6 +94,10 @@ std::string text(const Json::Value& value, const char* name) {
     return value[name].asString();
 }
 } // namespace
+
+namespace detail {
+void validate_delivery_url(std::string_view url, bool allow_query) { validate_endpoint(url, allow_query); }
+}
 
 struct DownloadTicketVerifier::State {
     AppKey app;

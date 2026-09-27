@@ -294,10 +294,12 @@ void ClientState::worker_loop() noexcept {
     while (!worker_cancelled.load(std::memory_order_relaxed)) {
         const auto observed_epoch = worker_epoch.load(std::memory_order_relaxed);
         bool refresh_now = false;
+        std::uint64_t expected_generation = 0;
         bool checkpoint_now = false;
         auto wake_at = std::chrono::steady_clock::now() + std::chrono::hours(1);
         {
             std::lock_guard<std::mutex> lock(mutex);
+            expected_generation = current_generation;
             if (persistent && offline && persistent_record.isMember("offline") &&
                 !persistent_record["offline"]["jws"].isNull()) {
                 const auto last = offline->last_checkpoint;
@@ -309,6 +311,27 @@ void ClientState::worker_loop() noexcept {
                 }
             } else if (!persistent || !credential || !persistent_record["pending_activation"].isNull()) {
                 // A pending key mutation is resumed only by the caller with the same key.
+            } else if (session_required && session_disabled) {
+                // An explicit end parks the worker until a foreground restart.
+            } else if (session_required && !session_disabled) {
+                const auto now = std::chrono::steady_clock::now();
+                if (session_retry_deadline && now < *session_retry_deadline) {
+                    wake_at = std::min(wake_at, *session_retry_deadline);
+                } else if (!session_grant || !session_anchor) {
+                    refresh_now = true;
+                } else {
+                    try {
+                        const auto server_now = session_anchor->now();
+                        const auto until =
+                            std::max<std::int64_t>(1, session_grant->refresh_after - server_now);
+                        if (server_now >= session_grant->refresh_after)
+                            refresh_now = true;
+                        else
+                            wake_at = std::min(wake_at, now + std::chrono::seconds(until));
+                    } catch (...) {
+                        refresh_now = true;
+                    }
+                }
             } else if (retry_deadline) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= *retry_deadline) {
@@ -326,10 +349,10 @@ void ClientState::worker_loop() noexcept {
                         state.access == ::orbit::Access::offline) {
                         refresh_now = true;
                     } else {
-                        const auto until = std::max<std::int64_t>(
-                            1, claims->refresh_after - anchor->now());
-                        wake_at = std::min(wake_at,
-                            std::chrono::steady_clock::now() + std::chrono::seconds(until));
+                        const auto until =
+                            std::max<std::int64_t>(1, claims->refresh_after - anchor->now());
+                        wake_at = std::min(wake_at, std::chrono::steady_clock::now() +
+                                                        std::chrono::seconds(until));
                     }
                 } catch (...) {
                     refresh_now = true;
@@ -341,8 +364,7 @@ void ClientState::worker_loop() noexcept {
                         std::chrono::seconds(60)) {
                     checkpoint_now = true;
                 } else {
-                    wake_at = std::min(wake_at, last_checkpoint +
-                        std::chrono::seconds(60));
+                    wake_at = std::min(wake_at, last_checkpoint + std::chrono::seconds(60));
                 }
             }
         }
@@ -351,12 +373,13 @@ void ClientState::worker_loop() noexcept {
             try {
                 std::lock_guard<std::mutex> lock(mutex);
                 checkpoint_persistent_locked(false);
-            } catch (const Error& error) {
+            } catch (const Error &error) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (error.kind() == ErrorKind::clock_uncertain && offline) {
                         offline->uncertain = true;
-                        if (offline_clock) offline_clock->uncertain = true;
+                        if (offline_clock)
+                            offline_clock->uncertain = true;
                     } else {
                         claims.reset();
                         anchor.reset();
@@ -385,8 +408,14 @@ void ClientState::worker_loop() noexcept {
                 // Transport failures normally set this deadline. Other failures
                 // before a reply must not turn a due grant into a busy loop.
                 std::lock_guard<std::mutex> lock(mutex);
+                if (current_generation != expected_generation)
+                    continue;
                 const auto earliest = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                if (!retry_deadline || *retry_deadline < earliest) retry_deadline = earliest;
+                if (session_required && !session_disabled) {
+                    if (!session_retry_deadline || *session_retry_deadline < earliest)
+                        session_retry_deadline = earliest;
+                } else if (!retry_deadline || *retry_deadline < earliest)
+                    retry_deadline = earliest;
             }
             continue;
         }
@@ -430,6 +459,52 @@ void ClientState::close() {
         std::unique_lock<std::mutex> lock(lifecycle_mutex);
         lifecycle_changed.wait(lock, [this] { return active_calls == 0; });
     }
+
+    // No foreground or worker operation can still be using the transport.
+    // Temporarily permit the bounded best-effort session release below.
+    if (persistent)
+        owner_cancelled->store(false, std::memory_order_relaxed);
+
+    std::optional<std::pair<Credential, std::string>> release;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (credential) {
+            if (session_grant)
+                release = std::make_pair(*credential, session_grant->session_id);
+            else if (pending_session_id)
+                release = std::make_pair(*credential, *pending_session_id);
+        }
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+    }
+    if (release) {
+        std::atomic_bool release_cancelled{false};
+        std::atomic_bool release_finished{false};
+        std::mutex release_mutex;
+        std::condition_variable release_changed;
+        std::thread deadline([&] {
+            std::unique_lock<std::mutex> lock(release_mutex);
+            if (release_changed.wait_for(lock, std::chrono::seconds(2), [&] {
+                    return release_finished.load(std::memory_order_relaxed);
+                }))
+                return;
+            if (!release_finished.load(std::memory_order_relaxed))
+                release_cancelled.store(true, std::memory_order_relaxed);
+        });
+        try {
+            const auto path = "/api/client/v1/activations/" + release->first.activation_id +
+                              "/sessions/" + release->second + "/end";
+            (void)transport.post(path, credential_body(release->first), false, release_cancelled);
+        } catch (...) {
+        }
+        release_finished.store(true, std::memory_order_relaxed);
+        release_changed.notify_all();
+        deadline.join();
+    }
+    if (persistent)
+        owner_cancelled->store(true, std::memory_order_relaxed);
 
     std::exception_ptr failure;
     {
