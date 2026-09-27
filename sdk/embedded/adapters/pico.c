@@ -52,8 +52,10 @@ int mbedtls_hardware_poll(void *unused, unsigned char *out, size_t n,
   return 0;
 }
 static int32_t poll_one(orbit_pico_t *b) {
+  /* lwIP reports handshake and certificate failures as an abort before the
+   * connection is established; a reset or abort afterwards is an outage. */
   if (b->failed)
-    return ORBIT_CLIENT_UNTRUSTED;
+    return b->connected ? ORBIT_CLIENT_TRANSIENT : ORBIT_CLIENT_UNTRUSTED;
   if (time_us_64() >= b->deadline)
     return ORBIT_CLIENT_TRANSIENT;
   cyw43_arch_poll();
@@ -166,7 +168,7 @@ static int32_t write_tls(void *arg, const uint8_t *p, uint32_t n) {
     if (r)
       return r;
     if (!b->pcb || b->closed)
-      return ORBIT_CLIENT_UNTRUSTED;
+      return ORBIT_CLIENT_TRANSIENT;
     uint32_t m = altcp_sndbuf(b->pcb);
     if (m > n)
       m = n;
@@ -178,7 +180,7 @@ static int32_t write_tls(void *arg, const uint8_t *p, uint32_t n) {
     if (e == ERR_MEM)
       continue;
     if (e != ERR_OK)
-      return ORBIT_CLIENT_UNTRUSTED;
+      return ORBIT_CLIENT_TRANSIENT;
     altcp_output(b->pcb);
     p += m;
     n -= m;

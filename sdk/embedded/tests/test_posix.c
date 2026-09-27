@@ -41,6 +41,20 @@ int main(void) {
   CHECK(s.load(s.context, out, sizeof(out), &length) == ORBIT_CLIENT_STORAGE);
   orbit_posix_close(&a);
   CHECK(unlinkat(dir, "orbit-journal.bin", 0) == 0);
+  /* A journal left empty by an interrupted first creation is initialized; a
+   * short journal containing data still fails closed. */
+  int partial = openat(dir, "orbit-journal.bin", O_RDWR | O_CREAT | O_EXCL, 0600);
+  CHECK(partial >= 0);
+  close(partial);
+  CHECK(orbit_posix_open(&a, dir, &s) == 0);
+  CHECK(s.load(s.context, out, sizeof(out), &length) == ORBIT_CLIENT_NOT_FOUND);
+  orbit_posix_close(&a);
+  CHECK(unlinkat(dir, "orbit-journal.bin", 0) == 0);
+  partial = openat(dir, "orbit-journal.bin", O_RDWR | O_CREAT | O_EXCL, 0600);
+  CHECK(partial >= 0 && write(partial, "ORBJNL2", 8) == 8);
+  close(partial);
+  CHECK(orbit_posix_open(&a, dir, &s) == ORBIT_CLIENT_STORAGE);
+  CHECK(unlinkat(dir, "orbit-journal.bin", 0) == 0);
   CHECK(symlinkat("/etc/passwd", dir, "orbit-journal.bin") == 0);
   CHECK(orbit_posix_open(&a, dir, &s) == ORBIT_CLIENT_STORAGE);
   CHECK(unlinkat(dir, "orbit-journal.bin", 0) == 0);

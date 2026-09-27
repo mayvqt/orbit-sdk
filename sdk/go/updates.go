@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -358,7 +359,17 @@ func (a DownloadAuthorization) download(ctx context.Context, destination string,
 	if ctx.Err() != nil {
 		return ErrCancelled
 	}
-	if err != nil || written != a.artifact.ByteLength || hex.EncodeToString(digest.Sum(nil)) != a.artifact.SHA256 {
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			return ErrStorage
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return ErrInvalidResponse
+		}
+		return classifyTransport(err)
+	}
+	if written != a.artifact.ByteLength || hex.EncodeToString(digest.Sum(nil)) != a.artifact.SHA256 {
 		return ErrInvalidResponse
 	}
 	if temp.Sync() != nil || temp.Close() != nil {

@@ -1,65 +1,42 @@
 # Python quickstart
 
-From the repository root, install the SDK into your application's virtual
-environment:
+Requires Python 3.12 or newer. From the repository root, install the SDK into
+your virtual environment and set the app key from Orbit's **Integration** page:
 
 ```sh
 python -m pip install ./sdk/python
-```
-
-Alternatively, set `PYTHONPATH=sdk/python` to use the checkout directly.
-Python 3.12 or newer is required. The Python client uses
-native Python logic and the `cryptography` package; no Rust build is needed.
-
-Copy the app key from Orbit's **Integration** page and set one variable:
-
-```sh
-export ORBIT_APP_KEY='orbit_app_test_...'
-```
-
-Run the key activation example:
-
-```sh
+export ORBIT_APP_KEY='orbit_app_test_…'
 python examples/python/quickstart.py
 ```
 
-The quickstart reuses valid online or offline access. It asks for a key only
-when no usable activation exists; network outages are shown without prompting
-for another key. The SDK keeps the secure retry ID and an input digest for an
-activation with an uncertain result. It never stores the raw key.
+The quickstart reuses existing access and asks for a licence key only when the
+installation has no activation. An outage is reported without prompting. Set
+`ORBIT_STATE_PATH` to use a dedicated absolute state directory.
 
-The client uses the native machine identity by default when available. Set
-`ORBIT_STATE_PATH` to an absolute private directory on persistent storage for
-a service or container. If a container shares machine identity with its image,
-open it with `machine_binding=False` in your application.
-
-## Optional: customer accounts
+## Customer accounts
 
 The username and password belong to your app's customer account, not an Orbit
-dashboard account. Sign-in does not grant access; customers still choose and
-activate a licence.
+dashboard account:
 
 ```sh
-export ORBIT_MODE=account
-export ORBIT_USERNAME='alice'
-python examples/python/quickstart.py
+ORBIT_MODE=account ORBIT_USERNAME='alice' python examples/python/quickstart.py
 ```
 
 The example prompts for the password without echoing it, lists the customer's
-owned licences and activates the selected licence. `ORBIT_MODE` defaults to
-`key`.
+licences and activates the one you choose.
 
-## Seller-hosted downloads
+## Updates, usage and resources
 
-Run `python examples/python/online_operations.py 1 ./chosen-update.bin` to discover
-and verify an update after activation. The arguments are your installed release
-number and an explicit destination. The example never executes the file and
-refuses to overwrite an existing destination. Its reusable functions also show
-usage consumption before report creation and explicit project allocation/release.
-Use durable job IDs for retries and store each allocation ID beside its project.
-Configure the policy's `exports` usage limit and `projects` resource limit first.
+After activation, discover and verify an update for installed release number
+`1`, saving it to an explicit destination that must not exist yet:
 
-The [seller backend example](seller-downloads/README.md) demonstrates verifying
-Orbit download tickets before returning an expiring URL from the seller's
-private S3-compatible storage. Ticket verification runs on the seller's backend,
-separately from the installed application.
+```sh
+python examples/python/online_operations.py 1 ./chosen-update.bin
+```
+
+The file is never executed. [`online_operations.py`](online_operations.py) also
+shows reserving `exports` usage before a report and tracking `projects`
+allocations; configure those limits on the policy first.
+
+The [seller backend example](seller-downloads/README.md) verifies Orbit
+download tickets before returning an expiring URL from private storage.

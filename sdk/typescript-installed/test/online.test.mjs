@@ -76,9 +76,11 @@ test("usage fixed replay, resource current replay, explicit release and invalid 
   reply("resources/projects/acquire", released);
   assert.equal((await client.acquireResource("projects", "project", 2, { idempotencyKey: key })).state, "released");
   const count = requests.length;
-  for (const units of [0, -1, true, 1.5, 2 ** 53]) assert.throws(() => client.consume("exports", units), TypeError);
-  for (const idempotencyKey of ["", "short", " ".repeat(16)]) assert.throws(() => client.consume("exports", 1, { idempotencyKey }), TypeError);
-  assert.throws(() => client.acquireResource("projects", "../path"), TypeError);
+  // Invalid input rejects the returned promise rather than throwing synchronously.
+  for (const units of [0, -1, true, 1.5, 2 ** 53]) await assert.rejects(client.consume("exports", units), TypeError);
+  for (const idempotencyKey of ["", "short", " ".repeat(16)]) await assert.rejects(client.consume("exports", 1, { idempotencyKey }), TypeError);
+  await assert.rejects(client.acquireResource("projects", "../path"), TypeError);
+  await assert.rejects(client.checkForUpdate(-1), TypeError);
   assert.equal(requests.length, count);
 });
 
@@ -87,7 +89,9 @@ test("lost replies, strict response failures, late logout and cancellation prese
   reply("usage/exports/consume", () => { throw fail("transient", "network_unavailable"); });
   let generated;
   await assert.rejects(client.consume("exports"), (e) => {
-    assert.ok(e instanceof MutationUncertainError); generated = e.idempotencyKey; return true;
+    assert.ok(e instanceof MutationUncertainError); generated = e.idempotencyKey;
+    assert.equal(e.cause?.code, "network_unavailable");
+    return true;
   });
   assert.equal(generated, requests.at(-1).body.idempotency_key);
   assert.ok(generated.length >= 16);

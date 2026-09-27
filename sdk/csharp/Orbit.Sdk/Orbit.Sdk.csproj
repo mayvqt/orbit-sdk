@@ -16,7 +16,7 @@
     <DefineConstants>$(DefineConstants);ORBIT_LOCAL_DEVELOPMENT</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
-    <None Include="../../LICENSE" Pack="true" PackagePath="" Link="LICENSE" />
+    <None Include="../LICENSE" Pack="true" PackagePath="" Link="LICENSE" />
   </ItemGroup>
   <Target Name="BuildOrbitMacOSShim" BeforeTargets="PrepareForBuild;GenerateNuspec"
           Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(OrbitMacOSShimPath)' == ''">

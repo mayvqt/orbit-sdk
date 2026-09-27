@@ -1529,6 +1529,7 @@ mod tests {
             Some("custom:new")
         );
     }
+    #[cfg(feature = "local-development")]
     impl Client {
         async fn open_with_transport(
             app: TestApp,
@@ -3586,6 +3587,7 @@ mod tests {
         client.close().await.unwrap();
     }
 
+    #[cfg(feature = "local-development")]
     fn signed_offline_file(
         installation: &str,
         sequence: u64,

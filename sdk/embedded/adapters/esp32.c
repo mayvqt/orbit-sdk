@@ -45,20 +45,25 @@ static int32_t connect_tls(void *p, const char *host, uint16_t port) {
   cfg.skip_common_name = false;
   b->connection = esp_tls_init();
   if (!b->connection)
-    return ORBIT_CLIENT_RESOURCE_LIMIT; /* esp-tls combines network and
-                                           certificate failures; conservatively
-                                           deny offline fallback. */
-  return esp_tls_conn_new_sync(host, strlen(host), port, &cfg, b->connection) ==
-                 1
-             ? 0
-             : ORBIT_CLIENT_UNTRUSTED;
+    return ORBIT_CLIENT_RESOURCE_LIMIT;
+  if (esp_tls_conn_new_sync(host, strlen(host), port, &cfg, b->connection) == 1)
+    return 0;
+  /* Name lookup, TCP connect and timeout failures are outages; certificate
+   * and handshake failures stay untrusted. */
+  esp_tls_error_handle_t error = NULL;
+  if (esp_tls_get_error_handle(b->connection, &error) == ESP_OK && error &&
+      (error->last_error == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME ||
+       error->last_error == ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST ||
+       error->last_error == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT))
+    return ORBIT_CLIENT_TRANSIENT;
+  return ORBIT_CLIENT_UNTRUSTED;
 }
 static int32_t write_tls(void *p, const uint8_t *b, uint32_t n) {
   orbit_esp32_t *s = p;
   while (n) {
     ssize_t m = esp_tls_conn_write(s->connection, b, n);
     if (m <= 0)
-      return ORBIT_CLIENT_UNTRUSTED;
+      return ORBIT_CLIENT_TRANSIENT; /* Reset or lost link after the handshake. */
     b += m;
     n -= (uint32_t)m;
   }
@@ -68,7 +73,7 @@ static int32_t read_tls(void *p, uint8_t *b, uint32_t c, uint32_t *n) {
   orbit_esp32_t *s = p;
   ssize_t m = esp_tls_conn_read(s->connection, b, c);
   if (m < 0)
-    return ORBIT_CLIENT_UNTRUSTED;
+    return ORBIT_CLIENT_TRANSIENT; /* Received bytes are verified separately. */
   *n = (uint32_t)m;
   return 0;
 }

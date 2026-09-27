@@ -126,7 +126,10 @@ fn child_probe() {
     match mode.as_str() {
         "blocked" | "unavailable" => {
             let error = SecretServiceStorage::open(directory, &config, &device).unwrap_err();
-            assert_eq!(format!("{error:?}"), "Credential storage failed");
+            assert_eq!(
+                format!("{error:?}"),
+                "Credential storage failed (code: storage)"
+            );
         }
         "invalidate" => {
             let storage = SecretServiceStorage::open(directory, &config, &device).unwrap();

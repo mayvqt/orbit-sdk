@@ -63,11 +63,12 @@ internal static partial class JsonWire
         foreach (var property in value.EnumerateObject()) if (!allowed.Remove(property.Name)) throw Invalid();
         if (allowed.Count != 0) throw Invalid();
     }
-    internal static bool Opaque(string value) => value.Length is >= 1 and <= 128 &&
+    // Validators treat null as invalid so a null argument is a configuration error, not a crash.
+    internal static bool Opaque(string? value) => value is { Length: >= 1 and <= 128 } &&
         value.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-');
-    internal static bool Bearer(string value) => value.Length == 43 && Opaque(value);
-    internal static bool OperationId(string value) => value.Length is >= 16 and <= 128 && Opaque(value);
-    internal static bool Feature(string value) => value.Length is >= 1 and <= 64 && value[0] is >= 'a' and <= 'z' &&
+    internal static bool Bearer(string? value) => value is { Length: 43 } && Opaque(value);
+    internal static bool OperationId(string? value) => value is { Length: >= 16 and <= 128 } && Opaque(value);
+    internal static bool Feature(string? value) => value is { Length: >= 1 and <= 64 } && value[0] is >= 'a' and <= 'z' &&
         value.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_');
     internal static IReadOnlyDictionary<string, bool> Entitlements(JsonElement value)
     {

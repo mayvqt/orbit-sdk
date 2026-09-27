@@ -268,15 +268,20 @@ public sealed class Transport : IDisposable
         catch (OrbitException error) { throw new AttemptFailure(error); }
     }
 
-    private static OrbitException ClassifyTransport(Exception error)
+    internal static OrbitException ClassifyTransport(Exception error)
     {
         var transient = false;
         for (Exception? cause = error; cause != null; cause = cause.InnerException)
         {
             if (cause is AuthenticationException || cause is HttpRequestException { HttpRequestError: HttpRequestError.SecureConnectionError })
                 return new OrbitException(OrbitError.TransportSecurity);
-            if (cause is SocketException socket && socket.SocketErrorCode is
-                SocketError.ConnectionRefused or SocketError.ConnectionReset or SocketError.NetworkUnreachable or SocketError.HostUnreachable or SocketError.TimedOut)
+            // Any failed name lookup is an outage: without a network or behind a
+            // captive portal the resolver often reports the Orbit host as not found.
+            if (cause is HttpRequestException { HttpRequestError: HttpRequestError.NameResolutionError } ||
+                cause is SocketException socket && socket.SocketErrorCode is
+                SocketError.ConnectionRefused or SocketError.ConnectionReset or SocketError.NetworkUnreachable or
+                SocketError.HostUnreachable or SocketError.TimedOut or SocketError.TryAgain or
+                SocketError.HostNotFound or SocketError.NoData)
                 transient = true;
         }
         return new OrbitException(transient ? OrbitError.Transient : OrbitError.TransportSecurity);

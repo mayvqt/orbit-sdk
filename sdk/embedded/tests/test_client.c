@@ -28,7 +28,7 @@ typedef struct mock {
   uint64_t ticks;
   uint8_t record[1024];
   uint32_t record_length, commits, posts, gets, large_response_length;
-  int post_transient, key_transient, denial, bad_signature, storage_failure,
+  int post_transient, key_transient, post_link, key_link, denial, bad_signature, storage_failure,
       oversized, oversized_response, offline, reenter, reenter_clock,
       reenter_commit, grant_hwid_claims, sent_fingerprint, sent_provider;
   char installation[129], operation_id[129], previous_operation[129], kid[129];
@@ -176,6 +176,8 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
     ++m->gets;
     if (m->key_transient)
       return ORBIT_CLIENT_TRANSIENT;
+    if (m->key_link)
+      return ORBIT_CLIENT_UNTRUSTED;
     *http = 200u;
     if (strcmp(path,
                "/.well-known/"
@@ -202,6 +204,8 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   get_string(body, "idempotency_key", m->operation_id, sizeof(m->operation_id));
   if (m->post_transient)
     return ORBIT_CLIENT_TRANSIENT;
+  if (m->post_link)
+    return ORBIT_CLIENT_UNTRUSTED;
   if (m->denial) {
     *http = 403u;
     return 0;
@@ -528,6 +532,62 @@ static int lifecycle(void) {
   orbit_client_destroy(&client);
   return 0;
 }
+static int has_credential(const mock_t *m) {
+  orbit_record_t record;
+  return orbit_record_decode(m->record, m->record_length, &record) == 0 &&
+         record.credential_length != 0u && record.pending_kind == 0u;
+}
+/* A failed connection is no evidence against the saved credential: validation
+ * denies access now and retries later without asking for the key again. */
+static int link_failures_keep_credential(void) {
+  mock_t m;
+  orbit_access_snapshot_t snapshot;
+  uint32_t requests;
+  reset(&m);
+  CHECK(init(&m) == 0);
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  orbit_client_destroy(&client);
+
+  CHECK(init(&m) == 0);
+  m.post_transient = 1;
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_TRANSIENT);
+  CHECK(has_credential(&m));
+  m.post_transient = 0;
+  orbit_client_destroy(&client);
+
+  CHECK(init(&m) == 0);
+  m.post_link = 1;
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_UNTRUSTED);
+  CHECK(has_credential(&m));
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && !snapshot.allowed &&
+        !snapshot.activation_required);
+  requests = m.posts;
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_TRANSIENT &&
+        m.posts == requests);
+  elapse(&m, 31);
+  m.post_link = 0;
+  CHECK(orbit_client_require_access(&client, S("export")) == 0 &&
+        m.posts == requests + 1u);
+  orbit_client_destroy(&client);
+
+  CHECK(init(&m) == 0);
+  strcpy(m.kid, "rotated-key");
+  m.key_link = 1;
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_UNTRUSTED);
+  CHECK(has_credential(&m));
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && !snapshot.allowed);
+  elapse(&m, 31);
+  m.key_link = 0;
+  CHECK(orbit_client_require_access(&client, S("export")) == 0);
+
+  elapse(&m, 901);
+  m.bad_signature = 1;
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_UNTRUSTED);
+  CHECK(!has_credential(&m));
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_ACTIVATION_REQUIRED);
+  orbit_client_destroy(&client);
+  return 0;
+}
 static int retry_and_storage(void) {
   mock_t m;
   uint32_t requests, writes;
@@ -716,6 +776,7 @@ int main(void) {
   CHECK(optional_machine_binding() == 0);
   CHECK(lifecycle() == 0);
   CHECK(retry_and_storage() == 0);
+  CHECK(link_failures_keep_credential() == 0);
   CHECK(journal_faults() == 0);
   EVP_PKEY_free(private_key);
   printf("client lifecycle/retry/clock/denial/no-reentry/storage faults "

@@ -61,6 +61,7 @@ type accessState struct {
 	transient               bool
 	nextRetry               int64
 	retryAt                 time.Time // Monotonic pacing only; never grants access.
+	failure                 error     // Last validation failure while a retry is paced.
 	offline                 *offlineRuntime
 	sessionRequired         bool
 	sessionPolicyKnown      bool
@@ -152,6 +153,7 @@ func clearAccess(state *accessState) {
 	state.transient = false
 	state.nextRetry = 0
 	state.retryAt = time.Time{}
+	state.failure = nil
 	state.sessionRequired = false
 	state.sessionPolicyKnown = false
 	state.sessionDisabled = false
@@ -166,7 +168,7 @@ func clearAccess(state *accessState) {
 func clearState(state *accessState) { clearAccess(state); state.account = nil }
 func (c *Client) syncStorageLocked() error {
 	if c.closed || c.lifecycle != nil && c.lifecycle.context.Err() != nil {
-		return ErrCancelled
+		return errClosed
 	}
 	version, err := c.storage.Version()
 	if err != nil {
@@ -532,7 +534,14 @@ func (c *Client) refreshMode(ctx context.Context, respectRetry, acquireSession b
 			}
 		}
 		if !retryDue || snapshot.Access != AccessRefreshRequired && snapshot.Access != AccessExpired && snapshot.Access != AccessOffline {
+			failure := c.state.failure
+			if c.state.transient {
+				failure = nil
+			}
 			c.mu.Unlock()
+			if snapshot.Access != AccessOffline && snapshot.Access != AccessOnline && failure != nil {
+				return Snapshot{}, failure
+			}
 			return snapshot, nil
 		}
 	}
@@ -729,12 +738,9 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		return snapshot, nil
 	}
 	if snapshot.Access != AccessRefreshRequired && snapshot.Access != AccessExpired && snapshot.Access != AccessOffline {
-		transient := c.state.transient
+		err := c.unavailableLocked()
 		c.mu.Unlock()
-		if transient {
-			return Snapshot{}, ErrTransient
-		}
-		return Snapshot{}, ErrNotActivated
+		return Snapshot{}, err
 	}
 	c.mu.Unlock()
 	if _, err := c.refresh(ctx, true); err != nil && !errors.Is(err, ErrTransient) {
@@ -755,16 +761,24 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		return Snapshot{}, ErrCancelled
 	}
 	if snapshot.Access != AccessOnline && snapshot.Access != AccessOffline {
-		unavailableDuringOutage := c.state.transient
-		if unavailableDuringOutage {
-			return Snapshot{}, ErrTransient
-		}
-		return Snapshot{}, ErrNotActivated
+		return Snapshot{}, c.unavailableLocked()
 	}
 	if !snapshot.Entitlements[feature] {
 		return Snapshot{}, ErrFeatureUnavailable
 	}
 	return snapshot, nil
+}
+
+// unavailableLocked explains why access is unavailable: the last paced
+// validation failure when a credential remains, otherwise missing activation.
+func (c *Client) unavailableLocked() error {
+	if c.state.credential != nil && c.state.failure != nil {
+		return c.state.failure
+	}
+	if c.state.transient {
+		return ErrTransient
+	}
+	return ErrNotActivated
 }
 
 func (c *Client) acceptAndAcquire(ctx, budget context.Context, response json.RawMessage, responseError error, generation uint64, previous *StoredCredential, licence string, started requestStart) (Snapshot, error) {
@@ -866,16 +880,13 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 			}
 			c.state.nextRetry = 0
 			c.state.retryAt = time.Time{}
+			c.state.failure = nil
 			c.wakeInstalled()
 			return c.snapshotLocked(), nil
 		}
 	}
 	if errors.Is(err, ErrTransient) {
-		var entropy [2]byte
-		delaySeconds := int64(15)
-		if _, randomError := rand.Read(entropy[:]); randomError == nil {
-			delaySeconds += int64(uint16(entropy[0])<<8|uint16(entropy[1])) % 30
-		}
+		delaySeconds := retryDelaySeconds()
 		if verifying {
 			// An unavailable signing key is no evidence for offline fallback.
 			// Keep only the existing credential for a fresh validation attempt;
@@ -890,6 +901,7 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 		}
 		wasTransient := c.state.transient
 		c.state.transient = true
+		c.state.failure = err
 		c.state.nextRetry = delaySeconds
 		c.state.retryAt = time.Now().Add(time.Duration(delaySeconds) * time.Second)
 		if c.state.anchor != nil {
@@ -913,20 +925,38 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 	if errors.Is(err, ErrCancelled) && budget.Err() == nil {
 		return Snapshot{}, ErrCancelled
 	}
-	clearState(&c.state)
+	if errors.Is(err, ErrCancelled) {
+		err = ErrInvalidResponse
+	}
 	if c.installed != nil && !errors.Is(err, ErrDenied) {
-		version, storageErr := c.installed.invalidate(false)
-		if storageErr != nil {
+		// A malformed reply, TLS failure or clock problem is no evidence that the
+		// saved credential or pending activation is invalid. Keep both for a
+		// later verified validation, discard cached authority and pace retries.
+		credential, account := c.state.credential, c.state.account
+		clearState(&c.state)
+		c.state.credential, c.state.account = credential, account
+		if storageErr := c.installed.dropCache(); storageErr != nil {
 			return Snapshot{}, storageErr
 		}
-		c.state.storageVersion = version
-	} else if storageErr := c.invalidateLocked(); storageErr != nil {
+		c.state.failure = err
+		c.state.retryAt = time.Now().Add(time.Duration(retryDelaySeconds()) * time.Second)
+		return Snapshot{}, err
+	}
+	clearState(&c.state)
+	if storageErr := c.invalidateLocked(); storageErr != nil {
 		return Snapshot{}, storageErr
 	}
-	if errors.Is(err, ErrCancelled) {
-		return Snapshot{}, ErrInvalidResponse
-	}
 	return Snapshot{}, err
+}
+
+// retryDelaySeconds paces automatic validation after a failure by 15-44 seconds.
+func retryDelaySeconds() int64 {
+	var entropy [2]byte
+	delaySeconds := int64(15)
+	if _, err := rand.Read(entropy[:]); err == nil {
+		delaySeconds += int64(uint16(entropy[0])<<8|uint16(entropy[1])) % 30
+	}
+	return delaySeconds
 }
 
 type grantReply struct {

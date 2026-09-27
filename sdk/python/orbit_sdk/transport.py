@@ -471,7 +471,7 @@ class Transport:
             connection.request(method, target, body=body, headers=headers)
             response = connection.getresponse()
             content_length = response.getheader("Content-Length")
-            if content_length is not None and content_length.isdigit() and int(content_length) > MAX_BYTES:
+            if content_length is not None and content_length.isascii() and content_length.isdecimal() and int(content_length) > MAX_BYTES:
                 raise _AttemptError(error(INVALID_RESPONSE, "response_too_large"))
             chunks = bytearray()
             while len(chunks) <= MAX_BYTES:
@@ -590,10 +590,8 @@ def _wait_cancel(cancel: Any, duration: float) -> bool:
 def _retry_after(value: str | None) -> float | None:
     if value is None or not value or not value.isascii() or not value.isdecimal():
         return None
-    try:
-        return min(float(int(value)), OPERATION_TIMEOUT)
-    except ValueError:
-        return OPERATION_TIMEOUT
+    # Compare as integers: an oversized header must not overflow float().
+    return float(min(int(value), int(OPERATION_TIMEOUT)))
 
 
 def _transient_os_error(exc: OSError) -> bool:
@@ -603,4 +601,8 @@ def _transient_os_error(exc: OSError) -> bool:
         if hasattr(errno, name)
     }
     transient.update((10051, 10053, 10054, 10060, 10061, 10065, 11002))
-    return exc.errno in transient or getattr(exc, "winerror", None) in transient or exc.errno == -3
+    if isinstance(exc, socket.gaierror):
+        # Any failed lookup is an outage: without network or behind a captive
+        # portal the resolver often reports the Orbit host as not found.
+        return True
+    return exc.errno in transient or getattr(exc, "winerror", None) in transient

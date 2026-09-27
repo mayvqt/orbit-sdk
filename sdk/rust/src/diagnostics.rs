@@ -292,7 +292,10 @@ mod tests {
                 request_id: Some("reference".into()),
             };
             assert_eq!(error.to_string(), guidance);
-            assert_eq!(format!("{error:?}"), guidance);
+            assert_eq!(
+                format!("{error:?}"),
+                format!("{guidance} (code: {code}, request ID: reference)")
+            );
         }
     }
 }

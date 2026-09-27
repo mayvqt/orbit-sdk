@@ -35,33 +35,43 @@ public sealed class OfflineKeys
 
     private OfflineKeys(string environment) => this.environment = environment;
 
-    /// <summary>Parse a trusted public JWKS for one app-key environment.</summary>
-    public static OfflineKeys Parse(string jwksJson, string environment)
+    /// <summary>
+    /// Parse a trusted offline-purpose public JWKS. The Test or Live environment
+    /// comes from the key IDs unless <paramref name="environment"/> pins it; the
+    /// client rejects keys whose environment differs from its app key.
+    /// </summary>
+    public static OfflineKeys Parse(string jwksJson, string? environment = null)
     {
         ArgumentNullException.ThrowIfNull(jwksJson);
         if (Encoding.UTF8.GetByteCount(jwksJson) > MaximumFileBytes) throw InvalidKeys();
         return Parse(Encoding.UTF8.GetBytes(jwksJson), environment);
     }
 
-    /// <summary>Parse a trusted public JWKS for one app-key environment.</summary>
-    internal string Environment => environment;
-
-    public static OfflineKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
+    /// <inheritdoc cref="Parse(string, string?)"/>
+    public static OfflineKeys Parse(ReadOnlyMemory<byte> jwksJson, string? environment = null)
     {
-        if (bytes.Length > MaximumFileBytes) throw InvalidKeys();
-        try { return Parse(JsonWire.Parse(bytes), environment); }
+        if (jwksJson.Length > MaximumFileBytes) throw InvalidKeys();
+        try { return Parse(JsonWire.Parse(jwksJson), environment); }
         catch (OrbitException) { throw InvalidKeys(); }
     }
 
-    internal static OfflineKeys Parse(JsonElement value, string environment)
+    internal string Environment => environment;
+
+    internal static OfflineKeys Parse(JsonElement value, string? environment)
     {
         try
         {
-            if (environment is not ("test" or "live") ||
-                Encoding.UTF8.GetByteCount(value.GetRawText()) > MaximumFileBytes) throw InvalidKeys();
+            if (Encoding.UTF8.GetByteCount(value.GetRawText()) > MaximumFileBytes) throw InvalidKeys();
             JsonWire.ExactFields(value, "keys");
             var entries = JsonWire.Field(value, "keys");
             if (entries.ValueKind != JsonValueKind.Array || entries.GetArrayLength() is < 1 or > 8) throw InvalidKeys();
+            environment ??= JsonWire.String(entries[0], "kid") switch
+            {
+                var kid when kid.StartsWith("offline-test-", StringComparison.Ordinal) => "test",
+                var kid when kid.StartsWith("offline-live-", StringComparison.Ordinal) => "live",
+                _ => throw InvalidKeys()
+            };
+            if (environment is not ("test" or "live")) throw InvalidKeys();
             var result = new OfflineKeys(environment);
             var prefix = $"offline-{environment}-";
             foreach (var entry in entries.EnumerateArray())

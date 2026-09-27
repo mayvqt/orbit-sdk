@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -800,5 +801,69 @@ func TestInstalledOutageDoesNotRequestAnotherActivation(t *testing.T) {
 	}
 	if f.activation.Load() != 1 {
 		t.Fatal("restart activated another credential")
+	}
+}
+
+func TestInstalledInvalidValidationReplyKeepsCredential(t *testing.T) {
+	f := newInstalledFixture(t, false)
+	path := filepath.Join(installedTestTempDir(t), "state")
+	c := mustInstalledOpen(t, f, path)
+	mustInstalledActivate(t, c)
+	_ = c.Close()
+	f.mode.Store(3)
+	if c, err := f.open(path); c != nil || !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("malformed validation reply: %v", err)
+	}
+	f.mode.Store(0)
+	c = mustInstalledOpen(t, f, path)
+	f.mode.Store(3)
+	if _, err := c.Refresh(context.Background()); !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("malformed refresh: %v", err)
+	}
+	prompted := false
+	_, err := c.EnsureAccess(context.Background(), "export", func(context.Context) (string, error) {
+		prompted = true
+		return "replacement-key", nil
+	})
+	if !errors.Is(err, ErrInvalidResponse) || prompted || c.installed.record.Access != nil {
+		t.Fatalf("paced failure prompted or kept cached access: %v, prompted=%v", err, prompted)
+	}
+	f.mode.Store(0)
+	if _, err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.RequireAccess(context.Background(), "export"); err != nil || f.activation.Load() != 1 {
+		t.Fatalf("saved credential did not recover: %v, activations=%d", err, f.activation.Load())
+	}
+}
+
+func TestInstalledNameResolutionFailureKeepsCredential(t *testing.T) {
+	for _, temporary := range []bool{true, false} {
+		t.Run(fmt.Sprint("temporary=", temporary), func(t *testing.T) {
+			f := newInstalledFixture(t, false)
+			path := filepath.Join(installedTestTempDir(t), "state")
+			c := mustInstalledOpen(t, f, path)
+			mustInstalledActivate(t, c)
+			_ = c.Close()
+			lookup := &net.DNSError{Err: "lookup failed", Name: "orbit.example.test", IsTemporary: temporary, IsNotFound: !temporary}
+			transport := testTransport(t, func(*http.Request) (*http.Response, error) { return nil, lookup })
+			c, err := openInstalled(context.Background(), testAppKey(), installedOptions(path), transport)
+			if err != nil {
+				t.Fatalf("name resolution failure blocked open: %v", err)
+			}
+			prompted := false
+			_, err = c.EnsureAccess(context.Background(), "export", func(context.Context) (string, error) {
+				prompted = true
+				return "replacement-key", nil
+			})
+			if !errors.Is(err, ErrTransient) || prompted {
+				t.Fatalf("name resolution failure: %v, prompted=%v", err, prompted)
+			}
+			_ = c.Close()
+			c = mustInstalledOpen(t, f, path)
+			if _, err := c.RequireAccess(context.Background(), "export"); err != nil || f.activation.Load() != 1 {
+				t.Fatalf("activation was lost: %v, activations=%d", err, f.activation.Load())
+			}
+		})
 	}
 }

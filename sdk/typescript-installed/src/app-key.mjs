@@ -73,6 +73,10 @@ export function scopeHash(key) {
 
 export const isOpaqueId = (value) => typeof value === "string" && idPattern.test(value);
 
+export function validProvider(value) {
+  return value === "machine_v1" || typeof value === "string" && /^custom:[a-z0-9_.-]{1,48}$/.test(value);
+}
+
 function invalidKey() {
   throw fail(ErrorKind.CONFIGURATION, "invalid_app_key");
 }

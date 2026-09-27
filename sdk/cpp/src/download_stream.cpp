@@ -311,6 +311,9 @@ void download_stream(const DownloadAuthorization &authorization, std::string_vie
                 url = redirect_url(url, transfer.location);
                 continue;
             }
+            // Seller errors abort the body write; report the status, not a transport failure.
+            if (transfer.status != 0 && transfer.status != 200)
+                raise(ErrorKind::invalid_response, "download_http_error");
             if (result != CURLE_OK) {
                 if (result == CURLE_PARTIAL_FILE)
                     raise(ErrorKind::invalid_response, "truncated_download");

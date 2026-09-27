@@ -36,6 +36,7 @@ export class MutationUncertainError extends OrbitError {
     super(cause.kind ?? "invalid_response", cause.code ?? "invalid_online_response", cause.requestId, cause.status);
     this.name = "MutationUncertainError";
     this.idempotencyKey = idempotencyKey;
+    Object.defineProperty(this, "cause", { value: cause, configurable: true, writable: true });
   }
 }
 

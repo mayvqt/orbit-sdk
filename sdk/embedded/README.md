@@ -14,8 +14,8 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-Exact resource costs, storage reservations and toolchains for each target are in
-the [board guide](docs/boards.md).
+Toolchains, build commands and storage reservations for each target are in the
+[board guide](docs/boards.md).
 
 ## Configure and activate
 
@@ -79,9 +79,9 @@ the [native HTTP API](../../examples/http/README.md).
 Enable `ORBIT_ENABLE_SERVICES` and initialize with one caller-owned extension for
 floating sessions, typed usage/resource APIs, update discovery and verified
 streaming downloads. Enable `ORBIT_ENABLE_OFFLINE` separately for trusted
-long-term licence files with a 4096- or 16384-byte profile. Connected defaults
-retain their original memory and storage footprint. The [services guide](docs/services.md)
-shows setup, retries, cancellation, file import and port callback requirements.
+long-term licence files with a 4096- or 16384-byte profile. The
+[services guide](docs/services.md) shows setup, retries, cancellation, file
+import and port callback requirements.
 
 ## Rust
 
@@ -96,21 +96,17 @@ client is alive. See [Rust setup](rust/README.md).
 
 Use authenticated HTTPS, a trusted UTC source, elapsed time including sleep, a
 CSPRNG and exclusive durable storage. Configuration and callback contexts must
-outlive the client. Calls are synchronous and serialized; the services guide documents the narrow
-local end-session fence allowed during a transport callback. Call `orbit_client_clock_lost` if sleep/resume makes elapsed time
-uncertain. Keep credentials out of logs and protect their storage on the device.
+outlive the client. Calls are synchronous and serialized; the services guide
+documents the one local end-session call allowed during a transport callback.
+Call `orbit_client_clock_lost` if sleep/resume makes elapsed time uncertain.
+Keep credentials out of logs and protect their storage on the device.
 
-The default client reserves **41,776 bytes** for state, 32 KiB transaction arena
-and parser scratch. Set `ORBIT_CLIENT_ARENA_BYTES=8192` for a **17,200-byte**
-compact caller buffer, or choose a runtime C arena from 8 to 32 KiB. A compact
-arena rejects any request or response that does not fit. Measured portable
-Cortex-M0+ client stack is conservatively **3,716 bytes** (app-key parsing adds
-at most **240 bytes**);
-crypto, TLS, board libraries, runtime helpers and interrupts are additional.
-The [board guide](docs/boards.md) records per-target measurements and hardware
-limits. Optional services add caller-owned state; long-term files also require an
-explicit file buffer and larger journal reservations.
-
-The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
-use. The [security and storage reference](docs/security.md) covers lifecycle and
-adapter contracts.
+The default client reserves **41,776 bytes** for state, a 32 KiB transaction
+arena and parser scratch. Set `ORBIT_CLIENT_ARENA_BYTES=8192` for a
+**17,200-byte** compact caller buffer, or choose a runtime C arena from 8 to
+32 KiB. A compact arena rejects any request or response that does not fit.
+Crypto, TLS, board libraries and stack are additional. The
+[memory and ABI reference](docs/memory.md) covers stack, optional-profile
+buffers, storage geometry and per-board footprints. The
+[security and storage reference](docs/security.md) covers lifecycle and adapter
+contracts.

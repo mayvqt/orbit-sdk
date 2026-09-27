@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import os
-import sys
 from getpass import getpass
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
-
-from orbit_sdk import Client, NotActivatedError  # noqa: E402
+from orbit_sdk import Client, NotActivatedError
 
 
 def required(name: str) -> str:

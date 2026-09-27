@@ -20,19 +20,23 @@ static uint64_t get64(const uint8_t *p) {
     n |= (uint64_t)p[i] << (8 * i);
   return n;
 }
+/* A byte-stream timeout is an outage; the framing is lost either way, so the
+ * bridge stays broken until it is initialized again. */
+static int32_t io_failure(orbit_bridge_t *b, int32_t r) {
+  b->broken = 1;
+  return r == ORBIT_CLIENT_TRANSIENT ? r : ORBIT_CLIENT_UNTRUSTED;
+}
 static int32_t rd(orbit_bridge_t *b, uint8_t *p, uint32_t n) {
-  if (b->broken || b->read(b->io_context, p, n)) {
-    b->broken = 1;
+  if (b->broken)
     return ORBIT_CLIENT_UNTRUSTED;
-  }
-  return 0;
+  int32_t r = b->read(b->io_context, p, n);
+  return r ? io_failure(b, r) : 0;
 }
 static int32_t wr(orbit_bridge_t *b, const uint8_t *p, uint32_t n) {
-  if (b->broken || b->write(b->io_context, p, n)) {
-    b->broken = 1;
+  if (b->broken)
     return ORBIT_CLIENT_UNTRUSTED;
-  }
-  return 0;
+  int32_t r = b->write(b->io_context, p, n);
+  return r ? io_failure(b, r) : 0;
 }
 static int32_t begin(orbit_bridge_t *b, uint8_t op, uint32_t origin,
                      uint32_t path, uint32_t body) {
@@ -46,13 +50,14 @@ static int32_t begin(orbit_bridge_t *b, uint8_t op, uint32_t origin,
 }
 static int32_t result(orbit_bridge_t *b) {
   uint8_t h[8];
-  if (rd(b, h, 8))
-    return ORBIT_CLIENT_UNTRUSTED;
+  int32_t r = rd(b, h, 8);
+  if (r)
+    return r;
   if (memcmp(h, "ORS1", 4)) {
     b->broken = 1;
     return ORBIT_CLIENT_UNTRUSTED;
   }
-  int32_t r = (int32_t)get32(h + 4);
+  r = (int32_t)get32(h + 4);
   if (r && r != ORBIT_CLIENT_TRANSIENT && r != ORBIT_CLIENT_CLOCK &&
       r != ORBIT_CLIENT_UNTRUSTED && r != ORBIT_CLIENT_RESOURCE_LIMIT) {
     b->broken = 1;
@@ -69,18 +74,17 @@ static int32_t exchange(void *ctx, const orbit_http_request_t *q,
   if (q->origin.length > 512 || q->path.length > 512 ||
       q->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES)
     return ORBIT_CLIENT_ARGUMENT;
-  if (begin(b, q->post ? 2 : 1, q->origin.length, q->path.length,
-            q->body.length) ||
-      wr(b, q->origin.data, q->origin.length) ||
-      wr(b, q->path.data, q->path.length) ||
-      wr(b, q->body.data, q->body.length))
-    return ORBIT_CLIENT_UNTRUSTED;
-  if (rd(b, h, 2))
-    return ORBIT_CLIENT_UNTRUSTED;
+  if ((r = begin(b, q->post ? 2 : 1, q->origin.length, q->path.length,
+                 q->body.length)) != 0 ||
+      (r = wr(b, q->origin.data, q->origin.length)) != 0 ||
+      (r = wr(b, q->path.data, q->path.length)) != 0 ||
+      (r = wr(b, q->body.data, q->body.length)) != 0 ||
+      (r = rd(b, h, 2)) != 0)
+    return r;
   *status = (uint16_t)(h[0] | ((uint16_t)h[1] << 8));
   for (;;) {
-    if (rd(b, h, 2))
-      return ORBIT_CLIENT_UNTRUSTED;
+    if ((r = rd(b, h, 2)) != 0)
+      return r;
     uint32_t n = h[0] | ((uint32_t)h[1] << 8);
     if (!n)
       return result(b);
@@ -88,8 +92,8 @@ static int32_t exchange(void *ctx, const orbit_http_request_t *q,
       b->broken = 1;
       return ORBIT_CLIENT_RESOURCE_LIMIT;
     }
-    if (rd(b, bytes, n))
-      return ORBIT_CLIENT_UNTRUSTED;
+    if ((r = rd(b, bytes, n)) != 0)
+      return r;
     total += n;
     r = receive(rc, bytes, n);
     if (r) {

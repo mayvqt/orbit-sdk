@@ -47,7 +47,7 @@ static int32_t write_tls(void *p, const uint8_t *b, uint32_t n) {
   while (n) {
     size_t m = c->connection.write(b, n);
     if (!m)
-      return ORBIT_CLIENT_UNTRUSTED;
+      return ORBIT_CLIENT_TRANSIENT; /* Reset or lost link after the handshake. */
     b += m;
     n -= static_cast<uint32_t>(m);
   }
@@ -66,7 +66,7 @@ static int32_t read_tls(void *p, uint8_t *b, uint32_t capacity, uint32_t *n) {
   }
   int m = c->connection.read(b, capacity);
   if (m < 0)
-    return ORBIT_CLIENT_UNTRUSTED;
+    return ORBIT_CLIENT_TRANSIENT; /* Received bytes are verified separately. */
   *n = static_cast<uint32_t>(m);
   return 0;
 }

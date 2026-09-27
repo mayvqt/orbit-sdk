@@ -330,7 +330,10 @@ impl Transport {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(body.to_vec());
         }
-        let mut response = request.send().await.map_err(AttemptFailure::transport)?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| AttemptFailure::transport(&error))?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -345,7 +348,11 @@ impl Transport {
             return Err(AttemptFailure::invalid());
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(AttemptFailure::transport)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| AttemptFailure::transport(&error))?
+        {
             if chunk.len() > MAX_BYTES - bytes.len() {
                 return Err(AttemptFailure::invalid());
             }
@@ -454,10 +461,56 @@ pub(crate) fn validate_local_origin(base: &str) -> Result<Url> {
     Ok(parsed)
 }
 
-fn client_builder() -> reqwest::ClientBuilder {
+/// Marks a failed host-name lookup. A disconnected machine usually fails here
+/// before any TCP or TLS work, so it counts as a network outage rather than a
+/// secure-connection failure.
+#[derive(Debug)]
+struct ResolutionFailed;
+
+impl std::fmt::Display for ResolutionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("host name resolution failed")
+    }
+}
+
+impl std::error::Error for ResolutionFailed {}
+
+/// The system resolver, reporting failures as `ResolutionFailed`.
+struct Resolver;
+
+impl reqwest::dns::Resolve for Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|_| ResolutionFailed)?
+                .collect();
+            if addresses.is_empty() {
+                return Err(ResolutionFailed.into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Builder shared by Orbit and seller-download clients: no automatic redirects
+/// or retries, and name-resolution failures that classify as outages.
+pub(crate) fn base_builder() -> reqwest::ClientBuilder {
     Client::builder()
+        .dns_resolver(Resolver)
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+}
+
+/// Classify a failed request: timeouts and concrete network failures are
+/// transient; everything else, including TLS failures, is a security failure.
+pub(crate) fn request_error(error: &reqwest::Error) -> Error {
+    AttemptFailure::transport(error).error
+}
+
+fn client_builder() -> reqwest::ClientBuilder {
+    base_builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(ATTEMPT_TIMEOUT)
 }
@@ -598,13 +651,15 @@ impl AttemptFailure {
         }
     }
 
-    fn transport(error: reqwest::Error) -> Self {
+    fn transport(error: &reqwest::Error) -> Self {
         let mut transient = error.is_timeout();
         let mut source = error.source();
         // A generic connection error is insufficient evidence of an outage: it
-        // also wraps certificate and TLS failures. Only concrete OS failures or
-        // timeout signals are eligible for retries and offline fallback.
+        // also wraps certificate and TLS failures. Only failed name resolution,
+        // concrete OS failures or timeout signals are eligible for retries and
+        // offline fallback.
         while let Some(cause) = source {
+            transient |= cause.is::<ResolutionFailed>();
             if let Some(io) = cause.downcast_ref::<io::Error>() {
                 transient |= matches!(
                     io.kind(),
@@ -612,6 +667,7 @@ impl AttemptFailure {
                         | io::ErrorKind::ConnectionReset
                         | io::ErrorKind::NetworkUnreachable
                         | io::ErrorKind::HostUnreachable
+                        | io::ErrorKind::TimedOut
                 );
             }
             source = cause.source();
@@ -1103,6 +1159,14 @@ pub(crate) mod tests {
                 .get_with_cancel("/.well-known/orbit-jwks.json", &cancel)
                 .await,
             Err(Error::Cancelled)
+        ));
+    }
+    #[tokio::test]
+    async fn failed_name_resolution_is_an_outage() {
+        let client = Transport::new("https://orbit.invalid").unwrap();
+        assert!(matches!(
+            client.get(JWKS_PATH).await,
+            Err(Error::Transient { .. })
         ));
     }
 }

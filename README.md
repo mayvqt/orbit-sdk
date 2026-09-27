@@ -1,7 +1,8 @@
 # Orbit SDKs
 
 Add licence activation and feature checks to your application with one public
-app key.
+app key. The installed SDKs remember activation, refresh access automatically
+and ask for a licence key only when the installation has no activation.
 
 1. Select your application's **Test** environment in Orbit and copy the
    **App key** from **Integration**.
@@ -9,10 +10,6 @@ app key.
    issue a Test licence using that policy.
 3. Install an SDK by following its guide. Open the client with the app key and
    check access before running the protected feature.
-
-The desktop SDKs remember activation and refresh access automatically. Their
-`ensure_access` helper asks for a licence key when activation is needed. Each
-guide includes installation, supported platforms and a working example:
 
 | Language | Setup | Example |
 | --- | --- | --- |
@@ -22,34 +19,29 @@ guide includes installation, supported platforms and a working example:
 | C++ | [SDK](sdk/cpp/README.md) | [Licensed export](examples/cpp/README.md) |
 | Python | [SDK](sdk/python/README.md) | [Quickstart](examples/python/README.md) |
 | Embedded C / Rust | [SDK](sdk/embedded/README.md) | [Boards](examples/embedded/README.md) |
-| JavaScript/TypeScript | [Backend SDK](sdk/typescript/README.md) | [Backend example](examples/typescript/backend.mjs) |
 | Node.js / Electron | [Installed SDK](sdk/typescript-installed/README.md) | [Installed client](examples/typescript-installed/client.mts), [Electron main process](examples/typescript-installed/main.mjs) |
+| JavaScript/TypeScript backend | [Backend SDK](sdk/typescript/README.md) | [Backend example](examples/typescript/backend.mjs) |
 
-Use the TypeScript backend SDK for online checks on your server, and the
-installed SDK for Node.js desktop applications and Electron's main process. Use the
-embedded SDK for caller-owned buffers and platform adapters on small devices.
-If you're calling the API without an SDK, see Orbit's [HTTP API guide](https://orbit.mayvie.dev/guides/http)
-and the runnable [HTTP walkthrough](examples/http/README.md).
-The [Rust backend example](examples/rust/licensed-backend/README.md) shows how
-to verify a customer session and check a feature on your own server.
+Use an installed SDK inside the application you ship, the embedded SDK on
+small devices with caller-owned buffers, and the backend SDK for online checks
+on your own server. The [Rust backend example](examples/rust/licensed-backend/README.md)
+verifies a customer session and checks a feature server-side. Without an SDK,
+see Orbit's [HTTP API guide](https://orbit.mayvie.dev/guides/http) and the
+[HTTP walkthrough](examples/http/README.md).
 
-The app key is public and can be included in your application. Test and Live
-have separate keys, IDs and data. Keep licence keys, passwords, sessions,
-activation credentials, and management tokens out of source and logs. A
-management token belongs only on your backend. Check access before protected
-work.
-
-The language guides also cover optional licensing features:
+Each guide also covers the optional licensing features:
 
 - **Floating sessions:** limit concurrent use and release a seat when work ends.
 - **Offline files:** import a signed licence for installations that spend long
   periods without a connection.
 - **Usage and resource limits:** count consumed work or reserve capacity for
-  active resources. Ordinary feature checks do not consume usage.
+  active resources.
 - **Downloads and updates:** find compatible releases and verify downloaded
-  files. Host the files yourself; the [seller download example](examples/python/seller-downloads/README.md)
-  shows how to protect them with expiring Orbit tickets.
+  files. You host the files; the [seller download example](examples/python/seller-downloads/README.md)
+  protects them with expiring Orbit tickets.
 
-Check your language guide for setup, lifecycle and retry behavior.
+The app key is public and can ship with your application; Test and Live have
+separate keys and data. Keep licence keys, passwords, sessions and management
+tokens out of source and logs.
 
 The SDKs and examples are [MIT licensed](LICENSE).

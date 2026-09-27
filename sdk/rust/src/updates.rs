@@ -349,11 +349,9 @@ impl DownloadAuthorization {
         max_size: u64,
         options: DownloadOptions,
     ) -> Result<()> {
-        let client = reqwest::Client::builder()
+        let client = crate::transport::base_builder()
             .https_only(true)
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(1800))
             .no_gzip()
@@ -409,7 +407,10 @@ impl DownloadAuthorization {
             {
                 request = request.bearer_auth(ticket);
             }
-            let result = request.send().await.map_err(|_| Error::TransportSecurity)?;
+            let result = request
+                .send()
+                .await
+                .map_err(|error| crate::transport::request_error(&error))?;
             if matches!(result.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if redirects == 5 {
                     return Err(Error::InvalidResponse);
@@ -457,7 +458,12 @@ impl DownloadAuthorization {
         }
         let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
         let mut size = 0u64;
-        while let Some(chunk) = response.chunk().await.map_err(|_| Error::InvalidResponse)? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            match crate::transport::request_error(&error) {
+                transient @ Error::Transient { .. } => transient,
+                _ => Error::InvalidResponse,
+            }
+        })? {
             size = size
                 .checked_add(chunk.len() as u64)
                 .ok_or(Error::InvalidResponse)?;

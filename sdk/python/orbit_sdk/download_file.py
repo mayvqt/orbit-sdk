@@ -8,6 +8,7 @@ import http.client
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import tempfile
 import time
@@ -15,7 +16,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .errors import CANCELLED, CONFIGURATION, INVALID_RESPONSE, STORAGE, TRANSIENT, TRANSPORT_SECURITY, OrbitError, error
 from .online import DownloadAuthorization, delivery_url, integer, parse_artifact, require
-from .transport import _AttemptError, _BoundedHTTPSConnection, _DNS_RESOLVER
+from .transport import _AttemptError, _BoundedHTTPSConnection, _DNS_RESOLVER, _ResolverBusy, _transient_os_error
 
 
 def download_file(authorization: DownloadAuthorization, destination: str | os.PathLike[str], *,
@@ -133,8 +134,12 @@ def _download_file(authorization, destination, *, max_bytes, replace=False, canc
     except (TimeoutError, http.client.HTTPException):
         check()
         raise error(TRANSIENT, "download_incomplete") from None
-    except OSError:
+    except _ResolverBusy:
+        raise error(TRANSIENT, "network_unavailable") from None
+    except OSError as exc:
         check()
+        if isinstance(exc, (socket.gaierror, ConnectionError)) or _transient_os_error(exc):
+            raise error(TRANSIENT, "network_unavailable") from None
         raise error(STORAGE, "download_failed") from None
     finally:
         if response is not None:

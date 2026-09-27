@@ -719,7 +719,12 @@ class FloatingLifecycleTests(unittest.TestCase):
             self.assertIsNone(client.snapshot().session)
             self.assertEqual(client.snapshot().access.value, "denied")
             self.assertIsNone(client._credential)
-            self.assertTrue(any(request[1].endswith(f"/sessions/{session_id}/end") for request in transport.requests))
+            # The release runs on a background thread after logout returns.
+            ended = lambda: any(request[1].endswith(f"/sessions/{session_id}/end") for request in transport.requests)
+            release_deadline = time.monotonic() + 2
+            while time.monotonic() < release_deadline and not ended():
+                time.sleep(0.01)
+            self.assertTrue(ended())
         finally:
             client.close()
 

@@ -14,10 +14,25 @@ mod services;
 #[cfg(feature = "services")]
 pub use services::*;
 
+/// A nonzero C client result code. Compare against the associated constants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Error(i32);
 impl Error {
     pub const ARGUMENT: Self = Self(10);
+    pub const STORAGE: Self = Self(11);
+    pub const UNTRUSTED: Self = Self(12);
+    pub const TRANSIENT: Self = Self(13);
+    pub const DENIED: Self = Self(14);
+    pub const ACTIVATION_REQUIRED: Self = Self(15);
+    pub const CLOCK: Self = Self(16);
+    pub const PENDING: Self = Self(17);
+    pub const STALE: Self = Self(18);
+    pub const RESOURCE_LIMIT: Self = Self(19);
+    pub const NOT_FOUND: Self = Self(20);
+    pub const BUSY: Self = Self(21);
+    pub const CANCELLED: Self = Self(23);
+    pub const CAPACITY: Self = Self(24);
+    pub const SESSION_REQUIRED: Self = Self(25);
     pub const fn from_code(code: i32) -> Option<Self> {
         if code == 0 {
             None
@@ -28,19 +43,34 @@ impl Error {
     pub const fn code(self) -> i32 {
         self.0
     }
-    pub const STORAGE: Self = Self(11);
-    pub const UNTRUSTED: Self = Self(12);
-    pub const TRANSIENT: Self = Self(13);
-    pub const DENIED: Self = Self(14);
-    pub const ACTIVATION_REQUIRED: Self = Self(15);
-    pub const CLOCK: Self = Self(16);
-    pub const PENDING: Self = Self(17);
-    pub const RESOURCE_LIMIT: Self = Self(19);
-    pub const NOT_FOUND: Self = Self(20);
-    pub const CANCELLED: Self = Self(23);
-    pub const CAPACITY: Self = Self(24);
-    pub const SESSION_REQUIRED: Self = Self(25);
+    /// The stable lowercase name of a known code, such as `activation_required`.
+    pub const fn name(self) -> &'static str {
+        match self.0 {
+            10 => "argument",
+            11 => "storage",
+            12 => "untrusted",
+            13 => "transient",
+            14 => "denied",
+            15 => "activation_required",
+            16 => "clock",
+            17 => "pending",
+            18 => "stale",
+            19 => "resource_limit",
+            20 => "not_found",
+            21 => "busy",
+            23 => "cancelled",
+            24 => "capacity",
+            25 => "session_required",
+            _ => "unknown",
+        }
+    }
 }
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Orbit {} ({})", self.name(), self.0)
+    }
+}
+impl core::error::Error for Error {}
 fn check(n: i32) -> Result<(), Error> {
     if n == 0 {
         Ok(())
@@ -732,6 +762,30 @@ mod tests {
         };
         let mut c = Client::new(&mut b, &mut p, app.config()).unwrap();
         assert_eq!(c.activate("example-key"), Err(Error::TRANSIENT));
+    }
+
+    #[test]
+    fn error_names_codes() {
+        assert_eq!(Error::ACTIVATION_REQUIRED.name(), "activation_required");
+        assert_eq!(Error::BUSY.code(), 21);
+        assert_eq!(Error::from_code(99).unwrap().name(), "unknown");
+        let mut text = [0u8; 32];
+        let mut out = Writer(&mut text, 0);
+        core::fmt::write(&mut out, format_args!("{}", Error::STALE)).unwrap();
+        let n = out.1;
+        assert_eq!(&text[..n], b"Orbit stale (18)");
+    }
+    struct Writer<'a>(&'a mut [u8], usize);
+    impl core::fmt::Write for Writer<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = self.1 + s.len();
+            self.0
+                .get_mut(self.1..end)
+                .ok_or(core::fmt::Error)?
+                .copy_from_slice(s.as_bytes());
+            self.1 = end;
+            Ok(())
+        }
     }
 
     #[test]

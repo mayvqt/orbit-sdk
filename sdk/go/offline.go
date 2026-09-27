@@ -86,9 +86,6 @@ func parseOfflineKeys(data []byte, environment Environment) (grantKeys, error) {
 	if environment == EnvironmentLive {
 		prefix = "offline-live-"
 	}
-	if len(keys) == 0 || len(keys) > 8 {
-		return nil, ErrConfiguration
-	}
 	for kid := range keys {
 		if !strings.HasPrefix(kid, prefix) || len(kid) == len(prefix) {
 			return nil, ErrConfiguration

@@ -51,8 +51,22 @@ type MutationError struct {
 	Cause       error
 }
 
+// Error describes the outcome without echoing the operation ID or server text.
 func (e *MutationError) Error() string {
-	return "Orbit mutation failed; retain its operation ID for recovery"
+	switch {
+	case e == nil:
+		return "Orbit mutation failed"
+	case e.Usage != nil:
+		return "The usage limit is reached."
+	case e.Resources != nil:
+		return "The resource limit is reached."
+	case e.Uncertain:
+		return "The Orbit mutation outcome is uncertain. Retry with the same operation ID and input."
+	case e.Cause != nil:
+		return e.Cause.Error()
+	default:
+		return "Orbit mutation failed"
+	}
 }
 func (e *MutationError) Unwrap() error             { return e.Cause }
 func (e MutationError) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(e.Error())) }

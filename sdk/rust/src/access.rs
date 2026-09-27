@@ -289,7 +289,7 @@ fn valid_stored_credential_identity(
         && bearer(&saved.credential)
 }
 impl Client {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "local-development"))]
     pub(crate) fn new(config: Config, device: Device, transport: Transport) -> Result<Self> {
         Self::with_storage(
             config,

@@ -252,7 +252,7 @@ int32_t orbit_client_start_session(orbit_client_t *client,
   orbit_client_state_t *c;
   orbit_client_extension_t *e;
   int32_t r;
-  if (!client || !out || client->private_state.magic != 0x4f524243u)
+  if (!client || !out || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   e = c->extension;
@@ -312,7 +312,7 @@ int32_t orbit_client_end_session(orbit_client_t *client,
   orbit_client_state_t *c;
   orbit_client_extension_t *e;
   int32_t r = 0;
-  if (!client || client->private_state.magic != 0x4f524243u)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   e = c->extension;
@@ -348,7 +348,7 @@ int32_t orbit_client_session(orbit_client_t *client,
   int64_t now;
   uint64_t ticks;
   int32_t r;
-  if (!client || !out || client->private_state.magic != 0x4f524243u)
+  if (!client || !out || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   if (!c->extension)
@@ -367,7 +367,7 @@ int32_t orbit_client_close(orbit_client_t *client,
                            const orbit_operation_t *op) {
   orbit_client_state_t *c;
   int32_t r = 0;
-  if (!client || client->private_state.magic != 0x4f524243u)
+  if (!client || client->private_state.magic != ORBIT_CLIENT_MAGIC)
     return ORBIT_CLIENT_ARGUMENT;
   c = &client->private_state;
   if (c->busy)

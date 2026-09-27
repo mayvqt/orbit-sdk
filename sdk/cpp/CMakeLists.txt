@@ -68,6 +68,8 @@ target_include_directories(orbit_sdk
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(orbit_sdk PUBLIC cxx_std_17)
+set(ORBIT_SDK_DEFINITIONS ORBIT_SDK_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(orbit_sdk PRIVATE ${ORBIT_SDK_DEFINITIONS})
 set(ORBIT_SDK_LINK_LIBRARIES
     CURL::libcurl OpenSSL::Crypto ${ORBIT_JSONCPP_TARGET} Threads::Threads)
 if(WIN32)
@@ -115,7 +117,7 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(orbit_sdk_tests tests/sdk_test.cpp ${ORBIT_SDK_SOURCES})
     target_include_directories(orbit_sdk_tests PRIVATE include src)
     target_compile_features(orbit_sdk_tests PRIVATE cxx_std_17)
-    target_compile_definitions(orbit_sdk_tests PRIVATE ORBIT_SDK_TESTING=1)
+    target_compile_definitions(orbit_sdk_tests PRIVATE ORBIT_SDK_TESTING=1 ${ORBIT_SDK_DEFINITIONS})
     target_link_libraries(orbit_sdk_tests PRIVATE ${ORBIT_SDK_LINK_LIBRARIES})
     target_compile_definitions(orbit_sdk_tests PRIVATE
         ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
@@ -173,7 +175,7 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         add_executable(orbit_transport_tls_tests tests/transport_tls_driver.cpp ${ORBIT_SDK_SOURCES})
         target_include_directories(orbit_transport_tls_tests PRIVATE include src)
         target_compile_features(orbit_transport_tls_tests PRIVATE cxx_std_17)
-        target_compile_definitions(orbit_transport_tls_tests PRIVATE ORBIT_SDK_TESTING=1)
+        target_compile_definitions(orbit_transport_tls_tests PRIVATE ORBIT_SDK_TESTING=1 ${ORBIT_SDK_DEFINITIONS})
         target_link_libraries(orbit_transport_tls_tests PRIVATE ${ORBIT_SDK_LINK_LIBRARIES})
         if(MSVC)
             target_compile_options(orbit_transport_tls_tests PRIVATE /W4 /permissive-)

@@ -97,8 +97,48 @@ static int check_content_length_limit(void) {
   }
   return 0;
 }
+static int check_malformed_chunk_size(void) {
+  const char *responses[] = {
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=1\r\nhello\r\n0\r\n\r\n",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"};
+  for (unsigned i = 0; i < sizeof(responses) / sizeof(responses[0]); ++i) {
+    uint16_t status = 0;
+    mock_t m = {responses[i], 0, 512, 0, 0, {0}, 0, &status};
+    orbit_tls_stream_t stream = {&m, connect_tls, write_tls, read_tls,
+                                 close_tls};
+    orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
+                              {(const uint8_t *)"/test", 5},
+                              {(const uint8_t *)"{}", 2},
+                              1};
+    CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) ==
+          ORBIT_CLIENT_UNTRUSTED);
+  }
+  return 0;
+}
+static int check_short_read(void) {
+  const char *responses[] = {
+      "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort",
+      "HTTP/1.1 200 OK\r\nContent-Len",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r"};
+  for (unsigned i = 0; i < sizeof(responses) / sizeof(responses[0]); ++i) {
+    uint16_t status = 0;
+    mock_t m = {responses[i], 0, 7, 0, 0, {0}, 0, &status};
+    orbit_tls_stream_t stream = {&m, connect_tls, write_tls, read_tls,
+                                 close_tls};
+    orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
+                              {(const uint8_t *)"/test", 5},
+                              {(const uint8_t *)"{}", 2},
+                              1};
+    CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) ==
+          ORBIT_CLIENT_TRANSIENT);
+  }
+  return 0;
+}
 int main(void) {
   CHECK(!check_content_length_limit());
+  CHECK(!check_short_read());
+  CHECK(!check_malformed_chunk_size());
   CHECK(!check_response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", 1,
                         "hello"));
   CHECK(!check_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: "

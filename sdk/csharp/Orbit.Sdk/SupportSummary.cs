@@ -19,6 +19,7 @@ public sealed partial class OrbitClient
     /// </summary>
     public SupportSummary SupportSummary(OrbitException error)
     {
+        ArgumentNullException.ThrowIfNull(error);
         var code = error.Error switch
         {
             OrbitError.Configuration => "configuration",

@@ -89,7 +89,7 @@ test("backend limit methods validate fixed usage and current resource replay res
     created_at: "2026-09-01T00:00:00Z", released_at: "2026-09-02T00:00:00Z" }], next_cursor: "scope.filter-id" });
   assert.equal((await client.listResourceAllocations("licence", "projects", { state: "released", limit: 50 })).nextCursor, "scope.filter-id");
   assert.equal(calls.at(-1).url.searchParams.get("state"), "released");
-  for (const units of [true, 1.5, 0, -1, 2 ** 53]) assert.throws(() => client.consume("licence", "exports", units));
+  for (const units of [true, 1.5, 0, -1, 2 ** 53]) await assert.rejects(client.consume("licence", "exports", units), TypeError);
   reply(counter(true, { idempotency_key: key, consumed_units: 2 }), 201);
   await assert.rejects(client.consume("licence", "exports", 2, { idempotencyKey: key }), OrbitMutationUncertainError);
 });

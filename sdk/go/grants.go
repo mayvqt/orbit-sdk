@@ -105,11 +105,19 @@ func parseKeys(data []byte) (grantKeys, error) {
 		return nil, ErrInvalidResponse
 	}
 	// Reject untrusted JOSE key metadata, including URLs and private material.
-	v, _ := uniqueJSON(data)
-	entries := v.(map[string]any)["keys"].([]any)
+	// decodeJSON has already required an object whose keys are all objects.
+	v, err := uniqueJSON(data)
+	if err != nil {
+		return nil, ErrInvalidResponse
+	}
+	root, _ := v.(map[string]any)
+	entries, _ := root["keys"].([]any)
+	if len(entries) != len(set.Keys) {
+		return nil, ErrInvalidResponse
+	}
 	keys := make(grantKeys, len(set.Keys))
 	for index, key := range set.Keys {
-		fields := entries[index].(map[string]any)
+		fields, _ := entries[index].(map[string]any)
 		if len(fields) != 7 {
 			return nil, ErrInvalidResponse
 		}

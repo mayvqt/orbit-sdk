@@ -474,7 +474,7 @@ void DownloadAuthorization::download(std::string_view destination, std::int64_t 
 namespace orbit::detail {
 namespace {
 std::optional<std::string> required_feature(const Json::Value &value) {
-    if (!value.isMember("required_feature"))
+    if (!value.isObject() || !value.isMember("required_feature"))
         raise(ErrorKind::invalid_response, "invalid_response");
     if (value["required_feature"].isNull())
         return std::nullopt;
@@ -489,7 +489,7 @@ std::optional<std::string> required_feature(const Json::Value &value) {
 template <class T, class Parser>
 std::map<std::string, T> definitions(const Json::Value &value, const char *field, Parser parse) {
     std::map<std::string, T> result;
-    if (!value.isMember(field))
+    if (!value.isObject() || !value.isMember(field))
         raise(ErrorKind::invalid_response, "invalid_response");
     const auto &entries = value[field];
     if (!entries.isObject() || entries.size() > 32)

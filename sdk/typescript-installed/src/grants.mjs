@@ -116,7 +116,7 @@ export function validEntitlements(value) {
   return Object.entries(value).every(([name, enabled]) => /^[a-z][a-z0-9_]{0,63}$/.test(name) && typeof enabled === "boolean");
 }
 
-function matches(value, type) {
+export function matches(value, type) {
   if (type === "integer") return isInteger(value);
   if (type === "object") return isRecord(value);
   return typeof value === type;

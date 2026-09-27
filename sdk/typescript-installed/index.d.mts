@@ -20,6 +20,7 @@ export declare class LimitReachedError extends OrbitError {
   readonly requestedUnits: number;
 }
 export declare class MutationUncertainError extends OrbitError { readonly idempotencyKey: string }
+export { openElectronClient } from "./electron.mjs";
 export declare function downloadFile(authorization: Online.DownloadAuthorization, destination: string, options: Online.DownloadOptions): Promise<string>;
 
 export declare class AppKey {

@@ -27,4 +27,4 @@ Import a signed file through `orbit_example_import_file`. See the
 usage/resources and application-owned verified download callbacks, and the
 [board profile table](../../sdk/embedded/docs/boards.md#offline-profile-builds)
 for exact flash reservations. Full-profile ESP8266 static RAM leaves little room
-for runtime TLS and must be measured on the actual firmware.
+for runtime TLS; check it on the actual firmware.

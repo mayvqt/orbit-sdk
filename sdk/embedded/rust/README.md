@@ -10,10 +10,8 @@ Add it from the local checkout:
 orbit-embedded = { path = "path/to/Orbit-SDK/sdk/embedded" }
 ```
 
-The Cargo manifest lives at the embedded SDK root so the crate contains its C
-sources and headers alongside the Rust wrapper. A local crate archive builds
-without sibling repository directories; it does not require a separately
-downloaded C SDK.
+The crate contains the C sources and headers; no separate C SDK download is
+needed.
 
 Implement `Platform` with the board's maintained TLS/crypto, trusted clock,
 CSPRNG and durable storage. `begin_request` must send the complete request
@@ -34,15 +32,18 @@ let mut client = Client::new(&mut buffers, &mut platform, app.config())?;
 ```
 
 The default arena is 32 KiB. `Buffers::<8192>` or `CompactBuffers` reserves the
-minimum arena and rejects oversized requests or responses cleanly. The full
-buffer object is 41,776 bytes by default and 17,200 bytes with the compact arena.
-Both sizes include the same 6,960-byte client state and 2,048-byte parser
-scratch. Stable caller-owned storage is recommended when the firmware stack is
-smaller than either buffer. Exclusive borrows prevent moving or reusing buffers,
-platform state or parsed origin while a client is active; dropping the client
-wipes its volatile state without revoking the persistent activation. With services
-enabled, drop also attempts bounded seat release and an offline clock checkpoint. Use
-`deactivate` or `invalidate` explicitly.
+minimum arena and rejects oversized requests or responses cleanly; the
+[memory reference](../docs/memory.md) lists both buffer sizes. Place buffers in
+stable caller-owned storage when the firmware stack is smaller. Exclusive
+borrows prevent moving or reusing buffers, platform state or parsed origin while
+a client is active. Dropping the client wipes its volatile state without
+revoking the persistent activation; with services enabled, drop also attempts a
+bounded seat release and an offline clock checkpoint. Use `deactivate` or
+`invalidate` explicitly.
+
+Every call returns `Result<_, Error>`. Compare an `Error` with its constants,
+such as `Error::ACTIVATION_REQUIRED` or `Error::TRANSIENT`; `name()` and
+`Display` give its stable code name.
 
 Host builds use the installed `cc` and `ar`. For cross compilation, set `ORBIT_CC`
 and `ORBIT_AR` to the installed target tools, and `ORBIT_CFLAGS` to their target
@@ -76,9 +77,7 @@ client.import_offline_file(signed_file)?;
 client.require_access("export")?;
 ```
 
-Use `Buffers::<16384>` or larger with the full profile. Place large buffers in
-stable caller-owned storage appropriate for the board, rather than a small task
-stack. `import_offline_reader` takes a bounded read closure and optional
+Use `Buffers::<16384>` or larger with the full profile. `import_offline_reader` takes a bounded read closure and optional
 `Operation`; it reuses `OfflineBuffers` transaction storage and needs no second
 file-sized input allocation. `offline_request` writes into caller output.
 

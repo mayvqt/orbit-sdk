@@ -17,8 +17,7 @@ ipcMain.handle("orbit:export", async (event) => {
       event.senderFrame.url !== rendererUrl) {
     throw new Error("unauthorized renderer");
   }
-  const access = await client.ensureAccess("export", async () => process.env.ORBIT_LICENCE_KEY ?? null);
-  if (!access.has("export")) throw new Error("export access unavailable");
+  await client.ensureAccess("export", async () => process.env.ORBIT_LICENCE_KEY ?? null);
   await exportProtectedDataInMainProcess();
   return Object.freeze({ completed: true });
 });

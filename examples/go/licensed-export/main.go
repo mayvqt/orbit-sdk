@@ -40,10 +40,6 @@ func (c *console) prompt(label string, password bool) (string, error) {
 func (c *console) password() (string, error) {
 	return c.prompt("Password (this console does not hide terminal input): ", true)
 }
-func operationID() (string, error) {
-	device, err := orbit.NewInstallation()
-	return device.InstallationID, err
-}
 
 func main() {
 	if err := run(); err != nil {
@@ -157,11 +153,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		if err != nil {
 			return err
 		}
-		operation, err := operationID()
-		if err != nil {
-			return err
-		}
-		state, err := c.client.ActivateAccount(ctx, licence, operation)
+		state, err := c.client.ActivateAccount(ctx, licence)
 		if err != nil {
 			return err
 		}
@@ -171,11 +163,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		if err != nil {
 			return err
 		}
-		operation, err := operationID()
-		if err != nil {
-			return err
-		}
-		licence, err := c.client.ClaimLicence(ctx, key, operation)
+		licence, err := c.client.ClaimLicence(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -308,11 +296,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		}
 		fmt.Println("Verified download saved. No installer was executed.")
 	case "deactivate":
-		operation, err := operationID()
-		if err != nil {
-			return err
-		}
-		if err := c.client.Deactivate(ctx, operation); err != nil {
+		if err := c.client.Deactivate(ctx); err != nil {
 			fmt.Printf("Local access cleared; server release was not confirmed: %v\n", err)
 			c.printSupport(err)
 		} else {

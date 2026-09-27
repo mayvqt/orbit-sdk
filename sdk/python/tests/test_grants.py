@@ -77,6 +77,18 @@ class GrantVectorTests(unittest.TestCase):
             with self.assertRaises(OrbitError):
                 parse_header(malformed)
 
+    def test_lone_surrogates_are_invalid_input_not_unicode_errors(self) -> None:
+        corpus = fixture_data()
+        keys = Keys.parse(corpus["jwks"])
+        for action in (
+            lambda: unique_json('{"keys":"\ud800"}'),
+            lambda: Keys.parse('{"keys":"\ud800"}'),
+            lambda: parse_header("\ud800." + corpus["cases"][0]["token"]),
+            lambda: verify("\ud800", keys, Expected(**corpus["expected"])),
+        ):
+            with self.assertRaises(OrbitError):
+                action()
+
     def test_jwks_rejects_duplicate_and_untrusted_metadata(self) -> None:
         corpus = fixture_data()
         key = corpus["jwks"]["keys"][0]

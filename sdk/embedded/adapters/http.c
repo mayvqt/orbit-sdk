@@ -23,18 +23,23 @@ static int next(reader_t *r) {
   }
   return r->bytes[r->at++];
 }
+/* The stream ended early: a short read is an outage unless the stream itself
+ * reported a more specific failure. */
+static int32_t ended(const reader_t *r) {
+  return r->error ? r->error : ORBIT_CLIENT_TRANSIENT;
+}
 static int32_t line(reader_t *r, char *out, uint32_t capacity) {
   uint32_t n = 0;
   for (;;) {
     int c = next(r);
     if (c < 0)
-      return r->error ? r->error : ORBIT_CLIENT_UNTRUSTED;
+      return ended(r);
     if (++r->headers > 8192)
       return ORBIT_CLIENT_RESOURCE_LIMIT;
     if (c == '\r') {
       c = next(r);
       if (c != '\n')
-        return r->error ? r->error : ORBIT_CLIENT_UNTRUSTED;
+        return c < 0 ? ended(r) : ORBIT_CLIENT_UNTRUSTED;
       ++r->headers;
       out[n] = 0;
       return 0;
@@ -77,7 +82,7 @@ static int32_t body(reader_t *r, uint32_t count, orbit_receive_fn receive,
     if (r->at == r->length) {
       int c = next(r);
       if (c < 0)
-        return r->error ? r->error : ORBIT_CLIENT_UNTRUSTED;
+        return ended(r);
       --r->at;
     }
     uint32_t n = r->length - r->at;
@@ -247,7 +252,11 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
       rc = line(&r, text, sizeof(text));
       if (rc)
         goto done;
-      if (!number(text, 16, &n) || n > ORBIT_CLIENT_ARENA_MAX_BYTES - total) {
+      if (!number(text, 16, &n)) {
+        rc = ORBIT_CLIENT_UNTRUSTED;
+        goto done;
+      }
+      if (n > ORBIT_CLIENT_ARENA_MAX_BYTES - total) {
         rc = ORBIT_CLIENT_RESOURCE_LIMIT;
         goto done;
       }
@@ -261,8 +270,9 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
       if (rc)
         goto done;
       total += n;
-      if (next(&r) != '\r' || next(&r) != '\n') {
-        rc = r.error ? r.error : ORBIT_CLIENT_UNTRUSTED;
+      int cr = next(&r), lf = cr == '\r' ? next(&r) : 0;
+      if (cr != '\r' || lf != '\n') {
+        rc = cr < 0 || lf < 0 ? ended(&r) : ORBIT_CLIENT_UNTRUSTED;
         goto done;
       }
     }

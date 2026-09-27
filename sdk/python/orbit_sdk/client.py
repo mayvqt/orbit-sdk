@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
@@ -123,6 +124,7 @@ class Snapshot:
     offline_allowed: bool
     remaining_offline: dt.timedelta
     session: SessionMetadata | None = None
+    offline_file_mode: bool = False
 
     def has(self, feature: str) -> bool:
         """Return whether ``feature`` is a currently granted entitlement."""
@@ -421,6 +423,7 @@ class Client:
         self._session_lock = threading.Lock()
         self._transient = False
         self._retry_deadline: float | None = None
+        self._last_failure: OrbitError | None = None
         self._account: _AccountSession | None = None
         self._device_value = device
         self._keys: Keys | None = None
@@ -832,9 +835,8 @@ class Client:
                         elif session_mode and session_remaining <= 0.0:
                             try:
                                 self._advance_session(self._lifecycle_stop)
-                            except OrbitError as exc:
-                                if exc.kind not in (TRANSIENT, DENIED, CANCELLED, STALE_RESPONSE, CLOCK_UNCERTAIN, STORAGE):
-                                    pass
+                            except OrbitError:
+                                pass
                             with self._state_lock:
                                 session_retry = self._session_retry_deadline
                             if session_retry is not None:
@@ -847,9 +849,8 @@ class Client:
                         if needs_refresh and (retry_remaining is None or retry_remaining <= 0.0):
                             try:
                                 self._refresh(self._lifecycle_stop, respect_retry=True)
-                            except OrbitError as exc:
-                                if exc.kind not in (TRANSIENT, CANCELLED, REAUTHENTICATION_REQUIRED, STALE_RESPONSE, CLOCK_UNCERTAIN, STORAGE):
-                                    pass
+                            except OrbitError:
+                                pass
                             with self._state_lock:
                                 retry = self._retry_deadline
                             if retry is not None:
@@ -864,10 +865,11 @@ class Client:
                             timeout = min(timeout, refresh_remaining)
                             if needs_refresh and retry_remaining is not None:
                                 timeout = min(timeout, retry_remaining)
+                except OrbitError:
+                    # OrbitError subclasses RuntimeError; only closing stops the worker.
+                    timeout = min(timeout, 5.0)
                 except RuntimeError:
                     return
-                except OrbitError:
-                    timeout = min(timeout, 5.0)
                 if self._lifecycle_stop.wait(timeout):
                     return
         finally:
@@ -926,6 +928,7 @@ class Client:
         self._offline_state = None
         self._transient = False
         self._retry_deadline = None
+        self._last_failure = None
 
     def _drop_floating_locked(self, *, release: bool, clear_profile: bool) -> None:
         current = self._floating
@@ -943,23 +946,7 @@ class Client:
             self._session_licence_expiry = None
             self._session_binding_mode = None
         if release and session_id and credential is not None:
-            self._schedule_session_release(session_id, credential)
-
-    def _schedule_session_release(self, session_id: str, credential: StoredCredential) -> None:
-        def release() -> None:
-            cancelled = threading.Event()
-            timer = threading.Timer(2.0, cancelled.set)
-            timer.daemon = True
-            timer.start()
-            try:
-                route = f"{CLIENT_PREFIX}activations/{credential.activation_id}/sessions/{session_id}/end"
-                self.transport.post(route, self._credential_body(credential), True, cancelled)
-            except BaseException:
-                pass
-            finally:
-                timer.cancel()
-
-        threading.Thread(target=release, name="orbit-session-release", daemon=True).start()
+            self._queue_session_release(session_id, credential)
 
     def _clear_all_locked(self) -> None:
         self._clear_access_locked()
@@ -1265,7 +1252,10 @@ class Client:
                 snapshot = self._snapshot()
                 with self._state_lock:
                     retry_due = self._retry_deadline is None or time.monotonic() >= self._retry_deadline
+                    last_failure = self._last_failure
                 if snapshot["access"] not in ("refresh_required", "expired", "offline") or not retry_due:
+                    if snapshot["access"] != "offline" and last_failure is not None:
+                        raise last_failure
                     return snapshot
             with self._state_lock:
                 saved = self._credential
@@ -1664,6 +1654,7 @@ class Client:
                     self._drop_floating_locked(release=True, clear_profile=False)
                 self._transient = False
                 self._retry_deadline = None
+                self._last_failure = None
                 return self._snapshot_locked()
         assert failure is not None
         if failure.kind == TRANSIENT:
@@ -1685,6 +1676,31 @@ class Client:
                 return snapshot
             raise failure
         if failure.kind == CANCELLED:
+            raise failure
+        if (
+            self._persistent_storage is not None
+            and self._persistent_storage.pending_activation is None
+            and failure.kind not in (DENIED, REAUTHENTICATION_REQUIRED)
+        ):
+            # A failed validation that is not an authoritative denial (TLS,
+            # transport or malformed reply) drops cached authority but keeps the
+            # saved credential, so a captive portal cannot force a new key prompt.
+            with self._state_lock:
+                if self._generation != generation:
+                    raise error(STALE_RESPONSE, "stale_response")
+                self._drop_floating_locked(release=False, clear_profile=True)
+                self._generation += 1
+                self._claims = None
+                self._anchor = None
+                self._persisted_access = None
+                self._transient = False
+                self._retry_deadline = time.monotonic() + random.randrange(15, 45)
+                self._last_failure = failure
+                try:
+                    self._persistent_storage.clear_access()
+                except BaseException as exc:
+                    self._clear_all_locked()
+                    raise error(STORAGE, "storage_failed") from exc
             raise failure
         preserve_pending = (
             self._persistent_storage is not None
@@ -1954,7 +1970,7 @@ class Client:
                                     lambda v: online.parse_authorization(v, release_id, artifact_id), cancellation)
 
     def download(self, authorization: online.DownloadAuthorization, destination: str | os.PathLike[str], *,
-                 max_bytes: int, replace: bool = False, cancellation: Cancellation | None = None) -> os.PathLike[str]:
+                 max_bytes: int, replace: bool = False, cancellation: Cancellation | None = None) -> Path:
         """Stream directly from the seller and atomically expose verified bytes."""
         from .download_file import download_file
         with self._operation(cancellation) as cancel:
@@ -2371,6 +2387,7 @@ def _to_snapshot(value: dict[str, Any]) -> Snapshot:
             expires_at=_instant(value["session"]["expires_at"]),
             refresh_after=_instant(value["session"]["refresh_after"]),
         ),
+        offline_file_mode=bool(value.get("offline_file_mode", False)),
     )
 
 

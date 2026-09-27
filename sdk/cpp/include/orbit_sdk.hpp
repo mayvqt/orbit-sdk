@@ -140,7 +140,8 @@ class AppKey {
 /// Trusted public keys for signed offline files. This contains no private key material.
 class OfflineKeys {
   public:
-    static OfflineKeys parse(std::string_view jwks_json, std::string_view environment);
+    /// An empty environment ("test" or "live") is taken from the key IDs.
+    static OfflineKeys parse(std::string_view jwks_json, std::string_view environment = {});
     const std::string& environment() const noexcept { return environment_; }
 
 private:
@@ -154,7 +155,8 @@ private:
 /// Trusted public connected-purpose keys used to verify floating-session grants.
 class SessionKeys {
 public:
-    static SessionKeys parse(std::string_view jwks_json, std::string_view environment);
+    /// An empty environment ("test" or "live") is taken from the key IDs.
+    static SessionKeys parse(std::string_view jwks_json, std::string_view environment = {});
     const std::string& environment() const noexcept { return environment_; }
 
 private:

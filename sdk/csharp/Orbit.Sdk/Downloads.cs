@@ -78,7 +78,7 @@ public sealed partial class OrbitClient
 
 internal static class DownloadWire
 {
-    internal static bool Label(string value) => value.Length is >= 1 and <= 32 && value[0] is >= 'a' and <= 'z' &&
+    internal static bool Label(string? value) => value is { Length: >= 1 and <= 32 } && value[0] is >= 'a' and <= 'z' &&
         value.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-');
     internal static void Artifact(ReleaseArtifact a)
     {
@@ -214,7 +214,7 @@ internal static class ArtifactDownload
                     var buffer = new byte[65536];
                     long received = 0;
                     int read;
-                    while ((read = await input.ReadAsync(buffer, transferToken).ConfigureAwait(false)) != 0)
+                    while ((read = await ReadBodyAsync(input, buffer, transferToken).ConfigureAwait(false)) != 0)
                     {
                         if (read > maximumBytes - received || read > authorization.Artifact.ByteLength - received) throw JsonWire.Invalid();
                         received += read;
@@ -236,6 +236,17 @@ internal static class ArtifactDownload
         catch (HttpRequestException) { throw new OrbitException(OrbitError.TransportSecurity); }
         catch (IOException) { throw new OrbitException(OrbitError.Storage); }
         catch (UnauthorizedAccessException) { throw new OrbitException(OrbitError.Storage); }
-        finally { try { File.Delete(temporary); } catch (IOException) { } }
+        finally
+        {
+            try { File.Delete(temporary); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    // A failed or truncated response body is a delivery failure, not a local storage failure.
+    private static async ValueTask<int> ReadBodyAsync(Stream input, byte[] buffer, CancellationToken cancellationToken)
+    {
+        try { return await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false); }
+        catch (IOException) { throw JsonWire.Invalid(); }
     }
 }

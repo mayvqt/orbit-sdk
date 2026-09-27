@@ -35,12 +35,16 @@ std::int64_t integer_value(const Json::Value &value) {
 }
 
 std::optional<std::int64_t> optional_integer(const Json::Value &value, const char *name) {
+    if (!value.isObject())
+        invalid();
     if (!value.isMember(name) || value[name].isNull())
         return std::nullopt;
     return integer_value(value[name]);
 }
 
 std::optional<std::string> optional_string(const Json::Value &value, const char *name) {
+    if (!value.isObject())
+        invalid();
     if (!value.isMember(name))
         return std::nullopt;
     return string_value(value[name]);

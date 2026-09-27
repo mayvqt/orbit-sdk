@@ -214,8 +214,11 @@ int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
     result = r.error;
     goto done;
   }
+  /* Socket-level failures are network unavailability; TLS and protocol
+   * failures stay untrusted. */
   if (code == CURLE_OPERATION_TIMEDOUT || code == CURLE_COULDNT_CONNECT ||
-      code == CURLE_COULDNT_RESOLVE_HOST) {
+      code == CURLE_COULDNT_RESOLVE_HOST || code == CURLE_SEND_ERROR ||
+      code == CURLE_RECV_ERROR || code == CURLE_GOT_NOTHING) {
     result = ORBIT_CLIENT_TRANSIENT;
     goto done;
   }
@@ -230,6 +233,28 @@ done:
   curl_easy_cleanup(curl);
   return result;
 #undef SET
+}
+/* A crash while creating the journal can leave it short. Only an all-erased
+ * prefix is safe to initialize again: it holds no generation or intent. */
+static int unfinished_creation(int fd, off_t size) {
+  uint8_t bytes[256];
+  off_t at = 0;
+  if (size < 0 || size >= (off_t)(2u * ORBIT_PORT_SLOT_BYTES))
+    return 0;
+  while (at < size) {
+    size_t want = (size_t)(size - at) < sizeof(bytes) ? (size_t)(size - at)
+                                                        : sizeof(bytes);
+    ssize_t n = pread(fd, bytes, want, at);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return 0;
+    for (ssize_t i = 0; i < n; ++i)
+      if (bytes[i] != 255u)
+        return 0;
+    at += n;
+  }
+  return 1;
 }
 int32_t orbit_posix_open(orbit_posix_t *c, int directory_fd,
                          orbit_client_services_t *services) {
@@ -260,7 +285,7 @@ int32_t orbit_posix_open(orbit_posix_t *c, int directory_fd,
   c->descriptor = fd;
   c->journal = (orbit_journal_t){
       c, ORBIT_PORT_SLOT_BYTES, file_read, file_erase, file_write, file_sync};
-  if (created) {
+  if (created || unfinished_creation(fd, info.st_size)) {
     if (file_erase(c, 0u) != 0 || file_erase(c, 1u) != 0 || file_sync(c) != 0 ||
         fsync(directory_fd) != 0)
       goto failed;

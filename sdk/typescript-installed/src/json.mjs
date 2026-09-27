@@ -141,6 +141,15 @@ export function exactFields(value, required, optional = []) {
   return result;
 }
 
+/** Canonical JSON with sorted object keys, used for digests. */
+export function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export function isInteger(value, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
   return Number.isSafeInteger(value) && value >= min && value <= max;
 }

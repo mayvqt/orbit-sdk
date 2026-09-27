@@ -33,24 +33,39 @@ public sealed class SessionKeys
 
     public string Environment { get; }
 
-    public static SessionKeys Parse(string json, string environment) =>
-        Parse(Encoding.UTF8.GetBytes(json), environment);
+    /// <summary>
+    /// Parse trusted connected-purpose public keys. The Test or Live environment
+    /// comes from the key IDs unless <paramref name="environment"/> pins it.
+    /// </summary>
+    public static SessionKeys Parse(string json, string? environment = null)
+    {
+        ArgumentNullException.ThrowIfNull(json);
+        return Parse(Encoding.UTF8.GetBytes(json), environment);
+    }
 
-    public static SessionKeys Parse(ReadOnlyMemory<byte> bytes, string environment)
+    /// <inheritdoc cref="Parse(string, string?)"/>
+    public static SessionKeys Parse(ReadOnlyMemory<byte> bytes, string? environment = null)
     {
         if (bytes.Length > MaximumBytes) throw InvalidKeys();
         try { return Parse(JsonWire.Parse(bytes), environment); }
         catch (OrbitException) { throw InvalidKeys(); }
     }
 
-    internal static SessionKeys Parse(JsonElement value, string environment)
+    internal static SessionKeys Parse(JsonElement value, string? environment)
     {
         try
         {
-            if (environment is not ("test" or "live") || Encoding.UTF8.GetByteCount(value.GetRawText()) > MaximumBytes)
+            if (Encoding.UTF8.GetByteCount(value.GetRawText()) > MaximumBytes)
                 throw InvalidKeys();
             JsonWire.ExactFields(value, "keys");
             var keys = GrantKeys.Parse(value);
+            environment ??= JsonWire.String(JsonWire.Field(value, "keys")[0], "kid") switch
+            {
+                var kid when kid.StartsWith("test-", StringComparison.Ordinal) => "test",
+                var kid when kid.StartsWith("live-", StringComparison.Ordinal) => "live",
+                _ => throw InvalidKeys()
+            };
+            if (environment is not ("test" or "live")) throw InvalidKeys();
             var prefix = environment + "-";
             foreach (var entry in JsonWire.Field(value, "keys").EnumerateArray())
             {
