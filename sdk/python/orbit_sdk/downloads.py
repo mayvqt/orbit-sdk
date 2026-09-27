@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from ipaddress import IPv6Address
 import json
 import re
 from typing import Any
@@ -61,6 +62,22 @@ class DownloadTicketVerifier:
             ):
                 raise ValueError("invalid endpoint")
             parsed = urlsplit(endpoint)
+            authority = parsed.netloc
+            if not authority or any(char in authority for char in "@%"):
+                raise ValueError("invalid endpoint authority")
+            if authority.startswith("["):
+                closing = authority.index("]")
+                IPv6Address(authority[1:closing])
+                suffix = authority[closing + 1:]
+                if suffix and not suffix.startswith(":"):
+                    raise ValueError("invalid endpoint authority")
+                port = suffix[1:] if suffix else None
+            else:
+                if any(char in authority for char in "[]") or authority.count(":") > 1:
+                    raise ValueError("invalid endpoint authority")
+                port = authority.split(":", 1)[1] if ":" in authority else None
+            if port is not None and (not port.isdecimal() or not 1 <= int(port) <= 65535):
+                raise ValueError("invalid endpoint port")
             _safe_origin(f"https://{parsed.netloc}")
             self._endpoint = endpoint
         except (OrbitError, ValueError, TypeError, UnicodeError) as exc:

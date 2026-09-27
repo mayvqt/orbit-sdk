@@ -80,7 +80,13 @@ part of a valid HTTP bearer token.
 
 The protected endpoint is a configured, exact HTTPS URL of at most 2048 ASCII
 characters, without credentials, query, fragment, whitespace or backslashes.
-Use valid percent encoding for non-ASCII or other characters outside URI syntax.
+Validate the raw authority before a URL parser can normalize it: require a
+nonempty host, reject any user-info delimiter (including an empty `@`) and
+percent encoding in the authority, and allow a port only as decimal digits
+from 1 through 65535. An explicit empty port is invalid. IPv6 addresses must
+use brackets, with only an optional port after the closing bracket. Use an
+ASCII hostname (Punycode for international names); valid percent encoding is
+allowed in the path. Preserve the exact configured URL for audience matching.
 A seller verifier returns
 verified artifact metadata, which the seller matches against its own artifact
 registry before selecting a file or storage object. It must not use an artifact

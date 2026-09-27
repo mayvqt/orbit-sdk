@@ -51,6 +51,11 @@ class DownloadTicketTests(unittest.TestCase):
             "https://downloads.example.test/has space", "https://downloads.example.test/\nfile",
             "https://downloads.example.test/\\file", "https://downloads.example.test/☃",
             "https://downloads.example.test:0/file", "https://downloads.example.test:65536/file",
+            "https://downloads.example.test:/file", "https://%64ownloads.example.test/file",
+            "https://@downloads.example.test/file", "https://:443/file",
+            "https://[::1]extra/file", "https://[::1]:/file", "https://[v1.test]/file",
+            "https://[::1]:0/file", "https://[::1]:65536/file", "https://::1/file",
+            "https://downloads.example.test:+443/file",
             "https://downloads.example.test/<file>", "https://downloads.example.test/%xx",
             "https://downloads.example.test/%", "https://downloads.example.test/{file}",
             "https:///file", "https://downloads.example.test/" + "a" * 2048,
@@ -58,6 +63,16 @@ class DownloadTicketTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint), self.assertRaises(OrbitError) as raised:
                 self.verifier(endpoint=endpoint)
             self.assertEqual(raised.exception.code, "invalid_download_endpoint")
+
+    def test_endpoint_preserves_valid_ports_ipv6_and_encoded_paths(self):
+        for endpoint in (
+            "https://downloads.example.test", "https://downloads.example.test:443/file",
+            "https://downloads.example.test:65535/file", "https://downloads.example.test:000443/file",
+            "https://[::1]/file", "https://[::1]:8443/file", "https://[::ffff:192.0.2.1]/file",
+            "https://xn--bcher-kva.example/%E2%98%83", "https://downloads.example.test/a%2Fb",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.verifier(endpoint=endpoint)._endpoint, endpoint)
 
     def test_key_input_is_bounded_strict_and_copied(self):
         encoded = json.dumps(self.corpus["jwks"])
