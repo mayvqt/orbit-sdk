@@ -85,6 +85,10 @@ bodies contain only the extra operation fields, never an activation proof.
 Dashboard actions call the same authoritative services after cookie/RBAC/CSRF
 authorization. Do not provide an unauthenticated licence-ID lookup.
 
+Successful reads, consumes, acquires and releases return HTTP 200, including
+successful mutation replays and acquisition of an already-active resource.
+All responses use `Cache-Control: no-store`.
+
 Management and dashboard allocation lists use
 `GET .../licences/{licence_id}/resources/{name}/allocations` and `resources:read`
 or the equivalent dashboard read permission. Return `items` and nullable
@@ -113,6 +117,37 @@ Capacity denials use HTTP 409 and the ordinary safe `code`, plus a typed
 Resource-capacity denials use the same envelope with `resource_limit_reached`
 and the resource counter shape. Other errors keep the existing error envelope;
 never place arbitrary request bodies or database diagnostics into these details.
+
+The counter and operation fields are inside `error`, alongside the service's
+safe message and request ID. For example, a usage-capacity denial has this shape:
+
+```json
+{
+  "error": {
+    "code": "usage_limit_reached",
+    "message": "The request conflicts with current state.",
+    "request_id": "request_example",
+    "counter": {
+      "name": "exports",
+      "period": "day",
+      "limit": 100,
+      "used": 100,
+      "remaining": 0,
+      "period_started_at": "2026-09-27T00:00:00Z",
+      "resets_at": "2026-09-28T00:00:00Z"
+    },
+    "idempotency_key": "export_job_example",
+    "requested_units": 1
+  }
+}
+```
+
+SDKs expose these details only after validating the expected counter kind and
+name, safe-integer bounds, `used <= limit`, `remaining = limit - used`, and the
+request's operation ID and units. A mismatched or malformed denial is an invalid
+response with an uncertain mutation outcome, so the caller retains the same
+operation ID for recovery. Do not present unvalidated error fields as counters
+or treat an invalid response as a new operation.
 
 Save both accepted and limit-denied outcomes for the replay window. Reusing an
 operation ID with different normalized input is a conflict. An identical retry
