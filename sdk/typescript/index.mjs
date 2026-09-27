@@ -733,7 +733,7 @@ function isLicence(value) {
     isEntitlements(entitlements) &&
     typeof value.reference === "string" && utf8Length(value.reference) <= 200 &&
     typeof value.note === "string" && utf8Length(value.note) <= 2000 &&
-    isTimestamp(value.created_at) && nullableTimestamp(value.reset_cooldown_until) &&
+    isTimestamp(value.created_at) && nullableTimestamp(value.transfer_retry_at) &&
     (value.customer_id === null || isId(value.customer_id)) &&
     isSafeInteger(value.key_generation, 1, Number.MAX_SAFE_INTEGER);
 }
@@ -777,7 +777,7 @@ function freezeLicence(value) {
     reference: value.reference,
     note: value.note,
     created_at: value.created_at,
-    reset_cooldown_until: value.reset_cooldown_until,
+    transfer_retry_at: value.transfer_retry_at,
     customer_id: value.customer_id,
     key_generation: value.key_generation,
   });

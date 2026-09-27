@@ -140,7 +140,7 @@ export interface OrbitLicence {
   readonly reference: string;
   readonly note: string;
   readonly created_at: string;
-  readonly reset_cooldown_until: string | null;
+  readonly transfer_retry_at: string | null;
   readonly customer_id: string | null;
   readonly key_generation: number;
 }

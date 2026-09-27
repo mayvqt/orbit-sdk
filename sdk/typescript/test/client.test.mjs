@@ -68,7 +68,7 @@ function licenceShape(overrides = {}) {
     reference: "",
     note: "",
     created_at: "2026-09-27T00:00:00Z",
-    reset_cooldown_until: null,
+    transfer_retry_at: null,
     customer_id: null,
     key_generation: 1,
     ...overrides,
