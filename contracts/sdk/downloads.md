@@ -142,6 +142,8 @@ contract.
   publication, scoped to application/environment/channel. A draft has no number.
   `POST /releases/{id}/unpublish` stops discovery and new authorization. Repeating
   either action is a no-op; republishing preserves its original number and bytes.
+  Unpublishing a never-published draft returns the unchanged draft, with null
+  publication number and time; it remains editable.
 
 Creation returns HTTP 201 with the created release or artifact. Release reads,
 metadata edits, publication and unpublication return HTTP 200 with the release;
