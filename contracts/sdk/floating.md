@@ -181,6 +181,14 @@ renewals, then sends the release request. A failed release does not restore
 authority; the server reservation expires naturally. Ending explicitly disables
 automatic reacquisition until the caller invokes `start_session` again.
 
+Calling `start_session` while the current session is still usable returns its
+current snapshot without allocating another seat. A stored activation whose
+policy is not yet known is checked online first. For a confirmed ordinary
+licence, `start_session` and `end_session` leave ordinary access unchanged and
+make no session request. This lets applications use the same idle/resume flow
+with ordinary and floating licences. Long-term offline-file mode never starts
+a session or switches online implicitly.
+
 Use existing generation fencing around network awaits: a late start or renewal
 cannot restore access after end, logout, close, credential change or cancellation.
 If a cancelled start may have reached the service, best-effort end its known ID;
