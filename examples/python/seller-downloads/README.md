@@ -2,9 +2,8 @@
 
 This example verifies an Orbit download ticket and redirects to a private
 S3-compatible object owned by the seller. It does not create a bucket, upload a
-file or send storage credentials to Orbit. Orbit's release and ticket-issuance
-API is still being implemented; the verifier and this endpoint can be exercised
-locally with synthetic tickets.
+file or send storage credentials to Orbit. Configure Orbit with this endpoint's
+URL; Orbit supplies the authorization ticket and your backend controls delivery.
 
 From the SDK checkout root, install into a local environment:
 
@@ -39,8 +38,7 @@ This command starts Flask's local development server. For an actual seller
 service, use its normal WSGI hosting behind HTTPS, route the configured endpoint
 path to this app, and apply request/header size limits at that front end. Keep
 debug mode off. Exclude authorization and `Location` response headers from logs;
-the latter contains a temporary storage capability. No hosted service is needed
-to run the checks below, and this example does not deploy one.
+the latter contains a temporary storage capability.
 
 The client sends an Orbit ticket in `Authorization: Bearer …`. The endpoint
 checks its signature, exact configured audience, scope, expiry, artifact ID,
@@ -57,6 +55,5 @@ build/seller-downloads-venv/bin/python -m unittest discover -s examples/python/s
 ```
 
 These tests exercise the real public verifier and Boto3 signing using synthetic
-credentials; they never contact a bucket. A live provider integration and the
-SDK's full TLS/streaming flow need separate checks when download issuance is
-available.
+credentials; they never contact a bucket. Test your provider integration and
+the complete TLS download flow separately before accepting user traffic.

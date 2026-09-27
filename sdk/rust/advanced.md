@@ -131,9 +131,7 @@ fingerprint, or server-private message.
 
 ## Local crate validation
 
-The candidate consists of `orbit-sdk` and its `orbit-sdk-native` platform helper.
-Neither crate is published yet; applications should use the README's local path
-dependency. `publish = false` remains set during the release hold.
+The SDK consists of `orbit-sdk` and its `orbit-sdk-native` platform helper.
 
 From the repository root, these commands build and verify local crate archives
 without uploading them:
@@ -144,12 +142,12 @@ RUSTUP_AUTO_INSTALL=0 cargo package -p orbit-sdk --offline --locked \
   --config 'patch.crates-io.orbit-sdk-native.path="sdk/rust/native"'
 ```
 
-The temporary command-line patch lets Cargo resolve the unpublished native helper
+The temporary command-line patch lets Cargo resolve the local native helper
 while checking the main archive. It does not change the dependency written into
 that archive or configure a consumer application. Both packages retain their MIT
 licence files. Add `--allow-dirty` only when deliberately checking uncommitted
 source. These checks pass on Linux; they do not establish Windows/macOS native
-runtime correctness or availability on crates.io.
+runtime correctness.
 
 ## Warm access benchmark
 
@@ -170,6 +168,9 @@ Each operation runs five measured trials of 10,000 calls after a 1,000-call warm
 
 The snapshot decision now samples the native anchor once. `require_access` checks a warm online grant under the initial state lock and, after an awaited refresh, builds a new decision from synchronized current state. These small differences are within expected host timing variation and do not establish a material speedup or a cross-platform performance guarantee.
 
-Linux tests run in this environment. Native macOS compilation, filesystem behavior and
-sleep-across-expiry checks remain pending because no Apple SDK or Mac hardware is
-available here.
+## Platform validation
+
+Automated validation covers Linux. Native macOS compilation, filesystem behavior
+and sleep across expiry are unverified. Validate lease contention, copied or
+replaced state, durable-write failures and sleep across expiry on macOS before
+distributing a Mac application.

@@ -38,11 +38,6 @@ are distinct from short-lived connected access grants. `expected` contains the
 app key, installation, optional binding, verification time and minimum accepted
 renewal sequence; per-case overrides and replacement trusted `jwks` work like the
 connected corpus. Python, Go, Rust, C# and C++ verifiers consume the corpus.
-Python, Go and Rust installed import, renewal and restart behavior is covered
-separately. The matching private Orbit candidate includes authenticated issuance,
-dashboard export and recovery handling; real Python interoperability and
-desktop/mobile browser checks pass. C#/C++, installed TypeScript and embedded
-lifecycle work remains in progress. Neither candidate has been released or deployed.
 
 Do not treat a passing file-verification corpus as evidence that issuance,
 durable renewal or reboot behavior is complete. Those require the behavioral
@@ -51,9 +46,8 @@ discovering a key from the file being verified.
 
 ## Licensed downloads
 
-The pending seller-hosted delivery feature is defined in
-[downloads.md](downloads.md). Its contract does not imply that release discovery,
-download authorization or SDK helpers are implemented.
+[downloads.md](downloads.md) defines seller-hosted release discovery, download
+authorization and verified streaming.
 
 [download-tickets.json](download-tickets.json) has 110 synthetic cases (10 valid,
 100 invalid), consumed by the Python, Go, Rust, C# and C++ seller-endpoint verifiers.
@@ -83,7 +77,7 @@ do not establish automatic acquisition, renewal, release or durable seat account
 
 [limits.md](limits.md) defines online usage consumption and persistent resource
 allocations, including retries and the trust boundary for customer-controlled
-applications. Implementation and behavioral tests remain pending.
+applications.
 
 ## App keys
 

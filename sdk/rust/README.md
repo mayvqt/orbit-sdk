@@ -1,11 +1,7 @@
 # Orbit Rust SDK
 
-Use the installed client to activate a licence and check protected features. The
-current workspace version is an unreleased v0.4.0 candidate; build it from this
-checkout rather than relying on a release tag or registry package.
-
-Use the matching Orbit development server for this candidate. Its app-key
-integration has not been deployed to the hosted production service yet.
+Use the installed client to activate a licence and check protected features.
+To use the SDK from source, add it to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -111,8 +107,7 @@ To use an explicit persistent directory or change binding policy, call
 `Client::open_with_options` with `Options`. Identity changes rotate the installation
 ID and clear its saved activation and cached grant before recovery.
 
-Native macOS compilation and runtime checks are pending; this workspace was checked
-on Linux only and has no Apple SDK or hardware.
+See [platform validation](advanced.md#platform-validation) for the tested scope.
 
 ## Verify seller download tickets
 

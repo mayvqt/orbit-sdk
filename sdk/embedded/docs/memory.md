@@ -89,7 +89,8 @@ The verifier-only API keeps its independent published limits.
 
 ## Linked example footprints
 
-These are cross-linked local candidate examples, not hardware measurements.
+These measurements come from cross-linked examples; they do not measure hardware
+at runtime.
 RAM headroom subtracts the linked static sections and the explicit minimum
 heap/stack reservations noted in the table from the board or linker region. It
 does not measure TLS heap use, runtime stack high-water or free heap after

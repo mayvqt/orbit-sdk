@@ -4,9 +4,8 @@ Add licence activation and feature checks to an installed Go application. The cl
 
 ## Quick start
 
-The workspace contains an unreleased v0.4.0 candidate. Use the local source checkout
-while integrating; there is no v0.4.0 release tag or registry artifact yet. Add the
-module to your application's `go.mod` with a replace path to this checkout:
+To use the SDK from source, add the module to your application's `go.mod` with
+a replace path to your SDK checkout:
 
 ```go
 require github.com/mayvqt/orbit-sdk/sdk/go v0.0.0

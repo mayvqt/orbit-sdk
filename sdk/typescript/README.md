@@ -1,8 +1,7 @@
 # Orbit trusted backend SDK for JavaScript and TypeScript
 
 This dependency-free ESM client runs on a trusted Node.js backend (Node 20 or
-newer). It uses the built-in Fetch API and needs no build step. This checkout
-contains the unreleased v0.4 candidate; the package is not published to npm.
+newer). It uses the built-in Fetch API and needs no build step.
 From your backend project, install the package from this SDK checkout:
 
 ```sh
@@ -90,8 +89,8 @@ Match it against a registry dedicated to the configured application/environment.
 Tickets can be replayed until expiry (at most 120 seconds); they are not single-use
 links. Never log the bearer or forward it to a storage redirect.
 
-This verifier does not host files or fetch seller URLs. Release metadata and ticket
-issuance require the matching unreleased Orbit server feature. A complete
+Orbit manages release metadata and issues tickets. Sellers host the files and
+verify tickets at their download endpoint. The
 [seller storage example](../../examples/python/seller-downloads/README.md) shows
 the storage boundary; sellers retain their own hosting and credentials.
 

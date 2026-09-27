@@ -31,10 +31,10 @@ AppKey while its client is active.
 The crate archive includes the C core, required headers, Rust wrapper and MIT
 licence. Package verification and the four Rust unit tests plus two compile-fail
 documentation tests pass from an extracted standalone archive on Linux. This
-checks local packaging only; `publish = false` remains set. Use `--allow-dirty`
+checks local packaging. Use `--allow-dirty`
 only when deliberately packaging uncommitted source for validation.
 
-For this local candidate, the same seven CTest executables were cross-built and
+For v0.4.0, the same seven CTest executables were cross-built and
 all passed under QEMU AArch64 11.1.1 with a Debian trixie arm64 sysroot, both
 with the default and 8 KiB C arena. The Linux example and bridge host also
 linked for AArch64. The Rust wrapper and its C build script passed `cargo check`
@@ -77,10 +77,10 @@ cmake --build build/embedded-sanitize
 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/embedded-sanitize --output-on-failure
 ```
 
-For this candidate, the app-key parser and client lifecycle suites were rerun
+For v0.4.0, the app-key parser and client lifecycle suites were rerun
 under ASan/UBSan with
 `ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/embedded-sanitize -R 'app_key|client_lifecycle' --output-on-failure`.
-Earlier full-suite sanitizer evidence predates this candidate. Leak detection was
+Full-suite sanitizer evidence predates v0.4.0. Leak detection was
 disabled because LeakSanitizer cannot run under the traced sandbox.
 The portable core itself has no heap. Board-specific builds/runs are separately listed in
 [board requirements](boards.md), and are not implied by host or M0+ object tests.

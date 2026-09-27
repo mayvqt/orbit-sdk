@@ -22,7 +22,7 @@ grant using process-local ticks after power loss. After a valid online result,
 trusted elapsed time advances the original server-time anchor. Offline access
 requires a signed `offline_allowed` grant and a qualifying network/server
 transient; it cannot extend the original expiry. An unknown-key fetch failure
-invalidates cached access rather than falling back across an unverified candidate.
+invalidates cached access if the new grant cannot be verified.
 Clock rollback or uncertainty clears access and requires online recovery.
 
 Finite credentials and strictly online grants use a signed refresh interval of

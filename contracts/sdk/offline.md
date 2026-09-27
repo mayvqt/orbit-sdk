@@ -1,8 +1,8 @@
 # Long-term offline licence files, version 1
 
-This is the implementation contract for the next offline-file batch. It does not
-mean the feature is implemented or released. Ordinary connected access grants
-retain their existing lifetime and refresh rules.
+Offline licence files provide signed access for installations that remain
+disconnected for an extended period. Ordinary connected access grants retain
+their existing lifetime and refresh rules.
 
 ## Setup and requests
 

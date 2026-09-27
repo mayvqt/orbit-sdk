@@ -1,7 +1,5 @@
 # Usage quotas and resource limits
 
-Implementation contract for the candidate feature. These APIs are pending; a
-boolean entitlement or a client-side counter does not implement this contract.
 Usage quotas limit work consumed during a period. Resource limits bound the units
 held by active allocations. Floating sessions have their own short-lived lease
 contract in [floating.md](floating.md).

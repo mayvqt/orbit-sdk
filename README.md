@@ -1,12 +1,7 @@
 # Orbit SDKs
 
 Add licence activation and feature checks to your application with one public
-app key. This checkout contains the **unreleased v0.4 candidate**. It is a
-pre-1.0 API and may change; no v0.4 packages or release tags are available yet.
-
-This candidate requires the matching unreleased Orbit server changes. Use a
-compatible development environment: the app-key setup described below has not
-been deployed to the hosted production service during this work.
+app key.
 
 1. Select your application's **Test** environment in Orbit and copy the
    **App key** from **Integration**.
@@ -44,7 +39,4 @@ activation credentials, and management tokens out of source and logs. A
 management token belongs only on your backend. Check access before protected
 work.
 
-This public SDK source is [MIT licensed](LICENSE). Orbit's server and dashboard
-are separate private software. Keep each SDK folder intact when installing
-manually; the language guides list any additional files it needs. Registry
-publishing is planned separately from this local candidate.
+The SDKs and examples are [MIT licensed](LICENSE).

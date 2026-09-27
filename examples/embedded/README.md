@@ -1,9 +1,5 @@
 # Embedded examples
 
-These examples use the unreleased local `0.4.0` candidate checkout; no tag or
-firmware package is implied. Each supported target has a current cross-link
-check, but no firmware has been flashed or run on physical boards.
-
 Choose [Linux/Pi](linux), [ESP32](esp32), [ESP8266/NodeMCU](esp8266),
 [Pico W/Pico 2 W Wi-Fi](pico_wifi), or [STM32G0B1RE host bridge](stm32g0b1re).
 Set one public `ORBIT_APP_KEY` build definition from the Orbit Integration page.
@@ -18,3 +14,6 @@ The [SDK guide](../../sdk/embedded/README.md) explains the lifecycle. Exact buil
 prerequisites, commands and current validation limits are in the
 [board guide](../../sdk/embedded/docs/boards.md). Firmware hook defaults deny
 access until the application supplies real provisioning and trust inputs.
+
+Each supported target has a cross-link check. Physical-board operation is not
+covered by those checks; validate your firmware on its target hardware.

@@ -25,7 +25,7 @@ Provision a key once with `orbit_example_activate`; call `orbit_example_tick`
 from your loop and `orbit_example_check` before each protected action.
 
 This port targets the STM32G0B1RE's 512 KiB flash and 144 KiB RAM. The host bridge
-supplies networking; the MCU does not have built-in Wi-Fi. The current candidate
+supplies networking; the MCU does not have built-in Wi-Fi. The example
 links with STM32CubeG0 1.6.3, Mbed TLS 3.6.6 and Arm GNU 14.3.1 through the
 [maintained link-only harness](validation/). Its 29,268-byte flash load image
 ends at `0x08007254`, below the reserved journal region at `0x0807f000`. The

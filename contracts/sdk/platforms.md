@@ -1,8 +1,8 @@
 # Installed platform contract
 
-This contract extends installed clients to macOS and JavaScript/TypeScript.
-It defines implementation requirements, not evidence of native platform testing.
-Each SDK's guide must list the platforms actually exercised by its checks.
+This contract defines platform identity, storage and clock requirements for macOS
+and installed JavaScript/TypeScript clients. Each SDK's guide records its native
+platform validation coverage.
 
 ## macOS
 

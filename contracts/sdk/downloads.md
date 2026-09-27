@@ -1,7 +1,6 @@
 # Seller-hosted releases and licensed downloads
 
-Implementation contract for the candidate feature; no release or deployment is
-implied. Sellers host their files. Orbit stores release metadata and authorizes
+Sellers host their files. Orbit stores release metadata and authorizes
 access; it does not upload, store, scan or proxy the file contents.
 
 ## Release metadata
@@ -118,8 +117,7 @@ Provide a minimal seller backend example that verifies tickets using configured
 public keys and returns an expiring storage URL. Keep private storage secrets on
 that backend. The dashboard flow is: add release, add seller URL and artifact
 details, choose delivery mode, publish metadata. Explain the public-URL sharing
-limitation at that choice. Metadata publication and the product's code releases
-remain separate operations.
+limitation at that choice.
 
 ## Metadata and HTTP profile
 
@@ -127,8 +125,7 @@ Management routes use `/api/management/v1/releases`, the ordinary explicit
 application/environment query scope, and `releases:read` or `releases:write`
 permissions. Dashboard routes use the same services after workspace RBAC and
 CSRF checks. All mutations use the service's existing idempotency key and replay
-contract. A metadata publication in a local fixture does not authorize deploying
-or releasing Orbit itself.
+contract.
 
 - `POST /releases` creates a draft from `channel`, `version`, `notes` and
   `idempotency_key`. `GET /releases` lists bounded, cursor-paginated releases

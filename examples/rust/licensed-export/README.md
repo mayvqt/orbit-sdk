@@ -3,8 +3,8 @@
 This console app remembers activation, checks the `export` entitlement before each
 synthetic report, and asks for a key only when activation is missing.
 
-The workspace contains an unreleased v0.4.0 candidate. From the repository root,
-set the one public app key from your dashboard's **Integration** page and run:
+From the repository root, set the public app key from your dashboard's
+**Integration** page and run:
 
 ```sh
 export ORBIT_APP_KEY='orbit_app_test_…'

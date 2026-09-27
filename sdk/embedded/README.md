@@ -1,8 +1,5 @@
 # Orbit for embedded devices
 
-This checkout contains candidate `0.4.0` embedded code. It is unreleased: no
-tag, firmware package or published Rust package is implied.
-
 Activate a licence key once, then check access before each protected operation.
 The C11 client owns no heap or threads. A `no_std` Rust wrapper provides the same
 client with exclusive buffer and platform borrows.
@@ -17,7 +14,7 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-The v0.4.0 local candidate has now been cross-compiled and linked for the
+The v0.4.0 examples have been cross-compiled and linked for the
 ESP32, ESP8266/NodeMCU, Pico W, Pico 2 W, STM32G0B1RE, and Linux/Pi AArch64
 examples. The default and 8 KiB arena profiles were linked for ESP32, both Pico
 boards, STM32, and Pi. All seven portable CTest suites pass under AArch64 QEMU

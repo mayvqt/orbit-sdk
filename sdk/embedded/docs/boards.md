@@ -8,7 +8,7 @@ through its own UI, and gates actions with the access helper. The examples do
 not embed or persist licence keys. Board hooks default to unavailable access
 until configured.
 
-The local v0.4.0 candidate has been cross-compiled and linked for all supported
+The v0.4.0 SDK has been cross-compiled and linked for all supported
 examples below. Seven portable CTest suites passed under AArch64 QEMU in both
 the default and 8 KiB arena profiles; the Rust wrapper passed Cortex-M0+ and
 Cortex-M33 target checks. No firmware has been flashed or run on physical
@@ -116,7 +116,7 @@ and update/debug controls for deployment. The port uses esp-tls and Mbed TLS,
 requires Wi-Fi entropy to be active, and performs no automatic storage erasure.
 Deep sleep resumes through client initialization and online validation.
 
-The current candidate linked with ESP-IDF 5.5.2 and Xtensa GCC 14.2.0 for both
+The ESP32 example linked with ESP-IDF 5.5.2 and Xtensa GCC 14.2.0 for both
 arena profiles. Its padded app binary is 440,576 bytes in the 1 MiB app
 partition, leaving 608,000 bytes. The IDF report shows 58,892 bytes DRAM used
 with the default arena and 34,316 with 8 KiB; the corresponding DRAM headroom is
@@ -141,7 +141,7 @@ locally is not negotiation. The port uses trusted wall time for conservative
 elapsed tracking and denies access after rollback. Measure free heap during TLS
 handshake as well as Orbit's static buffers; ESP8266 is the tightest RAM target.
 
-The current NodeMCU candidate linked with PlatformIO Core 6.1.19,
+The NodeMCU example linked with PlatformIO Core 6.1.19,
 Espressif8266 4.2.1, ESP8266 Arduino 3.1.2 and GCC 10.3.0. The 8 KiB Orbit
 profile uses 48,248 of PlatformIO's 81,920-byte RAM budget and 431,523 of the
 1,044,464-byte application slot. That leaves 33,672 bytes of link-time RAM and
@@ -207,7 +207,7 @@ cmake --build build/stm32g0b1re
 arm-none-eabi-size build/stm32g0b1re/your-application.elf
 ```
 
-The maintained link-only harness used for the candidate measurements can also
+The maintained link-only harness used for these measurements can also
 be built directly. Set the paths to your installed toolchain and vendor SDKs:
 
 ```sh
@@ -244,7 +244,7 @@ standalone networking needs an external network module and a separately
 integrated authenticated TLS transport.
 
 The [STM32G0B1RE](https://www.st.com/en/microcontrollers-microprocessors/stm32g0b1re.html)
-has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. The current candidate's
+has a 64 MHz Cortex-M0+, 512 KiB flash and 144 KiB RAM. The
 maintained link-only harness under
 [`validation`](../../../examples/embedded/stm32g0b1re/validation) links CubeG0
 1.6.3, Arm GNU 14.3.1 and Mbed TLS 3.6.6 with the parser and current Orbit

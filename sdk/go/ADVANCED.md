@@ -59,7 +59,7 @@ until its short expiry.
 
 Build installed clients on macOS 10.12 or newer with cgo enabled and the Xcode Command Line Tools installed. The macOS files link the system IOKit and CoreFoundation frameworks for platform identity and use `mach_continuous_time` for sleep-inclusive elapsed time. A filesystem that rejects `F_FULLFSYNC` fails closed; the SDK does not fall back to ordinary fsync for file contents. When cgo is disabled, Open returns `ErrNativeSupportRequired`.
 
-Portable Go tests cover the macOS UUID framing fixture, timebase scaling and overflow, while Linux runs the POSIX lease, restart and storage-failure tests. Native macOS compilation and runtime checks remain pending because this environment has no Apple SDK or hardware. Before claiming full Mac support, run the package tests and explicitly exercise sleep across expiry, lease contention, copied/replaced state and durable-write failure on a Mac.
+Portable Go tests cover the macOS UUID framing fixture, timebase scaling and overflow, while Linux runs the POSIX lease, restart and storage-failure tests. Native macOS compilation and runtime behavior are unverified. Before distributing a Mac application, run the package tests and exercise sleep across expiry, lease contention, copied or replaced state and durable-write failure on a Mac.
 
 ## Access and mutation IDs
 
