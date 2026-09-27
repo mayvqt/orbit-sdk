@@ -15,7 +15,7 @@ replace github.com/mayvqt/orbit-sdk/sdk/go => ../Orbit-SDK/sdk/go
 
 Run `go mod tidy` to add the SDK's transitive dependencies to the application module.
 
-Set Go 1.27.1 or newer, then paste the public Test app key from **Integration**:
+Use Go 1.27.1 or newer, then set the public Test app key from **Integration**:
 
 ```sh
 export ORBIT_APP_KEY='paste the Test app key from Integration'
@@ -68,53 +68,19 @@ func run() error {
 }
 ```
 
-`EnsureAccess` calls the prompt only when the installation has no usable access. An outage or a licence without the requested feature never prompts for another key. `RequireAccess` checks online before protected work when needed; `Snapshot` and `HasFeature` are display helpers only.
+`EnsureAccess` calls the prompt only when the installation has no usable access. An outage or a licence without the requested feature never prompts for another key. Call `RequireAccess` before each later protected operation; it checks online when needed. `Snapshot` and `HasFeature` are for display only.
 
-The app key is public configuration, not a secret. Keep licence keys and passwords out of source, command-line arguments and logs. Orbit never saves them. The SDK automatically uses native machine identity when available; see [advanced options](ADVANCED.md#installed-options-and-machine-binding) to disable binding for shared images or supply an application-owned provider.
+The app key is public configuration, not a secret. Keep licence keys and passwords out of source, command-line arguments and logs; the SDK never saves them. The SDK uses native machine identity automatically when available; see [advanced options](ADVANCED.md#installed-options-and-machine-binding) to disable binding for shared images or supply an application-owned provider.
 
-## Verify seller download tickets
+## Installation state
 
-If you serve protected artifacts, verify Orbit's short-lived bearer ticket on your
-seller backend before selecting the artifact from your own registry. Configure the
-exact HTTPS endpoint and a trusted connected-purpose JWKS; never accept keys or a
-destination URL from the ticket. This verifier makes no network request and returns
-only the signed artifact metadata.
+The state directory is private to the current user: owner-only files on Linux and macOS, and current-user DPAPI on Windows. On macOS 10.12 or newer, builds need cgo and the Xcode Command Line Tools; the installed client links IOKit and CoreFoundation. With `CGO_ENABLED=0`, opening an installed client returns `ErrNativeSupportRequired` instead of falling back to a weaker clock or storage path.
 
-```go
-package main
-
-import (
-	"fmt"
-	"os"
-
-	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
-)
-
-func main() {
-	appKey := os.Getenv("ORBIT_APP_KEY")
-	ticketToken := os.Getenv("ORBIT_DOWNLOAD_TICKET") // Authorization: Bearer value
-	keys, err := os.ReadFile("connected-jwks.json")
-	if err != nil { panic(err) }
-	verifier, err := orbit.NewDownloadTicketVerifier(appKey, "https://downloads.example.com/artifacts", keys)
-	if err != nil { panic(err) }
-	ticket, err := verifier.Verify(ticketToken)
-	if err != nil { panic(err) }
-	// Match all returned metadata against the seller's artifact registry.
-	fmt.Printf("licensed artifact %s (%s, %d bytes)\n", ticket.ArtifactID(), ticket.SHA256(), ticket.ByteLength())
-}
-```
-
-The ticket expires within 120 seconds and can be replayed until then. Treat the
-bearer as sensitive, do not log it, and never use an artifact ID as an unchecked
-filesystem path. See [seller download guidance](ADVANCED.md#seller-side-download-tickets).
-
-The state directory is private to the current user: owner-only files on Linux and macOS, and current-user DPAPI on Windows. On macOS 10.12 or newer, builds need cgo and the Xcode Command Line Tools; the installed client links IOKit and CoreFoundation. With CGO_ENABLED=0, installed-client setup returns ErrNativeSupportRequired rather than using a weaker clock or storage path. The macOS implementation has not yet been validated on native Apple hardware.
-
-`Options{StatePath: ...}` selects a dedicated absolute directory for a service account or persistent container volume. Share one `*Client` in the process; another process opening the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
+`Options{StatePath: ...}` selects a dedicated absolute directory for a service account or a persistent container volume. Share one `*Client` within a process; another process that opens the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
 
 ## Long-term offline files
 
-For an installation that will be disconnected longer than a connected grant allows,
+For an installation that stays disconnected longer than a connected grant allows,
 ship a trusted offline-purpose JWKS with the application or obtain it from the app-key
 origin over verified HTTPS. Configure it when opening the client; never take public
 keys from the imported file or from the person who hands you that file:
@@ -148,14 +114,14 @@ The request contains the app key and current installation/binding identity, but 
 licence key, account session or activation credential. Issuance and renewal happen
 through an authorized online workflow; this SDK verifies and imports the resulting
 `.orbit` file locally. Imports are signature-, scope-, binding-, expiry- and
-sequence-checked, and the signed file is saved before access is returned. Reimporting
+sequence-checked, and the SDK saves the signed file before returning access. Reimporting
 the same file does not extend its absolute expiry. `RequireAccess` never refreshes or
 prompts while a file is active; an expired file returns `offline_file_expired`.
 
-An already-issued file cannot be promptly revoked while disconnected. The local
+An issued file cannot be revoked while the installation is disconnected. The local
 sequence and clock floors prevent ordinary replay and clock rollback, but restoring a
-complete old machine or VM snapshot cannot be detected reliably. Give this limit to
-users before issuing long-term access. See [offline storage details](ADVANCED.md#long-term-offline-files).
+complete old machine or VM snapshot cannot be detected reliably. Explain this limit to
+customers before issuing long-term access. See [offline storage details](ADVANCED.md#long-term-offline-files).
 
 ## Optional customer accounts
 
@@ -167,7 +133,7 @@ Sign-in alone does not grant licensed access. Sessions remain in memory; install
 
 Floating policies acquire a seat automatically after activation and renew it in
 memory. `RequireAccess` checks the current signed interval locally. The snapshot’s `Session`
-contains read-only session metadata. A seat limit, expired seat or temporary outage
+holds read-only session details. A seat limit, expired seat or temporary outage
 does not ask for another licence key.
 
 Call `EndSession(ctx)` when your app becomes idle and `StartSession(ctx)` when it
@@ -239,3 +205,39 @@ These calls always require online activation proof and do not acquire floating s
 Offline files cannot authorize them. `RequireAccess` never consumes units or acquires
 resources. Installed software can be modified or bypass reporting: for authoritative
 metering, put the capacity check and actual work on your trusted backend.
+
+## Verify seller download tickets
+
+If you serve protected artifacts, verify Orbit's short-lived bearer ticket on your
+seller backend before selecting the artifact from your own registry. Configure the
+exact HTTPS endpoint and a trusted connected-purpose JWKS; never accept keys or a
+destination URL from the ticket. This verifier makes no network request and returns
+only the signed artifact metadata.
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+)
+
+func main() {
+	appKey := os.Getenv("ORBIT_APP_KEY")
+	ticketToken := os.Getenv("ORBIT_DOWNLOAD_TICKET") // Authorization: Bearer value
+	keys, err := os.ReadFile("connected-jwks.json")
+	if err != nil { panic(err) }
+	verifier, err := orbit.NewDownloadTicketVerifier(appKey, "https://downloads.example.com/artifacts", keys)
+	if err != nil { panic(err) }
+	ticket, err := verifier.Verify(ticketToken)
+	if err != nil { panic(err) }
+	// Match all returned metadata against the seller's artifact registry.
+	fmt.Printf("licensed artifact %s (%s, %d bytes)\n", ticket.ArtifactID(), ticket.SHA256(), ticket.ByteLength())
+}
+```
+
+A ticket expires within 120 seconds and can be replayed until then. Treat it
+as a secret, never log it, and never use an artifact ID as an unchecked
+filesystem path. See [seller download guidance](ADVANCED.md#seller-side-download-tickets).

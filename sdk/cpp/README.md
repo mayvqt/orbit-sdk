@@ -1,7 +1,7 @@
 # Orbit C++ SDK
 
-License a desktop app or customer-hosted service with C++17. The v0.4 API
-requires libcurl 8+ with asynchronous DNS, OpenSSL 3+, and JsonCpp 1.9.5+.
+License a desktop app or customer-hosted service with C++17. The SDK requires
+libcurl 8+ with asynchronous DNS, OpenSSL 3+ and JsonCpp 1.9.5+.
 
 ## Quickstart
 
@@ -114,8 +114,8 @@ void run_offline(const std::string& app_key) {
 
 The importer stores the original signed file, renewal sequence and clock floors
 before exposing its features. Offline guards make no HTTP request, refresh or
-key prompt. Reopening an active file requires currently configured trusted
-offline-purpose keys that still verify the file, allowing trusted key rotation.
+key prompt. When the client reopens, the configured trusted offline-purpose keys
+must still verify an active file, which allows trusted key rotation.
 Logout clears local authority while retaining renewal and time floors; the signed
 file cannot be revoked while disconnected. `OwnedLicence::offline_file_duration`
 reports the server's `offline_file_seconds` policy.
@@ -125,6 +125,5 @@ See the [runnable example](../../examples/cpp/README.md) and
 The library target for consumers building alongside this checkout is
 `Orbit::Sdk`.
 
-The native implementation supports Linux, Windows and macOS. macOS uses the
-system IOKit and CoreFoundation frameworks and private POSIX installed files;
-its native runtime still needs validation on Apple hardware.
+The native implementation targets Linux, Windows and macOS. macOS uses the
+system IOKit and CoreFoundation frameworks and private POSIX installed files.

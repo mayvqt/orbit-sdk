@@ -104,6 +104,6 @@ units. Allocations persist through close, logout and outages until explicit
 release. Use floating sessions for temporary process occupancy. Installed code
 cannot prove that every operation was reported. Gate authoritative metering on
 your trusted backend immediately before doing the actual work, using the
-[scoped management routes](../../contracts/sdk/limits.md#client-and-management-routes).
+scoped management routes in the [OpenAPI document](https://orbit.mayvie.dev/api/openapi.json).
 Keep management tokens there and store operation IDs with your jobs. Orbit's
 transaction is separate from your own database or external API.

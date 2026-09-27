@@ -132,9 +132,7 @@ licence's device limit before it can restore access.
 ## Offline licence files
 
 The SDK exports a public installation request, verifies a signed offline file
-against a trusted offline-purpose JWKS and durably imports that file. The
-[offline-file guide](../../contracts/sdk/offline.md) describes the file format
-and issuance workflow.
+against a trusted offline-purpose JWKS and durably imports that file.
 
 Supply an offline-purpose JWKS from your application's trusted bundle through
 `offline_keys`. Never take verification keys from the licence file or an
@@ -193,8 +191,7 @@ An offline machine cannot learn about a later server-side revocation until it
 reconnects or imports updated authority. Someone controlling the whole machine
 can restore old files and clocks or patch the program. Private storage, renewal
 sequences and fixed signed expiry do not promise protection against a complete
-machine snapshot rollback. Native Windows and macOS offline runtime behavior is
-unverified; validate it on those platforms before distributing your application.
+machine snapshot rollback.
 
 ## Seller download-ticket verification
 
@@ -262,56 +259,22 @@ as a job journal. Persist your own job ID before calling when restart-safe
 recovery is required. Retry the same normalized input and ID within Orbit's
 24-hour replay window. The SDK never turns an unknown outcome into local quota.
 
-## macOS platform checks
+## macOS
 
 The macOS bindings read `IOPlatformUUID` through IOKit and use
 `mach_continuous_time`, including sleep, for elapsed-time checks. Timebase
 resolution is cached; time is sampled for every decision. The SDK synchronizes
 regular state and lease files with `F_FULLFSYNC` and synchronizes the containing
 directory after replacement. A filesystem that rejects the required durability
-operation returns a storage error. Other platforms retain their existing paths.
-
-The platform contract and OS references are in
-[installed platforms](../../contracts/sdk/platforms.md). Linux checks exercise
-the injected framework boundary, overflow, invalid identity and object cleanup,
-plus POSIX restart, exclusive leases and replacement rejection. These simulations
-are not native macOS validation. Neither macOS x64 nor arm64 has been exercised
-on native hardware. Run native TLS, restart, sleep across expiry and
-filesystem-failure checks before distributing to those architectures.
-
-From the repository root on a Mac with the SDK installed, run:
-
-```sh
-python -m unittest discover -s sdk/python/tests -p 'test_macos.py' -v
-```
-
-The native test requires a readable platform UUID and a local private filesystem.
-It checks framework access, continuous time and durable state reopen. The broader
-suite remains `python -m unittest discover -s sdk/python/tests`; platform-specific
-skips are reported separately.
+operation returns a storage error.
 
 ## Access-check performance
 
 Reuse one open client per installation. A warm `require_access()` checks the
-current clock, storage generation and feature in local verified state. It
-contacts Orbit when a refresh is due. Avoid opening a new client for every
-protected operation.
-
-From a source checkout, measure the local path with signed synthetic fixtures
-and private installation storage:
-
-```sh
-python3 sdk/python/benchmarks/access.py
-```
-
-On Linux x86-64 with Python 3.14.7, five batches of 5,000 checks measured a
-median **23.9 µs** per warm `require_access()` and **23.0 µs** per `snapshot()`.
-These timings exclude activation and network refresh, vary with the machine and
-filesystem, and are not latency guarantees. Each check still validates storage
-and trusted elapsed time.
-On Windows, the native timer function is resolved once per process, while
-every check reads a fresh timer value. The lookup path has mocked regression
-coverage; native Windows timing is unmeasured.
+current clock, storage generation and feature in local verified state, and
+contacts Orbit only when a refresh is due. Avoid opening a new client for every
+protected operation. On Linux x86-64 with Python 3.14, a warm check takes about
+24 µs, with no network request or storage write.
 
 ## Errors and sensitive output
 

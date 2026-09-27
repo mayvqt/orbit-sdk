@@ -45,48 +45,9 @@ current identity differs from saved state, the SDK creates a new installation
 ID and clears the old credential, pending activation and cached grant before
 the new identity can activate.
 
-Native macOS calls and the Darwin file ABI are unverified on Apple hardware.
-Run the locked grants, security and installed suites on macOS before
-distributing a Mac application:
-
-```sh
-dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- contracts/sdk/grants.json
-dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --security
-dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --installed
-dotnet build examples/csharp/licensed-export/Orbit.LicensedExport.csproj --no-restore
-```
-
-Building from this source checkout on macOS automatically compiles and copies
-the small fixed-signature POSIX shim used for secure directory opens. Install
-Apple Xcode Command Line Tools first (`xcode-select --install`). The helper
-script emits a universal x86_64/arm64 dylib and checks both slices:
-
-```sh
-sdk/csharp/prepare-macos-shim.sh /tmp/liborbit_macos_shim.dylib
-```
-
-Packing on macOS builds that helper automatically. Packing from Linux or
-Windows requires a universal dylib prepared on a Mac; the pack target fails
-clearly when one is missing and places it in both NuGet runtime asset paths:
-
-```sh
-dotnet pack sdk/csharp/Orbit.Sdk/Orbit.Sdk.csproj --no-restore \
-  -p:OrbitMacOSShimPath=/path/to/liborbit_macos_shim.dylib
-```
-
-Also run the native fingerprint check with an independently calculated
-`machine_v1` digest for that Mac, and the interactive suspend check (suspend for
-at least two seconds, resume, then press Enter):
-
-```sh
-ORBIT_NATIVE_FINGERPRINT_EXPECTED='<independent scoped digest>' dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --native-device
-dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --clock-suspend
-ORBIT_NATIVE_GRANT_SUSPEND_TEST=1 dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -p:OrbitLocalDevelopment=true -- --grant-suspend
-```
-
-The last mode verifies grant expiry after at least 45 seconds of actual sleep
-and uses only a local synthetic server. Keep the raw `IOPlatformUUID` local;
-the check needs only the derived expected digest.
+Building from source on macOS compiles a small POSIX helper for secure
+directory opens automatically. Install the Xcode Command Line Tools first
+(`xcode-select --install`).
 
 ## Long-term offline files
 
@@ -95,9 +56,9 @@ the check needs only the derived expected digest.
 `CreateOfflineRequest()` returns serializable public scope for an authorized
 online issuance workflow; it contains no licence key or account proof.
 `ImportOfflineFile()` verifies the signed file and durably stores its original
-JWS, sequence and clock floors before returning a typed snapshot. Format-3
-records restore when the currently configured trusted offline-purpose keys
-still verify the file, allowing trusted key rotation.
+JWS, sequence and clock floors before returning a typed snapshot. After a
+restart, the configured trusted offline-purpose keys must still verify the
+file, which allows trusted key rotation.
 
 While a file is active, `Snapshot()`, `RequireAccessAsync()` and
 `EnsureAccessAsync()` check the storage lease, clock, expiry and signed feature
@@ -106,20 +67,6 @@ files remain available for deliberate renewal, while online activation and
 logout clear file authority but preserve its sequence and time floors. A full
 old machine snapshot cannot be detected reliably. `OwnedLicence.OfflineFileDuration`
 reports the server policy's `offline_file_seconds` value.
-
-The installed workflow is exercised by the offline fixture in `--installed`;
-the separate verifier consumes all 104 shared security cases. See the
-[offline contract](../../contracts/sdk/offline.md) and
-[test commands](tests/README.md#long-term-offline-file-verification).
-
-## Floating-session verification
-
-The internal session verifier uses .NET's built-in cryptography and consumes all
-184 shared signed cases. It binds a short grant to the current process session
-and exact renewal sequence, with immutable/redacted results. It never saves a
-session grant. This corpus tests signed-grant verification; session lifecycle
-and seat accounting require integration tests. See the [session contract](../../contracts/sdk/floating.md)
-and [test command](tests/README.md#floating-session-verification).
 
 ## Seller-hosted downloads
 
@@ -149,14 +96,14 @@ Create the verifier once with
 Pass artifact metadata from your own registry to the function. Invalid or expired
 tickets raise `OrbitException` with `OrbitError.Denied` and code
 `invalid_download_ticket`. Times are immutable `DateTimeOffset` values; the
-optional `Verify` clock argument is for trusted application clocks and tests.
+optional `Verify` clock argument accepts a trusted application clock.
 
 After authorization, serve the matching file or redirect to a short provider URL
 that expires no later than `ticket.ExpiresAt`. Return `Cache-Control: no-store`
 and keep tickets, redirect URLs and provider credentials out of logs. Sellers
 own the storage and bandwidth; Orbit does not store or proxy file bytes. Permanent
-public URLs remain shareable. See the [download contract](../../contracts/sdk/downloads.md)
-and the [complete Python seller endpoint](../../examples/python/seller-downloads/README.md).
+public URLs remain shareable. See the
+[complete Python seller endpoint](../../examples/python/seller-downloads/README.md).
 
 ## Customer accounts and backend identity
 
@@ -170,40 +117,19 @@ activation state uses its separate credential.
 for your trusted HTTPS backend. Never log, persist or forward it through a
 redirect. Your backend must verify it online at
 `GET /api/client/v1/sessions/current` and then authorize licensed work. See the
-backend example in the repository's Rust SDK.
+[backend example](../../examples/rust/licensed-backend/README.md).
 
 The SDK returns native result types. Timestamps use `DateTimeOffset`, elapsed
 and offline durations use `TimeSpan`, and `Snapshot.HasFeature` is suitable for
 display logic. Always call `RequireAccessAsync` immediately before protected
 work; `Snapshot()` is informational.
 
-## Warm access benchmark
+## Access-check performance
 
-With the locked dependencies already restored, run the opt-in Release benchmark
-from the repository root:
-
-```sh
-dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --configuration Release --no-restore -p:OrbitLocalDevelopment=true -- --benchmark-access
-```
-
-It activates a signed synthetic grant using private local installed storage and
-the native clock, warms both paths, then measures five batches of 10,000 calls
-for `RequireAccessAsync` and `Snapshot` separately. It reports median time and
-current-thread allocated bytes per call, and verifies that measured loops add
-no HTTP requests or storage writes while retaining per-call storage-version
-checks.
-
-On CachyOS Linux x86-64 with .NET 10.0.12, Release results were:
-
-| Path | Baseline at `4e735f8` | Current |
-| --- | ---: | ---: |
-| `RequireAccessAsync` | 6.971 µs/op, 552 B/op | 3.429 µs/op, 192 B/op |
-| `Snapshot` | 3.760 µs/op, 240 B/op | 3.235 µs/op, 120 B/op |
-
-After timing, a separate 500-guard/500-snapshot verification pass observed
-1,000 storage-version reads. The timed loops had zero writes and no increase
-from the two setup HTTP requests. These are local measurements, not
-cross-platform performance guarantees; Windows and macOS were not measured.
+Reuse one client per installation. A warm `RequireAccessAsync` checks the
+trusted clock, storage version and feature in local verified state, and contacts
+Orbit only when a refresh is due. On Linux x86-64 with .NET 10 it takes about
+3.5 µs and 200 bytes of allocation, with no network request or storage write.
 
 See [online operations](ONLINE.md) for floating seats, verified update downloads,
 usage reservation and persistent resource allocation.

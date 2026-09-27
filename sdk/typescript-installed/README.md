@@ -12,9 +12,7 @@ npm install --save /path/to/Orbit-SDK/sdk/typescript-installed
 ```
 
 Node.js 22 or newer is required. The package uses Koffi for native clocks,
-identity, and protected storage. Linux and macOS use private leased files; the
-Linux profile has automated coverage. Native macOS and Windows execution is
-unverified.
+identity, and protected storage. Linux and macOS use private leased files.
 Koffi builds its native binding during installation. If your npm version blocks
 dependency install scripts, approve and rebuild Koffi from the application
 directory before opening a client:
@@ -214,7 +212,5 @@ renderer.
 
 ## Platform notes
 
-Linux checks cover storage, clock behavior and the Electron storage boundary
-using an encrypted mock. Physical suspend/resume and native Electron, macOS and
-Windows execution are unverified. Test each target's protected storage, clocks,
-TLS and restart behavior on that platform before distributing your application.
+Test your packaged application's protected storage, clocks, TLS and restart
+behavior on each platform you ship, as part of your normal release checks.

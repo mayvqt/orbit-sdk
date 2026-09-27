@@ -39,7 +39,7 @@ when the arena is overwritten. The Rust wrapper exposes no raw FFI, pending
 constructor or mutable access to a live arena. C's private union layout supplies
 the actual state type and alignment; its members are not application API.
 
-## Measured portable footprint
+## Portable footprint
 
 Clang 22.1.8, `--target=arm-none-eabi -mcpu=cortex-m0plus -mthumb -Os
 -ffreestanding -fno-builtin`, followed by a relocatable `ld.lld -r` link:
@@ -50,7 +50,7 @@ Clang 22.1.8, `--target=arm-none-eabi -mcpu=cortex-m0plus -mthumb -Os
 | Full client, verifier, wire format, journal and app-key parser | 29,576 bytes | 0 |
 
 These are linked library modules, **not firmware images**. Compiler runtime
-helpers remain unresolved until a real target toolchain links them. Crypto,
+helpers are added when your target toolchain links them. Crypto,
 networking, TLS, adapters, application strings, vector tables and startup code
 are excluded. Static archive file sizes are not flash-use estimates.
 
@@ -63,9 +63,8 @@ additional. Mutation preparation uses a separate stack frame so its record copy
 is released before network work. Measure actual stack and free heap on each
 firmware build, especially ESP8266; its TLS memory is a separate constraint.
 
-Run `tests/measure_arm.py --output /tmp/orbit-arm-size` with the installed LLVM
-tools to reproduce the portable figures. The full client has no heap calls;
-platform TLS and crypto implementations may allocate internally.
+The full client has no heap calls; platform TLS and crypto implementations may
+allocate internally.
 
 The linked x86-64 Linux example with GCC 16.2.1 `-Os` has 47,569 bytes of code
 and read-only data, 1,056 bytes of initialized data, and 42,320 bytes of BSS.
@@ -89,12 +88,10 @@ The verifier-only API keeps its independent published limits.
 
 ## Linked example footprints
 
-These measurements come from cross-linked examples; they do not measure hardware
-at runtime.
-RAM headroom subtracts the linked static sections and the explicit minimum
-heap/stack reservations noted in the table from the board or linker region. It
-does not measure TLS heap use, runtime stack high-water or free heap after
-initialization. The Pico values include vectors and uninitialized data in the
+These are static linker figures for the example firmware. RAM headroom
+subtracts the linked static sections and the explicit minimum heap/stack
+reservations from the board or linker region; budget TLS heap and runtime stack
+within it. The Pico values include vectors and uninitialized data in the
 static RAM total. STM32 RAM headroom includes the linker's 512-byte minimum
 heap and 1 KiB minimum stack reservation.
 
@@ -126,12 +123,10 @@ NodeMCU's code total is `.text` + `.text1` + `.irom0.text`.
 The AArch64 Linux `orbit_pi` ELF is dynamically linked and has no fixed flash
 slot or per-process static RAM ceiling. `size` reports text/data/BSS of
 69,893/1,104/42,272 bytes with the default arena, and 69,893/1,104/17,696 bytes
-with 8 KiB. Linux shared libraries, process stack, TLS allocations, OS use and
-free RAM were not measured.
+with 8 KiB, excluding shared libraries, process stack and TLS allocations.
 
-Toolchains, linker budgets, and reproduction commands are listed in the
-[board guide](boards.md). None of these figures establishes a physical-board
-run.
+Build commands and linker budgets for each target are in the
+[board guide](boards.md).
 
 ## Optional profile buffers and storage
 
@@ -169,9 +164,7 @@ can discard unused functions. The slight compact/full code difference comes
 from constant-size instruction selection. Offline slice import uses a 2,636-byte
 conservative portable stack, reader import 2,692, extended initialization 2,708,
 consume 2,140, update discovery 1,716 and stream 344. Provider/TLS/reader callbacks,
-interrupts and target runtime helpers remain additional. Reproduce each row with
-`tests/measure_arm.py --profile connected|services|offline-compact|offline-full`
-and a distinct `--output` directory.
+interrupts and target runtime helpers remain additional.
 
 The connected record remains 1,024 bytes. Offline records reserve 1,024 bytes of
 metadata plus the exact selected file bound. The journal adds a 64-byte header;
@@ -186,6 +179,6 @@ each of two independent slots is rounded up to the port's erase unit:
 ESP8266 LittleFS needs additional filesystem capacity and runtime overhead beyond
 its two logical slots. Linux uses one journal file containing two independent slots. Firmware linker/partition
 reservations must match `ORBIT_OFFLINE_PROFILE_FILE_BYTES`; the supported board
-examples provide explicit reservations and compile/link checks. STM32 slots span
+examples provide explicit reservations. STM32 slots span
 independently erased pages. Pico slots erase each included sector. No offline
 profile changes the connected defaults or silently migrates existing storage.

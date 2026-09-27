@@ -7,8 +7,8 @@ app key.
    **App key** from **Integration**.
 2. Create a policy with your feature enabled (for example, `export`), then
    issue a Test licence using that policy.
-3. Install an SDK from this checkout using its language guide. Open the client
-   with the app key and check access before running the protected feature.
+3. Install an SDK by following its guide. Open the client with the app key and
+   check access before running the protected feature.
 
 The desktop SDKs remember activation and refresh access automatically. Their
 `ensure_access` helper asks for a licence key when activation is needed. Each
@@ -28,10 +28,10 @@ guide includes installation, supported platforms and a working example:
 Use the TypeScript backend SDK for online checks on your server, and the
 installed SDK for Node.js desktop applications and Electron's main process. Use the
 embedded SDK for caller-owned buffers and platform adapters on small devices.
-If you're calling the API without an SDK, see the [HTTP guide](examples/http/README.md).
+If you're calling the API without an SDK, see Orbit's [HTTP API guide](https://orbit.mayvie.dev/guides/http)
+and the runnable [HTTP walkthrough](examples/http/README.md).
 The [Rust backend example](examples/rust/licensed-backend/README.md) shows how
-to verify a customer session and check a feature on your own server. Shared
-signed-grant fixtures are in [contracts/sdk](contracts/sdk/README.md).
+to verify a customer session and check a feature on your own server.
 
 The app key is public and can be included in your application. Test and Live
 have separate keys, IDs and data. Keep licence keys, passwords, sessions,

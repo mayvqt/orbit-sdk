@@ -22,8 +22,7 @@ using Orbit.Sdk;
 
 var appKey = Environment.GetEnvironmentVariable("ORBIT_APP_KEY")
     ?? throw new InvalidOperationException("Set ORBIT_APP_KEY first.");
-await using var orbit = await OrbitClient.OpenAsync(
-    appKey);
+await using var orbit = await OrbitClient.OpenAsync(appKey);
 await orbit.EnsureAccessAsync("export", _ =>
 {
     Console.Write("Licence key: ");
@@ -61,8 +60,8 @@ is rejected.
 
 On macOS, the SDK derives its default `machine_v1` identity from IOKit's
 `IOPlatformUUID` and uses `mach_continuous_time` so sleep counts toward access
-expiry. It stores only the scoped hash. Native macOS runtime validation is still
-required; see [advanced integration](ADVANCED.md).
+expiry. It stores only the scoped hash. See
+[advanced integration](ADVANCED.md).
 
 ## Customer accounts
 
@@ -121,10 +120,10 @@ if (access.HasFeature("export"))
 Import verifies scope, binding, signature, expiry and renewal sequence before it
 stores the original file. `RequireAccessAsync` and `EnsureAccessAsync` use only
 that file while it is active; they do not refresh, make network requests or
-prompt for a key. A restart requires currently configured trusted offline-purpose
-keys that still verify the file, allowing trusted key rotation. Logout clears
+prompt for a key. After a restart, the configured trusted offline-purpose keys
+must still verify the file, which allows trusted key rotation. Logout clears
 local authority while retaining renewal and clock floors. A disconnected file
 cannot be revoked immediately. See [offline storage details](ADVANCED.md#long-term-offline-files).
 
-See [advanced integration](ADVANCED.md) for storage, backend proofs, local HTTP
-tests and recovery details. Source and examples are [MIT licensed](LICENSE).
+See [advanced integration](ADVANCED.md) for storage, backend proofs, and recovery
+details. Source and examples are [MIT licensed](LICENSE).

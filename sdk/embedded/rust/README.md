@@ -48,14 +48,7 @@ Host builds use the installed `cc` and `ar`. For cross compilation, set `ORBIT_C
 and `ORBIT_AR` to the installed target tools, and `ORBIT_CFLAGS` to their target
 flags. Alternatively enable `external-c` and link `Orbit::EmbeddedClient` from
 your firmware build. The build script never downloads tools or dependencies.
-
-`cargo test --offline` checks the actual C ABI layout, default and compact buffer
-use, AppKey parsing, callback lifecycle, a compile-fail buffer-reuse example and
-a compile-fail check that the AppKey outlives its client. The current checkout
-also passes `cargo check` for `thumbv6m-none-eabi` and
-`thumbv8m.main-none-eabi`, including the matching C cross-build script. These
-checks do not link a board application or establish target firmware operation;
-see the [embedded validation record](../docs/validation.md).
+The crate builds for `thumbv6m-none-eabi` and `thumbv8m.main-none-eabi`.
 
 ## Optional services and files
 

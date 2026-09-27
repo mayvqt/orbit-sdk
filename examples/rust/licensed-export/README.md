@@ -21,10 +21,6 @@ strict-online licences and security failures fail closed. Configure a dedicated 
 directory through `Client::open_with_options` when hosting a service or persistent
 container volume.
 
-For an isolated loopback Orbit fixture, enable `local-development`; that build uses
-`Client::open_local` and accepts only a literal loopback origin. TLS checks remain
-enabled for HTTPS.
-
 See the [SDK guide](../../../sdk/rust/README.md) and [advanced APIs](../../../sdk/rust/advanced.md).
 For long-disconnected installations, those guides also cover trusted offline keys,
 installation requests and importing seller-issued `.orbit` files.

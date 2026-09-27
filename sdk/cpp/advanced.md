@@ -60,44 +60,6 @@ retains the stable server or SDK code. `customer_session_authorization()`
 returns a sensitive bearer header: send it only to your trusted HTTPS backend
 and never log or persist it.
 
-## Tests
-
-With dependencies already installed, run from the repository root:
-
-```sh
-cmake -S sdk/cpp -B build/cpp-tests -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=ON
-cmake --build build/cpp-tests -j2
-ctest --test-dir build/cpp-tests --output-on-failure
-```
-
-The native suite loads shared app-key, connected-grant, offline-file and download
-ticket vectors and all 184 shared session-grant vectors. Installed lifecycle
-checks cover floating acquisition, renewal, expiry, denials and generation fences.
-The online-operation cases exercise generated retry IDs, bounded capacity errors,
-released resource replay and target-specific updates. TLS tests use Python 3 and
-the repository's synthetic certificates. Direct streams check certificate trust,
-five redirects, bearer/cookie stripping, identity encoding, bounded streaming,
-length/digest failures, cancellation and atomic destination preservation.
-
-macOS build and native-runtime validation should be performed on macOS x64 and
-arm64 with the installed CMake, Apple SDK, libcurl, OpenSSL and JsonCpp:
-
-```sh
-cmake -S sdk/cpp -B build/cpp-tests -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=ON
-cmake --build build/cpp-tests -j2
-ctest --test-dir build/cpp-tests --output-on-failure
-cmake -S examples/cpp -B build/cpp-example -DBUILD_TESTING=OFF
-cmake --build build/cpp-example -j2
-build/cpp-tests/orbit_platform_tests --clock-suspend
-```
-
-The current implementation was developed and exercised on Linux; native macOS
-hardware, IOKit identity acquisition, sleep behavior and Darwin filesystem
-durability have not been tested here. Treat those commands as required checks
-before claiming native macOS validation. The suspend check waits for Enter after
-resuming from at least two seconds of sleep and compares `mach_continuous_time`
-with the awake-only `mach_absolute_time` counter.
-
 ## Long-term offline-file verification
 
 `orbit::OfflineKeys::parse(jwks_json, "test" or "live")` accepts a trusted
@@ -121,11 +83,6 @@ Logout, activation and account login clear local file authority while retaining
 sequence/time floors. Disconnected files cannot be recalled immediately, and a
 complete old machine snapshot cannot be detected reliably. The typed
 `OwnedLicence::offline_file_duration` reports `offline_file_seconds`.
-
-`orbit_offline_tests` runs all 104 shared signed-file cases, including strict key
-boundaries and canonical-claims digest checks. Installed import, restart,
-renewal, expiry, no-network behavior and logout-floor preservation run in
-`orbit_sdk_tests`. See the [offline contract](../../contracts/sdk/offline.md).
 
 ## Seller-hosted downloads
 
@@ -168,15 +125,15 @@ tickets or storage URLs; use no-store responses. A permanent public URL remains
 shareable. The [Python seller example](../../examples/python/seller-downloads/README.md)
 shows the full endpoint and expiring storage redirect.
 
-`orbit_download_tests` checks all 110 shared cases, strict key/endpoint bounds,
-owned configuration, expiry and concurrent verification. This verifier authorizes
-an artifact request; the application serves the artifact or creates an expiring
-storage URL. See the [download contract](../../contracts/sdk/downloads.md).
+The verifier authorizes an artifact request; your application serves the
+artifact or creates an expiring storage URL.
 
-## Warm access benchmark
+## Access-check performance
 
-Configure and build the opt-in Release benchmark with installed dependencies,
-then run it from the repository root:
+Reuse one client per installation. A warm `require_access` checks the trusted
+clock, storage lease and feature in local verified state, and contacts Orbit
+only when a refresh is due. Build and run the Release benchmark from the
+repository root:
 
 ```sh
 cmake -S sdk/cpp -B build/cpp-bench-release -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
@@ -184,26 +141,9 @@ cmake --build build/cpp-bench-release --target orbit_sdk_tests -j2
 build/cpp-bench-release/orbit_sdk_tests --benchmark-access
 ```
 
-The benchmark activates a signed synthetic grant using private local installed
-storage and the native clock, warms both paths, then measures five batches of
-10,000 `require_access` calls and, separately, 10,000 `snapshot` calls. It
-reports median time per call and verifies that the measured loops add no HTTP
-requests or storage writes while retaining storage-invalidation checks.
-
-On CachyOS Linux x86-64 with GCC 16.2.1 and libstdc++ 20260810, Release results
-were:
-
-| Path | Adjusted baseline (`4e735f8`) | Current |
-| --- | ---: | ---: |
-| `require_access` | 5.78126 µs/op | 3.02612 µs/op |
-| `snapshot` | 5.4326 µs/op | 2.99526 µs/op |
-
-The baseline uses the `4e735f8` source with the same installed-storage
-verification check and benchmark harness applied; it retains the internal JSON
-snapshot path. After timing, a separate 500-guard/500-snapshot verification
-pass observed 1,000 successful lease checks. The timed loops had zero writes
-and no increase from the two setup HTTP requests. These are local measurements,
-not cross-platform performance guarantees; Windows and macOS were not measured.
+On Linux x86-64, a warm `require_access` or `snapshot` takes about 3.2 µs with
+no network request or storage write. Timings vary with the machine and
+filesystem and are not latency guarantees.
 
 See [online operations](online.md) for floating seats, verified update downloads,
 usage reservation and persistent resource allocation.

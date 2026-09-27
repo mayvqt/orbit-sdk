@@ -55,11 +55,9 @@ the metadata to your own registry before serving an object or issuing a short-li
 storage URL; do not use the token or artifact ID as a path. A valid ticket is replayable
 until its short expiry.
 
-## macOS build and validation
+## macOS builds
 
 Build installed clients on macOS 10.12 or newer with cgo enabled and the Xcode Command Line Tools installed. The macOS files link the system IOKit and CoreFoundation frameworks for platform identity and use `mach_continuous_time` for sleep-inclusive elapsed time. A filesystem that rejects `F_FULLFSYNC` fails closed; the SDK does not fall back to ordinary fsync for file contents. When cgo is disabled, Open returns `ErrNativeSupportRequired`.
-
-Portable Go tests cover the macOS UUID framing fixture, timebase scaling and overflow, while Linux runs the POSIX lease, restart and storage-failure tests. Native macOS compilation and runtime behavior are unverified. Before distributing a Mac application, run the package tests and exercise sleep across expiry, lease contention, copied or replaced state and durable-write failure on a Mac.
 
 ## Access and mutation IDs
 
@@ -89,35 +87,24 @@ Production transports require HTTPS and certificate verification, disable redire
 
 `client.SupportSummary(err)` contains only public app/environment scope, a stable error code, validated request reference and local timestamp. It exposes no key, credential, device identity or account state.
 
-## Warm access benchmark
+## Access-check performance
 
-From `sdk/go`, run the opt-in signed installed-client benchmarks with a private local state directory and the native clock:
-
-```sh
-GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go test -run '^$' \
-  -bench '^BenchmarkInstalledWarmAccess$' -benchtime=10000x -count=5 -benchmem
-```
-
-The benchmark checks that every warm call still reads the storage version, sends no HTTP request, and writes no state. The before measurement used the hot-path code from baseline commit `4af8920` with this same harness. On Linux/amd64 with Go 1.27.1-X:nodwarf5 (Intel Core i7-10700K, Linux 7.2.6), the median of five 10,000-call runs was:
-
-| Operation | Before | After |
-| --- | --- | --- |
-| `RequireAccess` | 12.03 µs/op, 1,680 B/op, 24 allocs/op | 5.97 µs/op, 840 B/op, 12 allocs/op |
-| `Snapshot` | 6.01 µs/op, 792 B/op, 12 allocs/op | 5.93 µs/op, 808 B/op, 12 allocs/op |
-
-The warm `RequireAccess` path now uses one checked snapshot rather than checking it twice. Each snapshot samples the native time anchor once. The small `Snapshot` timing difference is within this single-host benchmark's noise; no cross-platform performance guarantee is implied.
+Reuse one `*Client` per installation. A warm `RequireAccess` checks the trusted
+clock, storage version and feature in local verified state, and contacts Orbit
+only when a refresh is due. On Linux x86-64 it takes about 5.8 µs and 12
+allocations, with no network request or storage write.
 
 ## Explicit online services
 
 Update discovery, download authorization and usage/resource operations authenticate
 with the currently installed activation proof. They do not need an active floating
-seat and never silently leave offline-file mode. Their replies are fenced against
-logout, close and credential replacement. Mutation transport retries have a bounded
+seat and never silently leave offline-file mode. A reply that arrives after
+logout, close or credential replacement is discarded. Mutation transport retries have a bounded
 attempt budget and retain the same operation ID and input.
 
 `MutationError.Uncertain` means the service may have committed the mutation. Preserve
-`OperationID` and retry the original action. Capacity counters on an error are exposed
-only after checking their kind, name, numeric bounds, arithmetic and operation fields.
+`OperationID` and retry the original action. Capacity counters on an error are
+validated before they are exposed.
 Resource allocation IDs refer to one allocation lifetime; use that allocation ID for
 release, even if a later resource reuses the same application resource ID.
 

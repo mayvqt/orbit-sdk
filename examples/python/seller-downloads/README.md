@@ -48,12 +48,5 @@ forward the Orbit authorization header when following the storage redirect.
 Keep both URLs and tickets out of telemetry. A valid ticket or storage URL is
 replayable until its deadline; a downloaded file can still be copied.
 
-Run the local example checks:
-
-```sh
-build/seller-downloads-venv/bin/python -m unittest discover -s examples/python/seller-downloads -p 'test_*.py'
-```
-
-These tests exercise the real public verifier and Boto3 signing using synthetic
-credentials; they never contact a bucket. Test your provider integration and
-the complete TLS download flow separately before accepting user traffic.
+Test your storage provider integration and the complete TLS download flow
+before accepting user traffic.

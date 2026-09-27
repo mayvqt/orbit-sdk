@@ -108,6 +108,6 @@ explicit release; use floating seats for temporary process occupancy. Installed
 applications cannot prove that every operation was reported. For authoritative
 metering, perform the consume/acquire on your trusted backend immediately before
 the work, using the scoped management routes in the
-[limit contract](../../contracts/sdk/limits.md#client-and-management-routes).
+[OpenAPI document](https://orbit.mayvie.dev/api/openapi.json).
 Keep management credentials on that backend and coordinate its job record with
 the returned operation ID; Orbit's transaction is separate from your own database.

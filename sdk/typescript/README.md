@@ -273,14 +273,3 @@ It makes one online decision; it does not authenticate your users or start an
 HTTP server. Call the same SDK method from an authenticated backend route after
 your own user and account-binding checks. Keep real tokens out of shell history
 and source files.
-
-## Run focused tests
-
-```sh
-cd sdk/typescript
-npm test
-```
-
-Tests use mocked Fetch and verified local TLS fixtures; they do not contact a
-live Orbit service. The seller verifier also runs the shared download-ticket
-security corpus.

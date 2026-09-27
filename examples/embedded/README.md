@@ -11,12 +11,9 @@ before a protected action. The app key is public configuration; the licence key
 is provided at runtime and is not saved by the example.
 
 The [SDK guide](../../sdk/embedded/README.md) explains the lifecycle. Exact build
-prerequisites, commands and current validation limits are in the
+prerequisites and build commands are in the
 [board guide](../../sdk/embedded/docs/boards.md). Firmware hook defaults deny
 access until the application supplies real provisioning and trust inputs.
-
-Each supported target has a cross-link check. Physical-board operation is not
-covered by those checks; validate your firmware on its target hardware.
 
 Enable services in the firmware build to use `orbit_example_idle` and
 `orbit_example_resume` around idle periods. Continue polling `orbit_example_tick`

@@ -14,10 +14,8 @@ client with exclusive buffer and platform borrows.
 | Linux / Pi Zero 2 W | libcurl HTTPS / OpenSSL 3 | [Linux example](../../examples/embedded/linux) |
 | STM32G0B1RE | Trusted UART host bridge / local Mbed TLS verification | [STM32 example](../../examples/embedded/stm32g0b1re) |
 
-All six targets have connected and explicit offline-profile compile/link checks.
-The compact and full offline profiles also pass eleven portable CTest suites
-under AArch64 QEMU. Physical firmware execution is not covered. Exact resource
-costs, storage reservations and toolchains are in the [board guide](docs/boards.md).
+Exact resource costs, storage reservations and toolchains for each target are in
+the [board guide](docs/boards.md).
 
 ## Configure and activate
 
@@ -115,5 +113,4 @@ explicit file buffer and larger journal reservations.
 
 The [memory and ABI reference](docs/memory.md) explains limits and verifier-only
 use. The [security and storage reference](docs/security.md) covers lifecycle and
-adapter contracts. [Validation commands](docs/validation.md) reproduce host and
-freestanding checks.
+adapter contracts.

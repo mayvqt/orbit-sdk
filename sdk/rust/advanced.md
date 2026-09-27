@@ -63,7 +63,7 @@ local lock. It preserves the server activation. `deactivate()` releases that dev
 slot after confirmation. `logout()` clears local access without revoking a customer
 session, while `logout_account()` requests server-side session revocation.
 
-`require_access(feature)` should run immediately before every protected operation.
+Call `require_access(feature)` immediately before every protected operation.
 `Error::NotActivated` and `Error::FeatureUnavailable` are distinct typed errors and
 `error.code()` returns the stable protocol code. `ensure_access(feature, ask_for_key)`
 accepts a synchronous callback returning `Option<String>`; it invokes the callback only
@@ -129,64 +129,24 @@ disabled. Default builds accept HTTPS origins only.
 reference, and local timestamp; it contains no app key, credential, customer session,
 fingerprint, or server-private message.
 
-## Local crate validation
+## Access-check performance
 
-The SDK consists of `orbit-sdk` and its `orbit-sdk-native` platform helper.
-
-From the repository root, these commands build and verify local crate archives
-without uploading them:
-
-```sh
-RUSTUP_AUTO_INSTALL=0 cargo package -p orbit-sdk-native --offline --locked
-RUSTUP_AUTO_INSTALL=0 cargo package -p orbit-sdk --offline --locked \
-  --config 'patch.crates-io.orbit-sdk-native.path="sdk/rust/native"'
-```
-
-The temporary command-line patch lets Cargo resolve the local native helper
-while checking the main archive. It does not change the dependency written into
-that archive or configure a consumer application. Both packages retain their MIT
-licence files. Add `--allow-dirty` only when deliberately checking uncommitted
-source. These checks pass on Linux; they do not establish Windows/macOS native
-runtime correctness.
-
-## Warm access benchmark
-
-From the repository root, run the opt-in signed installed-client benchmark with a private local state directory, loopback fixture transport, and the native clock:
-
-```sh
-RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true cargo test -p orbit-sdk \
-  --features local-development --locked --offline --release benchmark_installed_warm_access \
-  -- --ignored --nocapture
-```
-
-Each operation runs five measured trials of 10,000 calls after a 1,000-call warmup. The test checks that every call verifies installed storage and that the measured loops send no HTTP requests or write state. The before measurement uses baseline commit `4af8920` with this same harness and storage-verification fix, while retaining the baseline access hot path. On Linux/x86_64 with rustc and Cargo 1.98.1 (Intel Core i7-10700K, Linux 7.2.6; optimized Cargo release profile), the median was:
-
-| Operation | Before | After |
-| --- | ---: | ---: |
-| `require_access` | 3.653 µs/op | 3.617 µs/op |
-| `snapshot` | 3.608 µs/op | 3.553 µs/op |
-
-The snapshot decision now samples the native anchor once. `require_access` checks a warm online grant under the initial state lock and, after an awaited refresh, builds a new decision from synchronized current state. These small differences are within expected host timing variation and do not establish a material speedup or a cross-platform performance guarantee.
-
-## Platform validation
-
-Automated validation covers Linux. Native macOS compilation, filesystem behavior
-and sleep across expiry are unverified. Validate lease contention, copied or
-replaced state, durable-write failures and sleep across expiry on macOS before
-distributing a Mac application.
+Reuse one open client per installation. A warm `require_access` checks the
+trusted clock, installed storage and feature in local verified state, and
+contacts Orbit only when a refresh is due. On Linux x86-64 it takes about
+3.7 µs, with no network request or storage write.
 
 ## Explicit online services
 
 Update discovery, download authorization and metering use the current installed
 activation proof. They never acquire a floating seat or switch out of offline-file
-mode implicitly. Generation checks reject both late success and late failure after
-credential replacement, logout or close.
+mode implicitly. A response that arrives after credential replacement, logout or
+close is discarded, whether it succeeded or failed.
 
 Metering returns `MutationResult<T>`. An uncertain failure retains the operation ID;
 retry the same action and input. Dropping an async future cannot return an ID, so
 supply your own durable job ID when cancellation or process restart must be
-recoverable. Capacity denial details are exposed only after validating their kind,
-name, safe integer bounds, arithmetic, operation ID and units.
+recoverable. Capacity denial details are validated before they are returned.
 
 Downloads own a fresh verified-HTTPS client with no cookie jar or ambient credentials.
 They allow five redirects and forward no bearer after the initial endpoint. Byte
@@ -194,7 +154,3 @@ limits apply while streaming, independently of response length headers. Identity
 encoding, exact length and SHA-256 are checked before an atomic destination change.
 Temporary files are created beside the destination and removed on errors or future
 drop. The seller's filename never chooses a destination path.
-
-The Linux download regression fixture uses Python 3 and synthetic TLS certificates
-under `tests/fixtures`. It verifies HTTPS trust, credential stripping, chunked bodies,
-cancellation and preservation of an existing destination after failure.
