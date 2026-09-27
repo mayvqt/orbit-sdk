@@ -40,6 +40,8 @@ ORBIT_INTERNAL void clear_access(orbit_client_state_t *c) {
   c->anchored = 0u;
   c->transient = 0u;
   c->retry_ticks = 0u;
+  c->version_denied = 0u;
+  c->update_length = 0u;
 }
 static int32_t advance(orbit_client_state_t *c) {
   if (c->generation == UINT64_MAX) {
@@ -157,7 +159,8 @@ static int valid_config(const orbit_client_config_t *cfg) {
       !orbit_client_opaque(cfg->environment_id, 1u, 128u) ||
       cfg->issuer.data == NULL || cfg->issuer.length == 0u ||
       cfg->issuer.length > ORBIT_GRANT_MAX_JSON_BYTES ||
-      !orbit_json_valid_utf8_no_nul(cfg->issuer.data, cfg->issuer.length))
+      !orbit_json_valid_utf8_no_nul(cfg->issuer.data, cfg->issuer.length) ||
+      (cfg->app_version.length && !orbit_app_version_valid(cfg->app_version)))
     return 0;
   for (i = 8u; i < origin.length; ++i)
     if (origin.data[i] <= 32u || origin.data[i] >= 127u ||
@@ -233,10 +236,11 @@ int32_t orbit_client_init(orbit_client_t *client,
       if (orbit_overlap(objects[i], sizes[i], objects[j], sizes[j]))
         return ORBIT_CLIENT_ARGUMENT;
   {
-    orbit_embedded_slice_t fields[6] = {
+    orbit_embedded_slice_t fields[7] = {
         cfg->api_origin,     cfg->issuer,      cfg->application_id,
-        cfg->environment_id, cfg->fingerprint, cfg->fingerprint_provider};
-    for (i = 0; i < 6u; ++i)
+        cfg->environment_id, cfg->fingerprint, cfg->fingerprint_provider,
+        cfg->app_version};
+    for (i = 0; i < 7u; ++i)
       if (orbit_overlap(fields[i].data, fields[i].length, client,
                         sizeof(*client)) ||
           orbit_overlap(fields[i].data, fields[i].length, arena,
@@ -293,9 +297,11 @@ failed:
   return result;
 }
 
+/* The activation retry digest omits app_version, so an interrupted
+ * activation can finish after a firmware update. */
 static void body(orbit_client_state_t *c, orbit_writer_t *w,
                  orbit_embedded_slice_t key, uint8_t operation,
-                 const orbit_record_t *r) {
+                 const orbit_record_t *r, int with_version) {
   ORBIT_LITERAL(w, "{\"application_id\":");
   orbit_write_string(w, c->config.application_id);
   ORBIT_LITERAL(w, ",\"environment_id\":");
@@ -312,6 +318,10 @@ static void body(orbit_client_state_t *c, orbit_writer_t *w,
     orbit_write_string(w, c->config.fingerprint_provider);
   else
     ORBIT_LITERAL(w, "null");
+  if (with_version && operation != 2u && c->config.app_version.length) {
+    ORBIT_LITERAL(w, ",\"app_version\":");
+    orbit_write_string(w, c->config.app_version);
+  }
   if (operation == 1u) {
     ORBIT_LITERAL(w, ",\"licence_key\":");
     orbit_write_string(w, key);
@@ -411,6 +421,7 @@ static int32_t fetch_keys_from(orbit_client_state_t *c, uint64_t generation,
   request.origin = c->config.api_origin;
   request.path = slice(path, w.length);
   request.body = slice(NULL, 0u);
+  request.client = orbit_client_header();
   request.post = 0u;
   (void)orbit_jwks_begin(&sink.importer, &c->keys);
   status = c->services.exchange(c->services.context, &request, &http,
@@ -490,7 +501,12 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   int64_t now;
   int32_t result;
   int is_hwid;
+  uint8_t update[32] = {0};
+  uint32_t update_length = 0u;
   result = orbit_reply_parse(c->arena, response_length, c->scratch, &reply);
+  if (result != 0)
+    goto done;
+  result = orbit_reply_update(c->arena, &reply, update, &update_length);
   if (result != 0)
     goto done;
   if (reply.replay_expired) {
@@ -679,6 +695,10 @@ static ORBIT_NOINLINE int32_t accept(orbit_client_state_t *c,
   apply_claims(c, &claims, reply.server_time, started);
   result = 0;
 done:
+  if (result == 0) {
+    orbit_copy(c->update_available, update, update_length);
+    c->update_length = (uint8_t)update_length;
+  }
   wipe(&next, sizeof(next));
   return result;
 }
@@ -707,12 +727,13 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
     else
       ORBIT_LITERAL(&route, "/validate");
   }
-  body(c, &request_body, key, operation, &c->record);
+  body(c, &request_body, key, operation, &c->record, 1);
   if (route.status || request_body.status)
     return ORBIT_CLIENT_RESOURCE_LIMIT;
   request.origin = c->config.api_origin;
   request.path = slice(path, route.length);
   request.body = slice(c->arena, request_body.length);
+  request.client = orbit_client_header();
   request.post = 1u;
   result = c->services.exchange(c->services.context, &request, &http,
                                 receive_response, &sink);
@@ -743,6 +764,10 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
       return terminal(c, 0);
   } else
     result = response_status(result, http);
+  if (result == ORBIT_CLIENT_DENIED && http == 403u && operation != 2u &&
+      orbit_error_code_is(c->arena, sink.length, c->scratch,
+                          "app_version_unsupported", 23u))
+    result = ORBIT_CLIENT_APP_VERSION_UNSUPPORTED;
   if (result == 0) {
     if (operation == 2u)
       result = ORBIT_CLIENT_UNTRUSTED;
@@ -778,12 +803,32 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
       c->active.valid = 0u;
     return result;
   }
+  if (result == ORBIT_CLIENT_APP_VERSION_UNSUPPORTED && operation == 0u) {
+    /* Keep the activation for updated firmware, but drop cached access with
+     * no offline fallback and pace further validation. */
+#ifdef ORBIT_ENABLE_SERVICES
+    if (c->extension) {
+      c->extension->session.active = 0;
+      c->extension->policy_known = 0;
+    }
+#endif
+    clear_access(c);
+    if (advance(c) != 0)
+      return ORBIT_CLIENT_STORAGE;
+    if (clock_now(c, &now, &started) != 0)
+      return ORBIT_CLIENT_CLOCK;
+    c->version_denied = 1u;
+    c->retry_ticks =
+        started > UINT64_MAX - 60000u ? UINT64_MAX : started + 60000u;
+    return result;
+  }
   if (result != 0 && result != ORBIT_CLIENT_PENDING &&
       result != ORBIT_CLIENT_CLOCK && result != ORBIT_CLIENT_STALE &&
       result != ORBIT_CLIENT_STORAGE) {
     /* An uncertain mutation keeps its durable retry identity. The pending
      * flag fences validation/access until a deliberate identical retry. */
-    if (operation != 0u && result != ORBIT_CLIENT_DENIED) {
+    if (operation != 0u && result != ORBIT_CLIENT_DENIED &&
+        result != ORBIT_CLIENT_APP_VERSION_UNSUPPORTED) {
       clear_access(c);
       (void)advance(c);
       return result;
@@ -823,7 +868,7 @@ static ORBIT_NOINLINE int32_t prepare_activation(orbit_client_state_t *c,
     goto done;
   }
   w = (orbit_writer_t){c->arena, 0u, c->arena_capacity, 0};
-  body(c, &w, key, 1u, &next);
+  body(c, &w, key, 1u, &next, 0);
   length = w.length;
   if (w.status || c->services.crypto.sha256(c->services.crypto.context,
                                             c->arena, length, digest) != 0) {
@@ -927,7 +972,8 @@ int32_t orbit_client_tick(orbit_client_t *client) {
   if (c->active.valid && now < c->active.refresh && now < c->active.expires)
     goto done;
   if (c->retry_ticks && ticks < c->retry_ticks) {
-    result = ORBIT_CLIENT_TRANSIENT;
+    result = c->version_denied ? ORBIT_CLIENT_APP_VERSION_UNSUPPORTED
+                               : ORBIT_CLIENT_TRANSIENT;
     goto done;
   }
   result = perform(c, 0u, slice(NULL, 0u));
@@ -963,6 +1009,8 @@ int32_t orbit_client_snapshot(orbit_client_t *client,
     out->activation_required = 0;
 #endif
   out->pending = c->record.pending_kind;
+  out->update_available_length = c->update_length;
+  orbit_copy(out->update_available, c->update_available, c->update_length);
   out->has_credential_expiry = c->record.has_expiry;
   out->credential_expires_at = c->record.credential_expiry;
   c->busy = 1u;

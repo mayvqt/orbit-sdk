@@ -33,6 +33,9 @@ impl Error {
     pub const CANCELLED: Self = Self(23);
     pub const CAPACITY: Self = Self(24);
     pub const SESSION_REQUIRED: Self = Self(25);
+    /// Licence policy blocks the configured application version. Update the
+    /// firmware; cached access is not used and the activation is kept.
+    pub const APP_VERSION_UNSUPPORTED: Self = Self(26);
     pub const fn from_code(code: i32) -> Option<Self> {
         if code == 0 {
             None
@@ -61,6 +64,7 @@ impl Error {
             23 => "cancelled",
             24 => "capacity",
             25 => "session_required",
+            26 => "app_version_unsupported",
             _ => "unknown",
         }
     }
@@ -86,11 +90,13 @@ pub struct Request<'a> {
     pub origin: &'a str,
     pub path: &'a str,
     pub body: &'a [u8],
+    /// Send as the `Orbit-Client` header value.
+    pub client: &'a str,
     pub post: bool,
 }
 /// Security-sensitive operations supplied by your maintained platform libraries.
 /// TLS must verify the certificate chain, hostname and dates. Return TRANSIENT
-/// only for a network timeout/unavailability. Commit is atomic, durable, compares
+/// for network unavailability, timeouts and resets. Commit is atomic, durable, compares
 /// generation, and never restores older authority after a torn newer write.
 /// This owner exclusively controls its storage for the entire client's lifetime.
 pub trait Platform {
@@ -119,13 +125,15 @@ pub struct Config<'a> {
     pub environment_id: &'a str,
     pub fingerprint: &'a str,
     pub fingerprint_provider: &'a str,
+    /// Optional firmware version, such as `"2.4.1"`; empty when unset.
+    pub app_version: &'a str,
 }
 #[repr(C, align(8))]
 struct State([u8; CLIENT_STATE_BYTES]);
 #[cfg(not(feature = "services"))]
-const CLIENT_STATE_BYTES: usize = 6960;
+const CLIENT_STATE_BYTES: usize = 7008;
 #[cfg(feature = "services")]
-const CLIENT_STATE_BYTES: usize = 6976;
+const CLIENT_STATE_BYTES: usize = 7024;
 pub const ARENA_MIN_BYTES: usize = 8192;
 pub const ARENA_MAX_BYTES: usize = 32768;
 /// Place in a static or another stable caller-owned allocation. The default
@@ -165,8 +173,18 @@ pub struct Snapshot {
     has_credential_expiry: u8,
     activation_required: u8,
     pending: u8,
+    update_length: u8,
+    update: [u8; 32],
 }
 impl Snapshot {
+    /// Newer firmware version from the last online check, when the licence
+    /// policy offers one.
+    pub fn update_available(&self) -> Option<&str> {
+        let length = usize::from(self.update_length).min(self.update.len());
+        core::str::from_utf8(&self.update[..length])
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
     pub fn allowed(&self) -> bool {
         self.allowed != 0
     }
@@ -224,6 +242,7 @@ impl<'a, P: Platform> Client<'a, P> {
             environment: Slice::str(config.environment_id)?,
             fingerprint: Slice::str(config.fingerprint)?,
             provider: Slice::str(config.fingerprint_provider)?,
+            app_version: Slice::str(config.app_version)?,
             #[cfg(feature = "services")]
             environment_kind: 0,
         };
@@ -304,6 +323,7 @@ pub struct AppKey<'a> {
     application_id: &'a str,
     environment_id: &'a str,
     environment: Environment,
+    app_version: &'a str,
 }
 impl<'a> AppKey<'a> {
     pub fn parse(value: &'a str) -> Result<Self, Error> {
@@ -336,7 +356,18 @@ impl<'a> AppKey<'a> {
             } else {
                 Environment::Live
             },
+            app_version: "",
         })
+    }
+    /// Sends the firmware version, such as `"2.4.1"`, with activation and
+    /// validation. The client rejects a value outside
+    /// `N[.N[.N[.N]]][-PRE][+BUILD]` in at most 32 bytes.
+    pub fn with_app_version(mut self, version: &'a str) -> Self {
+        self.app_version = version;
+        self
+    }
+    pub fn app_version(&self) -> &'a str {
+        self.app_version
     }
     #[cfg(feature = "offline")]
     pub fn as_str(&self) -> &'a str {
@@ -363,6 +394,7 @@ impl<'a> AppKey<'a> {
             environment_id: self.environment_id,
             fingerprint: "",
             fingerprint_provider: "",
+            app_version: self.app_version,
         }
     }
 }
@@ -425,6 +457,7 @@ impl RawConfig {
             environment: empty,
             fingerprint: empty,
             provider: empty,
+            app_version: empty,
             #[cfg(feature = "services")]
             environment_kind: 0,
         }
@@ -438,6 +471,7 @@ struct RawConfig {
     environment: Slice,
     fingerprint: Slice,
     provider: Slice,
+    app_version: Slice,
     #[cfg(feature = "services")]
     environment_kind: u8,
 }
@@ -446,6 +480,7 @@ struct RawRequest {
     origin: Slice,
     path: Slice,
     body: Slice,
+    client: Slice,
     post: u8,
 }
 type Receive = unsafe extern "C" fn(*mut c_void, *const u8, u32) -> i32;
@@ -490,11 +525,16 @@ unsafe extern "C" fn exchange<P: Platform>(
         Ok(v) => v,
         Err(_) => return 12,
     };
+    let client = match core::str::from_utf8(bytes(q.client.data, q.client.length)) {
+        Ok(v) => v,
+        Err(_) => return 12,
+    };
     // The request borrow ends before receive can overwrite the C transaction arena.
     let started = (&mut *p.cast::<P>()).begin_request(Request {
         origin,
         path,
         body: bytes(q.body.data, q.body.length),
+        client,
         post: q.post != 0,
     });
     let mut result = 0;
@@ -637,6 +677,14 @@ mod tests {
         for (index, value) in expected.into_iter().enumerate() {
             assert_eq!(unsafe { orbit_rust_layout(index as u32) }, value);
         }
+        let added = [
+            core::mem::offset_of!(RawConfig, app_version),
+            core::mem::offset_of!(RawRequest, client),
+            core::mem::offset_of!(Snapshot, update),
+        ];
+        for (index, value) in added.into_iter().enumerate() {
+            assert_eq!(unsafe { orbit_rust_layout(index as u32 + 21) }, value);
+        }
         assert_eq!(core::mem::size_of::<State>(), CLIENT_STATE_BYTES);
         assert_eq!(core::mem::align_of::<State>(), 8);
         assert_eq!(
@@ -647,7 +695,7 @@ mod tests {
             core::mem::size_of::<Buffers<8192>>(),
             CLIENT_STATE_BYTES + 8192 + 2048
         );
-        assert_eq!(core::mem::size_of::<Snapshot>(), 40);
+        assert_eq!(core::mem::size_of::<Snapshot>(), 72);
         assert_eq!(
             core::mem::size_of::<Crypto>(),
             4 * core::mem::size_of::<usize>()
@@ -661,7 +709,13 @@ mod tests {
         posts: u32,
     }
     impl Platform for Host {
-        fn begin_request(&mut self, _: Request<'_>) -> Result<u16, Error> {
+        fn begin_request(&mut self, request: Request<'_>) -> Result<u16, Error> {
+            assert!(request.client.starts_with(concat!(
+                "embedded/",
+                env!("CARGO_PKG_VERSION"),
+                " ("
+            )));
+            assert!(request.client.ends_with(')'));
             self.posts += 1;
             Err(Error::TRANSIENT)
         }
@@ -717,6 +771,7 @@ mod tests {
             environment_id: "env",
             fingerprint: "",
             fingerprint_provider: "",
+            app_version: "",
         }
     }
     #[test]
@@ -786,6 +841,35 @@ mod tests {
             self.1 = end;
             Ok(())
         }
+    }
+
+    #[test]
+    fn app_version_is_validated_and_update_hint_is_exposed() {
+        let value = "orbit_app_test_aHR0cHM6Ly9vcmJpdC5leGFtcGxlLnRlc3Q.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g";
+        let mut b = Buffers::<8192>::new();
+        let mut p = Host {
+            record: [0; 1024],
+            length: 0,
+            commits: 0,
+            posts: 0,
+        };
+        let invalid = AppKey::parse(value).unwrap().with_app_version("01");
+        assert!(matches!(
+            Client::new(&mut b, &mut p, invalid.config()),
+            Err(Error::ARGUMENT)
+        ));
+        let app = AppKey::parse(value)
+            .unwrap()
+            .with_app_version("2.4.1-beta.2");
+        assert_eq!(app.config().app_version, "2.4.1-beta.2");
+        let mut c = Client::new(&mut b, &mut p, app.config()).unwrap();
+        assert_eq!(c.snapshot().unwrap().update_available(), None);
+        let mut snapshot = Snapshot::default();
+        snapshot.update[..5].copy_from_slice(b"2.5.0");
+        snapshot.update_length = 5;
+        assert_eq!(snapshot.update_available(), Some("2.5.0"));
+        assert_eq!(Error::APP_VERSION_UNSUPPORTED.code(), 26);
+        assert_eq!(Error::APP_VERSION_UNSUPPORTED.name(), "app_version_unsupported");
     }
 
     #[test]

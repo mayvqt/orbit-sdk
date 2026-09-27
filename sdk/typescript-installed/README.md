@@ -83,6 +83,23 @@ For a policy reset that requires proof of the prior credential, pass
 digest for retries; the credential itself is never written to installation
 state.
 
+## Application version
+
+Pass `Client.open(appKey, { appVersion: "2.4.1" })` so your licence policy can
+require a minimum application version and offer updates. Use one to four
+dot-separated numbers without leading zeros, optionally followed by a
+`-pre-release` and `+build` part, in at most 32 bytes (for example
+`3.0.0-beta.2+build.5`). `open` rejects an invalid value with a `configuration`
+error and sends a valid one with activation and validation.
+
+When the policy blocks this version, access checks throw
+`AppVersionUnsupportedError`, and cached or offline access is not used. Ask the
+user to update the application; the activation is kept, so the updated version
+continues without a new licence key. `snapshot.updateAvailable` contains a
+newer version when the policy offers one and is `null` otherwise. Every request
+also identifies the SDK with an `Orbit-Client` header containing its language,
+version and platform.
+
 ## Floating sessions
 
 When the licence policy enables concurrent sessions, activation acquires a

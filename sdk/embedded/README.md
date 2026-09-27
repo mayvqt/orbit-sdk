@@ -70,6 +70,29 @@ pending mutation must be resolved first. Use `orbit_client_deactivate` to revoke
 the installation, or `orbit_client_invalidate` for immediate durable local denial.
 Treat storage errors as unavailable access; never erase storage automatically.
 
+### Firmware version
+
+Set `config.app_version` to your firmware version, such as `"2.4.1"`, before
+initialization so licence policy can require a minimum version. It is sent with
+activation and validation. The value must be `N[.N[.N[.N]]]`, optionally
+followed by `-PRE` and `+BUILD` dot-separated identifiers, in at most 32 bytes,
+with no leading zeros in numeric parts; initialization returns
+`ORBIT_CLIENT_ARGUMENT` otherwise. Leave it empty to send no version.
+
+When policy blocks the version, validation and `orbit_client_require_access`
+return `ORBIT_CLIENT_APP_VERSION_UNSUPPORTED`. Cached and offline access are not
+used, and the activation stays stored so updated firmware can validate without
+the licence key. A denied activation is final. When a newer version is offered,
+`orbit_access_snapshot_t` reports it in `update_available` with
+`update_available_length`; the length is 0 otherwise.
+
+Every request carries an `Orbit-Client` header naming this SDK, its version
+and the platform, such as `linux-x86_64`. Adapters send
+`orbit_http_request_t.client` as its value. To name a board more precisely,
+define `ORBIT_EMBEDDED_PLATFORM` as a string literal such as `"esp32-xtensa"`
+when building the client: at most 32 bytes of lowercase letters, digits, `_`,
+`.` or `-`, starting with a letter or digit.
+
 The [common example](../../examples/embedded/common/client.c) shows these calls.
 The tiny client focuses on key activation. Customer registration and sign-in use
 the [native HTTP API](../../examples/http/README.md).
@@ -101,9 +124,9 @@ documents the one local end-session call allowed during a transport callback.
 Call `orbit_client_clock_lost` if sleep/resume makes elapsed time uncertain.
 Keep credentials out of logs and protect their storage on the device.
 
-The default client reserves **41,776 bytes** for state, a 32 KiB transaction
+The default client reserves **41,824 bytes** for state, a 32 KiB transaction
 arena and parser scratch. Set `ORBIT_CLIENT_ARENA_BYTES=8192` for a
-**17,200-byte** compact caller buffer, or choose a runtime C arena from 8 to
+**17,248-byte** compact caller buffer, or choose a runtime C arena from 8 to
 32 KiB. A compact arena rejects any request or response that does not fit.
 Crypto, TLS, board libraries and stack are additional. The
 [memory and ABI reference](docs/memory.md) covers stack, optional-profile

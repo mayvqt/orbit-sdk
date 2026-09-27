@@ -1,4 +1,5 @@
 #include "core.hpp"
+#include "app_version.hpp"
 #include "online.hpp"
 
 #include "error.hpp"
@@ -413,6 +414,8 @@ void ClientState::clear_access_locked() {
     transient = false;
     refresh_failure.reset();
     retry_deadline.reset();
+    update_available.reset();
+    version_denial.reset();
 }
 
 void ClientState::clear_all_locked() {
@@ -559,6 +562,7 @@ std::string ClientState::account_path(std::string_view path,
 ::orbit::Snapshot ClientState::snapshot_locked(bool tolerate_clock_error) {
     if (offline) return offline_snapshot_locked();
     ::orbit::Snapshot result;
+    result.update_available = update_available;
     result.access = credential ? ::orbit::Access::refresh_required : ::orbit::Access::denied;
     result.reauthentication_required = !credential.has_value();
     if (credential && credential->expires_at) {
@@ -1046,11 +1050,13 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
     std::optional<VerifiedActivation> accepted;
     std::optional<ClockAnchor> accepted_anchor;
     std::optional<Error> failure;
+    std::optional<std::string> hint;
     const bool verifying = reply.has_value();
     if (response_error) {
         failure.emplace(*response_error);
     } else if (reply) {
         try {
+            hint = update_hint(*reply);
             ClockAnchor request_anchor;
             accepted.emplace(
                 verify_reply(*reply, previous, expected_licence, start, cancelled, request_anchor));
@@ -1109,6 +1115,8 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
         transient = false;
         refresh_failure.reset();
         retry_deadline.reset();
+        update_available = std::move(hint);
+        version_denial.reset();
         if (persistent) last_checkpoint = std::chrono::steady_clock::now();
         wake_worker();
         return snapshot_locked(true);
@@ -1118,6 +1126,7 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
 
     if (persistent && mutation &&
         failure->kind() != ErrorKind::denied &&
+        failure->kind() != ErrorKind::app_version_unsupported &&
         failure->kind() != ErrorKind::reauthentication_required) {
         // The server may have committed an activation whose reply was lost or
         // could not be verified. Keep its durable retry identity, but do not
@@ -1136,6 +1145,32 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
             retry_deadline = std::chrono::steady_clock::now() + delay;
         }
         wake_worker();
+        throw *failure;
+    }
+
+    if (failure->kind() == ErrorKind::app_version_unsupported && previous) {
+        // Keep the activation for an updated application, but drop cached
+        // access without offline fallback and pace further validation.
+        advance_generation_locked();
+        claims.reset();
+        anchor.reset();
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+        transient = false;
+        update_available.reset();
+        refresh_failure.reset();
+        version_denial = *failure;
+        std::uint8_t entropy = 0;
+        const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
+            ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
+        retry_deadline = std::chrono::steady_clock::now() + delay;
+        if (persistent) {
+            persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
+            persistent_record["access"] = null_value();
+            persist_record_locked();
+        }
         throw *failure;
     }
 
@@ -1181,6 +1216,7 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
         persistent_record["access"] = null_value();
         persist_record_locked();
         transient = false;
+        version_denial.reset();
         refresh_failure = *failure;
         std::uint8_t entropy = 0;
         const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
@@ -1305,6 +1341,7 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
     input["previous_credential"] = previous ? Json::Value(std::string(*previous)) : null_value();
     input["idempotency_key"] = operation_id;
     if (persistent) input["credential_mode"] = "persistent";
+    if (config.app_version) input["app_version"] = *config.app_version;
     if (account_licence) {
         input["customer_session"] = account_token;
         input["licence_id"] = std::string(*account_licence);
@@ -1736,7 +1773,8 @@ SessionGrant ClientState::verify_session_reply(const Json::Value &reply,
     }
     if (floating_profile)
         return advance_session_serialized(cancelled);
-    const auto input = credential_body(saved);
+    auto input = credential_body(saved);
+    if (config.app_version) input["app_version"] = *config.app_version;
     const auto path = "/api/client/v1/activations/" + saved.activation_id + "/validate";
     const ClockStart start = capture_clock();
     std::optional<Json::Value> response;
@@ -1813,6 +1851,7 @@ SessionGrant ClientState::verify_session_reply(const Json::Value &reply,
             raise(ErrorKind::denied, "session_access_unavailable");
         }
         if (credential && transient) raise(ErrorKind::transient, "network_unavailable");
+        if (credential && version_denial) throw *version_denial;
         if (credential && refresh_failure) throw *refresh_failure;
         raise(ErrorKind::not_activated, "access_unavailable");
     }
@@ -2610,6 +2649,9 @@ Client Client::open(const AppKey& app_key, Options options) {
             detail::raise(ErrorKind::configuration, "invalid_session_keys");
         config.session_keys = options.session_keys->keys_;
     }
+    if (options.app_version && !detail::valid_app_version(*options.app_version))
+        detail::raise(ErrorKind::configuration, "invalid_app_version");
+    config.app_version = std::move(options.app_version);
     config.fingerprint = detail::resolve_fingerprint(app_key, options);
     (void)detail::capture_clock();
     detail::Transport transport(config.api_origin);

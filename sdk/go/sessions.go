@@ -47,7 +47,7 @@ func cloneInt64(value *int64) *int64 {
 }
 
 func (c *Client) sessionSnapshotLocked() Snapshot {
-	snapshot := Snapshot{Access: AccessDenied, Entitlements: map[string]bool{}, ReauthenticationRequired: c.state.credential == nil, StorageCapability: c.storageCapability}
+	snapshot := Snapshot{Access: AccessDenied, Entitlements: map[string]bool{}, ReauthenticationRequired: c.state.credential == nil, StorageCapability: c.storageCapability, UpdateAvailable: c.state.updateAvailable}
 	if c.state.credential != nil {
 		snapshot.Access = AccessRefreshRequired
 		if c.state.credential.CredentialExpiresAt != 0 {

@@ -54,7 +54,9 @@ impl Error {
     /// Validated server correlation reference, absent for local failures.
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::Transient { request_id, .. } | Self::Denied { request_id, .. } => request_id
+            Self::Transient { request_id, .. }
+            | Self::Denied { request_id, .. }
+            | Self::AppVersionUnsupported { request_id } => request_id
                 .as_deref()
                 .filter(|value| valid_request_id(value)),
             _ => None,
@@ -78,6 +80,7 @@ impl Error {
             Self::Cancelled => "cancelled",
             Self::Transient { .. } => "transient",
             Self::Denied { .. } => "denied",
+            Self::AppVersionUnsupported { .. } => "app_version_unsupported",
             Self::NotActivated => "access_unavailable",
             Self::FeatureUnavailable => "feature_unavailable",
             Self::SessionRequired => "session_required",

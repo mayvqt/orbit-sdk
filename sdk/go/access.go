@@ -46,6 +46,9 @@ type Snapshot struct {
 	RemainingOffline         time.Duration
 	StorageCapability        StorageCapability
 	Session                  *SessionMetadata
+	// UpdateAvailable is a newer application version reported by the last
+	// online check, or empty when the licence policy offers none.
+	UpdateAvailable string
 }
 
 // HasFeature reports whether the snapshot's current access includes feature.
@@ -71,6 +74,9 @@ type accessState struct {
 	pendingSessionSince     time.Time
 	sessionRetryAt          time.Time
 	sessionLicenceExpiresAt *int64
+	updateAvailable         string
+	// versionDenial keeps an app_version_unsupported answer while retries are paced.
+	versionDenial error
 }
 
 // Client is safe for concurrent use. Create a separate context for each selected
@@ -90,6 +96,7 @@ type Client struct {
 	keys              grantKeys // Accessed only while holding the serial operation gate.
 	offlineKeys       grantKeys
 	sessionKeys       sessionVerifierKeys
+	appVersion        string
 }
 
 func (*Client) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte("[Orbit client]")) }
@@ -161,6 +168,8 @@ func clearAccess(state *accessState) {
 	state.pendingSessionID = ""
 	state.sessionRetryAt = time.Time{}
 	state.sessionLicenceExpiresAt = nil
+	state.updateAvailable = ""
+	state.versionDenial = nil
 	if state.offline != nil {
 		state.offline.authorized = false
 	}
@@ -314,7 +323,7 @@ func (c *Client) offlineSnapshotLocked(offline *offlineRuntime, now int64, clock
 	return snapshot
 }
 func (c *Client) snapshotLockedAt(now int64, clockValid bool) Snapshot {
-	snapshot := Snapshot{Access: AccessDenied, Entitlements: make(map[string]bool), ReauthenticationRequired: true, StorageCapability: c.storageCapability}
+	snapshot := Snapshot{Access: AccessDenied, Entitlements: make(map[string]bool), ReauthenticationRequired: true, StorageCapability: c.storageCapability, UpdateAvailable: c.state.updateAvailable}
 	state := &c.state
 	var credentialExpiry *int64
 	if state.credential != nil {
@@ -457,6 +466,9 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 		idempotencyKey, c.state.storageVersion = id, version
 	}
 	body := c.scopeBody(map[string]any{"installation_id": c.device.InstallationID, "fingerprint": c.device.Fingerprint, "fingerprint_provider": c.device.FingerprintProvider, "previous_credential": optionalString(previousCredential), "idempotency_key": idempotencyKey})
+	if c.appVersion != "" {
+		body["app_version"] = c.appVersion
+	}
 	if licence == "" {
 		clearState(&c.state)
 		body["licence_key"] = key
@@ -556,7 +568,11 @@ func (c *Client) refreshMode(ctx context.Context, respectRetry, acquireSession b
 	}
 	budget, cancel := context.WithTimeout(ctx, operationTimeout)
 	defer cancel()
-	response, responseError := c.transport.Post(budget, clientPrefix+"activations/"+saved.ActivationID+"/validate", c.credentialBody(saved), true)
+	body := c.credentialBody(saved)
+	if c.appVersion != "" {
+		body["app_version"] = c.appVersion
+	}
+	response, responseError := c.transport.Post(budget, clientPrefix+"activations/"+saved.ActivationID+"/validate", body, true)
 	if budget.Err() != nil && ctx.Err() == nil {
 		responseError = ErrTransient
 	}
@@ -769,9 +785,13 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 	return snapshot, nil
 }
 
-// unavailableLocked explains why access is unavailable: the last paced
-// validation failure when a credential remains, otherwise missing activation.
+// unavailableLocked explains why access is unavailable: an unsupported app
+// version, the last paced validation failure when a credential remains, an
+// outage, otherwise missing activation.
 func (c *Client) unavailableLocked() error {
+	if c.state.versionDenial != nil {
+		return c.state.versionDenial
+	}
 	if c.state.credential != nil && c.state.failure != nil {
 		return c.state.failure
 	}
@@ -805,6 +825,10 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 	floating := false
 	err := responseError
 	verifying := err == nil
+	updateAvailable := ""
+	if err == nil {
+		updateAvailable, err = updateHint(response)
+	}
 	if err == nil {
 		saved, claims, anchor, floating, err = c.verifyReply(budget, response, previous, licence, started)
 	}
@@ -875,6 +899,8 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 				c.state.sessionDisabled = false
 			}
 			c.state.transient = false
+			c.state.updateAvailable = updateAvailable
+			c.state.versionDenial = nil
 			if c.lifecycle != nil {
 				c.lifecycle.restoring = false
 			}
@@ -919,6 +945,27 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 				}
 			}
 			return snapshot, nil
+		}
+		return Snapshot{}, err
+	}
+	if previous != nil && errors.Is(err, ErrAppVersionUnsupported) {
+		// Keep the activation for an updated application, but drop cached access
+		// without offline fallback and pace further validation.
+		c.state.generation++
+		c.state.claims = nil
+		c.state.anchor = nil
+		c.state.transient = false
+		c.state.session = nil
+		c.state.pendingSessionID = ""
+		c.state.updateAvailable = ""
+		c.state.failure = nil
+		c.state.versionDenial = err
+		c.state.retryAt = time.Now().Add(time.Minute)
+		c.state.nextRetry = 0
+		if c.installed != nil {
+			if e := c.installed.dropCache(); e != nil {
+				return Snapshot{}, e
+			}
 		}
 		return Snapshot{}, err
 	}

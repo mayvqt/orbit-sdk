@@ -316,6 +316,7 @@ func (t *Transport) attempt(ctx context.Context, method string, endpoint *url.UR
 		return nil, 0, ErrConfiguration
 	}
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Orbit-Client", clientHeader)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 		request.ContentLength = int64(len(body))

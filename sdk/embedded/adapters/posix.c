@@ -140,7 +140,7 @@ static size_t receive_bytes(char *bytes, size_t size, size_t count, void *p) {
 int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
                              uint16_t *http, orbit_receive_fn receive,
                              void *context) {
-  char url[1025];
+  char url[1025], client[143];
   CURL *curl = NULL;
   struct curl_slist *headers = NULL;
   CURLcode code;
@@ -155,8 +155,18 @@ int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
       request->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES ||
       request->post > 1u || request->origin.length < 8u ||
       memcmp(request->origin.data, "https://", 8u) != 0 ||
-      request->path.length == 0u || request->path.data[0] != '/')
+      request->path.length == 0u || request->path.data[0] != '/' ||
+      request->client.length > 128u ||
+      (!request->client.data && request->client.length))
     return ORBIT_CLIENT_ARGUMENT;
+  for (length = 0u; length < request->client.length; ++length)
+    if (request->client.data[length] < 32u ||
+        request->client.data[length] >= 127u)
+      return ORBIT_CLIENT_ARGUMENT;
+  memcpy(client, "Orbit-Client: ", 14u);
+  if (request->client.length)
+    memcpy(client + 14u, request->client.data, request->client.length);
+  client[14u + request->client.length] = 0;
   length = request->origin.length + request->path.length;
   memcpy(url, request->origin.data, request->origin.length);
   memcpy(url + request->origin.length, request->path.data,
@@ -179,6 +189,12 @@ int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
   {
     struct curl_slist *more =
         curl_slist_append(headers, "Accept: application/json");
+    if (more == NULL)
+      goto done;
+    headers = more;
+  }
+  if (request->client.length) {
+    struct curl_slist *more = curl_slist_append(headers, client);
     if (more == NULL)
       goto done;
     headers = more;

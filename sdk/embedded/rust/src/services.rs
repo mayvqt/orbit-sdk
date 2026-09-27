@@ -102,6 +102,7 @@ fn raw_config(app: &AppKey<'_>, binding: Option<(&str, &str)>) -> Result<RawConf
         environment: Slice::str(app.environment_id())?,
         fingerprint: Slice::str(fingerprint)?,
         provider: Slice::str(provider)?,
+        app_version: Slice::str(app.app_version())?,
         environment_kind: match app.environment() {
             Environment::Test => 1,
             Environment::Live => 2,

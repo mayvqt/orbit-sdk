@@ -32,10 +32,11 @@ public sealed partial class OrbitClient
             OrbitError.StaleResponse => "stale_response",
             OrbitError.Storage => "storage",
             OrbitError.ClockUncertain => "clock_uncertain",
+            OrbitError.AppVersionUnsupported => "app_version_unsupported",
             _ => "unknown_error"
         };
         string? requestId = null;
-        if (error.Error is OrbitError.Denied or OrbitError.Transient)
+        if (error.Error is OrbitError.Denied or OrbitError.Transient or OrbitError.AppVersionUnsupported)
         {
             if (OrbitException.ValidCode(error.Code)) code = error.Code!;
             if (OrbitException.ValidRequestId(error.RequestId)) requestId = error.RequestId;

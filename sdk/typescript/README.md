@@ -63,7 +63,8 @@ the application and environment IDs. A malformed key throws `TypeError`; call
 `application_id`, `environment_id`, `environment`) before constructing a
 client, which also accepts a parsed `AppKey`. Requests go only to the key's
 HTTPS origin, reject redirects, time out after five seconds and cap JSON
-responses at 1 MiB.
+responses at 1 MiB. Every request identifies the SDK with an `Orbit-Client`
+header containing its language, version and platform.
 
 ## Management methods
 

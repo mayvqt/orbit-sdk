@@ -213,6 +213,7 @@ public sealed class Transport : IDisposable
         {
             using var request = new HttpRequestMessage(method, endpoint);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Headers.TryAddWithoutValidation("Orbit-Client", AppVersion.ClientHeader);
             if (bearer != null) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
             if (body != null)
             {
@@ -257,7 +258,9 @@ public sealed class Transport : IDisposable
                         ? TimeSpan.FromSeconds(seconds) : TimeSpan.FromSeconds(30);
             }
             var transient = status == 429 && code == "rate_limited" || status == 503 && code == "service_unavailable";
-            throw new AttemptFailure(new OrbitException(transient ? OrbitError.Transient : OrbitError.Denied, code, requestId)
+            var kind = transient ? OrbitError.Transient
+                : status == 403 && code == "app_version_unsupported" ? OrbitError.AppVersionUnsupported : OrbitError.Denied;
+            throw new AttemptFailure(new OrbitException(kind, code, requestId)
             { WireError = envelope, HttpStatus = status }, retryAfter);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

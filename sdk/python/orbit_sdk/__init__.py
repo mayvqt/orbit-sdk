@@ -18,7 +18,7 @@ from .client import (
 )
 from .device import installation_id_new, machine_fingerprint, native_fingerprint
 from .downloads import DownloadTicket, DownloadTicketVerifier
-from .errors import FeatureUnavailableError, NotActivatedError, OrbitError
+from .errors import AppVersionUnsupportedError, FeatureUnavailableError, NotActivatedError, OrbitError
 from .offline import OfflineRequest
 from .online import (Artifact, Release, Update, UpdateTarget, DownloadAuthorization, UsageCounter,
                      UsageConsumption, ResourceCounter, ResourceAllocation, UsageLimit, ResourceLimit,
@@ -29,6 +29,7 @@ __all__ = [
     "AccessStatus",
     "Account",
     "AppKey",
+    "AppVersionUnsupportedError",
     "Cancellation",
     "Client",
     "DeviceBinding",

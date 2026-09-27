@@ -420,7 +420,11 @@ impl Transport {
                 .map_err(|_| AttemptFailure::invalid());
         }
         Err(AttemptFailure {
-            error: if (status.as_u16() == 429 && error.code == "rate_limited")
+            error: if status.as_u16() == 403 && error.code == "app_version_unsupported" {
+                Error::AppVersionUnsupported {
+                    request_id: Some(error.request_id),
+                }
+            } else if (status.as_u16() == 429 && error.code == "rate_limited")
                 || (status.as_u16() == 503 && error.code == "service_unavailable")
             {
                 Error::Transient {
@@ -509,8 +513,14 @@ pub(crate) fn request_error(error: &reqwest::Error) -> Error {
     AttemptFailure::transport(error).error
 }
 
+/// Builder for Orbit API requests, which identify the SDK with `Orbit-Client`.
 fn client_builder() -> reqwest::ClientBuilder {
+    let mut headers = header::HeaderMap::new();
+    if let Ok(value) = header::HeaderValue::from_str(&crate::app_version::this_client()) {
+        headers.insert("orbit-client", value);
+    }
     base_builder()
+        .default_headers(headers)
         .connect_timeout(Duration::from_secs(3))
         .timeout(ATTEMPT_TIMEOUT)
 }

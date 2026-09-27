@@ -97,6 +97,23 @@ for example for a service account or persistent container volume. Share one
 deactivating the licence. [Advanced options](advanced.md#installed-options-and-machine-binding)
 cover disabling binding for shared images and custom identities.
 
+## Application version
+
+Set `Options{AppVersion: "2.4.1"}` so your licence policy can require a minimum
+application version and offer updates. Use one to four dot-separated numbers
+without leading zeros, optionally followed by a `-pre-release` and `+build`
+part, in at most 32 bytes (for example `3.0.0-beta.2+build.5`). `Open` rejects
+an invalid value with `ErrConfiguration` and sends a valid one with activation
+and validation.
+
+When the policy blocks this version, access checks return an error matching
+`ErrAppVersionUnsupported`, and cached or offline access is not used. Ask the
+user to update the application; the activation is kept, so the updated version
+continues without a new licence key. `Snapshot.UpdateAvailable` contains a
+newer version when the policy offers one and is empty otherwise. Every request
+also identifies the SDK with an `Orbit-Client` header containing its language,
+version and platform.
+
 ## Customer accounts
 
 Customer accounts belong to people using your software, separately from your

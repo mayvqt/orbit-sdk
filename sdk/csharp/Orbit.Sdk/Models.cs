@@ -50,6 +50,8 @@ public sealed record Snapshot(
     public int? PolicyVersion { get; init; }
     public bool OfflineFileMode { get; init; }
     public SessionInfo? Session { get; init; }
+    /// <summary>Newer application version reported by the last online check, when the licence policy offers one.</summary>
+    public string? UpdateAvailable { get; init; }
     public bool HasFeature(string feature) => Entitlements.TryGetValue(feature, out var enabled) && enabled;
     internal static readonly IReadOnlyDictionary<string, bool> EmptyEntitlements =
         new ReadOnlyDictionary<string, bool>(new Dictionary<string, bool>());

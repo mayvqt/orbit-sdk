@@ -45,6 +45,9 @@ enum class ErrorKind : std::uint32_t {
     internal = 13,
     installation_in_use = 14,
     corrupt_state = 15,
+    // Licence policy blocks Options::app_version. Update the application;
+    // cached or offline access is not used.
+    app_version_unsupported = 16,
 };
 
 class Error : public std::runtime_error {
@@ -173,6 +176,9 @@ struct Options {
     std::optional<Fingerprint> fingerprint;
     std::optional<OfflineKeys> offline_keys;
     std::optional<SessionKeys> session_keys;
+    // Your application's version, such as "2.4.1". Activation and validation
+    // send it so licence policy can require a minimum version and report updates.
+    std::optional<std::string> app_version;
 };
 
 enum class Access : std::uint32_t { denied, online, offline, refresh_required, expired };
@@ -259,6 +265,9 @@ struct Snapshot {
         std::int64_t sequence = 0;
     };
     std::optional<Session> session;
+    // Newer application version reported by the last online check, when the
+    // licence policy offers one.
+    std::optional<std::string> update_available;
 
     bool has_feature(std::string_view feature) const;
 };

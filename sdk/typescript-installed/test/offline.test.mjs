@@ -591,25 +591,21 @@ test("offline import write faults fail closed instead of accepting a partial rec
   await assert.rejects(openClientForTesting(appKeyText, { statePath, offlineKeys }), (error) => error.kind === ErrorKind.STORAGE);
 });
 
-test("connected format 2 state upgrades transactionally without replacing installation identity", async (context) => {
-  const base = await mkdtemp(path.join(os.tmpdir(), "orbit-js-state-upgrade-"));
+test("unsupported state formats are rejected without rewriting the record", async (context) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), "orbit-js-state-format-"));
   context.after(() => rm(base, { recursive: true, force: true }));
   const statePath = path.join(base, "state");
   const binding = { fingerprint: null, provider: null };
   const store = await PrivateFileStore.open(appKey, statePath, binding);
-  const installationId = store.state.installation.id;
   await store.close();
   const recordPath = path.join(statePath, "orbit-storage.bin");
-  const legacy = JSON.parse(await readFile(recordPath, "utf8"));
-  legacy.format = 2;
-  delete legacy.offline;
-  await writeFile(recordPath, JSON.stringify(legacy), { mode: 0o600 });
-  const upgraded = await PrivateFileStore.open(appKey, statePath, binding);
-  assert.equal(upgraded.state.format, 3);
-  assert.equal(upgraded.state.installation.id, installationId);
-  assert.equal(upgraded.state.offline.sequence, 0);
-  await upgraded.close();
-  assert.equal(JSON.parse(await readFile(recordPath, "utf8")).format, 3);
+  const older = JSON.parse(await readFile(recordPath, "utf8"));
+  older.format = 2;
+  delete older.offline;
+  const bytes = JSON.stringify(older);
+  await writeFile(recordPath, bytes, { mode: 0o600 });
+  await assert.rejects(PrivateFileStore.open(appKey, statePath, binding), (error) => error.kind === ErrorKind.STORAGE);
+  assert.equal(await readFile(recordPath, "utf8"), bytes);
 });
 
 test("offline persistence rejects coerced digest fields without rewriting the record", async (context) => {

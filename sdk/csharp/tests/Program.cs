@@ -60,6 +60,7 @@ if (root["format_version"] is not JsonValue version || !version.TryGetValue<int>
     return 2;
 }
 AppKeyTests.Run();
+AppVersionTests.Run();
 await NativeGrantTests.RunAsync(root);
 var passed = 0;
 var failed = 0;

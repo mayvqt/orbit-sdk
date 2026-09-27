@@ -23,6 +23,14 @@ export class FeatureUnavailableError extends OrbitError {
   }
 }
 
+/** Licence policy blocks the configured appVersion. Update the application; cached or offline access is not used. */
+export class AppVersionUnsupportedError extends OrbitError {
+  constructor(requestId = undefined, status = 403) {
+    super("denied", "app_version_unsupported", requestId, status);
+    this.name = "AppVersionUnsupportedError";
+  }
+}
+
 export class LimitReachedError extends OrbitError {
   constructor(code, requestId, details) {
     super("denied", code, requestId, 409);

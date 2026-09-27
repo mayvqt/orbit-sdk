@@ -71,6 +71,30 @@ installation credential, never the licence key.
 
 The [console example](../../examples/cpp/README.md) shows the complete flow.
 
+## Application version
+
+Set `orbit::Options::app_version` so your licence policy can require a minimum
+application version and offer updates. Use one to four
+dot-separated numbers without leading zeros, optionally followed by a
+`-pre-release` and `+build` part, in at most 32 bytes (for example
+`3.0.0-beta.2+build.5`).
+`Client::open` rejects an invalid value with `ErrorKind::configuration` and
+sends a valid one with activation and validation.
+
+```cpp
+orbit::Options options;
+options.app_version = "2.4.1";
+auto client = orbit::Client::open(app_key, options);
+```
+
+When the policy blocks this version, access checks throw an `orbit::Error` with
+`kind() == ErrorKind::app_version_unsupported`, and cached or offline access is
+not used. Ask the user to update the application; the activation is kept, so
+the updated version continues without a new licence key.
+`Snapshot::update_available` contains a newer version when the policy offers
+one. Every request also identifies the SDK with an `Orbit-Client` header
+containing its language, version and platform.
+
 ## Installation state
 
 `Client::open` creates one durable installation in the current user's private

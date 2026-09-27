@@ -15,6 +15,7 @@ typedef struct mock {
   char output[32];
   int closed;
   uint16_t *status;
+  char request[256];
 } mock_t;
 static int32_t connect_tls(void *p, const char *host, uint16_t port) {
   (void)p;
@@ -22,7 +23,11 @@ static int32_t connect_tls(void *p, const char *host, uint16_t port) {
 }
 static int32_t write_tls(void *p, const uint8_t *b, uint32_t n) {
   mock_t *m = p;
-  (void)b;
+  if (m->sent < sizeof(m->request) - 1u)
+    memcpy(m->request + m->sent, b,
+           n < sizeof(m->request) - 1u - m->sent
+               ? n
+               : sizeof(m->request) - 1u - m->sent);
   m->sent += n;
   return 0;
 }
@@ -57,9 +62,11 @@ static int check_response(const char *response, int valid,
     orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
                               {(const uint8_t *)"/test", 5},
                               {(const uint8_t *)"{}", 2},
+                              {(const uint8_t *)"embedded/0.4.0 (none-arm)", 25},
                               1};
     int32_t result = orbit_http_exchange(&stream, &q, &status, receive, &m);
     CHECK((result == 0) == valid);
+    CHECK(strstr(m.request, "\r\nOrbit-Client: embedded/0.4.0 (none-arm)\r\n"));
     CHECK(m.closed == 1);
     if (valid)
       CHECK(m.got == strlen(expected) && !memcmp(m.output, expected, m.got));
@@ -88,7 +95,8 @@ static int check_content_length_limit(void) {
       orbit_tls_stream_t stream = {&m, connect_tls, write_tls, read_tls, close_tls};
       orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
                                 {(const uint8_t *)"/test", 5},
-                                {(const uint8_t *)"{}", 2}, 1};
+                                {(const uint8_t *)"{}", 2},
+                                {(const uint8_t *)"embedded/0.4.0 (none-arm)", 25}, 1};
       int32_t result = orbit_http_exchange(&stream, &q, &status, count_receive, &m);
       CHECK(result == (extra ? ORBIT_CLIENT_RESOURCE_LIMIT : 0));
       CHECK(m.got == (extra ? 0 : length));
@@ -109,6 +117,7 @@ static int check_malformed_chunk_size(void) {
     orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
                               {(const uint8_t *)"/test", 5},
                               {(const uint8_t *)"{}", 2},
+                              {NULL, 0},
                               1};
     CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) ==
           ORBIT_CLIENT_UNTRUSTED);
@@ -129,13 +138,32 @@ static int check_short_read(void) {
     orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
                               {(const uint8_t *)"/test", 5},
                               {(const uint8_t *)"{}", 2},
+                              {NULL, 0},
                               1};
     CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) ==
           ORBIT_CLIENT_TRANSIENT);
   }
   return 0;
 }
+static int check_client_header(void) {
+  uint16_t status = 0;
+  mock_t m = {"HTTP/1.1 204 No Content\r\n\r\n", 0, 64, 0, 0, {0}, 0, &status, {0}};
+  orbit_tls_stream_t stream = {&m, connect_tls, write_tls, read_tls, close_tls};
+  orbit_http_request_t q = {{(const uint8_t *)"https://example.com", 19},
+                            {(const uint8_t *)"/test", 5},
+                            {(const uint8_t *)"{}", 2},
+                            {(const uint8_t *)"x/1 (a)\r\nX: y", 14},
+                            1};
+  CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) ==
+        ORBIT_CLIENT_ARGUMENT);
+  CHECK(m.sent == 0);
+  q.client.length = 0;
+  CHECK(orbit_http_exchange(&stream, &q, &status, receive, &m) == 0);
+  CHECK(!strstr(m.request, "Orbit-Client"));
+  return 0;
+}
 int main(void) {
+  CHECK(!check_client_header());
   CHECK(!check_content_length_limit());
   CHECK(!check_short_read());
   CHECK(!check_malformed_chunk_size());

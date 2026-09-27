@@ -2,6 +2,7 @@
 mod access;
 mod accounts;
 mod app_key;
+mod app_version;
 mod clock;
 mod device;
 mod diagnostics;
@@ -60,6 +61,11 @@ pub enum Error {
         code: String,
         request_id: Option<String>,
     },
+    /// The application version is blocked by the licence policy. Update the
+    /// application; retrying the same version or using cached access is denied.
+    AppVersionUnsupported {
+        request_id: Option<String>,
+    },
     NotActivated,
     FeatureUnavailable,
     SessionRequired,
@@ -85,6 +91,9 @@ impl std::fmt::Display for Error {
             Self::Denied { .. } => self
                 .guidance()
                 .unwrap_or("Orbit denied access. Contact application support."),
+            Self::AppVersionUnsupported { .. } => {
+                "This application version is no longer supported. Update the application to continue."
+            }
             Self::NotActivated => "Activate a licence to continue.",
             Self::FeatureUnavailable => "This licence does not include the requested feature.",
             Self::SessionRequired => "Start a floating session before continuing.",

@@ -20,9 +20,11 @@ from .errors import (
     INVALID_RESPONSE,
     TRANSIENT,
     TRANSPORT_SECURITY,
+    AppVersionUnsupportedError,
     OrbitError,
     error,
 )
+from .app_version import CLIENT_HEADER
 from .jsonutil import unique_json, fields, text
 
 MAX_BYTES = 64 * 1024
@@ -463,7 +465,7 @@ class Transport:
                 raise _AttemptError(error(TRANSIENT, "request_timeout"))
             if _cancelled(cancel):
                 raise _AttemptError(error(CANCELLED, "operation_cancelled"))
-            headers = {"Accept": "application/json"}
+            headers = {"Accept": "application/json", "Orbit-Client": CLIENT_HEADER}
             if body is not None:
                 headers["Content-Type"] = "application/json"
             if token:
@@ -523,6 +525,8 @@ class Transport:
                     raise _AttemptError(error(INVALID_RESPONSE, "invalid_error_response"))
                 from .online import capacity_error
                 raise _AttemptError(capacity_error(failure, target, unique_json(body)))
+            if status == 403 and failure["code"] == "app_version_unsupported":
+                raise _AttemptError(AppVersionUnsupportedError(failure["request_id"], status))
             raise _AttemptError(OrbitError(DENIED, failure["code"], failure["request_id"], status))
         except _AttemptError:
             raise

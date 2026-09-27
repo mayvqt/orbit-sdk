@@ -1,5 +1,6 @@
 #include "transport.hpp"
 
+#include "app_version.hpp"
 #include "error.hpp"
 
 #if defined(_WIN32)
@@ -395,6 +396,7 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
     set_option(handle.value, CURLOPT_USERAGENT, "Orbit-Cpp-SDK/" ORBIT_SDK_VERSION);
     HeaderList headers;
     headers.add("Accept: application/json");
+    headers.add("Orbit-Client: " + client_header());
     if (!bearer.empty()) {
         if (bearer.size() > 256 || !std::all_of(bearer.begin(), bearer.end(), [](unsigned char c) {
                 return std::isalnum(c) || c == '_' || c == '-';
@@ -514,8 +516,10 @@ std::optional<Json::Value> Transport::request(
             }
             continue;
         }
-        throw WireError(static_cast<std::uint32_t>(status),
-            temporary ? ErrorKind::transient : ErrorKind::denied, code, request_id, error);
+        const auto kind = temporary ? ErrorKind::transient
+            : status == 403 && code == "app_version_unsupported" ? ErrorKind::app_version_unsupported
+            : ErrorKind::denied;
+        throw WireError(static_cast<std::uint32_t>(status), kind, code, request_id, error);
     }
     raise(ErrorKind::transient, "service_unavailable");
 }

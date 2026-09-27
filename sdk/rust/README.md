@@ -67,6 +67,29 @@ identity is available. Orbit receives only that fingerprint, never the raw
 machine identifier. Call `Client::open_with_options` to choose a state directory
 or binding policy; see [advanced options](advanced.md#options-and-machine-binding).
 
+## Application version
+
+Set `Options::app_version` so your licence policy can require a minimum
+application version and offer updates. Use one to four dot-separated numbers
+without leading zeros, optionally followed by a `-pre-release` and `+build`
+part, in at most 32 bytes (for example `2.4.1` or `3.0.0-beta.2+build.5`). The
+client checks the value when it opens and sends it with activation and
+validation.
+
+```rust,ignore
+let client = Client::open_with_options(&app_key, Options {
+    app_version: Some(env!("CARGO_PKG_VERSION").into()),
+    ..Options::default()
+}).await?;
+```
+
+When the policy blocks this version, access fails with
+`Error::AppVersionUnsupported` and cached or offline access is not used. Ask the
+user to update the application; the activation is kept, so the updated version
+continues without a new licence key. `Snapshot::update_available` contains a
+newer version when the policy offers one. Every request also identifies the SDK
+with an `Orbit-Client` header containing its language, version and platform.
+
 ## Customer accounts
 
 Customer account methods are available on the same client. Account licence

@@ -27,7 +27,8 @@ typedef struct orbit_client_state {
     orbit_grant_keyset_t keys;
     uint64_t generation, anchor_ticks, last_ticks, retry_ticks;
     int64_t anchor_server, last_wall;
-    uint8_t busy, failed, anchored, transient;
+    uint8_t busy, failed, anchored, transient, version_denied, update_length;
+    uint8_t update_available[32];
 #ifdef ORBIT_ENABLE_SERVICES
   struct orbit_client_extension *extension;
 #endif

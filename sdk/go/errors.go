@@ -109,6 +109,8 @@ func errorGuidance(code string) string {
 		return "Start a floating session before continuing."
 	case "reset_cooldown":
 		return "Device changes are temporarily limited. Wait before trying again."
+	case "app_version_unsupported":
+		return "This application version is no longer supported. Update the application to continue."
 	case "application_maintenance":
 		return "The application is under maintenance. Try again after maintenance ends."
 	case "rate_limited":
@@ -128,11 +130,14 @@ func (e *Error) Is(target error) bool {
 }
 
 var (
-	ErrConfiguration            = &Error{Kind: Configuration}
-	ErrCancelled                = &Error{Kind: Cancelled}
-	ErrTransient                = &Error{Kind: Transient}
-	ErrDenied                   = &Error{Kind: Denied}
-	ErrSessionRequired          = &Error{Kind: Denied, Code: "session_required"}
+	ErrConfiguration   = &Error{Kind: Configuration}
+	ErrCancelled       = &Error{Kind: Cancelled}
+	ErrTransient       = &Error{Kind: Transient}
+	ErrDenied          = &Error{Kind: Denied}
+	ErrSessionRequired = &Error{Kind: Denied, Code: "session_required"}
+	// ErrAppVersionUnsupported is a final policy denial for Options.AppVersion.
+	// Update the application; cached or offline access is not used.
+	ErrAppVersionUnsupported    = &Error{Kind: Denied, Code: "app_version_unsupported"}
 	ErrNotActivated             = &Error{Kind: NotActivated, Code: "access_unavailable"}
 	ErrFeatureUnavailable       = &Error{Kind: FeatureUnavailable, Code: "feature_unavailable"}
 	ErrInvalidResponse          = &Error{Kind: InvalidResponse}
