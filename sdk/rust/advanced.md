@@ -129,6 +129,28 @@ disabled. Default builds accept HTTPS origins only.
 reference, and local timestamp; it contains no app key, credential, customer session,
 fingerprint, or server-private message.
 
+## Local crate validation
+
+The candidate consists of `orbit-sdk` and its `orbit-sdk-native` platform helper.
+Neither crate is published yet; applications should use the README's local path
+dependency. `publish = false` remains set during the release hold.
+
+From the repository root, these commands build and verify local crate archives
+without uploading them:
+
+```sh
+RUSTUP_AUTO_INSTALL=0 cargo package -p orbit-sdk-native --offline --locked
+RUSTUP_AUTO_INSTALL=0 cargo package -p orbit-sdk --offline --locked \
+  --config 'patch.crates-io.orbit-sdk-native.path="sdk/rust/native"'
+```
+
+The temporary command-line patch lets Cargo resolve the unpublished native helper
+while checking the main archive. It does not change the dependency written into
+that archive or configure a consumer application. Both packages retain their MIT
+licence files. Add `--allow-dirty` only when deliberately checking uncommitted
+source. These checks pass on Linux; they do not establish Windows/macOS native
+runtime correctness or availability on crates.io.
+
 ## Warm access benchmark
 
 From the repository root, run the opt-in signed installed-client benchmark with a private local state directory, loopback fixture transport, and the native clock:

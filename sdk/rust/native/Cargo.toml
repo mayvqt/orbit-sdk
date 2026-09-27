@@ -1,6 +1,8 @@
 [package]
 name = "orbit-sdk-native"
 version = "0.4.0"
+description = "Native operating-system helpers for the Orbit Rust SDK"
+repository = "https://github.com/mayvqt/orbit-sdk"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
