@@ -24,7 +24,7 @@ import (
 
 func testClient(t *testing.T, storage Storage, transport *Transport) *Client {
 	t.Helper()
-	client, err := NewClientWithStorage(Config{ApplicationID: "app", EnvironmentID: "test", Issuer: "https://orbit.example.test"}, Device{InstallationID: "installation_1234"}, transport, storage)
+	client, err := NewClientWithStorage(testAppKey(), Device{InstallationID: "installation_1234"}, transport, storage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func installTestContext(t *testing.T, client *Client, customer string, offline b
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	client.state.account = &accountSession{token: strings.Repeat("a", 43), account: Account{Customer: Customer{ID: customer, Username: "alice", Email: "alice@example.test"}, ExpiresAt: "2030-01-01T00:00:00Z"}}
+	client.state.account = &accountSession{token: strings.Repeat("a", 43), account: Account{Customer: Customer{ID: customer, Username: "alice", Email: "alice@example.test"}, ExpiresAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}}
 	client.state.credential = &StoredCredential{ApplicationID: "app", EnvironmentID: "test", ActivationID: "activation_" + customer, LicenceID: "licence", InstallationID: "installation_1234", Credential: strings.Repeat("c", 43), CredentialExpiresAt: 1800003600}
 	if err := client.storage.Save(client.state.storageVersion, *client.state.credential); err != nil {
 		t.Fatal(err)

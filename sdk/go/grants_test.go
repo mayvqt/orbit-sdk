@@ -1,9 +1,15 @@
 package orbit
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // Shared fixtures contain only fixed synthetic grants and public verification
@@ -35,8 +41,8 @@ func TestSharedGrantVectors(t *testing.T) {
 	if corpus.FormatVersion != 1 {
 		t.Fatalf("unsupported grant vector format: %d", corpus.FormatVersion)
 	}
-	if len(corpus.Cases) == 0 {
-		t.Fatal("shared corpus is empty")
+	if len(corpus.Cases) != 104 {
+		t.Fatalf("shared grant corpus has %d cases, want 104", len(corpus.Cases))
 	}
 	for _, vector := range corpus.Cases {
 		t.Run(vector.Name, func(t *testing.T) {
@@ -83,5 +89,88 @@ func TestSharedGrantVectors(t *testing.T) {
 				t.Fatalf("valid = %v, expected %v; error: %v", err == nil, vector.Valid, err)
 			}
 		})
+	}
+}
+
+func TestRuntimeAllowsUnboundGrantWithRequestedMachineIdentity(t *testing.T) {
+	data, err := os.ReadFile("../../contracts/sdk/grants.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus struct {
+		JWKS     json.RawMessage `json:"jwks"`
+		Expected struct {
+			Issuer              string `json:"issuer"`
+			Application         string `json:"application"`
+			Environment         string `json:"environment"`
+			Licence             string `json:"licence"`
+			Activation          string `json:"activation"`
+			Installation        string `json:"installation"`
+			Now                 int64  `json:"now"`
+			CredentialExpiresAt int64  `json:"credential_expires_at"`
+		} `json:"expected"`
+		Cases []struct {
+			Name  string `json:"name"`
+			Token string `json:"token"`
+			Valid bool   `json:"valid"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(data, &corpus); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := parseKeys(corpus.JWKS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var token string
+	for _, vector := range corpus.Cases {
+		if vector.Name == "strict-valid" && vector.Valid {
+			token = vector.Token
+			break
+		}
+	}
+	if token == "" {
+		t.Fatal("strict-valid app fixture is missing")
+	}
+	fingerprint, provider := strings.Repeat("a", 64), "machine_v1"
+	expected := expectedGrant{issuer: corpus.Expected.Issuer, application: corpus.Expected.Application, environment: corpus.Expected.Environment, licence: corpus.Expected.Licence, activation: corpus.Expected.Activation, installation: corpus.Expected.Installation, fingerprint: &fingerprint, fingerprintProvider: &provider, credentialExpiresAt: corpus.Expected.CredentialExpiresAt, now: corpus.Expected.Now}
+	if _, err := verifyGrant(token, keys, expected); err == nil {
+		t.Fatal("strict grant verification accepted unbound claims for a fingerprinted client")
+	}
+	expected.allowUnboundFingerprint = true
+	claims, err := verifyGrant(token, keys, expected)
+	if err != nil || claims.BindingMode != "none" || claims.Fingerprint != nil || claims.FingerprintProvider != nil {
+		t.Fatalf("runtime grant validation rejected legitimate unbound claims: %#v, %v", claims, err)
+	}
+}
+
+func TestUnboundGrantMustOmitFingerprintClaims(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const now int64 = 1800000000
+	claims := jwt.MapClaims{
+		"iss": "https://orbit.example.test", "aud": "orbit:app:test", "sub": "licence", "jti": "synthetic",
+		"iat": now, "nbf": now, "exp": now + 300, "application_id": "app", "environment_id": "test",
+		"activation_id": "activation", "installation_id": "installation", "binding_mode": "none",
+		"fingerprint": nil, "fingerprint_provider": nil, "policy_version": 1,
+		"entitlements": map[string]bool{"export": true}, "refresh_after": now + 60, "offline_allowed": false,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["typ"], token.Header["kid"] = "orbit-access+jwt", "null-fingerprint"
+	signed, err := token.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, provider := strings.Repeat("a", 64), "machine_v1"
+	expected := expectedGrant{
+		issuer: "https://orbit.example.test", application: "app", environment: "test", licence: "licence",
+		activation: "activation", installation: "installation", fingerprint: &fingerprint,
+		fingerprintProvider: &provider, allowUnboundFingerprint: true,
+		credentialExpiresAt: now + 3600, now: now,
+	}
+	if _, err := verifyGrant(signed, grantKeys{"null-fingerprint": &key.PublicKey}, expected); err == nil {
+		t.Fatal("unbound grant with explicit null fingerprint claims was accepted")
 	}
 }

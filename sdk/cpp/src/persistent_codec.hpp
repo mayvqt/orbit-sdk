@@ -10,7 +10,7 @@ constexpr std::uint64_t max_generation = 0x7fff'ffff'ffff'ffffULL;
 
 Json::Value empty_record(const Config& config, std::string_view provider);
 Json::Value decode(const Config& config, std::string_view provider,
-                   std::string_view bytes);
+                   std::string_view bytes, bool allow_identity_mismatch = false);
 std::string encode(const Config& config, std::string_view provider,
                    const Json::Value& record);
 

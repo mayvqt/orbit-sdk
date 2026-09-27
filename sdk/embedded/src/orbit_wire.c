@@ -136,7 +136,10 @@ invalid:
     return ORBIT_CLIENT_STORAGE;
 }
 
-static int timestamp(const uint8_t *data, orbit_json_span_t span, int64_t *out) {
+#ifndef ORBIT_ENABLE_SERVICES
+static
+#endif
+int orbit_timestamp(const uint8_t *data, orbit_json_span_t span, int64_t *out) {
     uint8_t text[20];
     uint32_t n, i;
     int year, month, day, hour, minute, second, leap;
@@ -213,6 +216,10 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
             bit = 256u;
         else if (orbit_json_span_equals_ascii(bytes, key, "secret_replay_expired", 21))
             bit = 512u;
+#ifdef ORBIT_ENABLE_SERVICES
+        else if (orbit_json_span_equals_ascii(bytes,key,"session_required",16)) bit=1024u;
+        else if (orbit_json_span_equals_ascii(bytes,key,"licence_id",10)) bit=2048u;
+#endif
         else {
             if (orbit_json_skip_value(&p, 1u) != 0)
                 return ORBIT_CLIENT_UNTRUSTED;
@@ -222,6 +229,12 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
             return ORBIT_CLIENT_UNTRUSTED;
         seen |= bit;
         orbit_json_skip_space(&p);
+#ifdef ORBIT_ENABLE_SERVICES
+        if (bit == 1024u) {
+            if (orbit_json_consume_literal(&p,"true",4)) return ORBIT_CLIENT_UNTRUSTED;
+            r->session_required=1;continue;
+        }
+#endif
         if (bit == 512u) {
             if (p.position < p.length && bytes[p.position] == 't') {
                 if (orbit_json_consume_literal(&p, "true", 4) != 0)
@@ -240,6 +253,10 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
         }
         if (orbit_json_scan_string(&p, &value) != 0)
             return ORBIT_CLIENT_UNTRUSTED;
+#ifdef ORBIT_ENABLE_SERVICES
+        if (bit == 2048u) r->licence=value;
+        else
+#endif
         if (bit == 1u)
             r->activation = value;
         else if (bit == 2u)
@@ -255,18 +272,21 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
             r->provider = value;
             r->has_provider = 1u;
         } else if (bit == 16u) {
-            if (!timestamp(bytes, value, &r->server_time))
+            if (!orbit_timestamp(bytes, value, &r->server_time))
                 return ORBIT_CLIENT_UNTRUSTED;
         } else if (bit == 128u) {
-            if (!timestamp(bytes, value, &r->credential_expiry))
+            if (!orbit_timestamp(bytes, value, &r->credential_expiry))
                 return ORBIT_CLIENT_UNTRUSTED;
             r->has_credential_expiry = 1u;
         } else if (bit == 256u) {
-            if (!timestamp(bytes, value, &r->licence_expiry))
+            if (!orbit_timestamp(bytes, value, &r->licence_expiry))
                 return ORBIT_CLIENT_UNTRUSTED;
             r->has_licence_expiry = 1u;
         }
     }
+#ifdef ORBIT_ENABLE_SERVICES
+    if (r->session_required && (!(seen&8u) || r->grant.length || !r->licence.length)) return ORBIT_CLIENT_UNTRUSTED;
+#endif
     if ((seen & (1u | 2u | 16u | 32u | 128u | 512u)) != (1u | 2u | 16u | 32u | 128u | 512u) ||
         orbit_json_finish(&p) != 0)
         return ORBIT_CLIENT_UNTRUSTED;

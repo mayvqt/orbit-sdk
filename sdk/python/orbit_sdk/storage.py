@@ -21,6 +21,18 @@ MAX_CIPHERTEXT = 64 * 1024
 MAX_GENERATION = (1 << 63) - 1
 
 
+def _sync_posix(fd: int) -> None:
+    if sys.platform == "darwin":
+        import fcntl
+        import stat
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            # Darwin F_FULLFSYNC orders writes through the device cache.
+            # Unsupported filesystems fail closed instead of weakening ordering.
+            fcntl.fcntl(fd, 51)
+            return
+    os.fsync(fd)
+
+
 @dataclass(frozen=True)
 class StoredCredential:
     application_id: str
@@ -240,10 +252,10 @@ class _LinuxLease:
             self.created = created
             self._verify(b"")
             if created:
-                os.fsync(self.fd)
+                _sync_posix(self.fd)
                 directory_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=self._dirs[-1][1])
                 try:
-                    os.fsync(directory_fd)
+                    _sync_posix(directory_fd)
                 finally:
                     os.close(directory_fd)
                 self._verify(b"")
@@ -282,19 +294,19 @@ class _LinuxLease:
     def begin_write(self) -> None:
         self.verify()
         os.pwrite(self.fd, self.PENDING, 0)
-        os.fsync(self.fd)
+        _sync_posix(self.fd)
         self._verify(self.PENDING)
 
     def complete_write(self) -> None:
         self._verify(self.PENDING)
         try:
             os.ftruncate(self.fd, 0)
-            os.fsync(self.fd)
+            _sync_posix(self.fd)
             self.verify()
         except BaseException:
             try:
                 os.pwrite(self.fd, self.PENDING, 0)
-                os.fsync(self.fd)
+                _sync_posix(self.fd)
             except OSError:
                 pass
             raise

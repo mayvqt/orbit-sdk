@@ -7,7 +7,7 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <RestoreConfigFile>$(MSBuildThisFileDirectory)../NuGet.Config</RestoreConfigFile>
     <PackageId>Orbit.Sdk</PackageId>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <Description>Orbit licensing client SDK.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <IsPackable>true</IsPackable>
@@ -17,6 +17,26 @@
   </PropertyGroup>
   <ItemGroup>
     <None Include="../../LICENSE" Pack="true" PackagePath="" Link="LICENSE" />
-    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="[8.23.0]" />
   </ItemGroup>
+  <Target Name="BuildOrbitMacOSShim" BeforeTargets="PrepareForBuild;GenerateNuspec"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(OrbitMacOSShimPath)' == ''">
+    <PropertyGroup>
+      <OrbitMacOSShimPath>$(MSBuildProjectDirectory)/$(IntermediateOutputPath)native/liborbit_macos_shim.dylib</OrbitMacOSShimPath>
+    </PropertyGroup>
+    <Exec Command="&quot;$(MSBuildThisFileDirectory)../prepare-macos-shim.sh&quot; &quot;$(OrbitMacOSShimPath)&quot;" />
+  </Target>
+  <Target Name="RequireOrbitMacOSShimForPackage" BeforeTargets="GenerateNuspec"
+          Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
+    <Error Condition="'$(OrbitMacOSShimPath)' == ''"
+           Text="Packaging Orbit.Sdk requires a universal macOS shim. Build it on a Mac with sdk/csharp/prepare-macos-shim.sh OUTPUT_DYLIB and pass -p:OrbitMacOSShimPath=OUTPUT_DYLIB." />
+  </Target>
+  <Target Name="AddOrbitMacOSShimAssets" BeforeTargets="PrepareForBuild;GenerateNuspec" DependsOnTargets="BuildOrbitMacOSShim">
+    <Error Condition="'$(OrbitMacOSShimPath)' != '' and !Exists('$(OrbitMacOSShimPath)')"
+           Text="OrbitMacOSShimPath does not exist: $(OrbitMacOSShimPath)" />
+    <ItemGroup Condition="'$(OrbitMacOSShimPath)' != ''">
+      <None Include="$(OrbitMacOSShimPath)" Pack="true" PackagePath="runtimes/osx-x64/native/liborbit_macos_shim.dylib" />
+      <None Include="$(OrbitMacOSShimPath)" Pack="true" PackagePath="runtimes/osx-arm64/native/liborbit_macos_shim.dylib" />
+      <None Include="$(OrbitMacOSShimPath)" Pack="false" CopyToOutputDirectory="PreserveNewest" TargetPath="liborbit_macos_shim.dylib" />
+    </ItemGroup>
+  </Target>
 </Project>

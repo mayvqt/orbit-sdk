@@ -1,5 +1,6 @@
 #include "persistent_codec.hpp"
 
+#include "core.hpp"
 #include "error.hpp"
 #include "grants.hpp"
 #include "json.hpp"
@@ -111,6 +112,29 @@ void validate_access(const Json::Value& value, const Json::Value& credential) {
     }
 }
 
+void validate_offline(const Json::Value& value, const Json::Value& credential,
+                      const Json::Value& pending, const Json::Value& access) {
+    std::int64_t sequence = 0, verified = 0, time_high = 0, wall_high = 0;
+    if (!exact(value, {"jws", "sequence", "issuance_id", "content_digest",
+                       "verified_at", "time_high_water", "wall_high_water"}) ||
+        (!value["jws"].isNull() && !value["jws"].isString()) ||
+        !signed_integer(value["sequence"], sequence) || sequence < 1 ||
+        sequence > 9007199254740991LL || !value["issuance_id"].isString() ||
+        !opaque(value["issuance_id"].asString()) || !value["content_digest"].isString() ||
+        !lower_hex(value["content_digest"].asString()) ||
+        !signed_integer(value["verified_at"], verified) ||
+        !signed_integer(value["time_high_water"], time_high) ||
+        !signed_integer(value["wall_high_water"], wall_high) ||
+        verified > 253402300799LL || time_high > 253402300799LL ||
+        wall_high > 253402300799LL || time_high < verified) corrupt();
+    if (value["jws"].isString()) {
+        const auto& token = value["jws"].asString();
+        if (token.empty() || token.size() > max_jws ||
+            std::any_of(token.begin(), token.end(), [](unsigned char c) { return c > 127; }) ||
+            !credential.isNull() || !pending.isNull() || !access.isNull()) corrupt();
+    }
+}
+
 std::uint64_t generation_value(const Json::Value& value) {
     std::uint64_t output = 0;
     if (value.type() == Json::intValue) {
@@ -156,7 +180,7 @@ Json::Value empty_record(const Config& config, std::string_view provider) {
 }
 
 Json::Value decode(const Config& config, std::string_view provider,
-                   std::string_view bytes) {
+                   std::string_view bytes, bool allow_identity_mismatch) {
     if (bytes.empty() || bytes.size() > max_plaintext) corrupt();
     Json::Value record;
     try {
@@ -164,10 +188,16 @@ Json::Value decode(const Config& config, std::string_view provider,
     } catch (...) {
         corrupt();
     }
-    if (!exact(record, {"sdk", "format", "provider", "scope", "installation",
-                        "generation", "credential", "pending_activation", "access"}) ||
+    const auto format = record.isMember("format") && record["format"].type() == Json::intValue
+        ? record["format"].asInt() : 0;
+    const bool fields_ok = format == 2
+        ? exact(record, {"sdk", "format", "provider", "scope", "installation",
+                         "generation", "credential", "pending_activation", "access"})
+        : format == 3 && exact(record, {"sdk", "format", "provider", "scope", "installation",
+                                        "generation", "credential", "pending_activation", "access", "offline"});
+    if (!fields_ok ||
         !record["sdk"].isString() || record["sdk"] != "orbit.installed-client" ||
-        record["format"].type() != Json::intValue || record["format"].asInt() != 2 ||
+        (format != 2 && format != 3) || (format == 2) != !record.isMember("offline") ||
         !record["provider"].isString() || record["provider"].asString() != provider ||
         !exact(record["scope"], {"api_origin", "issuer", "application_id", "environment_id"}) ||
         !record["scope"]["api_origin"].isString() ||
@@ -190,16 +220,18 @@ Json::Value decode(const Config& config, std::string_view provider,
     const bool valid_binding = fingerprint.isString() && fingerprint_provider_value.isString() &&
         lower_hex(fingerprint.asString()) &&
         fingerprint_provider(fingerprint_provider_value.asString());
-    if ((!no_binding && !valid_binding) ||
-        (config.fingerprint
-            ? (!fingerprint.isString() || fingerprint.asString() != config.fingerprint->value ||
-               !fingerprint_provider_value.isString() ||
-               fingerprint_provider_value.asString() != config.fingerprint->provider)
-            : !no_binding)) corrupt();
+    const bool identity_matches = config.fingerprint
+        ? fingerprint.isString() && fingerprint.asString() == config.fingerprint->value &&
+          fingerprint_provider_value.isString() &&
+          fingerprint_provider_value.asString() == config.fingerprint->provider
+        : no_binding;
+    if ((!no_binding && !valid_binding) || (!allow_identity_mismatch && !identity_matches)) corrupt();
 
     validate_credential(record["credential"]);
     validate_pending(record["pending_activation"]);
     validate_access(record["access"], record["credential"]);
+    if (format == 3) validate_offline(record["offline"], record["credential"],
+                                      record["pending_activation"], record["access"]);
     return record;
 }
 

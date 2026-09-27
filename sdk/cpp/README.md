@@ -1,56 +1,129 @@
 # Orbit C++ SDK
 
-License a desktop app or customer-hosted service with C++17. Requires libcurl 8+
-with asynchronous DNS, OpenSSL 3+, and JsonCpp 1.9.5+.
+License a desktop app or customer-hosted service with C++17. The SDK requires
+libcurl 8+ with asynchronous DNS, OpenSSL 3+ and JsonCpp 1.9.5+.
 
-## Setup
+## Quickstart
 
-Copy the API origin, application ID, environment ID and issuer from Orbit's
-**Integration** page. Start in **Test**.
+Keep the SDK checkout beside your application directory. Add this
+`CMakeLists.txt` to your application, then save the program below as `main.cpp`:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(licensed_app LANGUAGES CXX)
+add_subdirectory(../Orbit-SDK/sdk/cpp orbit-sdk)
+add_executable(licensed_app main.cpp)
+target_link_libraries(licensed_app PRIVATE Orbit::Sdk)
+```
+
+Build from your application directory:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build
+```
+
+Copy the public app key from Orbit's **Integration** page (start in **Test**) to
+`ORBIT_APP_KEY`. The SDK selects a scoped `machine_v1` fingerprint by default;
+ordinary setup does not need hardware-ID code.
 
 ```cpp
 #include <orbit_sdk.hpp>
 
-// Configure once with public values from Integration.
-auto orbit = orbit::Client::open({
-    "https://orbit.mayvie.dev", "application_id", "environment_id", "issuer"
-});
+#include <cstdlib>
+#include <iostream>
+#include <optional>
+#include <string>
 
-// Reuse access after a restart; ask for a key only when none is available.
-try {
-    orbit.require_access("export");
-} catch (const orbit::Error& failure) {
-    if (failure.code() != "access_unavailable") throw;
-    orbit.activate(read_licence_key()); // Your UI or terminal prompt.
-    orbit.require_access("export");
+int main() {
+    const char* app_key = std::getenv("ORBIT_APP_KEY");
+    if (app_key == nullptr || *app_key == '\0') return 2;
+
+    try {
+        auto client = orbit::Client::open(app_key);
+        client.ensure_access("export", []() -> std::optional<std::string> {
+            std::cout << "Licence key: ";
+            std::string key;
+            std::getline(std::cin, key);
+            if (key.empty()) return std::nullopt;
+            return key;
+        });
+        // Perform the protected export here.
+        client.close();
+    } catch (const orbit::Error& error) {
+        std::cerr << "Orbit error: " << error.code() << '\n';
+        return 1;
+    }
+    return 0;
 }
 ```
 
-`open()` remembers the installation and credential, refreshes access automatically
-and handles uncertain activation retries. It never stores the licence key.
-Call `require_access()` before protected work; `snapshot()` is informational.
-Temporary connection failures do not require another activation.
+`ensure_access` asks for a key only when the installation has no usable access.
+Feature denials and service outages propagate without prompting. Access results
+are typed `Snapshot` values; use `snapshot()` for display and
+`require_access("export")` immediately before protected work.
 
-Copies of `Client` share one installation. `close()` stops refreshes and saves
-state without deactivating it; destruction also closes the last copy.
+The SDK stores an installation credential, never the licence key. Copies of a
+`Client` share state. `close()` stops refresh work while keeping the installation
+for the next run. `logout()` clears local access; `deactivate()` releases the
+server-side device slot.
 
-## Build
+Customer accounts are separate from Orbit dashboard accounts. When account
+authentication is enabled, call `login`, inspect `owned_licences`, then use
+`activate_account` and `require_access`. Login alone grants no licensed access.
 
-Clone the release; CMake discovers installed dependencies without downloading them:
+## Floating seats, updates and metering
 
-```sh
-git clone --depth 1 --branch v0.3.0 https://github.com/mayvqt/orbit-sdk.git && cd orbit-sdk
-cmake -S sdk/cpp -B build/orbit-cpp -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build build/orbit-cpp
-cmake --install build/orbit-cpp --prefix /path/to/prefix
+Floating policies acquire and renew sessions automatically. Use `end_session()`
+to stop seat use and `start_session()` to resume it. `check_for_update()` discovers
+the newest eligible runtime release; `authorize_download()` and the result's
+`download()` authorize and verify a direct transfer. `usage()`, `consume()`,
+`resources()`, `acquire_resource()` and `release_resource()` return typed counters
+and allocations. See [online operations](online.md) for examples and retry rules.
+
+## Long-term offline files
+
+When a licence policy enables `offline_file_seconds`, configure the trusted
+offline-purpose public keys, export the current installation request, and import
+the signed `.orbit` file returned through your authorized issuance workflow:
+
+```cpp
+#include <orbit_sdk.hpp>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <string>
+
+std::string read_file(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void run_offline(const std::string& app_key) {
+    auto keys = orbit::OfflineKeys::parse(read_file("trusted-offline-jwks.json"), "test");
+    orbit::Options options;
+    options.offline_keys = keys;
+    auto client = orbit::Client::open(app_key, options);
+    std::cout << client.offline_request().to_json() << '\n';
+    // Transfer this public request to an authorized seller/customer issuance flow.
+    const auto snapshot = client.import_offline_file(read_file("licence.orbit"));
+    if (snapshot.has_feature("export")) client.require_access("export");
+    client.close();
+}
 ```
 
-Link the in-tree `Orbit::Sdk` target, or use the installed package:
-
-```cmake
-find_package(OrbitSdk CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE Orbit::Sdk)
-```
+The importer stores the original signed file, renewal sequence and clock floors
+before exposing its features. Offline guards make no HTTP request, refresh or
+key prompt. When the client reopens, the configured trusted offline-purpose keys
+must still verify an active file, which allows trusted key rotation.
+Logout clears local authority while retaining renewal and time floors; the signed
+file cannot be revoked while disconnected. `OwnedLicence::offline_file_duration`
+reports the server's `offline_file_seconds` policy.
 
 See the [runnable example](../../examples/cpp/README.md) and
-[advanced usage](advanced.md) for account sign-in, custom storage and cancellation.
+[advanced usage](advanced.md) for storage options, cancellation and account APIs.
+The library target for consumers building alongside this checkout is
+`Orbit::Sdk`.
+
+The native implementation targets Linux, Windows and macOS. macOS uses the
+system IOKit and CoreFoundation frameworks and private POSIX installed files.

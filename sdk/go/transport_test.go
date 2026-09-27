@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -35,7 +36,7 @@ func testResponse(request *http.Request, status int, body string) *http.Response
 	}
 }
 
-func testTransport(t *testing.T, handler roundTripFunc) *Transport {
+func testTransport(t testing.TB, handler roundTripFunc) *Transport {
 	t.Helper()
 	transport, err := NewTransport("https://orbit.example.test")
 	if err != nil {
@@ -122,9 +123,30 @@ func fixtureTransport(t *testing.T, handler http.HandlerFunc) *Transport {
 	}
 	trust := x509.NewCertPool()
 	trust.AddCert(server.Certificate())
-	transport.client.Transport.(*http.Transport).TLSClientConfig.RootCAs = trust
+	inner := transport.client.Transport.(*http.Transport)
+	inner.TLSClientConfig.RootCAs = trust
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.base, _ = url.Parse("https://orbit.example.test")
+	transport.client.Transport = rewriteFixtureOrigin{inner: inner, target: target}
 	t.Cleanup(transport.CloseIdleConnections)
 	return transport
+}
+
+type rewriteFixtureOrigin struct {
+	inner  http.RoundTripper
+	target *url.URL
+}
+
+func (transport rewriteFixtureOrigin) RoundTrip(request *http.Request) (*http.Response, error) {
+	copy := request.Clone(request.Context())
+	urlCopy := *request.URL
+	urlCopy.Scheme, urlCopy.Host = transport.target.Scheme, transport.target.Host
+	copy.URL = &urlCopy
+	copy.Host = transport.target.Host
+	return transport.inner.RoundTrip(copy)
 }
 
 func TestTransportRetriesPreserveMutation(t *testing.T) {

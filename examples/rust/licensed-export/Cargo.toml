@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 orbit-sdk = { path = "../../../sdk/rust" }
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 default = []

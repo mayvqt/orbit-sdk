@@ -175,7 +175,7 @@ impl Backend {
         backend.verify()?;
         Ok((backend, bytes))
     }
-    fn verify(&self) -> Result<()> {
+    pub(super) fn verify(&self) -> Result<()> {
         self.verify_marker(&[])
     }
     fn verify_marker(&self, marker: &[u8]) -> Result<()> {
@@ -233,6 +233,8 @@ impl Backend {
             self.verify_marker(WRITE_PENDING)?;
             #[cfg(test)]
             self.fault.check(3)?;
+            #[cfg(test)]
+            self.fault.delay_once();
             let completed = (|| {
                 self.lease.set_len(0).map_err(|_| Error::Storage)?;
                 #[cfg(test)]

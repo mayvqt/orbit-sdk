@@ -275,10 +275,10 @@ std::optional<Json::Value> Transport::delete_bearer(
 std::optional<Json::Value> Transport::post(std::string_view path,
                                            const Json::Value& body,
                                            bool retry_safe,
-                                           const std::atomic_bool& cancelled) const {
+                                           const std::atomic_bool& cancelled, long expected_status) const {
     const auto encoded = encode_json(body);
     if (encoded.size() > kMaxBytes) raise(ErrorKind::configuration, "request_too_large");
-    return request("POST", path, encoded, {}, retry_safe, cancelled);
+    return request("POST", path, encoded, {}, retry_safe, cancelled, expected_status);
 }
 
 std::string Transport::endpoint(std::string_view path) const {
@@ -438,7 +438,7 @@ HttpResponse Transport::attempt(std::string_view method, std::string_view url,
 std::optional<Json::Value> Transport::request(
     std::string_view method, std::string_view path, std::string_view body,
     std::string_view bearer, bool retry_safe,
-    const std::atomic_bool& caller_cancelled) const {
+    const std::atomic_bool& caller_cancelled, long expected_status) const {
     const CancellationView cancelled(caller_cancelled, owner_cancelled_);
     check_cancelled(cancelled.load(std::memory_order_relaxed));
     const auto url = endpoint(path);
@@ -473,6 +473,8 @@ std::optional<Json::Value> Transport::request(
         }
         check_cancelled(cancelled.load(std::memory_order_relaxed));
         const auto status = response.status;
+        if (status >= 200 && status < 300 && expected_status && status != expected_status)
+            raise(ErrorKind::invalid_response, "invalid_response");
         if (status == 204) {
             if (!response.body.empty()) raise(ErrorKind::invalid_response, "invalid_response");
             return std::nullopt;
@@ -509,7 +511,8 @@ std::optional<Json::Value> Transport::request(
             }
             continue;
         }
-        raise(temporary ? ErrorKind::transient : ErrorKind::denied, code, request_id);
+        throw WireError(static_cast<std::uint32_t>(status),
+            temporary ? ErrorKind::transient : ErrorKind::denied, code, request_id, error);
     }
     raise(ErrorKind::transient, "service_unavailable");
 }

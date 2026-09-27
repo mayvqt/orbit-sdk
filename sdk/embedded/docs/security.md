@@ -22,7 +22,7 @@ grant using process-local ticks after power loss. After a valid online result,
 trusted elapsed time advances the original server-time anchor. Offline access
 requires a signed `offline_allowed` grant and a qualifying network/server
 transient; it cannot extend the original expiry. An unknown-key fetch failure
-invalidates cached access rather than falling back across an unverified candidate.
+invalidates cached access if the new grant cannot be verified.
 Clock rollback or uncertainty clears access and requires online recovery.
 
 Finite credentials and strictly online grants use a signed refresh interval of
@@ -78,3 +78,19 @@ an initially unprogrammed flash block, including on encrypted/ECC flash. A devic
 that cannot persist even that first intent cannot promise durable invalidation:
 report the storage error and deny access in the running client; never report a
 successful logout or erase storage to recover automatically.
+
+## Optional services and file mode
+
+The [services guide](services.md) specifies the opt-in session, counter, download
+and long-term file APIs. A floating seat is volatile and expires at its exact
+signed deadline; an ended or authoritatively denied seat cannot be reused.
+Counters are server-authoritative explicit operations with caller-visible retry
+IDs. Download tickets never appear in redirect requests, URLs or SDK diagnostics.
+
+Offline file mode stores the original signed file, installation identity,
+sequence and UTC floor in one journal generation. It verifies purpose and the
+app-key-selected Test/Live trust family before persistence and again at boot.
+Incomplete storage transitions fail closed. Local disk/flash integrity cannot
+replace rollback-resistant hardware against an attacker who can restore the
+entire device state; retain the documented physical storage and trusted-clock
+assumptions. File mode never silently acquires a seat or contacts online services.

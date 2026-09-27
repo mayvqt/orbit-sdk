@@ -8,6 +8,12 @@
 namespace orbit::detail {
 namespace {
 
+#ifdef ORBIT_SDK_TESTING
+std::atomic_bool count_benchmark_invalidation_checks{false};
+std::atomic_size_t benchmark_invalidation_checks{0};
+std::atomic_size_t benchmark_storage_writes{0};
+#endif
+
 std::int64_t stored_integer(const Json::Value& value) {
     return json_int64(value);
 }
@@ -21,6 +27,36 @@ std::int64_t absolute_difference(std::int64_t left, std::int64_t right) {
 }
 
 } // namespace
+
+#ifdef ORBIT_SDK_TESTING
+void reset_access_benchmark_metrics() noexcept {
+    benchmark_invalidation_checks.store(0, std::memory_order_relaxed);
+    benchmark_storage_writes.store(0, std::memory_order_relaxed);
+    count_benchmark_invalidation_checks.store(false, std::memory_order_relaxed);
+}
+
+void set_access_benchmark_invalidation_counting(bool enabled) noexcept {
+    count_benchmark_invalidation_checks.store(enabled, std::memory_order_relaxed);
+}
+
+std::size_t access_benchmark_invalidation_checks() noexcept {
+    return benchmark_invalidation_checks.load(std::memory_order_relaxed);
+}
+
+std::size_t access_benchmark_storage_writes() noexcept {
+    return benchmark_storage_writes.load(std::memory_order_relaxed);
+}
+
+void note_access_benchmark_invalidation_check() noexcept {
+    if (count_benchmark_invalidation_checks.load(std::memory_order_relaxed)) {
+        benchmark_invalidation_checks.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void note_access_benchmark_storage_write() noexcept {
+    benchmark_storage_writes.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 void ClientState::persist_record_locked() {
     if (!persistent || !installed_storage || persistent_record.isNull()) {
@@ -39,11 +75,15 @@ void ClientState::commit_persistent_locked(Json::Value record) {
     try {
         const auto bytes = persistent_codec::encode(config, installed_storage->provider(), record);
         installed_storage->save(bytes);
+#ifdef ORBIT_SDK_TESTING
+        note_access_benchmark_storage_write();
+#endif
         persistent_record = std::move(record);
     } catch (...) {
         persistence_failed.store(true, std::memory_order_relaxed);
         claims.reset();
         anchor.reset();
+        offline.reset();
         transient = true;
         worker_cancelled.store(true, std::memory_order_relaxed);
         wake_worker();
@@ -52,6 +92,10 @@ void ClientState::commit_persistent_locked(Json::Value record) {
 }
 
 void ClientState::checkpoint_persistent_locked(bool force) {
+    if (offline) {
+        checkpoint_offline_locked(force);
+        return;
+    }
     if (!persistent || !installed_storage || !claims || !anchor ||
         !persistent_record.isObject() || persistent_record["access"].isNull()) {
         return;
@@ -85,6 +129,55 @@ void ClientState::checkpoint_persistent_locked(bool force) {
     }
     persist_record_locked();
     last_checkpoint = steady_now;
+}
+
+void ClientState::checkpoint_offline_locked(bool force) {
+    if (!persistent || !installed_storage || !offline ||
+        !persistent_record.isObject() || !persistent_record.isMember("offline") ||
+        persistent_record["offline"]["jws"].isNull()) return;
+    if (!offline_clock) {
+        offline_clock = OfflineClockState{offline->anchor, offline->time_high_water,
+            offline->wall_high_water, offline->uncertain, offline->last_checkpoint};
+    }
+    const auto steady_now = std::chrono::steady_clock::now();
+    if (!force && offline_clock->last_checkpoint != std::chrono::steady_clock::time_point{} &&
+        steady_now - offline_clock->last_checkpoint < std::chrono::seconds(60)) return;
+    try {
+        const auto wall = capture_clock().wall_seconds;
+        const auto server = offline_clock->anchor.now();
+        if (wall + 30 < offline_clock->wall_high_water || server < offline_clock->time_high_water ||
+            wall < 0 || server < 0) {
+            raise(ErrorKind::clock_uncertain, "clock_uncertain");
+        }
+        auto candidate = persistent_record;
+        candidate["offline"]["time_high_water"] = static_cast<Json::Int64>(std::max(server, offline_clock->time_high_water));
+        candidate["offline"]["wall_high_water"] = static_cast<Json::Int64>(std::max(wall, offline_clock->wall_high_water));
+        if (candidate != persistent_record) commit_persistent_locked(std::move(candidate));
+        offline_clock->time_high_water = std::max(server, offline_clock->time_high_water);
+        offline_clock->wall_high_water = std::max(wall, offline_clock->wall_high_water);
+        offline_clock->uncertain = false;
+        offline_clock->last_checkpoint = steady_now;
+        offline->anchor = offline_clock->anchor;
+        offline->time_high_water = offline_clock->time_high_water;
+        offline->wall_high_water = offline_clock->wall_high_water;
+        offline->uncertain = false;
+        offline->last_checkpoint = steady_now;
+        last_checkpoint = steady_now;
+    } catch (const Error& error) {
+        if (error.kind() == ErrorKind::clock_uncertain) {
+            offline_clock->uncertain = true;
+            if (offline) offline->uncertain = true;
+        }
+        throw;
+    }
+}
+
+void ClientState::checkpoint_offline_before_transition_locked() {
+    try {
+        checkpoint_offline_locked(true);
+    } catch (const Error& error) {
+        if (error.kind() != ErrorKind::clock_uncertain) throw;
+    }
 }
 
 bool ClientState::restore_persistent_cache(bool allow_offline) {
@@ -137,7 +230,7 @@ bool ClientState::restore_persistent_cache(bool allow_offline) {
         GrantExpected expected{
             config.issuer, config.application_id, config.environment_id, licence,
             saved.activation_id, *config.installation_id, fingerprint, provider,
-            saved.expires_at, licence_expiry, received_server,
+            saved.expires_at, licence_expiry, received_server, true, std::nullopt,
         };
         auto restored_claims = restored_keys.verify(cached["jws"].asString(), expected);
         if (!restored_claims.offline_allowed || estimated_server >= restored_claims.expires_at) {
@@ -201,12 +294,44 @@ void ClientState::worker_loop() noexcept {
     while (!worker_cancelled.load(std::memory_order_relaxed)) {
         const auto observed_epoch = worker_epoch.load(std::memory_order_relaxed);
         bool refresh_now = false;
+        std::uint64_t expected_generation = 0;
         bool checkpoint_now = false;
         auto wake_at = std::chrono::steady_clock::now() + std::chrono::hours(1);
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!persistent || !credential || !persistent_record["pending_activation"].isNull()) {
+            expected_generation = current_generation;
+            if (persistent && offline && persistent_record.isMember("offline") &&
+                !persistent_record["offline"]["jws"].isNull()) {
+                const auto last = offline->last_checkpoint;
+                if (last == std::chrono::steady_clock::time_point{} ||
+                    std::chrono::steady_clock::now() - last >= std::chrono::seconds(60)) {
+                    checkpoint_now = true;
+                } else {
+                    wake_at = std::min(wake_at, last + std::chrono::seconds(60));
+                }
+            } else if (!persistent || !credential || !persistent_record["pending_activation"].isNull()) {
                 // A pending key mutation is resumed only by the caller with the same key.
+            } else if (session_required && session_disabled) {
+                // An explicit end parks the worker until a foreground restart.
+            } else if (session_required && !session_disabled) {
+                const auto now = std::chrono::steady_clock::now();
+                if (session_retry_deadline && now < *session_retry_deadline) {
+                    wake_at = std::min(wake_at, *session_retry_deadline);
+                } else if (!session_grant || !session_anchor) {
+                    refresh_now = true;
+                } else {
+                    try {
+                        const auto server_now = session_anchor->now();
+                        const auto until =
+                            std::max<std::int64_t>(1, session_grant->refresh_after - server_now);
+                        if (server_now >= session_grant->refresh_after)
+                            refresh_now = true;
+                        else
+                            wake_at = std::min(wake_at, now + std::chrono::seconds(until));
+                    } catch (...) {
+                        refresh_now = true;
+                    }
+                }
             } else if (retry_deadline) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= *retry_deadline) {
@@ -219,14 +344,15 @@ void ClientState::worker_loop() noexcept {
             } else {
                 try {
                     const auto state = snapshot_locked(true);
-                    if (state["access"] == "refresh_required" ||
-                        state["access"] == "expired" || state["access"] == "offline") {
+                    if (state.access == ::orbit::Access::refresh_required ||
+                        state.access == ::orbit::Access::expired ||
+                        state.access == ::orbit::Access::offline) {
                         refresh_now = true;
                     } else {
-                        const auto until = std::max<std::int64_t>(
-                            1, claims->refresh_after - anchor->now());
-                        wake_at = std::min(wake_at,
-                            std::chrono::steady_clock::now() + std::chrono::seconds(until));
+                        const auto until =
+                            std::max<std::int64_t>(1, claims->refresh_after - anchor->now());
+                        wake_at = std::min(wake_at, std::chrono::steady_clock::now() +
+                                                        std::chrono::seconds(until));
                     }
                 } catch (...) {
                     refresh_now = true;
@@ -238,8 +364,7 @@ void ClientState::worker_loop() noexcept {
                         std::chrono::seconds(60)) {
                     checkpoint_now = true;
                 } else {
-                    wake_at = std::min(wake_at, last_checkpoint +
-                        std::chrono::seconds(60));
+                    wake_at = std::min(wake_at, last_checkpoint + std::chrono::seconds(60));
                 }
             }
         }
@@ -248,11 +373,28 @@ void ClientState::worker_loop() noexcept {
             try {
                 std::lock_guard<std::mutex> lock(mutex);
                 checkpoint_persistent_locked(false);
+            } catch (const Error &error) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (error.kind() == ErrorKind::clock_uncertain && offline) {
+                        offline->uncertain = true;
+                        if (offline_clock)
+                            offline_clock->uncertain = true;
+                    } else {
+                        claims.reset();
+                        anchor.reset();
+                        offline.reset();
+                        transient = true;
+                    }
+                }
+                worker_cancelled.store(true, std::memory_order_relaxed);
+                break;
             } catch (...) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     claims.reset();
                     anchor.reset();
+                    offline.reset();
                     transient = true;
                 }
                 worker_cancelled.store(true, std::memory_order_relaxed);
@@ -266,8 +408,14 @@ void ClientState::worker_loop() noexcept {
                 // Transport failures normally set this deadline. Other failures
                 // before a reply must not turn a due grant into a busy loop.
                 std::lock_guard<std::mutex> lock(mutex);
+                if (current_generation != expected_generation)
+                    continue;
                 const auto earliest = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                if (!retry_deadline || *retry_deadline < earliest) retry_deadline = earliest;
+                if (session_required && !session_disabled) {
+                    if (!session_retry_deadline || *session_retry_deadline < earliest)
+                        session_retry_deadline = earliest;
+                } else if (!retry_deadline || *retry_deadline < earliest)
+                    retry_deadline = earliest;
             }
             continue;
         }
@@ -311,6 +459,52 @@ void ClientState::close() {
         std::unique_lock<std::mutex> lock(lifecycle_mutex);
         lifecycle_changed.wait(lock, [this] { return active_calls == 0; });
     }
+
+    // No foreground or worker operation can still be using the transport.
+    // Temporarily permit the bounded best-effort session release below.
+    if (persistent)
+        owner_cancelled->store(false, std::memory_order_relaxed);
+
+    std::optional<std::pair<Credential, std::string>> release;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (credential) {
+            if (session_grant)
+                release = std::make_pair(*credential, session_grant->session_id);
+            else if (pending_session_id)
+                release = std::make_pair(*credential, *pending_session_id);
+        }
+        session_grant.reset();
+        session_anchor.reset();
+        pending_session_id.reset();
+        pending_renewal_sequence.reset();
+    }
+    if (release) {
+        std::atomic_bool release_cancelled{false};
+        std::atomic_bool release_finished{false};
+        std::mutex release_mutex;
+        std::condition_variable release_changed;
+        std::thread deadline([&] {
+            std::unique_lock<std::mutex> lock(release_mutex);
+            if (release_changed.wait_for(lock, std::chrono::seconds(2), [&] {
+                    return release_finished.load(std::memory_order_relaxed);
+                }))
+                return;
+            if (!release_finished.load(std::memory_order_relaxed))
+                release_cancelled.store(true, std::memory_order_relaxed);
+        });
+        try {
+            const auto path = "/api/client/v1/activations/" + release->first.activation_id +
+                              "/sessions/" + release->second + "/end";
+            (void)transport.post(path, credential_body(release->first), false, release_cancelled);
+        } catch (...) {
+        }
+        release_finished.store(true, std::memory_order_relaxed);
+        release_changed.notify_all();
+        deadline.join();
+    }
+    if (persistent)
+        owner_cancelled->store(true, std::memory_order_relaxed);
 
     std::exception_ptr failure;
     {

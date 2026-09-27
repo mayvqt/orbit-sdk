@@ -1,0 +1,37 @@
+[package]
+name = "orbit-embedded"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "Allocation-free Orbit licensing client for firmware"
+links = "orbit_embedded"
+publish = false
+build = "build.rs"
+repository = "https://github.com/mayvqt/orbit-sdk"
+readme = "rust/README.md"
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "LICENSE",
+    "README.md",
+    "rust/README.md",
+    "docs/**",
+    "rust/src/**",
+    "include/**",
+    "src/**",
+]
+
+[lib]
+path = "rust/src/lib.rs"
+
+[features]
+default = []
+external-c = []
+services = []
+offline = ["services"]
+offline-full = ["offline"]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

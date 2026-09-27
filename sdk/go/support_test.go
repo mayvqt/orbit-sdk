@@ -23,7 +23,7 @@ func (unavailableSupportStorage) Invalidate() (uint64, error) {
 }
 
 func TestSupportSummaryIsSafeAndIndependentOfState(t *testing.T) {
-	client := &Client{config: Config{ApplicationID: "app", EnvironmentID: "test"}, storage: unavailableSupportStorage{},
+	client := &Client{key: testAppKey(), storage: unavailableSupportStorage{},
 		device: Device{InstallationID: "private_installation_1234"},
 		state:  accessState{account: &accountSession{token: "synthetic-secret"}}}
 	failure := &Error{Kind: Denied, Code: "licence_expired", RequestID: "Req_A-9"}

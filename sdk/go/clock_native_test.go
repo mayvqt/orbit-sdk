@@ -1,4 +1,4 @@
-//go:build linux || windows
+//go:build linux || windows || (darwin && cgo)
 
 package orbit
 
@@ -41,7 +41,7 @@ func nativeSleepReply(t *testing.T, key *ecdsa.PrivateKey, offline bool) string 
 		"iss": "https://orbit.example.test", "aud": "orbit:app:test", "sub": "licence", "jti": "sleep_fixture",
 		"iat": now, "nbf": now, "exp": expires, "application_id": "app", "environment_id": "test",
 		"activation_id": "activation", "installation_id": "installation_1234", "binding_mode": "none",
-		"fingerprint": nil, "fingerprint_provider": nil, "policy_version": 1, "entitlements": map[string]bool{"export": true},
+		"policy_version": 1, "entitlements": map[string]bool{"export": true},
 		"refresh_after": expires, "offline_allowed": offline, "licence_expires_at": nil,
 	})
 	token.Header["typ"] = "orbit-access+jwt"
@@ -107,7 +107,7 @@ func TestNativeGrantExpiresAcrossSuspend(t *testing.T) {
 				return nil, ErrInvalidResponse
 			}
 		})
-		fixture.client, err = NewClient(Config{ApplicationID: "app", EnvironmentID: "test", Issuer: "https://orbit.example.test"}, Device{InstallationID: "installation_1234"}, transport)
+		fixture.client, err = NewClient(testAppKey(), Device{InstallationID: "installation_1234"}, transport)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,7 +152,7 @@ func TestNativeGrantExpiresAcrossSuspend(t *testing.T) {
 	assertExpired := func(client *Client) {
 		t.Helper()
 		snapshot, err := client.Snapshot()
-		if err != nil || snapshot.Access != AccessExpired || len(snapshot.Entitlements) != 0 || snapshot.RemainingOfflineSeconds != 0 {
+		if err != nil || snapshot.Access != AccessExpired || len(snapshot.Entitlements) != 0 || snapshot.RemainingOffline != 0 {
 			t.Fatal("Expired grant retained access or entitlements")
 		}
 	}
@@ -162,7 +162,7 @@ func TestNativeGrantExpiresAcrossSuspend(t *testing.T) {
 		_, err := fixture.client.RequireAccess(ctx, "export")
 		cancel()
 		var denied *Error
-		if !errors.As(err, &denied) || denied.Kind != Denied || denied.Code != "access_unavailable" || fixture.denied.Load() == 0 {
+		if !errors.As(err, &denied) || denied.Kind != NotActivated || denied.Code != "access_unavailable" || fixture.denied.Load() == 0 {
 			t.Fatal("Expired protected access did not deny after blocked refresh")
 		}
 		assertExpired(fixture.client)

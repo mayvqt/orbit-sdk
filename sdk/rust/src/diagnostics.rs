@@ -26,7 +26,7 @@ impl Client {
         SupportSummary {
             application_id: self.0.config.application_id.clone(),
             environment_id: self.0.config.environment_id.clone(),
-            code: error.safe_code().to_owned(),
+            code: error.code().to_owned(),
             request_id: error.request_id().map(str::to_owned),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -68,7 +68,7 @@ impl Error {
         }
     }
 
-    fn safe_code(&self) -> &str {
+    pub fn code(&self) -> &str {
         match self {
             Self::Denied { code, .. } if valid_code(code) => code,
             Self::Transient {
@@ -78,6 +78,9 @@ impl Error {
             Self::Cancelled => "cancelled",
             Self::Transient { .. } => "transient",
             Self::Denied { .. } => "denied",
+            Self::NotActivated => "access_unavailable",
+            Self::FeatureUnavailable => "feature_unavailable",
+            Self::SessionRequired => "session_required",
             Self::InvalidResponse => "invalid_response",
             Self::TransportSecurity => "transport_security",
             Self::ReauthenticationRequired => "reauthentication_required",
@@ -92,7 +95,7 @@ impl Error {
     }
 
     pub(crate) fn guidance(&self) -> Option<&'static str> {
-        Some(match self.safe_code() {
+        Some(match self.code() {
             "invalid_credentials"
             | "credential_expired"
             | "credential_revoked"
@@ -102,6 +105,9 @@ impl Error {
             "session_expired" | "session_revoked" => "Sign in again to continue.",
             "licence_expired" => {
                 "Your licence has expired. Contact application support to renew it."
+            }
+            "offline_file_expired" => {
+                "Your offline licence file has expired. Request a renewed file from application support."
             }
             "licence_suspended" => "Your licence is suspended. Contact application support.",
             "licence_revoked" => "Your licence was revoked. Contact application support.",

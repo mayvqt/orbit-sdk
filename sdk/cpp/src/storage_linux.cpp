@@ -1,5 +1,6 @@
 #include "storage_linux.hpp"
 
+#include "core.hpp"
 #include "storage_codec.hpp"
 #include "storage_linux_internal.hpp"
 

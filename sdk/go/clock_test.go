@@ -31,3 +31,18 @@ func TestClockAnchorRejectsRollbackAndIncludesElapsed(t *testing.T) {
 		t.Fatal("wall rollback accepted")
 	}
 }
+
+func TestScaleMachTicksChecksTimebaseAndOverflow(t *testing.T) {
+	for _, ratio := range [][2]uint32{{0, 1}, {1, 0}} {
+		if _, err := scaleMachTicks(1, ratio[0], ratio[1]); !errors.Is(err, ErrClockUncertain) {
+			t.Fatalf("accepted invalid timebase %v", ratio)
+		}
+	}
+	value, err := scaleMachTicks(3, 125, 3)
+	if err != nil || value != 125*time.Nanosecond {
+		t.Fatalf("scaled continuous ticks incorrectly: %v %v", value, err)
+	}
+	if _, err := scaleMachTicks(^uint64(0), ^uint32(0), 1); !errors.Is(err, ErrClockUncertain) {
+		t.Fatal("accepted overflowing continuous time")
+	}
+}

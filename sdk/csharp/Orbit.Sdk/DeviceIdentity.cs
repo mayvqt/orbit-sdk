@@ -12,7 +12,7 @@ public static class DeviceIdentity
     public static string MachineFingerprint(string applicationId, string environmentId, string osFamily, string machineId)
     {
         CheckScope(applicationId, environmentId);
-        if (osFamily is not ("linux" or "windows")) throw new OrbitException(OrbitError.Configuration);
+        if (osFamily is not ("linux" or "windows" or "macos")) throw new OrbitException(OrbitError.Configuration);
         if (string.IsNullOrEmpty(machineId)) throw Unavailable();
         var normalized = machineId.Trim(' ', '\t', '\n', '\r', '\v', '\f')
             .Replace("-", "", StringComparison.Ordinal).ToLowerInvariant();
@@ -29,6 +29,8 @@ public static class DeviceIdentity
         CheckScope(applicationId, environmentId);
         if (OperatingSystem.IsWindows())
             return MachineFingerprint(applicationId, environmentId, "windows", WindowsDeviceIdentity.Read());
+        if (OperatingSystem.IsMacOS())
+            return MachineFingerprint(applicationId, environmentId, "macos", MacOSDeviceIdentity.Read());
         if (!OperatingSystem.IsLinux()) throw Unavailable();
         try
         {

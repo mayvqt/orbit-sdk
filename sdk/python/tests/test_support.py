@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import struct
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
-from orbit_sdk import Config, installation_id_new, machine_fingerprint
-from orbit_sdk.clock import Anchor, Start, timestamp
+from orbit_sdk import installation_id_new, machine_fingerprint
+from orbit_sdk.clock import Anchor, Start, _windows_interrupt_clock, elapsed_ns, timestamp
 from orbit_sdk.device import _smbios_uuid, native_fingerprint
 from orbit_sdk.errors import OrbitError
 
 
 class ClockTests(unittest.TestCase):
+    def test_windows_clock_reads_fresh_native_time_and_rejects_overflow(self) -> None:
+        values = iter((10, 20, (1 << 63) // 100 + 1))
+
+        def query(output) -> None:
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_ulonglong))[0] = next(values)
+
+        _windows_interrupt_clock.cache_clear()
+        self.addCleanup(_windows_interrupt_clock.cache_clear)
+        library = SimpleNamespace(QueryInterruptTimePrecise=query)
+        with patch("orbit_sdk.clock.sys.platform", "win32"), patch("orbit_sdk.clock.ctypes.WinDLL", return_value=library, create=True):
+            self.assertEqual(elapsed_ns(), 1_000)
+            self.assertEqual(elapsed_ns(), 2_000)
+            with self.assertRaises(OrbitError) as raised:
+                elapsed_ns()
+            self.assertEqual(raised.exception.code, "clock_uncertain")
+
     def test_anchor_counts_suspend_and_rejects_wall_rollback(self) -> None:
         with patch("orbit_sdk.clock.elapsed_ns", return_value=1_000_000_000):
             anchor = Anchor(1_800_000_000, Start(1_000_000_000, 1_800_000_000))

@@ -50,3 +50,19 @@ def error(kind: str, code: str, request_id: str | None = None) -> OrbitError:
 
 def is_error(value: BaseException | None, kind: str, code: str | None = None) -> bool:
     return isinstance(value, OrbitError) and value.kind == kind and (code is None or value.code == code)
+
+
+class NotActivatedError(OrbitError):
+    """No usable access: the installation has not been activated (or its
+    activation no longer provides access). Distinguishable from
+    ``FeatureUnavailableError`` without comparing ``code`` strings."""
+
+    def __init__(self, request_id: str | None = None, status: int = 1) -> None:
+        super().__init__(DENIED, "access_unavailable", request_id, status)
+
+
+class FeatureUnavailableError(OrbitError):
+    """Activation grants access, but not the requested feature."""
+
+    def __init__(self, request_id: str | None = None, status: int = 1) -> None:
+        super().__init__(DENIED, "feature_unavailable", request_id, status)

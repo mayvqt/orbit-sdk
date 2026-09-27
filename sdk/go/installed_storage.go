@@ -34,6 +34,11 @@ func (s *installedStorage) writeLocked(record installedRecord) error {
 	if err := s.checkLocked(); err != nil {
 		return err
 	}
+	if record.Offline == nil {
+		record.Format = 2
+	} else {
+		record.Format = 3
+	}
 	data, err := json.Marshal(record)
 	if err != nil || len(data) > installedLimit {
 		return ErrStorage
@@ -66,7 +71,15 @@ func (s *installedStorage) Save(version uint64, credential StoredCredential) err
 	}
 	r := s.record
 	r.Credential, r.Access = installedCredentialFrom(&credential), nil
+	clearOfflineAuthority(&r)
 	return s.writeLocked(r)
+}
+func clearOfflineAuthority(record *installedRecord) {
+	if record.Offline != nil {
+		offline := *record.Offline
+		offline.JWS = nil
+		record.Offline = &offline
+	}
 }
 func installedCredentialFrom(c *StoredCredential) *installedCredential {
 	if c == nil {
@@ -79,7 +92,8 @@ func installedCredentialFrom(c *StoredCredential) *installedCredential {
 	}
 	return r
 }
-func (s *installedStorage) Invalidate() (uint64, error) { return s.invalidate(true) }
+func (s *installedStorage) Invalidate() (uint64, error)                  { return s.invalidate(true) }
+func (s *installedStorage) invalidatePreservingPending() (uint64, error) { return s.invalidate(false) }
 func (s *installedStorage) invalidate(clearPending bool) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,6 +103,7 @@ func (s *installedStorage) invalidate(clearPending bool) (uint64, error) {
 	}
 	r.Generation++
 	r.Credential, r.Access = nil, nil
+	clearOfflineAuthority(&r)
 	if clearPending {
 		r.Pending = nil
 	}
@@ -104,16 +119,44 @@ func (s *installedStorage) dropCache() error {
 	r.Access = nil
 	return s.writeLocked(r)
 }
-func (s *installedStorage) begin(key, licence, previous, operation string) (string, uint64, error) {
+func (s *installedStorage) rebindIfChanged(fingerprint, provider *string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkLocked(); err != nil {
+		return false, err
+	}
+	if equalString(s.record.Installation.Fingerprint, fingerprint) && equalString(s.record.Installation.FingerprintProvider, provider) {
+		return false, nil
+	}
+	if s.record.Generation == math.MaxInt64 {
+		return false, ErrStorage
+	}
+	device, err := NewInstallation()
+	if err != nil {
+		return false, err
+	}
+	record := s.record
+	record.Generation++
+	record.Installation = installedIdentity{ID: device.InstallationID, Fingerprint: cloneString(fingerprint), FingerprintProvider: cloneString(provider)}
+	record.Credential, record.Access, record.Pending = nil, nil, nil
+	record.Offline = nil
+	return true, s.writeLocked(record)
+}
+func (s *installedStorage) begin(key, licence, customerID, previous, operation string, fingerprint, fingerprintProvider *string) (string, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.record
 	kind, input := "key", key
 	if licence != "" {
 		kind, input = "account", licence
+		if !opaque(customerID) {
+			return "", 0, ErrConfiguration
+		}
+	} else if customerID != "" {
+		return "", 0, ErrConfiguration
 	}
 	// Marshaling maps recursively sorts keys; retain only this scoped digest.
-	encoded, err := json.Marshal(map[string]any{"scope": map[string]any{"api_origin": r.Scope.APIOrigin, "issuer": r.Scope.Issuer, "application_id": r.Scope.ApplicationID, "environment_id": r.Scope.EnvironmentID}, "installation": map[string]any{"id": r.Installation.ID, "fingerprint": r.Installation.Fingerprint, "fingerprint_provider": r.Installation.FingerprintProvider}, "principal_kind": kind, "licence_input": input, "previous_credential": optionalString(previous), "credential_mode": "persistent"})
+	encoded, err := json.Marshal(map[string]any{"scope": map[string]any{"api_origin": r.Scope.APIOrigin, "issuer": r.Scope.Issuer, "application_id": r.Scope.ApplicationID, "environment_id": r.Scope.EnvironmentID}, "installation": map[string]any{"id": r.Installation.ID, "fingerprint": fingerprint, "fingerprint_provider": fingerprintProvider}, "principal_kind": kind, "licence_input": input, "customer_id": optionalString(customerID), "previous_credential": optionalString(previous), "credential_mode": "persistent"})
 	if err != nil {
 		return "", 0, ErrConfiguration
 	}
@@ -147,6 +190,7 @@ func (s *installedStorage) begin(key, licence, previous, operation string) (stri
 	}
 	r.Generation++
 	r.Credential, r.Access = nil, nil
+	clearOfflineAuthority(&r)
 	return operation, r.Generation, s.writeLocked(r)
 }
 func (s *installedStorage) commit(version uint64, credential *StoredCredential, response json.RawMessage, keys grantKeys, anchor *timeAnchor) error {
@@ -185,7 +229,23 @@ func (s *installedStorage) commit(version uint64, credential *StoredCredential, 
 	}
 	r := s.record
 	r.Credential, r.Pending = installedCredentialFrom(credential), nil
+	clearOfflineAuthority(&r)
+	r.Installation.Fingerprint = cloneString(credential.Fingerprint)
+	r.Installation.FingerprintProvider = cloneString(credential.FingerprintProvider)
 	r.Access = &installedAccess{JWS: *reply.Grant, JWKS: set, LicenceExpiresAt: licenceExpiry, ReceivedServerTime: anchor.server, ReceivedWallTime: anchor.wall, ServerHighWater: now, WallHighWater: time.Now().Unix()}
+	return s.writeLocked(r)
+}
+func (s *installedStorage) commitCredential(version uint64, credential *StoredCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if version != s.record.Generation {
+		return ErrStaleResponse
+	}
+	r := s.record
+	r.Credential, r.Pending, r.Access = installedCredentialFrom(credential), nil, nil
+	clearOfflineAuthority(&r)
+	r.Installation.Fingerprint = cloneString(credential.Fingerprint)
+	r.Installation.FingerprintProvider = cloneString(credential.FingerprintProvider)
 	return s.writeLocked(r)
 }
 func (s *installedStorage) checkpoint(server, wall int64) error {
@@ -202,6 +262,54 @@ func (s *installedStorage) checkpoint(server, wall int64) error {
 	}
 	access.ServerHighWater, access.WallHighWater = server, wall
 	r.Access = &access
+	return s.writeLocked(r)
+}
+func (s *installedStorage) offlineState() (*offlineRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkLocked(); err != nil {
+		return nil, err
+	}
+	if s.record.Offline == nil {
+		return nil, nil
+	}
+	state := *s.record.Offline
+	if state.JWS != nil {
+		token := *state.JWS
+		state.JWS = &token
+	}
+	return &state, nil
+}
+func (s *installedStorage) saveOffline(version uint64, offline offlineRecord) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if version != s.record.Generation {
+		return 0, ErrStaleResponse
+	}
+	previous := s.record.Offline
+	if previous != nil {
+		if offline.Sequence < previous.Sequence || offline.Sequence == previous.Sequence && (offline.IssuanceID != previous.IssuanceID || offline.ContentDigest != previous.ContentDigest) || offline.TimeHighWater < previous.TimeHighWater || offline.WallHighWater < previous.WallHighWater {
+			return 0, offlineError("offline_sequence")
+		}
+	}
+	if s.record.Generation == math.MaxInt64 {
+		return 0, ErrStorage
+	}
+	r := s.record
+	r.Generation++
+	r.Credential, r.Access, r.Pending = nil, nil, nil
+	r.Offline = &offline
+	return r.Generation, s.writeLocked(r)
+}
+func (s *installedStorage) checkpointOffline(offline offlineRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.record.Offline
+	if previous == nil || previous.JWS == nil || offline.JWS == nil || *offline.JWS != *previous.JWS || offline.Sequence != previous.Sequence || offline.IssuanceID != previous.IssuanceID || offline.ContentDigest != previous.ContentDigest || offline.VerifiedAt != previous.VerifiedAt || offline.TimeHighWater < previous.TimeHighWater || offline.WallHighWater < previous.WallHighWater {
+		return ErrStaleResponse
+	}
+	r := s.record
+	r.Offline = &offline
 	return s.writeLocked(r)
 }
 func (s *installedStorage) close() error {

@@ -32,13 +32,23 @@ if (args is ["--native-protection"])
     }
 }
 
+if (args is ["--download-stream"]) return await DownloadStreamTests.RunAsync();
+
 if (args is ["--installed"]) return await InstalledTests.RunAsync();
+
+if (args is ["--benchmark-access"]) return await InstalledTests.RunBenchmarkAsync();
 
 if (args is ["--security"]) return await SecurityTests.RunAsync();
 
+if (args is ["--offline-vectors", var offlinePath]) return OfflineFileTests.Run(offlinePath);
+
+if (args is ["--download-vectors", var downloadPath]) return DownloadTicketTests.Run(downloadPath);
+
+if (args is ["--session-vectors", var sessionPath]) return await SessionGrantTests.RunAsync(sessionPath);
+
 if (args.Length != 1)
 {
-    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --security | --installed | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
+    Console.Error.WriteLine("Usage: Orbit.Sdk.Tests PATH_TO_SHARED_GRANTS_JSON | --offline-vectors PATH | --download-vectors PATH | --session-vectors PATH | --security | --installed | --benchmark-access | --native-device | --native-protection | --native-storage | --clock-suspend | --grant-suspend");
     return 2;
 }
 
@@ -49,6 +59,8 @@ if (root["format_version"] is not JsonValue version || !version.TryGetValue<int>
     Console.Error.WriteLine("Shared grants require format_version 1 and nonempty cases");
     return 2;
 }
+AppKeyTests.Run();
+await NativeGrantTests.RunAsync(root);
 var passed = 0;
 var failed = 0;
 foreach (var entry in cases)

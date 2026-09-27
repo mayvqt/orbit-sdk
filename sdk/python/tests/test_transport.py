@@ -312,6 +312,48 @@ class TransportTests(unittest.TestCase):
             transport._ssl = context
             self.assertEqual(transport.get("/api/client/v1/status"), b"{}")
 
+    def test_failed_first_address_preserves_get_and_post_request_state(self) -> None:
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                requests.append((self.command, b""))
+                self.reply()
+
+            def do_POST(self) -> None:
+                requests.append((self.command, self.rfile.read(int(self.headers["Content-Length"]))))
+                self.reply()
+
+            def reply(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_: object) -> None:
+                pass
+
+        with _trusted_tls_server(Handler) as (origin, context), socket.socket() as refused:
+            # Reserve a TCP endpoint without listening so its connection fails
+            # deterministically while the second address reaches real TLS.
+            refused.bind(("127.0.0.1", 0))
+
+            def addresses(host: str, port: int, **_kwargs: Any) -> list[tuple[Any, ...]]:
+                return [
+                    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", refused.getsockname()),
+                    (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port)),
+                ]
+
+            resolver = _ResolverPool(getaddrinfo=addresses, workers=1, queue_limit=1)
+            try:
+                transport = Transport(origin, _resolver=resolver)
+                transport._ssl = context
+                self.assertEqual(transport.get("/api/client/v1/status"), b"{}")
+                self.assertEqual(transport.post("/api/client/v1/activations", {"probe": 1}, False), b"{}")
+                self.assertEqual(requests, [("GET", b""), ("POST", b'{"probe":1}')])
+            finally:
+                resolver.close()
+
     def test_absolute_deadline_aborts_slow_headers_and_body_with_trusted_tls(self) -> None:
         for slow_body in (False, True):
             entered = threading.Event()

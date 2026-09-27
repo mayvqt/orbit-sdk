@@ -33,8 +33,8 @@ type nativeWindowsStorage struct {
 // OpenWindowsStorage opens an existing dedicated absolute local directory in
 // the caller's private Windows profile. It never resets existing/corrupt state.
 // The lifetime lease must be closed before another process/object opens it.
-func OpenWindowsStorage(directory string, config Config, device Device) (*WindowsStorage, error) {
-	scope, err := newStorageScope(config, device)
+func OpenWindowsStorage(directory string, key AppKey, device Device) (*WindowsStorage, error) {
+	scope, err := newStorageScope(key, device)
 	if err != nil {
 		return nil, err
 	}

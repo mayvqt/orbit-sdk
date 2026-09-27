@@ -1,8 +1,5 @@
-use orbit_sdk::{AppConfig, Cancellation, Client, Error};
-use std::{
-    io::{self, Write},
-    path::Path,
-};
+use orbit_sdk::Client;
+use std::io::{self, Write};
 
 fn prompt(label: &str) -> io::Result<String> {
     print!("{label}");
@@ -11,24 +8,15 @@ fn prompt(label: &str) -> io::Result<String> {
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().into())
 }
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let app = AppConfig {
-        api_origin: args.next().ok_or(
-            "Usage: orbit-licensed-export URL APP_ID ENVIRONMENT_ID ISSUER [STATE_DIRECTORY]",
-        )?,
-        application_id: args.next().ok_or("Missing application ID")?,
-        environment_id: args.next().ok_or("Missing environment ID")?,
-        issuer: args.next().ok_or("Missing grant issuer")?,
-        fingerprint: None,
-        fingerprint_provider: None,
-    };
-    let directory = args.next();
-    if args.next().is_some() {
-        return Err("Unexpected argument".into());
-    }
-    let client = open(app, directory.as_deref().map(Path::new)).await?;
+    let app_key = std::env::var("ORBIT_APP_KEY")?;
+    #[cfg(feature = "local-development")]
+    let client = Client::open_local(&app_key).await?;
+    #[cfg(not(feature = "local-development"))]
+    let client = Client::open(&app_key).await?;
+
     let result = run(&client).await;
     let closed = client.close().await;
     if let Err(error) = &result {
@@ -38,40 +26,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     closed?;
     Ok(())
 }
-async fn open(app: AppConfig, directory: Option<&Path>) -> orbit_sdk::Result<Client> {
-    #[cfg(feature = "local-development")]
-    if app.api_origin.starts_with("http:") {
-        return Client::open_local(app, directory).await;
-    }
-    Client::open(app, directory).await
-}
+
 async fn run(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
-    let cancel = Cancellation::new();
-    match client.require_access("export", &cancel).await {
-        Ok(_) => {}
-        Err(Error::Denied { code, .. }) if code == "access_unavailable" => {
-            let key = prompt("Licence key: ")?;
-            client.activate_key(&key, &cancel).await?;
-            client.require_access("export", &cancel).await?;
-        }
-        Err(error) => {
-            eprintln!("Support summary: {}", client.support_summary(&error));
-            return Err(error.into());
-        }
-    }
-    println!("Activation is remembered. Commands: export, status, quit");
+    client
+        .ensure_access("export", || prompt("Licence key: ").ok())
+        .await?;
+    println!(
+        "Activation is remembered. Commands: export, metered-export, updates, download, idle, resume, status, quit"
+    );
     loop {
         match prompt("orbit> ")?.as_str() {
-            "export" => match client.require_access("export", &cancel).await {
+            "export" => match client.require_access("export").await {
                 Ok(_) => println!("Export authorized: synthetic report, rows=3, total=42"),
                 Err(error) => {
                     println!("Export denied: {error}");
                     println!("Support summary: {}", client.support_summary(&error));
                 }
             },
+            "idle" => {
+                client.end_session().await?;
+            }
+            "resume" => {
+                client.start_session().await?;
+            }
+            "metered-export" => {
+                client.require_access("export").await?;
+                let job = prompt("Export job ID (16–128 characters; reuse for retries): ")?;
+                match client.consume_with_id("exports", 1, &job).await {
+                    Ok(result) => println!(
+                        "Export authorized: synthetic report. Remaining exports: {}",
+                        result.counter.remaining
+                    ),
+                    Err(error) => {
+                        println!("Export denied: {}", error.cause);
+                        if error.uncertain {
+                            println!("Outcome unknown. Retry with the same job ID.");
+                        }
+                    }
+                }
+            }
+            command @ ("updates" | "download") => {
+                if let Some(update) = client.check_for_updates(0).await? {
+                    println!("Update available: {}", update.release.version);
+                    if command == "download" {
+                        let destination = prompt("Destination file (must not already exist): ")?;
+                        let authorization = client
+                            .authorize_download(&update.release.id, &update.artifact.id)
+                            .await?;
+                        authorization
+                            .download(destination, 128 * 1024 * 1024)
+                            .await?;
+                        println!("Verified download saved. No installer was executed.");
+                    }
+                } else {
+                    println!("No eligible update for this target.");
+                }
+            }
             "status" => println!("{:?}", client.snapshot()?),
             "quit" | "" => break,
-            _ => println!("Commands: export, status, quit"),
+            _ => println!(
+                "Commands: export, metered-export, updates, download, idle, resume, status, quit"
+            ),
         }
     }
     Ok(())

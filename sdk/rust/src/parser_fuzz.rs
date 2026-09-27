@@ -34,6 +34,7 @@ fn bounded_parser_fuzz() {
         installation: "installation",
         fingerprint: None,
         fingerprint_provider: None,
+        allow_unbound_fingerprint: false,
         credential_expires_at: Some(1_800_090_000),
         licence_expires_at: None,
         now: 1_800_000_000,

@@ -109,6 +109,9 @@ func requiredShape(v any, t reflect.Type) error {
 		}
 		return requiredShape(v, t.Elem())
 	}
+	if reflect.PointerTo(t).Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()) {
+		return nil
+	}
 	if v == nil {
 		return ErrInvalidResponse
 	}

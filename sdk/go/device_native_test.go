@@ -1,3 +1,5 @@
+//go:build linux || windows || (darwin && cgo)
+
 package orbit
 
 import (

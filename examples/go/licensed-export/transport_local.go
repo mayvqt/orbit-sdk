@@ -5,12 +5,11 @@ package main
 import (
 	"context"
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
-	"strings"
 )
 
-func openClient(ctx context.Context, config orbit.AppConfig) (*orbit.Client, error) {
-	if strings.HasPrefix(config.APIOrigin, "http:") {
-		return orbit.OpenLocal(ctx, config)
+func openClient(ctx context.Context, appKey string, options orbit.Options) (*orbit.Client, error) {
+	if _, err := orbit.ParseAppKey(appKey); err == nil {
+		return orbit.Open(ctx, appKey, options)
 	}
-	return orbit.Open(ctx, config)
+	return orbit.OpenLocal(ctx, appKey, options)
 }

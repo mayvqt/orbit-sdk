@@ -67,7 +67,7 @@ static int32_t exchange(void *ctx, const orbit_http_request_t *q,
   uint32_t total = 0;
   int32_t r;
   if (q->origin.length > 512 || q->path.length > 512 ||
-      q->body.length > ORBIT_CLIENT_ARENA_BYTES)
+      q->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES)
     return ORBIT_CLIENT_ARGUMENT;
   if (begin(b, q->post ? 2 : 1, q->origin.length, q->path.length,
             q->body.length) ||
@@ -84,7 +84,7 @@ static int32_t exchange(void *ctx, const orbit_http_request_t *q,
     uint32_t n = h[0] | ((uint32_t)h[1] << 8);
     if (!n)
       return result(b);
-    if (n > sizeof(bytes) || n > ORBIT_CLIENT_ARENA_BYTES - total) {
+    if (n > sizeof(bytes) || n > ORBIT_CLIENT_ARENA_MAX_BYTES - total) {
       b->broken = 1;
       return ORBIT_CLIENT_RESOURCE_LIMIT;
     }

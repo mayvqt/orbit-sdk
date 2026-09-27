@@ -90,7 +90,7 @@ struct ParsedToken {
     std::vector<unsigned char> signature;
 };
 
-ParsedToken parse_token(std::string_view token) {
+ParsedToken parse_token(std::string_view token, std::string_view purpose = "orbit-access+jwt") {
     if (token.empty() || token.size() > 16384) invalid();
     const auto first = token.find('.');
     if (first == std::string_view::npos) invalid();
@@ -107,7 +107,7 @@ ParsedToken parse_token(std::string_view token) {
     const auto alg = string_value(required(header, "alg"));
     const auto typ = string_value(required(header, "typ"));
     const auto kid = string_value(required(header, "kid"));
-    if (alg != "ES256" || typ != "orbit-access+jwt" || kid.empty() || kid.size() > 128 ||
+    if (alg != "ES256" || typ != purpose || kid.empty() || kid.size() > 128 ||
         std::any_of(kid.begin(), kid.end(), [](unsigned char c) { return c > 0x7f; })) invalid();
     return {token.substr(0, second), kid, parse_json(claims_text, 32768), std::move(signature)};
 }
@@ -168,7 +168,7 @@ bool verify_signature(EVP_PKEY* key, std::string_view signing_input,
 }
 
 std::optional<std::string> optional_string(const Json::Value& value, const char* key) {
-    if (!value.isMember(key) || value[key].isNull()) return std::nullopt;
+    if (!value.isMember(key)) return std::nullopt;
     return string_value(value[key]);
 }
 
@@ -246,6 +246,11 @@ bool GrantKeys::contains(std::string_view token) const {
     return keys_.find(std::string(parsed.kid)) != keys_.end();
 }
 
+bool GrantKeys::contains_session(std::string_view token) const {
+    const auto parsed = parse_token(token, "orbit-session+jwt");
+    return keys_.find(std::string(parsed.kid)) != keys_.end();
+}
+
 Json::Value GrantKeys::jwks_for(std::string_view token) const {
     const auto parsed = parse_token(token);
     const auto found = public_keys_.find(std::string(parsed.kid));
@@ -256,6 +261,27 @@ Json::Value GrantKeys::jwks_for(std::string_view token) const {
     return result;
 }
 
+GrantKeys::SignedOfflinePayload GrantKeys::verify_offline_signature(std::string_view token) const {
+    auto parsed = parse_token(token, "orbit-offline+jwt");
+    const auto key = keys_.find(parsed.kid);
+    if (key == keys_.end() || !verify_signature(key->second.get(), parsed.signing_input, parsed.signature)) invalid();
+    return {std::move(parsed.kid), std::move(parsed.claims)};
+}
+
+Json::Value GrantKeys::verify_download_signature(std::string_view token) const {
+    auto parsed = parse_token(token, "orbit-download+jwt");
+    const auto key = keys_.find(parsed.kid);
+    if (key == keys_.end() || !verify_signature(key->second.get(), parsed.signing_input, parsed.signature)) invalid();
+    return std::move(parsed.claims);
+}
+
+Json::Value GrantKeys::verify_session_signature(std::string_view token) const {
+    auto parsed = parse_token(token, "orbit-session+jwt");
+    const auto key = keys_.find(parsed.kid);
+    if (key == keys_.end() || !verify_signature(key->second.get(), parsed.signing_input, parsed.signature)) invalid();
+    return std::move(parsed.claims);
+}
+
 GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expected) const {
     const auto parsed = parse_token(token);
     const auto key = keys_.find(std::string(parsed.kid));
@@ -263,12 +289,19 @@ GrantClaims GrantKeys::verify(std::string_view token, const GrantExpected& expec
     auto claims = parse_claims(parsed.claims);
     const auto audience = "orbit:" + std::string(expected.application) + ":" + std::string(expected.environment);
     const bool bound = [&] {
-        if (!expected.fingerprint && !expected.fingerprint_provider) {
-            return claims.binding_mode == "none" && !claims.fingerprint && !claims.fingerprint_provider;
-        }
-        return expected.fingerprint && expected.fingerprint_provider && claims.binding_mode == "hwid" &&
-               claims.fingerprint && *claims.fingerprint == *expected.fingerprint &&
-               claims.fingerprint_provider && *claims.fingerprint_provider == *expected.fingerprint_provider;
+        if (expected.expected_binding_mode && claims.binding_mode != *expected.expected_binding_mode)
+            return false;
+        const bool expected_unbound = !expected.fingerprint && !expected.fingerprint_provider;
+        const bool expected_optional_binding = expected.allow_unbound_fingerprint &&
+            expected.fingerprint && expected.fingerprint_provider;
+        const bool unbound = claims.binding_mode == "none" && !claims.fingerprint &&
+            !claims.fingerprint_provider &&
+            (expected_unbound || expected_optional_binding);
+        const bool hardware_bound = claims.binding_mode == "hwid" && expected.fingerprint &&
+            expected.fingerprint_provider && claims.fingerprint &&
+            *claims.fingerprint == *expected.fingerprint && claims.fingerprint_provider &&
+            *claims.fingerprint_provider == *expected.fingerprint_provider;
+        return unbound || hardware_bound;
     }();
     const auto allowance = claims.offline_allowed ? std::int64_t{86400} : std::int64_t{300};
     const auto add_saturated = [](std::int64_t value, std::int64_t delta) {

@@ -1,5 +1,6 @@
 #include "storage_windows.hpp"
 
+#include "core.hpp"
 #include "storage_codec.hpp"
 #include "installed_storage.hpp"
 
@@ -832,6 +833,14 @@ public:
     }
 
     bool initialization_needed() const noexcept override { return initialize_; }
+
+    void verify() override {
+        try {
+            check();
+        } catch (...) {
+            throw Error(1, ErrorKind::storage, "installation_storage_unavailable", {});
+        }
+    }
 
     std::optional<std::string> load() override {
         try {

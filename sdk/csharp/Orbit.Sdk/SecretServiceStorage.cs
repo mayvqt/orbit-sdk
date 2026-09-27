@@ -25,7 +25,7 @@ public sealed class SecretServiceStorage : ICredentialStorage, IDisposable
         scope = SecretTool.Scope(config, device, lease.Directory);
     }
 
-    public static SecretServiceStorage Open(string directory, OrbitConfig config, Device device)
+    internal static SecretServiceStorage Open(string directory, OrbitConfig config, Device device)
     {
         LinuxStorageLease? lease = null;
         SecretServiceStorage? storage = null;

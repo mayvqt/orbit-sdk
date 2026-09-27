@@ -31,8 +31,8 @@ type nativeSecretStorage struct {
 
 // OpenSecretServiceStorage opens an existing absolute private Linux directory
 // for one scope. It never unlocks the keyring or resets missing/corrupt state.
-func OpenSecretServiceStorage(directory string, config Config, device Device) (*SecretServiceStorage, error) {
-	scope, err := newStorageScope(config, device)
+func OpenSecretServiceStorage(directory string, key AppKey, device Device) (*SecretServiceStorage, error) {
+	scope, err := newStorageScope(key, device)
 	if err != nil {
 		return nil, err
 	}

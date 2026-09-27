@@ -2,6 +2,8 @@
 
 #include "grants.hpp"
 #include "installed_storage.hpp"
+#include "offline.hpp"
+#include "session_grants.hpp"
 #include "persistent_codec.hpp"
 #include "platform.hpp"
 #include "transport.hpp"
@@ -9,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -20,6 +23,40 @@
 #include <thread>
 
 namespace orbit::detail {
+
+#ifdef ORBIT_SDK_TESTING
+void reset_access_benchmark_metrics() noexcept;
+void set_access_benchmark_invalidation_counting(bool enabled) noexcept;
+std::size_t access_benchmark_invalidation_checks() noexcept;
+std::size_t access_benchmark_storage_writes() noexcept;
+void note_access_benchmark_invalidation_check() noexcept;
+void note_access_benchmark_storage_write() noexcept;
+#endif
+
+enum class StorageMode : std::uint32_t {
+    memory = 0,
+    windows_dpapi = 1,
+    linux_secret_service = 2,
+};
+
+struct Storage {
+    StorageMode mode = StorageMode::memory;
+    std::string path;
+};
+
+struct Config {
+    std::string api_origin;
+    std::string application_id;
+    std::string environment_id;
+    std::string environment;
+    std::string issuer;
+    std::optional<std::string> installation_id;
+    std::optional<Fingerprint> fingerprint;
+    std::optional<std::string> public_app_key;
+    std::shared_ptr<const OfflineKeys> offline_keys;
+    std::shared_ptr<const SessionKeys> session_keys;
+    Storage storage;
+};
 
 struct CancellationState {
     std::atomic_bool cancelled{false};
@@ -44,12 +81,31 @@ struct ClockStart {
 };
 
 ClockStart capture_clock();
+std::optional<Fingerprint> resolve_fingerprint(const ::orbit::AppKey& app_key,
+                                               const ::orbit::Options& options);
 
 struct ClockAnchor {
     std::int64_t server_seconds = 0;
     std::int64_t elapsed_nanoseconds = 0;
     std::int64_t wall_seconds = 0;
     std::int64_t now() const;
+};
+
+struct OfflineRuntime {
+    OfflineFile file;
+    ClockAnchor anchor;
+    std::int64_t time_high_water = 0;
+    std::int64_t wall_high_water = 0;
+    bool uncertain = false;
+    std::chrono::steady_clock::time_point last_checkpoint{};
+};
+
+struct OfflineClockState {
+    ClockAnchor anchor;
+    std::int64_t time_high_water = 0;
+    std::int64_t wall_high_water = 0;
+    bool uncertain = false;
+    std::chrono::steady_clock::time_point last_checkpoint{};
 };
 
 struct AccountSession {
@@ -65,17 +121,24 @@ public:
                 std::optional<Credential> credential, bool persistent = false);
 
     ~ClientState() noexcept;
-    Json::Value snapshot();
+    ::orbit::Snapshot snapshot();
+    ::orbit::OfflineRequest offline_request();
+    ::orbit::Snapshot import_offline_file(std::string_view file,
+                                          const std::atomic_bool& cancelled);
+    void restore_offline();
     void close();
     void start_worker();
     void begin_call();
     void end_call() noexcept;
-    Json::Value activate(std::string_view key, std::string_view idempotency_key,
-                         std::optional<std::string_view> previous,
-                         const std::atomic_bool& cancelled,
-                         std::optional<std::string_view> account_licence = std::nullopt);
-    Json::Value refresh(const std::atomic_bool& cancelled, bool if_needed = false);
-    Json::Value require_access(std::string_view feature, const std::atomic_bool& cancelled);
+    ::orbit::Snapshot activate(std::string_view key, std::string_view idempotency_key,
+                               std::optional<std::string_view> previous,
+                               const std::atomic_bool& cancelled,
+                               std::optional<std::string_view> account_licence = std::nullopt);
+    ::orbit::Snapshot refresh(const std::atomic_bool& cancelled, bool if_needed = false,
+                              bool acquire_session = true);
+    ::orbit::Snapshot start_session(const std::atomic_bool& cancelled);
+    ::orbit::Snapshot end_session(const std::atomic_bool& cancelled);
+    ::orbit::Snapshot require_access(std::string_view feature, const std::atomic_bool& cancelled);
     void deactivate(std::string_view idempotency_key, const std::atomic_bool& cancelled);
     void local_logout();
     std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> register_customer(
@@ -97,6 +160,8 @@ public:
                                    const std::atomic_bool& cancelled);
     std::string customer_session_authorization();
 
+    Json::Value online_operation(std::string_view route, Json::Value extra,
+                                 const std::atomic_bool& cancelled);
     std::uint64_t generation();
     void sync_storage_locked();
     void persist_record_locked();
@@ -123,6 +188,18 @@ public:
     std::optional<Credential> credential;
     std::optional<GrantClaims> claims;
     std::optional<ClockAnchor> anchor;
+    std::optional<OfflineRuntime> offline;
+    std::optional<OfflineClockState> offline_clock;
+    bool session_required = false;
+    bool session_profile_known = false;
+    bool session_disabled = false;
+    std::optional<SessionGrant> session_grant;
+    std::optional<ClockAnchor> session_anchor;
+    std::optional<std::string> pending_session_id;
+    std::optional<std::int64_t> pending_renewal_sequence;
+    std::optional<std::chrono::steady_clock::time_point> session_retry_deadline;
+    std::optional<std::int64_t> session_licence_expiry;
+    std::string session_binding_mode;
     std::optional<AccountSession> customer;
     bool transient = false;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
@@ -144,7 +221,6 @@ public:
     std::size_t active_calls = 0;
 
 private:
-    friend std::shared_ptr<ClientState> connect_state(Config);
 #ifdef ORBIT_SDK_TESTING
     friend ::orbit::Client make_test_client(Config, Transport,
                                              std::shared_ptr<CredentialStorage>);
@@ -153,22 +229,39 @@ private:
     void check_generation(std::uint64_t request_generation,
                           const std::atomic_bool& cancelled);
     std::unique_lock<std::timed_mutex> lock_serial(const std::atomic_bool& cancelled);
-    Json::Value snapshot_locked(bool tolerate_clock_error);
-    std::pair<Credential, GrantClaims> verify_reply(
+    ::orbit::Snapshot snapshot_locked(bool tolerate_clock_error);
+    ::orbit::Snapshot offline_snapshot_locked();
+    void checkpoint_offline_locked(bool force);
+    void checkpoint_offline_before_transition_locked();
+    struct VerifiedActivation {
+        Credential credential;
+        std::optional<GrantClaims> claims;
+        ClockAnchor anchor;
+        bool session_required = false;
+        std::optional<std::int64_t> licence_expires_at;
+        std::string binding_mode;
+    };
+    VerifiedActivation verify_reply(
         const Json::Value& reply, const std::optional<Credential>& previous,
         std::optional<std::string_view> expected_licence, ClockStart start,
         const std::atomic_bool& cancelled, ClockAnchor& out_anchor);
-    Json::Value accept_reply(const std::optional<Json::Value>& reply,
-                             const Error* response_error,
-                             std::uint64_t request_generation,
-                             const std::optional<Credential>& previous,
-                             std::optional<std::string_view> expected_licence,
-                             ClockStart start,
-                             const std::atomic_bool& cancelled, bool mutation = false);
+    ::orbit::Snapshot accept_reply(const std::optional<Json::Value>& reply,
+                                   const Error* response_error,
+                                   std::uint64_t request_generation,
+                                   const std::optional<Credential>& previous,
+                                   std::optional<std::string_view> expected_licence,
+                                   ClockStart start,
+                                   const std::atomic_bool& cancelled, bool mutation = false);
+    ::orbit::Snapshot start_session_serialized(const std::atomic_bool& cancelled, bool explicit_start);
+    ::orbit::Snapshot advance_session_serialized(const std::atomic_bool& cancelled);
+    SessionGrant verify_session_reply(const Json::Value& reply, std::string_view session_id,
+                                      std::int64_t sequence, const Credential& saved,
+                                      ClockStart start, ClockAnchor& out_anchor,
+                                      const std::atomic_bool& cancelled);
     void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();
-    void invalidate_locked();
+    void invalidate_locked(bool clear_pending = true);
     std::uint64_t request_generation_locked();
     Credential stored_credential(const Json::Value& value) const;
     Json::Value credential_json(const Credential& value) const;
@@ -191,7 +284,6 @@ private:
     ClientState* state_;
 };
 
-std::shared_ptr<ClientState> connect_state(Config config);
 std::shared_ptr<ClientState> open_installed_state(
     Config config, Transport transport, std::shared_ptr<InstalledStorage> installed);
 
@@ -202,6 +294,7 @@ void set_test_clock(TestClock clock);
                                  std::shared_ptr<CredentialStorage> storage);
 ::orbit::Client make_test_installed_client(
     Config config, Transport transport, std::shared_ptr<InstalledStorage> storage);
+::orbit::Client make_test_client_from_state(std::shared_ptr<ClientState> state);
 #endif
 
 } // namespace orbit::detail

@@ -1,3 +1,4 @@
+#define ORBIT_PORT_SLOT_BYTES ORBIT_PROFILE_SLOT_BYTES(4096u)
 #define _GNU_SOURCE
 #include "orbit_posix.h"
 #include <curl/curl.h>
@@ -10,16 +11,19 @@
 #include <time.h>
 #include <unistd.h>
 
+_Static_assert(ORBIT_PORT_SLOT_BYTES % 4096u == 0 && ORBIT_PORT_SLOT_BYTES >= ORBIT_PROFILE_RECORD_BYTES + 64u,"journal profile geometry");
+
 static int32_t file_read(void *p, uint8_t slot, uint32_t offset, uint8_t *bytes,
                          uint32_t length) {
   orbit_posix_t *c = p;
   uint32_t at = 0u;
   ssize_t n;
-  if (slot > 1u || offset > 4096u || length > 4096u - offset)
+  if (slot > 1u || offset > ORBIT_PORT_SLOT_BYTES ||
+      length > ORBIT_PORT_SLOT_BYTES - offset)
     return ORBIT_CLIENT_STORAGE;
   while (at < length) {
     n = pread(c->descriptor, bytes + at, length - at,
-              (off_t)slot * 4096 + offset + at);
+              (off_t)slot * ORBIT_PORT_SLOT_BYTES + offset + at);
     if (n < 0 && errno == EINTR)
       continue;
     if (n <= 0)
@@ -33,11 +37,12 @@ static int32_t file_write(void *p, uint8_t slot, uint32_t offset,
   orbit_posix_t *c = p;
   uint32_t at = 0u;
   ssize_t n;
-  if (slot > 1u || offset > 4096u || length > 4096u - offset)
+  if (slot > 1u || offset > ORBIT_PORT_SLOT_BYTES ||
+      length > ORBIT_PORT_SLOT_BYTES - offset)
     return ORBIT_CLIENT_STORAGE;
   while (at < length) {
     n = pwrite(c->descriptor, bytes + at, length - at,
-               (off_t)slot * 4096 + offset + at);
+               (off_t)slot * ORBIT_PORT_SLOT_BYTES + offset + at);
     if (n < 0 && errno == EINTR)
       continue;
     if (n <= 0)
@@ -50,7 +55,7 @@ static int32_t file_erase(void *p, uint8_t slot) {
   uint8_t bytes[256];
   uint32_t at;
   memset(bytes, 255, sizeof(bytes));
-  for (at = 0u; at < 4096u; at += sizeof(bytes))
+  for (at = 0u; at < ORBIT_PORT_SLOT_BYTES; at += sizeof(bytes))
     if (file_write(p, slot, at, bytes, sizeof(bytes)) != 0)
       return ORBIT_CLIENT_STORAGE;
   return 0;
@@ -118,7 +123,7 @@ static size_t receive_bytes(char *bytes, size_t size, size_t count, void *p) {
     r->error = ORBIT_CLIENT_UNTRUSTED;
     return 0;
   }
-  if (n > ORBIT_CLIENT_ARENA_BYTES - r->total) {
+  if (n > ORBIT_CLIENT_ARENA_MAX_BYTES - r->total) {
     r->error = ORBIT_CLIENT_RESOURCE_LIMIT;
     return 0u;
   }
@@ -147,8 +152,8 @@ int32_t orbit_posix_exchange(void *p, const orbit_http_request_t *request,
   if (!request || !http || !receive || !request->origin.data ||
       !request->path.data || (!request->body.data && request->body.length) ||
       request->origin.length > 512u || request->path.length > 512u ||
-      request->body.length > ORBIT_CLIENT_ARENA_BYTES || request->post > 1u ||
-      request->origin.length < 8u ||
+      request->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES ||
+      request->post > 1u || request->origin.length < 8u ||
       memcmp(request->origin.data, "https://", 8u) != 0 ||
       request->path.length == 0u || request->path.data[0] != '/')
     return ORBIT_CLIENT_ARGUMENT;
@@ -253,13 +258,14 @@ int32_t orbit_posix_open(orbit_posix_t *c, int directory_fd,
     return ORBIT_CLIENT_STORAGE;
   }
   c->descriptor = fd;
-  c->journal =
-      (orbit_journal_t){c, 4096u, file_read, file_erase, file_write, file_sync};
+  c->journal = (orbit_journal_t){
+      c, ORBIT_PORT_SLOT_BYTES, file_read, file_erase, file_write, file_sync};
   if (created) {
     if (file_erase(c, 0u) != 0 || file_erase(c, 1u) != 0 || file_sync(c) != 0 ||
         fsync(directory_fd) != 0)
       goto failed;
-  } else if (info.st_size != 8192 || pread(fd, &marker, 1u, 0) != 1)
+  } else if (info.st_size != (2u * ORBIT_PORT_SLOT_BYTES) ||
+             pread(fd, &marker, 1u, 0) != 1)
     goto failed;
   if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
     goto failed;

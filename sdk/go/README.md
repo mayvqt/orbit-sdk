@@ -1,102 +1,243 @@
 # Orbit Go SDK
 
-Add licence activation and feature checks to installed Go applications.
-Use Go 1.27.1 or newer. [Run the console example](../../examples/go/licensed-export/README.md)
-for a complete working application.
+Add licence activation and feature checks to an installed Go application. The client remembers activation, refreshes access, and restores eligible cached access after a restart. The SDK and examples are [MIT licensed](LICENSE).
 
-## Install and configure
+## Quick start
+
+To use the SDK from source, add the module to your application's `go.mod` with
+a replace path to your SDK checkout:
+
+```go
+require github.com/mayvqt/orbit-sdk/sdk/go v0.0.0
+
+replace github.com/mayvqt/orbit-sdk/sdk/go => ../Orbit-SDK/sdk/go
+```
+
+Run `go mod tidy` to add the SDK's transitive dependencies to the application module.
+
+Use Go 1.27.1 or newer, then set the public Test app key from **Integration**:
 
 ```sh
-go get github.com/mayvqt/orbit-sdk/sdk/go@v0.3.0
+export ORBIT_APP_KEY='paste the Test app key from Integration'
 ```
 
-Copy the four public values from your application's **Integration** page in Orbit.
-Start with the **Test** environment.
-
 ```go
-import orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+package main
 
-client, err := orbit.Open(ctx, orbit.AppConfig{
-    APIOrigin:     "https://orbit.mayvie.dev",
-    Issuer:        grantIssuer,
-    ApplicationID: applicationID,
-    EnvironmentID: environmentID,
-})
-if err != nil { return err }
-defer client.Close()
-```
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
 
-`Open` remembers this installation and refreshes its access automatically. Share
-one `*Client` within your application. `Close` saves its state and stops refresh;
-it does not release the licence.
+	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+)
 
-## First activation
-
-Check access first. Ask for a licence key only when the error code is
-`access_unavailable`, then activate and check again:
-
-```go
-_, err = client.RequireAccess(ctx, "export")
-if err != nil {
-    var failure *orbit.Error
-    if !errors.As(err, &failure) || failure.Code != "access_unavailable" {
-        return err
-    }
-    key := promptForLicenceKey() // Your application's input UI.
-    if _, err = client.Activate(ctx, key); err != nil { return err }
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
-if _, err = client.RequireAccess(ctx, "export"); err != nil { return err }
-// Perform the protected export here.
+
+func run() error {
+	ctx := context.Background()
+	client, err := orbit.Open(ctx, os.Getenv("ORBIT_APP_KEY"))
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	input := bufio.NewReader(os.Stdin)
+	_, err = client.EnsureAccess(ctx, "export", func(context.Context) (string, error) {
+		fmt.Print("Licence key: ")
+		line, readErr := input.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return "", readErr
+		}
+		return strings.TrimSpace(line), nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println("Export authorized: synthetic report")
+	return nil
+}
 ```
 
-This example also imports the standard `errors` package. Keep licence keys and
-passwords out of source, command-line arguments and logs. Orbit never saves them.
+`EnsureAccess` calls the prompt only when the installation has no usable access. An outage or a licence without the requested feature never prompts for another key. Call `RequireAccess` before each later protected operation; it checks online when needed. `Snapshot` and `HasFeature` are for display only.
 
-## Access checks and restarts
+The app key is public configuration, not a secret. Keep licence keys and passwords out of source, command-line arguments and logs; the SDK never saves them. The SDK uses native machine identity automatically when available; see [advanced options](ADVANCED.md#installed-options-and-machine-binding) to disable binding for shared images or supply an application-owned provider.
 
-Call `RequireAccess` immediately before each protected operation. `Snapshot` is
-for display; it cannot authorize work. Reopen the same configuration on restart;
-the saved credential is checked online first. During a recognized outage, a
-verified offline-enabled grant can authorize access until its original expiry.
-An outage never means the user should activate again automatically.
+## Installation state
 
-State is stored privately under `$XDG_STATE_HOME/orbit` (normally
-`~/.local/state/orbit`) on Linux, or `%LOCALAPPDATA%\Orbit` using current-user
-DPAPI on Windows. Set `AppConfig.StatePath` to a dedicated absolute directory for
-a service account or persistent container volume. Another process opening the
-same installation receives `ErrInstallationInUse`; share the existing client or
-close the other process.
+The state directory is private to the current user: owner-only files on Linux and macOS, and current-user DPAPI on Windows. On macOS 10.12 or newer, builds need cgo and the Xcode Command Line Tools; the installed client links IOKit and CoreFoundation. With `CGO_ENABLED=0`, opening an installed client returns `ErrNativeSupportRequired` instead of falling back to a weaker clock or storage path.
 
-An uncertain activation can be retried with the same key: the SDK remembers its
-operation ID for 24 hours. Different input returns `ErrPendingActivation`.
-`Logout` deliberately clears saved access and pending activation; it does not
-release a device slot. `Deactivate` releases a slot after server acknowledgement.
+`Options{StatePath: ...}` selects a dedicated absolute directory for a service account or a persistent container volume. Share one `*Client` within a process; another process that opens the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
 
-<a id="customer-accounts"></a>
+## Long-term offline files
 
-## Optional: username/password sign-in
-
-These are accounts for people using **your software**, separate from Orbit
-dashboard accounts. Skip this section when buyers activate with a licence key.
-For Account or Both mode, register and confirm the email link, then sign in:
+For an installation that stays disconnected longer than a connected grant allows,
+ship a trusted offline-purpose JWKS with the application or obtain it from the app-key
+origin over verified HTTPS. Configure it when opening the client; never take public
+keys from the imported file or from the person who hands you that file:
 
 ```go
-_, err = client.Login(ctx, username, password)
-if err != nil { return err }
-licences, err := client.OwnedLicences(ctx, "")
-if err != nil { return err }
-// Let the user select a licence from licences.Items.
-_, err = client.ActivateAccount(ctx, selectedLicenceID, "")
-if err != nil { return err }
-_, err = client.RequireAccess(ctx, "export")
+func runOffline(ctx context.Context, appKey string) error {
+	trustedKeys, err := os.ReadFile("trusted-offline-jwks.json")
+	if err != nil { return err }
+	client, err := orbit.Open(ctx, appKey, orbit.Options{OfflineKeys: trustedKeys})
+	if err != nil { return err }
+	defer client.Close()
+
+	request, err := client.OfflineRequest()
+	if err != nil { return err }
+	requestJSON, err := json.MarshalIndent(request, "", "  ")
+	if err != nil { return err }
+	if err := os.WriteFile("offline-request.json", requestJSON, 0600); err != nil { return err }
+	// Transfer this public request to an authorized seller/customer issuance workflow.
+	file, err := os.ReadFile("licence.orbit")
+	if err != nil { return err }
+	if _, err := client.ImportOfflineFile(ctx, file); err != nil { return err }
+	if _, err := client.RequireAccess(ctx, "export"); err != nil { return err }
+	return nil
+}
 ```
 
-Sign-in alone does not grant access. Sessions stay in memory; installed access
-uses its separate saved credential. See the [console example](../../examples/go/licensed-export/README.md)
-for registration, recovery, claiming keys and account logout.
+This function uses the same standard-library and `orbit` imports as the Quick start,
+plus `encoding/json`.
 
-## Advanced integration
+The request contains the app key and current installation/binding identity, but no
+licence key, account session or activation credential. Issuance and renewal happen
+through an authorized online workflow; this SDK verifies and imports the resulting
+`.orbit` file locally. Imports are signature-, scope-, binding-, expiry- and
+sequence-checked, and the SDK saves the signed file before returning access. Reimporting
+the same file does not extend its absolute expiry. `RequireAccess` never refreshes or
+prompts while a file is active; an expired file returns `offline_file_expired`.
 
-[Advanced APIs and storage](ADVANCED.md) cover caller-owned transports and
-storage, hardware binding, explicit mutation IDs, customer session proofs and
-support diagnostics. The SDK and examples are [MIT licensed](LICENSE).
+An issued file cannot be revoked while the installation is disconnected. The local
+sequence and clock floors prevent ordinary replay and clock rollback, but restoring a
+complete old machine or VM snapshot cannot be detected reliably. Explain this limit to
+customers before issuing long-term access. See [offline storage details](ADVANCED.md#long-term-offline-files).
+
+## Optional customer accounts
+
+Customer accounts belong to people using your software, separately from your Orbit dashboard account. After a buyer registers and confirms the email link, call `Login`, `OwnedLicences`, and `ActivateAccount`, then use `RequireAccess` before the first protected operation. `EnsureAccess` is for the purchase-key activation flow; it does not perform customer sign-in or licence selection.
+
+Sign-in alone does not grant licensed access. Sessions remain in memory; installed access uses a separate saved credential. See the [console example](../../examples/go/licensed-export/README.md) for registration, recovery, claiming keys and account logout, and [advanced APIs](ADVANCED.md) for explicit storage, custom binding and caller-supplied mutation IDs.
+
+## Floating seats
+
+Floating policies acquire a seat automatically after activation and renew it in
+memory. `RequireAccess` checks the current signed interval locally. The snapshot’s `Session`
+holds read-only session details. A seat limit, expired seat or temporary outage
+does not ask for another licence key.
+
+Call `EndSession(ctx)` when your app becomes idle and `StartSession(ctx)` when it
+resumes. Ending clears local access before contacting Orbit and disables automatic
+reacquisition. These calls are local no-ops for a confirmed ordinary licence; an
+unknown policy is checked online first. Offline-file mode stays offline.
+
+`Close` attempts a bounded seat release while keeping the installation credential.
+Restart acquires a fresh seat online. A crash or failed release can occupy the old
+seat until its remaining interval expires, at most 120 seconds. An outage permits
+only the current verified interval; remote revocation can take effect locally at
+that interval's deadline. Session IDs and grants are never restored from disk.
+
+## Licensed updates
+
+```go
+update, err := client.CheckForUpdates(ctx, installedReleaseNumber)
+if err != nil { return err }
+if update != nil {
+    authorization, err := client.AuthorizeDownload(ctx, update.Release.ID, update.Artifact.ID)
+    if err != nil { return err }
+    if err := authorization.Download(ctx, "update.bin", 128*1024*1024); err != nil { return err }
+}
+```
+
+Use the increasing release number stored with your application, rather than comparing
+display versions. Discovery defaults to `stable` and the running supported desktop
+target. Pass `UpdateOptions{Channel: "beta", Platform: "linux", Architecture: "arm64"}`
+for an explicit target. There is no fallback to another target.
+
+Authorization checks current licence access separately from discovery. Downloading
+streams directly from the seller over verified HTTPS, strips bearer credentials on
+every redirect, requests identity encoding, and checks the exact length and SHA-256.
+The destination appears atomically after verification. Existing files are refused
+unless you pass `DownloadOptions{ReplaceExisting: true}`; failures preserve them.
+Cancellation removes the temporary file. Nothing executes or unpacks the download.
+Keep authorizations in memory and out of logs. A public delivery URL is shareable;
+protected seller endpoints must verify the short-lived ticket or broker an expiring
+storage URL. See the [seller endpoint example](../../examples/python/seller-downloads/README.md).
+
+## Usage and resources
+
+Configure an `exports` usage limit, then reserve one unit before doing an export:
+
+```go
+result, err := client.Consume(ctx, "exports", 1, exportJobID)
+if err != nil { return err }
+fmt.Println("Remaining exports:", result.Remaining)
+// Perform the export and record its result with exportJobID.
+```
+
+`Usage(ctx, name)` and `Resources(ctx, name)` read current authoritative counters.
+`AcquireResource(ctx, name, resourceID, units, operationID...)` returns an allocation;
+release it with `ReleaseResource(ctx, name, allocationID, operationID...)` when the
+actual resource is removed. Close, logout and outages do not release resources.
+
+Mutation IDs are optional and generated securely when omitted. Pass a stable job ID
+of 16–128 characters for retries across restarts. `*MutationError` retains `OperationID`
+and `Uncertain`; retry an uncertain outcome with that same ID and identical input.
+Capacity denials expose validated `Usage` or `Resources` counters. Do not retry a
+capacity denial using a new ID unless the user intends a new operation.
+
+Usage retries preserve the original debit or denial across period boundaries. Resource
+retries preserve allocation identity and charged units but report its current state
+and current counter; an old acquire may return `State == "released"`. It never
+reactivates that allocation. An export failure does not refund consumed quota.
+
+These calls always require online activation proof and do not acquire floating seats.
+Offline files cannot authorize them. `RequireAccess` never consumes units or acquires
+resources. Installed software can be modified or bypass reporting: for authoritative
+metering, put the capacity check and actual work on your trusted backend.
+
+## Verify seller download tickets
+
+If you serve protected artifacts, verify Orbit's short-lived bearer ticket on your
+seller backend before selecting the artifact from your own registry. Configure the
+exact HTTPS endpoint and a trusted connected-purpose JWKS; never accept keys or a
+destination URL from the ticket. This verifier makes no network request and returns
+only the signed artifact metadata.
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
+)
+
+func main() {
+	appKey := os.Getenv("ORBIT_APP_KEY")
+	ticketToken := os.Getenv("ORBIT_DOWNLOAD_TICKET") // Authorization: Bearer value
+	keys, err := os.ReadFile("connected-jwks.json")
+	if err != nil { panic(err) }
+	verifier, err := orbit.NewDownloadTicketVerifier(appKey, "https://downloads.example.com/artifacts", keys)
+	if err != nil { panic(err) }
+	ticket, err := verifier.Verify(ticketToken)
+	if err != nil { panic(err) }
+	// Match all returned metadata against the seller's artifact registry.
+	fmt.Printf("licensed artifact %s (%s, %d bytes)\n", ticket.ArtifactID(), ticket.SHA256(), ticket.ByteLength())
+}
+```
+
+A ticket expires within 120 seconds and can be replayed until then. Treat it
+as a secret, never log it, and never use an artifact ID as an unchecked
+filesystem path. See [seller download guidance](ADVANCED.md#seller-side-download-tickets).

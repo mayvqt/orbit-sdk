@@ -23,6 +23,8 @@ class State:
         self.lock = threading.Lock()
         self.counts: collections.Counter[str] = collections.Counter()
         self.authorizations: dict[str, list[str]] = collections.defaultdict(list)
+        self.cookies: dict[str, list[str]] = collections.defaultdict(list)
+        self.encodings: dict[str, list[str]] = collections.defaultdict(list)
 
     def record(self, path: str, authorization: str) -> None:
         with self.lock:
@@ -43,9 +45,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         route = urlsplit(self.path).path
         state: State = self.server.state  # type: ignore[attr-defined]
         state.record(route, self.headers.get("Authorization", ""))
+        state.cookies[route].append(self.headers.get("Cookie", ""))
+        state.encodings[route].append(self.headers.get("Accept-Encoding", ""))
         if self.command == "POST":
             length = int(self.headers.get("Content-Length", "0"))
             self.rfile.read(length)
+
+        if route.startswith("/download/"):
+            if route.startswith("/download/redirect/"):
+                remaining = int(route.rsplit("/", 1)[1])
+                target = "/download/bytes" if remaining == 1 else f"/download/redirect/{remaining - 1}"
+                self._respond(302, b"redirect", headers={"Location": target, "Set-Cookie": "secret=fixture"})
+                return
+            if route == "/download/downgrade":
+                self._respond(302, b"", headers={"Location": "http://127.0.0.1/bytes"})
+                return
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            if route == "/download/encoded":
+                self.send_header("Content-Encoding", "gzip")
+            if route == "/download/length":
+                self.send_header("Content-Length", "4")
+            if route not in ("/download/length", "/download/oversize", "/download/chunked"):
+                self.send_header("Content-Length", "3")
+            if route == "/download/chunked":
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if route == "/download/slow":
+                time.sleep(2)
+            payload = b"3\r\nabc\r\n0\r\n\r\n" if route == "/download/chunked" else b"abc"
+            if route == "/download/short":
+                payload = b"ab"
+            if route == "/download/wrong":
+                payload = b"xyz"
+            if route == "/download/oversize":
+                payload = b"abcd"
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except OSError:
+                pass
+            return
 
         if route == "/capture":
             self._respond(200, b'{"captured":true}')
@@ -240,6 +281,16 @@ def main() -> None:
         run_driver(args.driver, "untrusted", endpoint, args.ca)
         run_driver(args.driver, "hostname", origin(mismatch_server), args.ca)
 
+        run_driver(args.driver, "downloads", endpoint, args.ca)
+        first = server.state.authorizations["/download/redirect/5"]
+        if first[0] != "Bearer e30.e30.c2ln":
+            raise AssertionError("protected download lost its initial bearer")
+        for route, values in server.state.authorizations.items():
+            if route.startswith("/download/"):
+                expected = ["Bearer e30.e30.c2ln"] + [""] * (len(values) - 1) if route == "/download/redirect/5" else [""] * len(values)
+                if values != expected or any(server.state.cookies[route]) or any(value != "identity" for value in server.state.encodings[route]):
+                    raise AssertionError("download leaked redirect credentials or changed encoding")
+
         run_driver(args.driver, "redirect", endpoint, args.ca)
         session_route = "/api/client/v1/sessions/current"
         if server.state.counts[session_route] != 1 or server.state.counts["/capture"] != 0:
@@ -281,7 +332,7 @@ def main() -> None:
         refused_port = reservation.getsockname()[1]
     run_driver(args.driver, "refused", f"https://127.0.0.1:{refused_port}", args.ca)
 
-    print("TLS transport checks passed: 21 driver scenarios plus retry/redirect assertions")
+    print("TLS transport checks passed: 22 driver scenarios plus retry/redirect/stream assertions")
 
 
 if __name__ == "__main__":

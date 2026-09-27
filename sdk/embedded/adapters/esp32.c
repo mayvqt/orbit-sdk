@@ -1,9 +1,12 @@
+#define ORBIT_PORT_SLOT_BYTES ORBIT_PROFILE_SLOT_BYTES(4096u)
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "orbit_esp32.h"
 #include <string.h>
 #include <time.h>
+_Static_assert(ORBIT_PORT_SLOT_BYTES % 4096u == 0 && ORBIT_PORT_SLOT_BYTES >= ORBIT_PROFILE_RECORD_BYTES + 64u,"journal profile geometry");
+
 static int32_t now(void *p, int64_t *u, uint64_t *t) {
   orbit_esp32_t *b = p;
   time_t v = time(NULL);
@@ -72,9 +75,12 @@ static int32_t read_tls(void *p, uint8_t *b, uint32_t c, uint32_t *n) {
 static int32_t read_slot(void *p, uint8_t s, uint32_t o, uint8_t *b,
                          uint32_t n) {
   orbit_esp32_t *c = p;
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o)
+    return ORBIT_CLIENT_STORAGE;
   if (c->partition->encrypted) {
-    if (esp_partition_read_raw(c->partition, (size_t)s * 4096 + o, b, n) !=
-        ESP_OK)
+    if (esp_partition_read_raw(c->partition,
+                               (size_t)s * ORBIT_PORT_SLOT_BYTES + o, b,
+                               n) != ESP_OK)
       return ORBIT_CLIENT_STORAGE;
     uint32_t i;
     for (i = 0; i < n && b[i] == 255; ++i) {
@@ -82,21 +88,30 @@ static int32_t read_slot(void *p, uint8_t s, uint32_t o, uint8_t *b,
     if (i == n)
       return 0; /* An erased encrypted sector has no plaintext yet. */
   }
-  return esp_partition_read(c->partition, (size_t)s * 4096 + o, b, n) == ESP_OK
+  return esp_partition_read(c->partition, (size_t)s * ORBIT_PORT_SLOT_BYTES + o,
+                            b, n) == ESP_OK
              ? 0
              : ORBIT_CLIENT_STORAGE;
 }
 static int32_t erase_slot(void *p, uint8_t s) {
   orbit_esp32_t *c = p;
-  return esp_partition_erase_range(c->partition, (size_t)s * 4096, 4096) ==
-                 ESP_OK
+  if (s > 1)
+    return ORBIT_CLIENT_STORAGE;
+  return esp_partition_erase_range(c->partition,
+                                   (size_t)s * ORBIT_PORT_SLOT_BYTES,
+                                   ORBIT_PORT_SLOT_BYTES) == ESP_OK
              ? 0
              : ORBIT_CLIENT_STORAGE;
 }
 static int32_t program_slot(void *p, uint8_t s, uint32_t o, const uint8_t *b,
                             uint32_t n) {
   orbit_esp32_t *c = p;
-  return esp_partition_write(c->partition, (size_t)s * 4096 + o, b, n) == ESP_OK
+  if (s > 1 || o > ORBIT_PORT_SLOT_BYTES || n > ORBIT_PORT_SLOT_BYTES - o ||
+      o % 16 || n % 16)
+    return ORBIT_CLIENT_STORAGE;
+  return esp_partition_write(c->partition,
+                             (size_t)s * ORBIT_PORT_SLOT_BYTES + o, b,
+                             n) == ESP_OK
              ? 0
              : ORBIT_CLIENT_STORAGE;
 }
@@ -111,7 +126,7 @@ int32_t orbit_esp32_open(orbit_esp32_t *b, const char *label, const char *ca,
   memset(b, 0, sizeof(*b));
   b->partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
                                           ESP_PARTITION_SUBTYPE_ANY, label);
-  if (!b->partition || b->partition->size < 8192)
+  if (!b->partition || b->partition->size < (2u * ORBIT_PORT_SLOT_BYTES))
     return ORBIT_CLIENT_STORAGE;
   b->root_ca_pem = ca;
   b->trusted_time = 1;
@@ -121,7 +136,7 @@ int32_t orbit_esp32_open(orbit_esp32_t *b, const char *label, const char *ca,
   b->platform.crypto = *orbit_mbedtls_crypto();
   b->platform.tls =
       (orbit_tls_stream_t){b, connect_tls, write_tls, read_tls, close_tls};
-  b->platform.journal = (orbit_journal_t){b,          4096,         read_slot,
-                                          erase_slot, program_slot, sync_slot};
+  b->platform.journal = (orbit_journal_t){
+      b, ORBIT_PORT_SLOT_BYTES, read_slot, erase_slot, program_slot, sync_slot};
   return orbit_platform_services(&b->platform, s);
 }

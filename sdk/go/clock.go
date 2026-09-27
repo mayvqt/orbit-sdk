@@ -2,8 +2,24 @@ package orbit
 
 import (
 	"math"
+	"math/bits"
 	"time"
 )
+
+func scaleMachTicks(ticks uint64, numerator, denominator uint32) (time.Duration, error) {
+	if numerator == 0 || denominator == 0 {
+		return 0, ErrClockUncertain
+	}
+	hi, lo := bits.Mul64(ticks, uint64(numerator))
+	if hi >= uint64(denominator) {
+		return 0, ErrClockUncertain
+	}
+	nanoseconds, _ := bits.Div64(hi, lo, uint64(denominator))
+	if nanoseconds > math.MaxInt64 {
+		return 0, ErrClockUncertain
+	}
+	return time.Duration(nanoseconds), nil
+}
 
 type requestStart struct {
 	elapsed time.Duration
@@ -26,19 +42,24 @@ func captureStart() (requestStart, error) {
 	return requestStart{elapsed: elapsed, wall: wall}, nil
 }
 func (a timeAnchor) now() (int64, error) {
+	now, _, err := a.nowWithWall()
+	return now, err
+}
+func (a timeAnchor) nowWithWall() (int64, int64, error) {
 	elapsed, err := elapsedClock()
 	if err != nil || elapsed < a.elapsed {
-		return 0, ErrClockUncertain
+		return 0, 0, ErrClockUncertain
 	}
 	seconds := int64((elapsed - a.elapsed) / time.Second)
 	if a.wall > math.MaxInt64-seconds || a.server > math.MaxInt64-seconds {
-		return 0, ErrClockUncertain
+		return 0, 0, ErrClockUncertain
 	}
-	difference := time.Now().Unix() - (a.wall + seconds)
+	wall := time.Now().Unix()
+	difference := wall - (a.wall + seconds)
 	if difference < -30 || difference > 30 {
-		return 0, ErrClockUncertain
+		return 0, wall, ErrClockUncertain
 	}
-	return a.server + seconds, nil
+	return a.server + seconds, wall, nil
 }
 
 func timestamp(value string) (int64, error) {

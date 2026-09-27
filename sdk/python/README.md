@@ -1,87 +1,148 @@
 # Orbit Python SDK
 
-Add licence activation and feature checks to Python applications on Windows
-and Linux. Requires Python 3.12 or newer.
+Add licence activation and feature checks to Python applications on Windows,
+Linux and macOS. Requires Python 3.12 or newer.
 
 ## Install
 
+To use the SDK from source, run this from the repository root inside your
+application's virtual environment:
+
 ```sh
-python -m pip install https://github.com/mayvqt/orbit-sdk/releases/download/v0.3.0/orbit_sdk-0.3.0-py3-none-any.whl
+python -m pip install ./sdk/python
 ```
 
-For a source checkout, run `python -m pip install ./sdk/python` from the
-repository root.
+## Open and check access
 
-## Configure and activate
-
-Copy the public values from **Integration** in your Orbit dashboard.
-`Client.open()` remembers this installation and refreshes access automatically.
+Copy the app key from **Integration** in your Orbit dashboard, starting with
+the Test environment. The SDK creates a stable installation, uses the native
+machine identity when available, and refreshes access automatically.
 
 ```python
 from getpass import getpass
-from orbit_sdk import AppConfig, Client, OrbitError
+import os
 
-config = AppConfig(
-    api_origin="https://orbit.mayvie.dev",
-    application_id="app_id_from_integration",
-    environment_id="environment_id_from_integration",
-    issuer="https://issuer.example",
-)
+from orbit_sdk import Client
 
-with Client.open(config) as orbit:
-    try:
-        orbit.require_access("export")
-    except OrbitError as failure:
-        if failure.code != "access_unavailable":
-            raise
-        orbit.activate(getpass("Licence key: "))
-        orbit.require_access("export")
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    snapshot = orbit.ensure_access("export", lambda: getpass("Licence key: "))
     # Perform the protected export here.
 ```
 
-## Access checks and restarts
+`ensure_access()` asks for a licence key only when no usable activation exists.
+It does not prompt after an outage, a denied request or a missing feature.
+`snapshot()` returns a frozen `Snapshot` with timezone-aware datetimes,
+`timedelta` values, an immutable entitlement map and `snapshot.has(name)`.
+Always call `require_access()` or `ensure_access()` before protected work;
+`snapshot()` is for display.
 
-Call `require_access()` before each protected operation. `snapshot()` is for
-display only. Reopen the same configuration after restarting; the customer
-only enters their key for the first activation.
+## Floating sessions
 
-On restart, Orbit checks the saved credential online. During an outage, access
-continues only while a verified offline-enabled grant is valid. An outage is
-not a reason to ask for the licence key again.
+When the licence policy enables concurrent sessions, activation automatically
+acquires a short online session and the SDK renews it while the client is open.
+`Snapshot.session` exposes immutable session metadata. Session grants and IDs
+are never restored from disk; after a restart the client acquires a fresh
+session using its saved activation credential. During an outage, a running
+client can use its current grant only until the exact signed expiry.
 
-If activation has an uncertain result, retry with the same key. The SDK keeps
-the operation ID for up to 24 hours and never saves the raw key or password.
-
-State uses a private directory on Linux and current-user DPAPI on Windows.
-For a service or container, pass `state_path` to `Client.open()` with a dedicated
-persistent directory. Share one client per installation and close it at shutdown;
-the `with` block above handles that automatically.
-
-## Optional: username/password sign-in
-
-These accounts belong to people using **your software**, separate from Orbit
-dashboard accounts. Skip this section if customers use licence keys only.
-For Account or Both mode, register and confirm the email link before signing in.
-
-After opening a client, sign in and let the customer choose an owned licence:
+Applications can release a seat while idle and explicitly acquire it again:
 
 ```python
-import uuid
-
-orbit.login(username, password)
-licences = orbit.owned_licences()["items"]
-licence_id = choose_licence(licences)  # Your application's selection UI.
-operation_id = str(uuid.uuid4())  # 16–128 characters; reuse it for retries.
-orbit.activate_account(licence_id, operation_id)
-orbit.require_access("export")
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    snapshot = orbit.ensure_access("export", lambda: getpass("Licence key: "))
+    if snapshot.session is not None:
+        print("Session expires at", snapshot.session.expires_at)
+        orbit.end_session()
+        orbit.start_session()
+    orbit.require_access("export")
 ```
 
-Sign-in alone does not grant access. Create one `operation_id` per selection and
-keep it unchanged if you retry that account activation. On later starts, check saved
-access before showing a sign-in form.
+`end_session()` clears local authority before asking Orbit to release the seat
+and disables automatic reacquisition until `start_session()` is called.
+Ordinary licences and offline-file mode make both methods no-ops. A seat-limit
+denial keeps the activation credential and never prompts for another key. See
+[advanced session details](advanced.md#floating-sessions).
+
+State uses a private directory on Linux and current-user DPAPI on Windows.
+Pass `state_path` to use a dedicated directory for a service or container.
+Share one client per installation and close it at shutdown; the `with` block
+above handles that automatically. If activation has an uncertain result, retry
+with the same key. The SDK keeps the operation ID for up to 24 hours and never
+saves the raw key or password.
+
+## Optional: customer accounts
+
+These accounts belong to people using **your software**, separate from Orbit
+dashboard accounts. For Account or Both mode, register and confirm the email
+link before signing in.
+
+```python
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    account = orbit.login(username, password)
+    page = orbit.owned_licences()
+    for licence in page.items:
+        print(licence.id, licence.policy_name, licence.state)
+    licence_id = input("Licence ID to activate: ").strip()
+    orbit.activate_account(licence_id)
+    orbit.require_access("export")
+```
+
+`login()` returns an `Account`, and `owned_licences()` returns an
+`OwnedLicencePage`; each `OwnedLicence.concurrent_session_limit` reports the
+licence's session capacity separately from its device limit. Claiming a licence
+does not activate it. Mutation IDs such as the optional ID for `claim_licence()`
+are generated securely when omitted; provide and reuse an ID when your
+application needs explicit retry control.
+`logout()` clears local activation and customer state. `logout_account()` also
+asks Orbit to revoke the remote customer session.
+
+## Updates and online limits
+
+Discover the newest eligible release for this runtime, then authorize the exact
+artifact separately. Release numbers order updates; display versions are labels.
+
+```python
+update = orbit.check_for_update(installed_release_number=1)
+if update is not None:
+    authorization = orbit.authorize_download(update.release.id, update.artifact.id)
+    orbit.download(authorization, "./chosen-update.bin", max_bytes=200_000_000)
+```
+
+The default channel is `stable`; pass `target=UpdateTarget("windows", "arm64")`
+for an explicit target. Downloads use verified HTTPS, strip the Orbit ticket
+from every redirect, and expose the destination atomically after exact length
+and SHA-256 checks. An existing file requires `replace=True`; failed downloads
+preserve it. The SDK never runs an installer. Public delivery URLs are shareable;
+protected seller endpoints must verify the short-lived ticket. Keep authorization
+responses out of logs and request fresh authorization for a later attempt.
+
+`usage(name)` and `resources(name)` read authoritative counters. `consume(name,
+units, idempotency_key)` reserves usage before work; `acquire_resource(name,
+resource_id, units, idempotency_key)` records a resource until explicit
+`release_resource(name, allocation_id, idempotency_key)`. Each mutation's ID is
+optional and generated securely. Use your durable job ID to retry across restarts.
+`LimitReachedError` contains the validated counter, `idempotency_key` and
+`requested_units`. `MutationUncertainError.idempotency_key` identifies the same
+operation to resume after a lost or invalid response; omitting it on a new call
+starts a new operation.
+
+Usage retries return the original debit or denial, including its original period.
+Resource retries preserve allocation identity and units, with the allocation's
+current state and current counter; retrying an old acquire cannot reactivate a
+released resource. Closing or logging out does not release tracked resources.
+Reads are display information, not a reservation; only successful consume/acquire
+admits the requested units. Ordinary `require_access` never consumes or acquires.
+Offline files cannot authorize these online operations. Installed metering depends
+on your software reporting the work; gate valuable work on your trusted backend
+when users must not bypass reporting. Usage is not automatically refunded if work
+fails. See the [complete installed example](../../examples/python/online_operations.py).
 
 ## Advanced integration
 
+[Offline licence files](advanced.md#offline-licence-files) support installations
+that cannot contact Orbit. The SDK exports an installation request, verifies a
+trusted signed file and stores it durably for local access checks.
+
 [Advanced APIs and storage](advanced.md) cover registration, cancellation,
-hardware binding, custom storage, explicit operation IDs and recovery.
+custom machine identities, manual storage and recovery.
 [Run the console example](../../examples/python/README.md) for a complete app.

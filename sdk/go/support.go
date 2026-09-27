@@ -18,7 +18,7 @@ type SupportSummary struct {
 // SupportSummary reads only configured public scope and the supplied error.
 // It does not read account, access, device or storage state or contact Orbit.
 func (c *Client) SupportSummary(err error) SupportSummary {
-	summary := SupportSummary{ApplicationID: c.config.ApplicationID, EnvironmentID: c.config.EnvironmentID, Code: "unknown_error"}
+	summary := SupportSummary{ApplicationID: c.key.applicationID, EnvironmentID: c.key.environmentID, Code: "unknown_error"}
 	now := time.Now().Unix()
 	if now >= 0 {
 		summary.Timestamp = &now
@@ -28,7 +28,7 @@ func (c *Client) SupportSummary(err error) SupportSummary {
 		return summary
 	}
 	switch failure.Kind {
-	case Configuration, Cancelled, Transient, Denied, InvalidResponse, TransportSecurity,
+	case Configuration, Cancelled, Transient, Denied, NotActivated, FeatureUnavailable, InvalidResponse, TransportSecurity,
 		ReauthenticationRequired, StaleResponse, StorageFailure, ClockUncertain:
 		summary.Code = string(failure.Kind)
 	}

@@ -1,5 +1,5 @@
 use crate::config::{Config, opaque};
-use orbit_sdk::{Cancellation, Transport};
+use orbit_sdk::Transport;
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::json;
@@ -86,7 +86,7 @@ impl Orbit {
     ) -> Result<String, Failure> {
         let value = self
             .sessions
-            .get_bearer(&self.current, token, &Cancellation::new())
+            .get_bearer(&self.current, token)
             .await
             .map_err(|error| match error {
                 orbit_sdk::Error::Denied { code, .. }

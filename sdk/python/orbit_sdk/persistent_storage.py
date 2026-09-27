@@ -14,7 +14,7 @@ from typing import Any
 from .device import installation_id_new, lower_hex, opaque, valid_provider
 from .errors import STALE_RESPONSE, STORAGE, OrbitError, error
 from .jsonutil import strict_int, unique_json
-from .storage import MAX_GENERATION, _LinuxLease
+from .storage import MAX_GENERATION, _LinuxLease, _sync_posix
 from .transport import _safe_origin
 
 MAX_ENVELOPE = 64 * 1024
@@ -49,6 +49,20 @@ class AccessState:
         return "AccessState(<redacted>)"
 
 
+@dataclass(frozen=True, repr=False)
+class OfflineState:
+    jws: str | None
+    sequence: int
+    issuance_id: str
+    content_digest: str
+    verified_at: int
+    time_high_water: int
+    wall_high_water: int
+
+    def __repr__(self) -> str:
+        return "OfflineState(<redacted>)"
+
+
 @dataclass(frozen=True)
 class InstallationState:
     installation_id: str
@@ -58,6 +72,7 @@ class InstallationState:
     credential: Any | None
     pending_activation: PendingActivation | None
     access: AccessState | None
+    offline: OfflineState | None = None
 
     def __repr__(self) -> str:
         return "InstallationState(<redacted>)"
@@ -94,6 +109,11 @@ def default_state_directory(config: Any) -> str:
         if not base or not os.path.isabs(base):
             raise error(STORAGE, "storage_unavailable")
         return os.path.join(base, "Orbit", digest)
+    if sys.platform == "darwin":
+        home = os.path.expanduser("~")
+        if not home or home == "~" or not os.path.isabs(home):
+            raise error(STORAGE, "storage_unavailable")
+        return os.path.join(home, "Library", "Application Support", "Orbit", digest)
     if not sys.platform.startswith("linux"):
         raise error(STORAGE, "storage_unavailable")
     base = os.environ.get("XDG_STATE_HOME")
@@ -111,7 +131,7 @@ def _ensure_directory(path: str) -> str:
     if not os.path.isabs(path) or "\0" in path or ".." in Path(path).parts:
         raise error(STORAGE, "storage_failed")
     try:
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") or sys.platform == "darwin":
             _ensure_linux_directory(path)
         elif sys.platform == "win32":
             _ensure_windows_directory(path)
@@ -144,7 +164,7 @@ def _ensure_linux_directory(path: str) -> None:
                 except FileExistsError:
                     pass
                 if created:
-                    os.fsync(fd)
+                    _sync_posix(fd)
                 next_fd = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
             os.close(fd)
             fd = next_fd
@@ -259,6 +279,38 @@ def _pending_to_json(pending: PendingActivation | None) -> Any:
     }
 
 
+def _offline_to_json(offline: OfflineState) -> dict[str, Any]:
+    return {
+        "jws": offline.jws,
+        "sequence": offline.sequence,
+        "issuance_id": offline.issuance_id,
+        "content_digest": offline.content_digest,
+        "verified_at": offline.verified_at,
+        "time_high_water": offline.time_high_water,
+        "wall_high_water": offline.wall_high_water,
+    }
+
+
+def _decode_offline(value: Any) -> OfflineState:
+    from .offline import MAX_FILE_BYTES, MAX_SEQUENCE, MAX_TIME
+    if (
+        not isinstance(value, dict)
+        or value.keys() != {"jws", "sequence", "issuance_id", "content_digest", "verified_at", "time_high_water", "wall_high_water"}
+        or value["jws"] is not None and (not isinstance(value["jws"], str) or not value["jws"].isascii() or not 1 <= len(value["jws"]) <= MAX_FILE_BYTES)
+        or not strict_int(value["sequence"], minimum=1, maximum=MAX_SEQUENCE)
+        or not opaque(value["issuance_id"]) or not lower_hex(value["content_digest"], 64)
+        or not strict_int(value["verified_at"], minimum=0, maximum=MAX_TIME)
+        or not strict_int(value["time_high_water"], minimum=value["verified_at"], maximum=MAX_TIME)
+        or not strict_int(value["wall_high_water"], minimum=0, maximum=MAX_TIME)
+    ):
+        raise error(STORAGE, "storage_failed")
+    return OfflineState(**value)
+
+
+def _without_offline_file(offline: OfflineState | None) -> OfflineState | None:
+    return None if offline is None else replace(offline, jws=None)
+
+
 def encode_envelope(config: Any, provider: str, state: InstallationState) -> bytes:
     if provider not in ("private_file", "windows_dpapi"):
         raise error(STORAGE, "storage_failed")
@@ -304,9 +356,14 @@ def encode_envelope(config: Any, provider: str, state: InstallationState) -> byt
         "bearer": state.credential.credential,
         "expires_at": state.credential.credential_expires_at,
     }
+    offline = state.offline
+    if offline is not None:
+        _decode_offline(_offline_to_json(offline))
+        if offline.jws is not None and (credential is not None or pending is not None or access is not None):
+            raise error(STORAGE, "storage_failed")
     value = {
         "sdk": "orbit.installed-client",
-        "format": 2,
+        "format": 2 if offline is None else 3,
         "provider": provider,
         "scope": scope,
         "installation": {
@@ -319,25 +376,35 @@ def encode_envelope(config: Any, provider: str, state: InstallationState) -> byt
         "pending_activation": _pending_to_json(pending),
         "access": _access_to_json(access),
     }
+    if offline is not None:
+        value["offline"] = _offline_to_json(offline)
     raw = json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")
     if len(raw) > MAX_ENVELOPE:
         raise error(STORAGE, "storage_failed")
     return raw
 
 
-def decode_envelope(config: Any, provider: str, raw: bytes) -> InstallationState:
+def decode_envelope(
+    config: Any,
+    provider: str,
+    raw: bytes,
+    *,
+    allow_device_mismatch: bool = False,
+) -> InstallationState:
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_ENVELOPE:
         raise error(STORAGE, "storage_failed")
     try:
         value = unique_json(raw)
         names = {"sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access"}
+        if isinstance(value, dict) and value.get("format") == 3:
+            names.add("offline")
         if not isinstance(value, dict) or value.keys() != names:
             raise ValueError
         scope = value["scope"]
         if not isinstance(scope, dict) or scope.keys() != {"api_origin", "issuer", "application_id", "environment_id"}:
             raise ValueError
         if (
-            value["sdk"] != "orbit.installed-client" or type(value["format"]) is not int or value["format"] != 2
+            value["sdk"] != "orbit.installed-client" or type(value["format"]) is not int or value["format"] not in (2, 3)
             or value["provider"] != provider or scope != canonical_scope(config)
             or not strict_int(value["generation"], minimum=0, maximum=MAX_GENERATION)
         ):
@@ -351,8 +418,8 @@ def decode_envelope(config: Any, provider: str, raw: bytes) -> InstallationState
             not opaque(installation_id) or len(installation_id) < 16
             or (fingerprint is None) != (fingerprint_provider is None)
             or fingerprint is not None and (not lower_hex(fingerprint, 64) or not valid_provider(fingerprint_provider))
-            or fingerprint != (config.fingerprint or None)
-            or fingerprint_provider != (config.fingerprint_provider or None)
+            or not allow_device_mismatch and fingerprint != (config.fingerprint or None)
+            or not allow_device_mismatch and fingerprint_provider != (config.fingerprint_provider or None)
         ):
             raise ValueError
         credential = None
@@ -410,7 +477,10 @@ def decode_envelope(config: Any, provider: str, raw: bytes) -> InstallationState
             if len(keys._entries) != 1:
                 raise ValueError
             access = AccessState(item["jws"], item["jwks"], expiry, *(item[name] for name in numbers))
-        return InstallationState(installation_id, fingerprint, fingerprint_provider, value["generation"], credential, pending, access)
+        offline = _decode_offline(value["offline"]) if value["format"] == 3 else None
+        if offline is not None and offline.jws is not None and (credential is not None or pending is not None or access is not None):
+            raise ValueError
+        return InstallationState(installation_id, fingerprint, fingerprint_provider, value["generation"], credential, pending, access, offline)
     except (ValueError, TypeError, KeyError, UnicodeError, OrbitError) as exc:
         if isinstance(exc, OrbitError) and exc.kind == STORAGE:
             raise
@@ -428,15 +498,15 @@ class InstallationStorage:
 
     @classmethod
     def open(cls, directory: str | os.PathLike[str] | None, config: Any) -> InstallationStorage:
-        # AppConfig is deliberately defined in client.py; validate its public
+        # _AppScope is deliberately defined in client.py; validate its public
         # fields structurally here to avoid an import cycle.
         required = ("api_origin", "issuer", "application_id", "environment_id", "fingerprint", "fingerprint_provider")
         if any(not hasattr(config, name) for name in required):
-            raise TypeError("config must be an orbit_sdk.AppConfig")
+            raise TypeError("config must be an internal _AppScope")
         target = os.fspath(directory) if directory is not None else default_state_directory(config)
         if not isinstance(target, str) or not os.path.isabs(target):
             raise error(STORAGE, "storage_failed")
-        provider = "windows_dpapi" if sys.platform == "win32" else "private_file" if sys.platform.startswith("linux") else "unsupported"
+        provider = "windows_dpapi" if sys.platform == "win32" else "private_file" if (sys.platform.startswith("linux") or sys.platform == "darwin") else "unsupported"
         if provider == "unsupported":
             raise error(STORAGE, "storage_unavailable")
         parent = _ensure_directory(target)
@@ -455,7 +525,11 @@ class InstallationStorage:
                 state = InstallationState(installation_id_new(), config.fingerprint or None, config.fingerprint_provider or None, 0, None, None, None)
                 _write_linux_record(lease, encode_envelope(config, provider, state))
             else:
-                state = decode_envelope(config, provider, raw)
+                state = decode_envelope(config, provider, raw, allow_device_mismatch=True)
+                previous_generation = state.generation
+                state = _reset_for_changed_device(state, config)
+                if state.generation != previous_generation:
+                    _write_linux_record(lease, encode_envelope(config, provider, state))
             result = cls(directory, config, provider, state, lease)
             result._check()
             return result
@@ -517,7 +591,11 @@ class InstallationStorage:
                 raw = encode_envelope(config, provider, state)
                 _write_windows_record(directory, dirs, lease, raw, entropy)
             else:
-                state = decode_envelope(config, provider, raw)
+                state = decode_envelope(config, provider, raw, allow_device_mismatch=True)
+                previous_generation = state.generation
+                state = _reset_for_changed_device(state, config)
+                if state.generation != previous_generation:
+                    _write_windows_record(directory, dirs, lease, encode_envelope(config, provider, state), entropy)
             adapter = cls(directory, config, provider, state, lease, windows=True)
             adapter._directories = dirs
             adapter._entropy = entropy
@@ -530,6 +608,7 @@ class InstallationStorage:
             if isinstance(exc, OrbitError):
                 raise
             raise error(STORAGE, "storage_failed") from exc
+
 
     @property
     def installation_id(self) -> str:
@@ -554,6 +633,12 @@ class InstallationStorage:
         with self._lock:
             self._check()
             return self._state.access
+
+    @property
+    def offline(self) -> OfflineState | None:
+        with self._lock:
+            self._check()
+            return self._state.offline
 
     def _check(self) -> None:
         if self._poisoned:
@@ -600,7 +685,7 @@ class InstallationStorage:
                 raise error(STALE_RESPONSE, "stale_response")
             self._commit(replace(self._state, credential=credential, access=None, pending_activation=None))
 
-    def save_verified(self, version: int, credential: Any, access: AccessState) -> None:
+    def save_verified(self, version: int, credential: Any, access: AccessState | None) -> None:
         with self._lock:
             self._check()
             if version != self._state.generation:
@@ -616,7 +701,7 @@ class InstallationStorage:
                 raise error(STORAGE, "storage_failed")
             next_generation = self._state.generation + 1
             credential = self._state.credential if preserve_credential else None
-            self._commit(replace(self._state, generation=next_generation, credential=credential, access=None, pending_activation=pending))
+            self._commit(replace(self._state, generation=next_generation, credential=credential, access=None, pending_activation=pending, offline=_without_offline_file(self._state.offline)))
             return next_generation
 
     def invalidate(self, *, preserve_pending: bool = False) -> int:
@@ -626,8 +711,40 @@ class InstallationStorage:
                 raise error(STORAGE, "storage_failed")
             generation = self._state.generation + 1
             pending = self._state.pending_activation if preserve_pending else None
-            self._commit(replace(self._state, generation=generation, credential=None, access=None, pending_activation=pending))
+            self._commit(replace(self._state, generation=generation, credential=None, access=None, pending_activation=pending, offline=_without_offline_file(self._state.offline)))
             return generation
+
+    def save_offline(self, version: int, offline: OfflineState) -> int:
+        with self._lock:
+            self._check()
+            if version != self._state.generation:
+                raise error(STALE_RESPONSE, "stale_response")
+            if version == MAX_GENERATION:
+                raise error(STORAGE, "storage_failed")
+            previous = self._state.offline
+            if previous is not None and (
+                offline.sequence < previous.sequence
+                or offline.sequence == previous.sequence and (offline.issuance_id != previous.issuance_id or offline.content_digest != previous.content_digest)
+                or offline.time_high_water < previous.time_high_water
+                or offline.wall_high_water < previous.wall_high_water
+            ):
+                raise error(STALE_RESPONSE, "stale_offline_file")
+            self._commit(replace(self._state, generation=version + 1, credential=None, access=None, pending_activation=None, offline=offline))
+            return version + 1
+
+    def checkpoint_offline(self, offline: OfflineState) -> None:
+        with self._lock:
+            self._check()
+            previous = self._state.offline
+            if previous is None or (
+                offline.jws != previous.jws or offline.sequence != previous.sequence
+                or offline.issuance_id != previous.issuance_id or offline.content_digest != previous.content_digest
+                or offline.verified_at != previous.verified_at
+                or offline.time_high_water < previous.time_high_water
+                or offline.wall_high_water < previous.wall_high_water
+            ):
+                raise error(STALE_RESPONSE, "stale_response")
+            self._commit(replace(self._state, offline=offline))
 
     def clear_access(self) -> None:
         with self._lock:
@@ -655,6 +772,28 @@ class InstallationStorage:
 
     def __repr__(self) -> str:
         return "InstallationStorage(<redacted>)"
+
+
+def _reset_for_changed_device(state: InstallationState, config: Any) -> InstallationState:
+    fingerprint = config.fingerprint or None
+    provider = config.fingerprint_provider or None
+    if state.fingerprint == fingerprint and state.fingerprint_provider == provider:
+        return state
+    if state.generation >= MAX_GENERATION:
+        raise error(STORAGE, "storage_failed")
+    # Device identity is part of the activation scope. A copied installation
+    # must never regain cached offline authority on another machine.
+    return replace(
+        state,
+        installation_id=installation_id_new(),
+        fingerprint=fingerprint,
+        fingerprint_provider=provider,
+        generation=state.generation + 1,
+        credential=None,
+        pending_activation=None,
+        offline=None,
+        access=None,
+    )
 
 
 def _read_linux_record(lease: _LinuxLease) -> bytes | None:
@@ -705,7 +844,7 @@ def _write_linux_record(lease: _LinuxLease, raw: bytes) -> None:
         offset = 0
         while offset < len(raw):
             offset += os.write(fd, raw[offset:])
-        os.fsync(fd)
+        _sync_posix(fd)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise error(STORAGE, "storage_failed")
@@ -713,7 +852,7 @@ def _write_linux_record(lease: _LinuxLease, raw: bytes) -> None:
         replaced = True
         dir_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=directory_fd)
         try:
-            os.fsync(dir_fd)
+            _sync_posix(dir_fd)
         finally:
             os.close(dir_fd)
         lease.complete_write()

@@ -1,34 +1,52 @@
-//! Orbit v1 key and customer SDK. Check access before each protected operation.
+//! Orbit key and customer SDK. Check access before each protected operation.
 mod access;
 mod accounts;
+mod app_key;
 mod clock;
 mod device;
 mod diagnostics;
+pub mod downloads;
 mod grants;
 mod installed;
+pub mod limits;
+mod offline;
 #[cfg(test)]
 mod parser_fuzz;
-mod setup;
+mod sessions;
 #[cfg(all(
     test,
     feature = "local-development",
-    any(target_os = "linux", target_os = "windows")
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
 mod sleep_tests;
 mod storage;
 pub mod transport;
+pub mod updates;
 
-pub use access::{Access, Client, Config, Device, Snapshot};
+pub use access::{Access, Client, SessionMetadata, Snapshot};
+pub(crate) use access::{Config, Device};
 pub use accounts::{
     Account, Customer, CustomerSessionProof, OwnedLicence, OwnedLicences, PendingRegistration,
     Registration,
 };
+pub use app_key::{AppEnvironment, AppKey};
 pub use device::{machine_fingerprint, native_fingerprint};
 pub use diagnostics::SupportSummary;
-pub use installed::AppConfig;
-pub use setup::Setup;
-pub use storage::{MemoryStorage, SecretServiceStorage, Storage, StoredCredential, WindowsStorage};
-pub use transport::{Cancellation, Transport};
+pub use downloads::{DownloadTicket, DownloadTicketVerifier};
+pub use installed::{MachineBinding, Options};
+pub use limits::{
+    CapacityCounter, Consumption, MutationError, MutationResult, ResourceAllocation,
+    ResourceCounter, ResourceLimit, ResourceState, UsageCounter, UsageLimit, UsagePeriod,
+};
+pub use offline::OfflineRequest;
+#[cfg(test)]
+pub(crate) use storage::MemoryStorage;
+pub(crate) use storage::{Storage, StoredCredential};
+pub(crate) use transport::Cancellation;
+pub use transport::Transport;
+pub use updates::{
+    Artifact, DeliveryMode, DownloadAuthorization, DownloadOptions, Release, Update, UpdateOptions,
+};
 
 #[derive(Clone)]
 pub enum Error {
@@ -42,6 +60,9 @@ pub enum Error {
         code: String,
         request_id: Option<String>,
     },
+    NotActivated,
+    FeatureUnavailable,
+    SessionRequired,
     InvalidResponse,
     TransportSecurity,
     ReauthenticationRequired,
@@ -64,6 +85,9 @@ impl std::fmt::Display for Error {
             Self::Denied { .. } => self
                 .guidance()
                 .unwrap_or("Orbit denied access. Contact application support."),
+            Self::NotActivated => "Activate a licence to continue.",
+            Self::FeatureUnavailable => "This licence does not include the requested feature.",
+            Self::SessionRequired => "Start a floating session before continuing.",
             Self::InvalidResponse => "Orbit response verification failed",
             Self::TransportSecurity => "Secure connection failed",
             Self::ReauthenticationRequired => "Fresh licence authentication is required",

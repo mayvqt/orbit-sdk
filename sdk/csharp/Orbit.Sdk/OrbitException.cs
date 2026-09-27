@@ -2,14 +2,21 @@ namespace Orbit.Sdk;
 
 public enum OrbitError
 {
-    Configuration, Cancelled, Transient, Denied, InvalidResponse, TransportSecurity,
-    ReauthenticationRequired, StaleResponse, Storage, ClockUncertain
+    Configuration, Cancelled, Transient, Denied, NotActivated, FeatureUnavailable,
+    InvalidResponse, TransportSecurity, ReauthenticationRequired, StaleResponse, Storage, ClockUncertain
 }
 
 /// <summary>Contains only safe error classification, never server messages or bearer material.</summary>
 public sealed class OrbitException : Exception
 {
     public OrbitError Error { get; }
+    /// <summary>Reuse this ID when a mutation's outcome is uncertain.</summary>
+    public string? OperationId { get; internal set; }
+    public UsageCounter? UsageCounter { get; internal set; }
+    public ResourceCounter? ResourceCounter { get; internal set; }
+    public long? RequestedUnits { get; internal set; }
+    internal System.Text.Json.JsonElement? WireError { get; init; }
+    internal int HttpStatus { get; init; }
     public string? Code { get; }
     /// <summary>Validated server correlation reference; absent for local failures.</summary>
     public string? RequestId { get; }
@@ -51,6 +58,8 @@ public sealed class OrbitException : Exception
         return error switch
         {
             OrbitError.Configuration => "Invalid Orbit configuration",
+            OrbitError.NotActivated => "Activate a licence before using this feature",
+            OrbitError.FeatureUnavailable => "This licence does not include the requested feature",
             OrbitError.Cancelled => "Operation cancelled",
             OrbitError.Transient => "Orbit is temporarily unreachable. Try again later.",
             OrbitError.Denied => "Orbit denied access. Contact application support.",

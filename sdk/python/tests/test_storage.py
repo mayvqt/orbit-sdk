@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orbit_sdk import Config
+from orbit_sdk.client import _Config as Config
 from orbit_sdk.errors import OrbitError
 from orbit_sdk.storage import (
     MAX_GENERATION,

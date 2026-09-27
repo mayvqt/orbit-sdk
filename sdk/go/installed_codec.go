@@ -52,6 +52,18 @@ type installedRecord struct {
 	Credential   *installedCredential `json:"credential"`
 	Pending      *installedPending    `json:"pending_activation"`
 	Access       *installedAccess     `json:"access"`
+	Offline      *offlineRecord       `json:"offline,omitempty"`
+}
+type installedRecordV2 struct {
+	SDK          string               `json:"sdk"`
+	Format       int                  `json:"format"`
+	Provider     string               `json:"provider"`
+	Scope        installedScope       `json:"scope"`
+	Installation installedIdentity    `json:"installation"`
+	Generation   uint64               `json:"generation"`
+	Credential   *installedCredential `json:"credential"`
+	Pending      *installedPending    `json:"pending_activation"`
+	Access       *installedAccess     `json:"access"`
 }
 
 // Every envelope member is required, including nullable fields.
@@ -82,14 +94,26 @@ func exactInstalledShape(value any, kind reflect.Type) bool {
 	return true
 }
 
-func decodeInstalled(data []byte, scope installedScope, provider string, fingerprint, fingerprintProvider *string) (installedRecord, error) {
+func decodeInstalled(data []byte, scope installedScope, provider string) (installedRecord, error) {
 	var record installedRecord
 	value, err := uniqueJSON(data)
-	if err != nil || !exactInstalledShape(value, reflect.TypeOf(record)) || json.Unmarshal(data, &record) != nil {
+	if err != nil || json.Unmarshal(data, &record) != nil {
+		return record, ErrStorage
+	}
+	shape := reflect.TypeOf(record)
+	if record.Format == 2 {
+		if !exactInstalledShape(value, reflect.TypeOf(installedRecordV2{})) {
+			return record, ErrStorage
+		}
+	} else if record.Format == 3 {
+		if !exactInstalledShape(value, shape) {
+			return record, ErrStorage
+		}
+	} else {
 		return record, ErrStorage
 	}
 	identity := record.Installation
-	if record.SDK != installedSDK || record.Format != 2 || record.Provider != provider || record.Scope != scope || record.Generation > math.MaxInt64 || !opaque(identity.ID) || len(identity.ID) < 16 || !equalString(identity.Fingerprint, fingerprint) || !equalString(identity.FingerprintProvider, fingerprintProvider) {
+	if record.SDK != installedSDK || record.Provider != provider || record.Scope != scope || record.Generation > math.MaxInt64 || !opaque(identity.ID) || len(identity.ID) < 16 || (identity.Fingerprint == nil) != (identity.FingerprintProvider == nil) || identity.Fingerprint != nil && !lowerHex(*identity.Fingerprint, 64) || identity.FingerprintProvider != nil && !validProvider(*identity.FingerprintProvider) || record.Format == 2 && record.Offline != nil || record.Format == 3 && record.Offline == nil {
 		return record, ErrStorage
 	}
 	if c := record.Credential; c != nil {
@@ -119,6 +143,11 @@ func decodeInstalled(data []byte, scope installedScope, provider string, fingerp
 			if stamp < 0 || stamp > 253402300799 {
 				return record, ErrStorage
 			}
+		}
+	}
+	if offline := record.Offline; offline != nil {
+		if offline.Sequence < 1 || offline.Sequence > offlineMaxSequence || !opaque(offline.IssuanceID) || len(offline.IssuanceID) > 128 || !lowerHex(offline.ContentDigest, 64) || offline.VerifiedAt < 0 || offline.VerifiedAt > 253402300799 || offline.TimeHighWater < offline.VerifiedAt || offline.TimeHighWater > 253402300799 || offline.WallHighWater < 0 || offline.WallHighWater > 253402300799 || offline.JWS != nil && (len(*offline.JWS) == 0 || len(*offline.JWS) > offlineMaxFile || record.Credential != nil || record.Access != nil || record.Pending != nil) {
+			return record, ErrStorage
 		}
 	}
 	return record, nil

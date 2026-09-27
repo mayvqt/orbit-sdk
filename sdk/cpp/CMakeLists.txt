@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(orbit_sdk_cpp VERSION 0.3.0 LANGUAGES CXX)
+project(orbit_sdk_cpp VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -38,9 +38,13 @@ endif()
 
 set(ORBIT_SDK_SOURCES
     src/core.cpp
+    src/downloads.cpp
+    src/download_stream.cpp
     src/grants.cpp
     src/installed_storage.cpp
     src/json.cpp
+    src/online.cpp
+    src/offline.cpp
     src/persistent_codec.cpp
     src/platform.cpp
     src/persistent_client.cpp
@@ -50,7 +54,9 @@ set(ORBIT_SDK_SOURCES
     src/storage_linux_helper.cpp
     src/storage_linux_lease.cpp
     src/storage_linux_installed.cpp
+    src/storage_macos_installed.cpp
     src/storage_windows.cpp
+    src/session_grants.cpp
     src/transport.cpp
 )
 
@@ -67,6 +73,14 @@ set(ORBIT_SDK_LINK_LIBRARIES
 if(WIN32)
     list(APPEND ORBIT_SDK_LINK_LIBRARIES
         ws2_32 bcrypt ntdll userenv advapi32 crypt32 secur32 mincore)
+endif()
+if(APPLE)
+    find_library(ORBIT_IOKIT_FRAMEWORK IOKit)
+    find_library(ORBIT_COREFOUNDATION_FRAMEWORK CoreFoundation)
+    if(NOT ORBIT_IOKIT_FRAMEWORK OR NOT ORBIT_COREFOUNDATION_FRAMEWORK)
+        message(FATAL_ERROR "IOKit and CoreFoundation frameworks are required on macOS")
+    endif()
+    list(APPEND ORBIT_SDK_LINK_LIBRARIES ${ORBIT_IOKIT_FRAMEWORK} ${ORBIT_COREFOUNDATION_FRAMEWORK})
 endif()
 target_link_libraries(orbit_sdk PUBLIC ${ORBIT_SDK_LINK_LIBRARIES})
 set_target_properties(orbit_sdk PROPERTIES EXPORT_NAME Sdk)
@@ -104,7 +118,10 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_compile_definitions(orbit_sdk_tests PRIVATE ORBIT_SDK_TESTING=1)
     target_link_libraries(orbit_sdk_tests PRIVATE ${ORBIT_SDK_LINK_LIBRARIES})
     target_compile_definitions(orbit_sdk_tests PRIVATE
+        ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
         ORBIT_GRANT_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/grants.json"
+        ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json"
+        ORBIT_SESSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/session-grants.json"
         ORBIT_GRANT_PRIVATE_KEY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/es256-test-private.pem"
     )
     if(MSVC)
@@ -113,6 +130,32 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
         target_compile_options(orbit_sdk_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME orbit_sdk_tests COMMAND orbit_sdk_tests)
+
+    add_executable(orbit_offline_tests tests/offline_test.cpp)
+    target_include_directories(orbit_offline_tests PRIVATE include src)
+    target_compile_features(orbit_offline_tests PRIVATE cxx_std_17)
+    target_link_libraries(orbit_offline_tests PRIVATE Orbit::Sdk)
+    target_compile_definitions(orbit_offline_tests PRIVATE
+        ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json")
+    if(MSVC)
+        target_compile_options(orbit_offline_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_offline_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME orbit_offline_tests COMMAND orbit_offline_tests)
+
+    add_executable(orbit_download_tests tests/download_test.cpp)
+    target_include_directories(orbit_download_tests PRIVATE include src)
+    target_compile_features(orbit_download_tests PRIVATE cxx_std_17)
+    target_link_libraries(orbit_download_tests PRIVATE Orbit::Sdk)
+    target_compile_definitions(orbit_download_tests PRIVATE
+        ORBIT_DOWNLOAD_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/download-tickets.json")
+    if(MSVC)
+        target_compile_options(orbit_download_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_download_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME orbit_download_tests COMMAND orbit_download_tests)
 
     add_executable(orbit_platform_tests tests/platform_test.cpp)
     target_include_directories(orbit_platform_tests PRIVATE include src)

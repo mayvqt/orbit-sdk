@@ -14,3 +14,7 @@
 .DS_Store
 
 /sdk/embedded/rust/target/
+/sdk/embedded/target/
+
+# Local maintainer notes for agents; never published.
+INTERNAL.md

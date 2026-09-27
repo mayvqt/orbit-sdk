@@ -135,6 +135,7 @@ class Expected:
     credential_expires_at: int | None
     licence_expires_at: int | None
     now: int
+    allow_unbound_fingerprint: bool = False
 
 
 def valid_entitlements(value: Any) -> bool:
@@ -153,8 +154,13 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
     public = keys._entries.get(header["kid"])
     if public is None:
         _invalid()
+    raw_claims = unique_json(payload)
+    if isinstance(raw_claims, dict) and raw_claims.get("binding_mode") == "none" and (
+        "fingerprint" in raw_claims or "fingerprint_provider" in raw_claims
+    ):
+        _invalid()
     claims = fields(
-        unique_json(payload),
+        raw_claims,
         _CLAIM_TYPES,
         optional=("fingerprint", "fingerprint_provider", "licence_expires_at"),
     )
@@ -166,7 +172,9 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         _invalid()
     if not valid_entitlements(claims["entitlements"]):
         _invalid()
-    for name in ("iss", "aud", "sub", "jti", "application_id", "environment_id", "activation_id", "installation_id", "binding_mode"):
+    # Issuer/audience match trusted scope below. The HTTPS origin and an audience
+    # containing two valid IDs may each exceed an individual ID's 128-byte limit.
+    for name in ("sub", "jti", "application_id", "environment_id", "activation_id", "installation_id", "binding_mode"):
         if not text(claims[name], maximum=128):
             _invalid()
     for name in ("fingerprint", "fingerprint_provider"):
@@ -185,8 +193,11 @@ def verify(token: str, keys: Keys, expected: Expected) -> dict[str, Any]:
         claims["binding_mode"] == "none"
         and claims["fingerprint"] is None
         and claims["fingerprint_provider"] is None
-        and expected.fingerprint is None
-        and expected.fingerprint_provider is None
+        and (
+            expected.fingerprint is None and expected.fingerprint_provider is None
+            or expected.allow_unbound_fingerprint
+            and expected.fingerprint is not None and expected.fingerprint_provider is not None
+        )
     ) or (
         claims["binding_mode"] == "hwid"
         and claims["fingerprint"] == expected.fingerprint

@@ -10,12 +10,23 @@ func NewLocalTransport(base string) (*Transport, error) { return newTransport(ba
 
 // OpenLocal is the installed client for an explicitly enabled loopback test server.
 // It retains the same persistence, verification and refresh behavior as Open.
-func OpenLocal(ctx context.Context, config AppConfig) (*Client, error) {
-	transport, err := NewLocalTransport(config.APIOrigin)
+func OpenLocal(ctx context.Context, rawAppKey string, options ...Options) (*Client, error) {
+	if len(options) > 1 {
+		return nil, ErrConfiguration
+	}
+	var config Options
+	if len(options) == 1 {
+		config = options[0]
+	}
+	key, err := parseAppKey(rawAppKey, "http", true)
 	if err != nil {
 		return nil, err
 	}
-	client, err := openInstalled(ctx, config, transport)
+	transport, err := NewLocalTransport(key.apiOrigin)
+	if err != nil {
+		return nil, err
+	}
+	client, err := openInstalled(ctx, key, config, transport)
 	if err != nil {
 		transport.CloseIdleConnections()
 	}

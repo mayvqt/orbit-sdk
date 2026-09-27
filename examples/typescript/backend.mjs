@@ -7,9 +7,7 @@ function required(name) {
 }
 
 const orbit = new OrbitBackendClient({
-  apiOrigin: required("ORBIT_API_ORIGIN"),
-  applicationId: required("ORBIT_APPLICATION_ID"),
-  environmentId: required("ORBIT_ENVIRONMENT_ID"),
+  appKey: required("ORBIT_APP_KEY"),
   managementToken: required("ORBIT_MANAGEMENT_TOKEN"),
 });
 

@@ -62,7 +62,7 @@ static int32_t receive(void *ctx, const uint8_t *p, uint32_t n) {
   return 0;
 }
 int main(int argc, char **argv) {
-  static uint8_t body[ORBIT_CLIENT_ARENA_BYTES];
+  static uint8_t body[ORBIT_CLIENT_ARENA_MAX_BYTES];
   uint8_t h[16], boot[16];
   char origin[513], path[513], id[37];
   if (argc != 2 || strncmp(argv[1], "https://", 8)) {

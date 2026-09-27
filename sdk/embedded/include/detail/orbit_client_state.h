@@ -18,6 +18,7 @@ typedef struct orbit_active {
 } orbit_active_t;
 typedef struct orbit_client_state {
     uint32_t magic;
+    uint32_t arena_capacity;
     orbit_client_config_t config;
     orbit_client_services_t services;
     uint8_t *arena, *scratch;
@@ -27,6 +28,9 @@ typedef struct orbit_client_state {
     uint64_t generation, anchor_ticks, last_ticks, retry_ticks;
     int64_t anchor_server, last_wall;
     uint8_t busy, failed, anchored, transient;
+#ifdef ORBIT_ENABLE_SERVICES
+  struct orbit_client_extension *extension;
+#endif
 } orbit_client_state_t;
 
 #endif

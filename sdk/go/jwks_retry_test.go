@@ -64,12 +64,12 @@ func TestUnavailableKeysPreserveOnlyExistingCredential(t *testing.T) {
 			}
 			state, err := client.Snapshot()
 			if err != nil || state.Access != AccessRefreshRequired || state.OfflineAllowed ||
-				len(state.Entitlements) != 0 || state.ExpiresAt != nil || state.RemainingOfflineSeconds != 0 {
+				len(state.Entitlements) != 0 || state.ExpiresAt != nil || state.RemainingOffline != 0 {
 				t.Fatalf("unverified reply retained authority: %+v, %v", state, err)
 			}
 			requestsAfterFailure := requests
 			for range 3 {
-				if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrDenied) {
+				if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrTransient) {
 					t.Fatalf("unavailable keys authorized protected work: %v", err)
 				}
 			}
@@ -87,7 +87,7 @@ func TestUnavailableKeysPreserveOnlyExistingCredential(t *testing.T) {
 				client.mu.Lock()
 				client.state.retryAt = time.Now().Add(-time.Second)
 				client.mu.Unlock()
-				if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrDenied) || requests == requestsAfterFailure {
+				if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrTransient) || requests == requestsAfterFailure {
 					t.Fatalf("elapsed retry did not recheck unavailable keys: %v, %d requests", err, requests)
 				}
 			}
@@ -147,7 +147,7 @@ func TestQueuedAutomaticRefreshRespectsTransientPacing(t *testing.T) {
 	if err := waitError(t, queued); err != nil || validations.Load() != 1 {
 		t.Fatalf("queued automatic refresh bypassed pacing: %v, %d validations", err, validations.Load())
 	}
-	if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrDenied) || validations.Load() != 1 {
+	if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrTransient) || validations.Load() != 1 {
 		t.Fatalf("protected access retried or authorized without a grant: %v, %d validations", err, validations.Load())
 	}
 	if state, err := client.Refresh(context.Background()); err != nil || state.Access != AccessOnline || validations.Load() != 2 {

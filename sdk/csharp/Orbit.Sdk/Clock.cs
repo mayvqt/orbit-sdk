@@ -5,8 +5,14 @@ namespace Orbit.Sdk;
 // Native elapsed-clock ABIs stay isolated from credential and grant state.
 internal static class Clock
 {
+#if ORBIT_LOCAL_DEVELOPMENT
+    private static Func<ClockStart>? testClock;
+    internal static void SetTestClock(Func<ClockStart>? clock) => Volatile.Write(ref testClock, clock);
+#endif
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec { public long Seconds; public long Nanoseconds; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MachTimebase { public uint Numerator; public uint Denominator; }
 
     [DllImport("libc", EntryPoint = "clock_gettime", SetLastError = true)]
     private static extern int ClockGetTime(int clockId, out Timespec value);
@@ -14,8 +20,36 @@ internal static class Clock
     [DllImport("api-ms-win-core-realtime-l1-1-1.dll", EntryPoint = "QueryInterruptTimePrecise")]
     private static extern void QueryInterruptTimePrecise(out ulong ticks);
 
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_timebase_info")]
+    private static extern int MachTimebaseInfo(out MachTimebase info);
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "mach_continuous_time")]
+    private static extern ulong MachContinuousTime();
+
+    private static readonly Lazy<MachTimebase> MacTimebase = new(() =>
+    {
+        if (MachTimebaseInfo(out var info) != 0 || info.Numerator == 0 || info.Denominator == 0)
+            throw new OrbitException(OrbitError.ClockUncertain);
+        return info;
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    internal static bool TryConvertMachToTimeSpanTicks(ulong ticks, uint numerator, uint denominator, out long result)
+    {
+        result = 0;
+        if (numerator == 0 || denominator == 0) return false;
+        var nanoseconds = (UInt128)ticks * numerator / denominator;
+        var timeSpanTicks = nanoseconds / 100;
+        if (timeSpanTicks > (UInt128)long.MaxValue) return false;
+        result = (long)timeSpanTicks;
+        return true;
+    }
+
     internal static long ElapsedTicks()
     {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test().ElapsedTicks;
+#endif
         try
         {
             if (OperatingSystem.IsWindows())
@@ -24,6 +58,15 @@ internal static class Clock
                 // The biased clock includes time spent in sleep and hibernation.
                 QueryInterruptTimePrecise(out var ticks);
                 return checked((long)ticks);
+            }
+            if (OperatingSystem.IsMacOS())
+            {
+                if (!Environment.Is64BitProcess)
+                    throw new OrbitException(OrbitError.ClockUncertain);
+                var ratio = MacTimebase.Value;
+                if (!TryConvertMachToTimeSpanTicks(MachContinuousTime(), ratio.Numerator, ratio.Denominator, out var converted))
+                    throw new OrbitException(OrbitError.ClockUncertain);
+                return converted;
             }
             if (!OperatingSystem.IsLinux() || !Environment.Is64BitProcess)
                 throw new OrbitException(OrbitError.ClockUncertain);
@@ -39,7 +82,23 @@ internal static class Clock
         }
     }
 
-    internal static ClockStart Capture() => new(ElapsedTicks(), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    internal static long WallSeconds()
+    {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test().WallSeconds;
+#endif
+        return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    }
+
+    internal static ClockStart Capture()
+    {
+#if ORBIT_LOCAL_DEVELOPMENT
+        if (Volatile.Read(ref testClock) is { } test)
+            return test();
+#endif
+        return new ClockStart(ElapsedTicks(), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    }
 }
 
 internal readonly record struct ClockStart(long ElapsedTicks, long WallSeconds);
@@ -48,6 +107,17 @@ internal sealed class ClockAnchor(long serverSeconds, ClockStart start)
 {
     internal long ServerSeconds => serverSeconds;
     internal long WallSeconds => start.WallSeconds;
+    internal ClockAnchor AdvanceFloor(long seconds)
+    {
+        var current = Now();
+        if (seconds <= current) return this;
+        try
+        {
+            var advance = checked(seconds - current);
+            return new ClockAnchor(checked(serverSeconds + advance), start);
+        }
+        catch (OverflowException) { throw new OrbitException(OrbitError.ClockUncertain); }
+    }
     internal long Now()
     {
         try
@@ -56,7 +126,7 @@ internal sealed class ClockAnchor(long serverSeconds, ClockStart start)
             if (elapsed < 0) throw new OrbitException(OrbitError.ClockUncertain);
             var seconds = elapsed / TimeSpan.TicksPerSecond;
             var expected = checked(start.WallSeconds + seconds);
-            if (Math.Abs(checked(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - expected)) > 30)
+            if (Math.Abs(checked(Clock.WallSeconds() - expected)) > 30)
                 throw new OrbitException(OrbitError.ClockUncertain);
             return checked(serverSeconds + seconds);
         }

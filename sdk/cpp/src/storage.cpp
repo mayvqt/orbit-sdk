@@ -1,5 +1,6 @@
 #include "platform.hpp"
 
+#include "core.hpp"
 #include "storage_linux.hpp"
 #include "storage_windows.hpp"
 

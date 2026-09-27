@@ -1,0 +1,9 @@
+{
+  "artifact_example": {
+    "release_id": "release_example",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "byte_length": 1024,
+    "bucket": "your-private-bucket",
+    "object_key": "releases/example/app.zip"
+  }
+}

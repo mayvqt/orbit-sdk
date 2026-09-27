@@ -11,7 +11,7 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
-from orbit_sdk import Config
+from orbit_sdk.client import _Config as Config
 from orbit_sdk.errors import CANCELLED, error
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -40,6 +40,7 @@ def sign_grant(
     server_time: int | None = None,
     credential_expires_at: int | None = None,
     persistent: bool = False,
+    binding_mode: str | None = None,
 ) -> tuple[str, int, int]:
     now = int(time.time()) if server_time is None else server_time
     credential_expiry = now + 3600 if credential_expires_at is None else credential_expires_at
@@ -55,14 +56,14 @@ def sign_grant(
         "environment_id": config.environment_id,
         "activation_id": activation_id,
         "installation_id": config.installation_id,
-        "binding_mode": "hwid" if config.fingerprint else "none",
+        "binding_mode": binding_mode or ("hwid" if config.fingerprint else "none"),
         "policy_version": 1,
         "entitlements": {"export": True, "sync": False},
         "refresh_after": now + (900 if persistent and offline else 60),
         "offline_allowed": offline,
         "licence_expires_at": None,
     }
-    if config.fingerprint:
+    if claims["binding_mode"] == "hwid":
         claims["fingerprint"] = config.fingerprint
         claims["fingerprint_provider"] = config.fingerprint_provider
     header = {"alg": "ES256", "typ": "orbit-access+jwt", "kid": "test-key"}
@@ -75,9 +76,10 @@ def sign_grant(
     return signing_input + "." + b64url(signature), now, credential_expiry
 
 
-def activation_reply(config: Config, *, account: bool = False, offline: bool = False, previous: bool = False, credential_expiry: int | None = None, persistent: bool = False) -> bytes:
+def activation_reply(config: Config, *, account: bool = False, offline: bool = False, previous: bool = False, credential_expiry: int | None = None, persistent: bool = False, binding_mode: str | None = None) -> bytes:
     licence = "licence" if account else "licence"
-    token, server_time, expiry = sign_grant(config, licence_id=licence, offline=offline, credential_expires_at=credential_expiry, persistent=persistent and credential_expiry is None)
+    mode = binding_mode or ("hwid" if config.fingerprint else "none")
+    token, server_time, expiry = sign_grant(config, licence_id=licence, offline=offline, credential_expires_at=credential_expiry, persistent=persistent and credential_expiry is None, binding_mode=mode)
     instant = dt.datetime.fromtimestamp(server_time, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     expiry_text = None if persistent and credential_expiry is None else dt.datetime.fromtimestamp(expiry, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     body = {
@@ -87,7 +89,7 @@ def activation_reply(config: Config, *, account: bool = False, offline: bool = F
         "credential_expires_at": expiry_text,
         "grant": token,
         "server_time": instant,
-        "binding_mode": "hwid" if config.fingerprint else "none",
+        "binding_mode": mode,
         "fingerprint_provider": config.fingerprint_provider or None,
         "licence_expires_at": None,
         "secret_replay_expired": False,
@@ -179,8 +181,11 @@ def licence_value() -> dict[str, Any]:
         "expires_at": None,
         "duration_seconds": None,
         "device_limit": 2,
+        "concurrent_session_limit": 0,
+        "usage_limits": {}, "resource_limits": {},
         "hwid_locked": False,
         "offline_allowed": True,
         "offline_seconds": 900,
+        "offline_file_seconds": 0,
         "entitlements": {"export": True},
     }

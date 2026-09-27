@@ -1,5 +1,6 @@
 #include "installed_storage.hpp"
 
+#include "core.hpp"
 #include "error.hpp"
 #include "json.hpp"
 #if defined(_WIN32)
@@ -74,6 +75,12 @@ std::string default_state_parent() {
     return std::string(home) + "/.local/state/orbit";
 #elif defined(_WIN32)
     return local_app_data() + "\\Orbit";
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (!home || !*home || home[0] != '/' || std::string_view(home).find('\0') != std::string_view::npos) {
+        configuration_failure();
+    }
+    return std::string(home) + "/Library/Application Support/Orbit";
 #else
     configuration_failure();
 #endif
@@ -102,6 +109,8 @@ std::string installed_provider() {
     return "private_file";
 #elif defined(_WIN32)
     return "windows_dpapi";
+#elif defined(__APPLE__)
+    return "private_file";
 #else
     raise(ErrorKind::configuration, "installed_client_unsupported");
 #endif
@@ -131,6 +140,9 @@ std::shared_ptr<InstalledStorage> open_installed_storage(
     return open_linux_installed_storage(std::move(directory));
 #elif defined(_WIN32)
     return storage_windows::open_installed(std::move(directory), config);
+#elif defined(__APPLE__)
+    (void)config;
+    return open_macos_installed_storage(std::move(directory));
 #else
     (void)config;
     (void)directory;

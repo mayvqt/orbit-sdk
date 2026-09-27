@@ -1,64 +1,65 @@
 # Python quickstart
 
-Install the v0.2.0 package from the source release:
+From the repository root, install the SDK into your application's virtual
+environment:
 
 ```sh
-python -m pip install https://github.com/mayvqt/orbit-sdk/releases/download/v0.2.0/orbit_sdk-0.2.0-py3-none-any.whl
+python -m pip install ./sdk/python
 ```
 
-For source development from the repository root, install with
-`python -m pip install ./sdk/python`, or set `PYTHONPATH=sdk/python` to use the
-checkout directly. Python 3.12 or newer is required. The Python client uses
+Alternatively, set `PYTHONPATH=sdk/python` to use the checkout directly.
+Python 3.12 or newer is required. The Python client uses
 native Python logic and the `cryptography` package; no Rust build is needed.
 
-Set the public integration values. `Client.open()` creates a stable
-installation ID, persists activation state for the current user, and generates
-a retry ID for key activation:
+Copy the app key from Orbit's **Integration** page and set one variable:
 
 ```sh
-export ORBIT_API_ORIGIN='https://orbit.example'
-export ORBIT_APPLICATION_ID='application_id'
-export ORBIT_ENVIRONMENT_ID='environment_id'
-export ORBIT_ISSUER='https://issuer.example'
+export ORBIT_APP_KEY='orbit_app_test_...'
 ```
 
-Key activation is the default and needs no account or operation-ID setup:
+Run the key activation example:
 
 ```sh
 python examples/python/quickstart.py
 ```
 
-The quickstart first calls `require_access()` against the credential and signed
-grant already stored in the installation directory. A valid online grant or an
-allowed offline grant is reused without asking for a key or starting another
-activation. It asks for a new key only when access is unavailable; temporary
-network failures are shown so a later run can retry the existing installation.
-For a key activation whose result is uncertain, the SDK keeps its generated
-operation ID and a digest of the input until recovery is resolved. It never
-stores the raw key.
+The quickstart reuses valid online or offline access. It asks for a key only
+when no usable activation exists; network outages are shown without prompting
+for another key. The SDK keeps the secure retry ID and an input digest for an
+activation with an uncertain result. It never stores the raw key.
 
-For a service or container, set `ORBIT_STATE_PATH` to an absolute dedicated
-private directory on a persistent volume. Keep it owned by the service user
-and mode `0700` on Linux. Only one process can own an installation directory
-at a time; use separate directories for concurrent workers.
+The client uses the native machine identity by default when available. Set
+`ORBIT_STATE_PATH` to an absolute private directory on persistent storage for
+a service or container. If a container shares machine identity with its image,
+open it with `machine_binding=False` in your application.
 
-## Optional: username/password sign-in
+## Optional: customer accounts
 
 The username and password belong to your app's customer account, not an Orbit
-dashboard account. Sign-in lets a customer claim and choose a licence, but
-sign-in alone does not grant access. Key activation remains the simple path.
-
-To use account activation, set `ORBIT_MODE=account`, optionally set
-`ORBIT_USERNAME`, and provide the explicit operation ID required for this
-session-bound mutation:
+dashboard account. Sign-in does not grant access; customers still choose and
+activate a licence.
 
 ```sh
 export ORBIT_MODE=account
-export ORBIT_OPERATION_ID='stable_account_activation_operation_id'
+export ORBIT_USERNAME='alice'
 python examples/python/quickstart.py
 ```
 
-Keep the same ID when retrying the same account mutation in the same customer
-session. The caller-supplied account operation ID is not stored by the SDK.
-The example prompts for the password without echoing it, and only does so when
-the installed credential cannot provide access.
+The example prompts for the password without echoing it, lists the customer's
+owned licences and activates the selected licence. `ORBIT_MODE` defaults to
+`key`.
+
+## Seller-hosted downloads
+
+Run `python examples/python/online_operations.py 1 ./chosen-update.bin` to discover
+and verify an update after activation. The arguments are your installed release
+number and an explicit destination. The example never executes the file and
+refuses to overwrite an existing destination. Its reusable functions also show
+usage consumption before report creation and explicit project allocation/release.
+Use durable job IDs for retries and store each allocation ID beside its project.
+Configure the policy's `exports` usage limit and `projects` resource limit first.
+
+The [seller backend example](seller-downloads/README.md) demonstrates verifying
+Orbit download tickets before returning an expiring URL from the seller's
+private S3-compatible storage. Ticket verification runs on the seller's backend,
+separately from the installed application.

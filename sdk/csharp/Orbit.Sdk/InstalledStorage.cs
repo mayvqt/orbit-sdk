@@ -3,6 +3,55 @@ using System.Text.Json;
 
 namespace Orbit.Sdk;
 
+#if ORBIT_LOCAL_DEVELOPMENT
+internal static class InstalledStorageDiagnostics
+{
+    private static long versionReads, writes;
+    private static int enabled, countVersionReads;
+    private static Action<string>? offlineWriteCompleted;
+    private static Action? offlineImportQueued;
+
+    internal static long VersionReads => Interlocked.Read(ref versionReads);
+    internal static long Writes => Interlocked.Read(ref writes);
+    internal static Action<string>? OfflineWriteCompleted
+    {
+        get => Volatile.Read(ref offlineWriteCompleted);
+        set => Volatile.Write(ref offlineWriteCompleted, value);
+    }
+    internal static Action? OfflineImportQueued
+    {
+        get => Volatile.Read(ref offlineImportQueued);
+        set => Volatile.Write(ref offlineImportQueued, value);
+    }
+
+    internal static void Begin()
+    {
+        Interlocked.Exchange(ref versionReads, 0);
+        Interlocked.Exchange(ref writes, 0);
+        Volatile.Write(ref countVersionReads, 0);
+        Volatile.Write(ref enabled, 1);
+    }
+
+    internal static void CountVersionReads(bool value) =>
+        Volatile.Write(ref countVersionReads, value ? 1 : 0);
+
+    internal static void End() => Volatile.Write(ref enabled, 0);
+
+    internal static void NoteVersionRead()
+    {
+        if (Volatile.Read(ref enabled) != 0 && Volatile.Read(ref countVersionReads) != 0)
+            Interlocked.Increment(ref versionReads);
+    }
+
+    internal static void NoteWrite()
+    {
+        if (Volatile.Read(ref enabled) != 0)
+            Interlocked.Increment(ref writes);
+    }
+    internal static void NoteOfflineWrite(string stage) => Volatile.Read(ref offlineWriteCompleted)?.Invoke(stage);
+}
+#endif
+
 internal interface IInstalledFiles : IDisposable
 {
     string Provider
@@ -43,7 +92,21 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
         {
             try
             {
-                Record = InstalledCodec.Decode(bytes, scope, files.Provider, fingerprint, provider);
+                Record = InstalledCodec.Decode(bytes, scope, files.Provider, fingerprint, provider, allowIdentityMismatch: true);
+                if (Record.Installation.Fingerprint != fingerprint || Record.Installation.FingerprintProvider != provider)
+                {
+                    // A changed or unavailable device identity starts a new installation scope. Never
+                    // carry a pending mutation or signed grant onto the new identity.
+                    Write(Record with
+                    {
+                        Installation = new(Device.NewInstallation().InstallationId, fingerprint, provider),
+                        Generation = 0,
+                        Credential = null,
+                        PendingActivation = null,
+                        Access = null,
+                        Offline = null
+                    });
+                }
             }
             finally { CryptographicOperations.ZeroMemory(bytes); }
         }
@@ -53,15 +116,20 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
     {
         if (disposed || poisoned)
             throw Storage();
-        files.Check();
+        try { files.Check(); }
+        catch (Exception) { poisoned = true; throw Storage(); }
     }
     private void Write(InstalledRecord value)
     {
         Check();
+        value = value with { Format = value.Offline == null ? 2 : 3 };
         var bytes = InstalledCodec.Encode(value);
         try
         {
             files.Write(bytes);
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteWrite();
+#endif
             Record = value;
         }
         catch (Exception) { poisoned = true; throw Storage(); }
@@ -74,6 +142,9 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             lock (gate)
             {
                 Check();
+#if ORBIT_LOCAL_DEVELOPMENT
+                InstalledStorageDiagnostics.NoteVersionRead();
+#endif
                 return Record.Generation;
             }
         }
@@ -83,6 +154,9 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
         lock (gate)
         {
             Check();
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteVersionRead();
+#endif
             return (Record.Generation, Record.Stored);
         }
     }
@@ -117,7 +191,8 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 Generation = Record.Generation + 1,
                 Credential = null,
                 Access = null,
-                PendingActivation = clearPending ? null : Record.PendingActivation
+                PendingActivation = clearPending ? null : Record.PendingActivation,
+                Offline = Record.Offline is { } offline ? offline with { Jws = null } : null
             });
             return Record.Generation;
         }
@@ -134,7 +209,8 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 });
         }
     }
-    internal (string OperationId, long Version) Begin(string principal, bool account, string? previous, string? operation)
+    internal (string OperationId, long Version) Begin(string principal, bool account, string? previous,
+        string? operation, string? principalIdentity = null)
     {
         lock (gate)
         {
@@ -144,6 +220,7 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 ["scope"] = new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["api_origin"] = Record.Scope.ApiOrigin, ["issuer"] = Record.Scope.Issuer, ["application_id"] = Record.Scope.ApplicationId, ["environment_id"] = Record.Scope.EnvironmentId },
                 ["installation"] = new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["id"] = Record.Installation.Id, ["fingerprint"] = Record.Installation.Fingerprint, ["fingerprint_provider"] = Record.Installation.FingerprintProvider },
                 ["principal_kind"] = account ? "account" : "key",
+                ["principal_identity"] = principalIdentity,
                 ["licence_input"] = principal,
                 ["previous_credential"] = previous,
                 ["credential_mode"] = "persistent"
@@ -174,7 +251,8 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                 Generation = Record.Generation + 1,
                 Credential = null,
                 Access = null,
-                PendingActivation = pending
+                PendingActivation = pending,
+                Offline = Record.Offline is { } offline ? offline with { Jws = null } : null
             });
             return (operation, Record.Generation);
         }
@@ -197,6 +275,21 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             });
         }
     }
+    internal void CommitFloating(long version, StoredCredential credential, JsonElement response)
+    {
+        lock (gate)
+        {
+            Match(version);
+            if (Record.PendingActivation != null && JsonWire.Field(response, "credential").ValueKind == JsonValueKind.Null)
+                throw new OrbitException(OrbitError.Storage, "pending_activation");
+            Write(Record with
+            {
+                Credential = Saved(credential),
+                Access = null,
+                PendingActivation = null
+            });
+        }
+    }
     internal void Checkpoint(long server, long wall)
     {
         lock (gate)
@@ -214,6 +307,57 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
                     WallHighWater = wall
                 }
             });
+        }
+    }
+    internal InstalledOffline? OfflineState()
+    {
+        lock (gate)
+        {
+            Check();
+            return Record.Offline;
+        }
+    }
+    internal long SaveOffline(long version, InstalledOffline offline)
+    {
+        lock (gate)
+        {
+            Match(version);
+            if (Record.Offline is { } previous && (offline.Sequence < previous.Sequence ||
+                offline.Sequence == previous.Sequence &&
+                    (offline.IssuanceId != previous.IssuanceId || offline.ContentDigest != previous.ContentDigest) ||
+                offline.TimeHighWater < previous.TimeHighWater || offline.WallHighWater < previous.WallHighWater))
+                throw new OrbitException(OrbitError.Denied, "offline_sequence");
+            if (Record.Generation == long.MaxValue)
+                throw Storage();
+            Write(Record with
+            {
+                Generation = Record.Generation + 1,
+                Credential = null,
+                Access = null,
+                PendingActivation = null,
+                Offline = offline
+            });
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteOfflineWrite("save");
+#endif
+            return Record.Generation;
+        }
+    }
+    internal void CheckpointOffline(InstalledOffline offline)
+    {
+        lock (gate)
+        {
+            Check();
+            if (Record.Offline is not { Jws: not null } previous ||
+                offline.Jws != previous.Jws || offline.Sequence != previous.Sequence ||
+                offline.IssuanceId != previous.IssuanceId || offline.ContentDigest != previous.ContentDigest ||
+                offline.VerifiedAt != previous.VerifiedAt || offline.TimeHighWater < previous.TimeHighWater ||
+                offline.WallHighWater < previous.WallHighWater)
+                throw new OrbitException(OrbitError.StaleResponse);
+            Write(Record with { Offline = offline });
+#if ORBIT_LOCAL_DEVELOPMENT
+            InstalledStorageDiagnostics.NoteOfflineWrite("checkpoint");
+#endif
         }
     }
     public void Dispose()

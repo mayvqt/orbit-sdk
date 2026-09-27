@@ -42,7 +42,7 @@ pub struct Claims {
     pub offline_allowed: bool,
     pub licence_expires_at: Option<i64>,
 }
-fn entitlements<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn entitlements<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, bool>, D::Error> {
     struct Entries;
@@ -96,6 +96,9 @@ pub struct Keys(BTreeMap<String, DecodingKey>, BTreeMap<String, Jwk>);
 impl Keys {
     pub fn parse(value: serde_json::Value) -> Result<Self> {
         let jwks: Jwks = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
+        Self::from_jwks(jwks)
+    }
+    fn from_jwks(jwks: Jwks) -> Result<Self> {
         if jwks.keys.is_empty() || jwks.keys.len() > 8 {
             return Err(Error::InvalidResponse);
         }
@@ -114,6 +117,24 @@ impl Keys {
             {
                 return Err(Error::InvalidResponse);
             }
+            let mut point = Vec::with_capacity(65);
+            point.push(4);
+            point.extend_from_slice(&canonical(&key.x)?);
+            point.extend_from_slice(&canonical(&key.y)?);
+            let private = aws_lc_rs::agreement::EphemeralPrivateKey::generate(
+                &aws_lc_rs::agreement::ECDH_P256,
+                &aws_lc_rs::rand::SystemRandom::new(),
+            )
+            .map_err(|_| Error::InvalidResponse)?;
+            aws_lc_rs::agreement::agree_ephemeral(
+                private,
+                aws_lc_rs::agreement::UnparsedPublicKey::new(
+                    &aws_lc_rs::agreement::ECDH_P256,
+                    point,
+                ),
+                Error::InvalidResponse,
+                |_| Ok(()),
+            )?;
             let public = DecodingKey::from_ec_components(&key.x, &key.y)
                 .map_err(|_| Error::InvalidResponse)?;
             public_keys.insert(key.kid.clone(), key.clone());
@@ -122,6 +143,45 @@ impl Keys {
             }
         }
         Ok(Self(keys, public_keys))
+    }
+    pub(crate) fn parse_offline(data: &[u8], prefix: &str) -> Result<Self> {
+        if data.is_empty() || data.len() > 16 * 1024 {
+            return Err(Error::Configuration);
+        }
+        let jwks: Jwks = serde_json::from_slice(data).map_err(|_| Error::Configuration)?;
+        if jwks.keys.iter().any(|key| {
+            !key.kid.starts_with(prefix)
+                || key.kid.len() == prefix.len()
+                || !key
+                    .kid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }) {
+            return Err(Error::Configuration);
+        }
+        Self::from_jwks(jwks).map_err(|_| Error::Configuration)
+    }
+    pub(crate) fn parse_connected(data: &[u8], environment: &str) -> Result<Self> {
+        if data.is_empty() || data.len() > 16 * 1024 {
+            return Err(Error::InvalidResponse);
+        }
+        let prefix = match environment {
+            "test" => "test-",
+            "live" => "live-",
+            _ => return Err(Error::InvalidResponse),
+        };
+        let jwks: Jwks = serde_json::from_slice(data).map_err(|_| Error::InvalidResponse)?;
+        if jwks.keys.iter().any(|key| {
+            !key.kid.starts_with(prefix)
+                || key.kid.len() == prefix.len()
+                || !crate::access::opaque(&key.kid)
+        }) {
+            return Err(Error::InvalidResponse);
+        }
+        Self::from_jwks(jwks).map_err(|_| Error::InvalidResponse)
+    }
+    pub(crate) fn decoding_key(&self, kid: &str) -> Option<&DecodingKey> {
+        self.0.get(kid)
     }
     pub(crate) fn public_key(&self, token: &str) -> Result<serde_json::Value> {
         let key = self
@@ -171,6 +231,9 @@ pub struct Expected<'a> {
     pub installation: &'a str,
     pub fingerprint: Option<&'a str>,
     pub fingerprint_provider: Option<&'a str>,
+    /// Permit mode=none while the runtime sent optional identity metadata.
+    /// Shared contract vectors intentionally leave this false.
+    pub allow_unbound_fingerprint: bool,
     pub credential_expires_at: Option<i64>,
     pub licence_expires_at: Option<i64>,
     pub now: i64,
@@ -192,6 +255,15 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
     let claims: Claims = decode::<Claims>(token, key, &validation)
         .map_err(|_| Error::InvalidResponse)?
         .claims;
+    if claims.binding_mode == "none" {
+        let payload = token.split('.').nth(1).ok_or(Error::InvalidResponse)?;
+        let fields: serde_json::Value =
+            serde_json::from_slice(&canonical(payload)?).map_err(|_| Error::InvalidResponse)?;
+        let fields = fields.as_object().ok_or(Error::InvalidResponse)?;
+        if fields.contains_key("fingerprint") || fields.contains_key("fingerprint_provider") {
+            return Err(Error::InvalidResponse);
+        }
+    }
     let allowance = if claims.offline_allowed { 86400 } else { 300 };
     let (refresh_min, refresh_max) =
         if expected.credential_expires_at.is_none() && claims.offline_allowed {
@@ -206,9 +278,13 @@ pub fn verify(token: &str, keys: &Keys, expected: &Expected<'_>) -> Result<Claim
                 && claims.fingerprint_provider.is_none()
         }
         (Some(fingerprint), Some(provider)) => {
-            claims.binding_mode == "hwid"
+            (claims.binding_mode == "hwid"
                 && claims.fingerprint.as_deref() == Some(fingerprint)
-                && claims.fingerprint_provider.as_deref() == Some(provider)
+                && claims.fingerprint_provider.as_deref() == Some(provider))
+                || (expected.allow_unbound_fingerprint
+                    && claims.binding_mode == "none"
+                    && claims.fingerprint.is_none()
+                    && claims.fingerprint_provider.is_none())
         }
         _ => false,
     };
@@ -282,6 +358,7 @@ mod tests {
             installation: "installation",
             fingerprint: None,
             fingerprint_provider: None,
+            allow_unbound_fingerprint: false,
             credential_expires_at: Some(NOW + 3600),
             licence_expires_at: None,
             now: NOW,
@@ -312,6 +389,18 @@ mod tests {
         let mut timed = expected();
         timed.licence_expires_at = Some(NOW + 250);
         assert!(verify(&sign(&claims(), None), &keys(), &timed).is_err());
+    }
+    #[test]
+    fn unbound_grants_must_omit_fingerprint_claims() {
+        let mut value = claims();
+        value["fingerprint"] = serde_json::Value::Null;
+        value["fingerprint_provider"] = serde_json::Value::Null;
+        let mut expected = expected();
+        expected.fingerprint =
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        expected.fingerprint_provider = Some("machine_v1");
+        expected.allow_unbound_fingerprint = true;
+        assert!(verify(&sign(&value, None), &keys(), &expected).is_err());
     }
     #[test]
     fn scope_types_lifetime_and_missing_claims_fail_closed() {

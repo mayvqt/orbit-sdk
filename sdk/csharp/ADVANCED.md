@@ -1,83 +1,135 @@
 # Advanced C# integration
 
-Use [the installed client](README.md) for ordinary desktop and server applications.
-The APIs below preserve explicit ownership for custom integrations.
+The ordinary entry point is `OrbitClient.OpenAsync(appKey, options?)`; the
+public app key is parsed into the origin, application, environment and grant
+issuer. It is not a licence key. `OpenLocalAsync` is available only in a build
+with `OrbitLocalDevelopment=true` and accepts HTTP only for literal loopback
+addresses.
 
-## Explicit setup and storage
+## Installed state and recovery
 
-`OrbitClient.Connect(OrbitSetup)` uses memory storage and a caller-supplied stable
-installation ID. The constructor accepts an `OrbitConfig`, `Device`, caller-owned
-`Transport` and optional `ICredentialStorage`. These clients do not schedule a
-worker; refresh from `Snapshot().NextCheckAt` and enforce each operation with
-`RequireAccessAsync`.
+The installed client owns its installation ID, state directory and automatic
+refresh worker. `OrbitOptions.StatePath` selects a dedicated absolute directory.
+Linux files are private to the current user; Windows uses current-user DPAPI and
+private DACLs. macOS uses owner-only POSIX files, an exclusive pinned lease,
+`F_FULLFSYNC` for regular-file writes and a parent-directory sync after atomic
+replacement. This macOS profile does not promise Keychain encryption.
+Unsupported targets fail closed. Share one client per installation; a second
+process is rejected while the lease is held.
 
-`WindowsStorage.Open` and `SecretServiceStorage.Open` remain explicit
-credential-only adapters. They require an existing private dedicated directory,
-retain format-1 records and require online validation after restart. Secret
-Service also needs an operational keyring and `/usr/bin/secret-tool`; Orbit does
-not install or unlock them. Custom storage must atomically compare `Save`'s
-expected generation with `Invalidate`, and observe current invalidation in `Version`.
+State includes the scoped installation, credential, pending activation digest,
+signed grant, verification key and clock evidence. It never contains a raw
+licence key, password or customer session. Interrupted activation delivery
+retains an operation ID and input digest for 24 hours; retry the same key or
+licence selection and allow the client to reuse the saved ID. For account
+activation, sign in again as the same customer after a restart. Failed sign-in
+does not discard the pending operation, and another customer cannot reuse it.
+`Logout()` deliberately clears local
+state. `DeactivateAsync()` clears local access first and releases the device
+slot only after server acknowledgement.
 
-Explicit activation operation IDs remain supported. Preserve the exact input and
-ID when delivery is uncertain. `ActivateWithPreviousAsync` and its account
-equivalent accept an original bearer for an authorized rebind, including on a
-fresh installation. Never log that bearer.
+Sleep counts toward grant expiry. Offline restart checks saved server and wall
+clock progress against the original signed deadline. Clock rollback or a
+restored machine snapshot cannot be reliably detected by portable local state;
+this protects continuity but is not tamper-proof local enforcement.
 
-## State protection and recovery
+## Machine binding
 
-Installed state includes the scoped installation, credential, pending activation
-digest, original signed grant, verification key and clock evidence. It never
-contains a raw licence key, password or customer session. Linux files are private
-to their owner. Windows uses current-user DPAPI and protected private DACLs;
-impersonated threads cannot open or write installed state.
+Installed clients compute the existing scoped `machine_v1` fingerprint by
+default on supported Windows, Linux and macOS x64/arm64 systems. macOS reads `IOPlatformUUID`
+through IOKit and uses `mach_continuous_time`, which includes system sleep. Set
+`DisableMachineBinding = true` for shared VM or container identities, or pass a
+custom `Fingerprint(value, provider)` using a `custom:` provider. The SDK never
+exports the raw machine ID. Unavailable identity sends no fingerprint. When the
+current identity differs from saved state, the SDK creates a new installation
+ID and clears the old credential, pending activation and cached grant before
+the new identity can activate.
 
-Keep the state directory when reporting corruption or provider failure. Do not
-delete its lock or automatically switch storage providers. The SDK rejects links,
-unsafe ownership and permissions, missing initialized data, unknown fields and
-competing leases. Interrupted writes remain fenced on the next open. State
-files are private to this SDK; do not copy them between SDK languages.
+Building from source on macOS compiles a small POSIX helper for secure
+directory opens automatically. Install the Xcode Command Line Tools first
+(`xcode-select --install`).
 
-Sleep counts toward grant expiry. Offline restart checks saved wall/server clock
-progress and retains the original signed deadline. Rollback or inconsistent
-evidence requires online recovery. A clock changed while stopped to above its
-saved high-water, or a restored VM/disk snapshot, cannot reliably be detected by
-portable local storage. This is continuity protection, not tamper-proof local
-licence enforcement.
+## Long-term offline files
 
-Linux native storage supports x64 and ARM64 with architecture-specific file
-flags. Compile checks are separate from native ARM64 or physical Raspberry Pi
-testing. The native Linux clock requires a 64-bit process; 32-bit ARM is not
-claimed by an ARM64 build. Unsupported native targets fail closed.
+`OrbitOptions.OfflineKeys` accepts only trusted offline-purpose public JWKS.
+`OfflineKeys.Parse` validates the entire key set before installed state opens.
+`CreateOfflineRequest()` returns serializable public scope for an authorized
+online issuance workflow; it contains no licence key or account proof.
+`ImportOfflineFile()` verifies the signed file and durably stores its original
+JWS, sequence and clock floors before returning a typed snapshot. After a
+restart, the configured trusted offline-purpose keys must still verify the
+file, which allows trusted key rotation.
 
-## Hardware binding
+While a file is active, `Snapshot()`, `RequireAccessAsync()` and
+`EnsureAccessAsync()` check the storage lease, clock, expiry and signed feature
+locally. They perform no HTTP validation and do not prompt for a key. Expired
+files remain available for deliberate renewal, while online activation and
+logout clear file authority but preserve its sequence and time floors. A full
+old machine snapshot cannot be detected reliably. `OwnedLicence.OfflineFileDuration`
+reports the server policy's `offline_file_seconds` value.
 
-Only set `AppConfig.Fingerprint` and `FingerprintProvider` for a policy requiring
-hardware binding. `DeviceIdentity.NativeFingerprint(appId, environmentId)`
-derives a scoped `machine_v1` digest on supported Windows/Linux systems. Never
-send the raw machine identifier. A missing required identity fails closed.
+## Seller-hosted downloads
 
-## Accounts and backend identity
+Use `DownloadTicketVerifier` on a seller's protected download endpoint. Configure
+the public app key, the exact HTTPS endpoint URL and a trusted connected-purpose
+JWKS from Orbit. Do not choose the audience from the incoming Host header or take
+keys from the ticket. The verifier performs no network requests and needs no
+management credential.
 
-`RegisterAsync`, `ResendRegistrationAsync`, recovery and email-change methods
-start flows completed through browser/email proofs. `ClaimLicenceAsync` adds an
-eligible key to a signed-in account. Use the returned `NextCursor` when listing
-additional owned licences. Ordinary customer-session expiry does not expire the
-separate installation credential; explicit revocation still applies.
+```csharp
+using Orbit.Sdk;
 
-`CustomerSessionProof().AuthorizationHeader()` exposes sensitive Bearer proof
-for your own trusted HTTPS backend. Never log, persist or forward it through
-redirects. The backend must verify it online at
-`GET /api/client/v1/sessions/current`, then separately authorize the licensed
-operation. See the [backend example](../../examples/rust/licensed-backend/README.md).
+static DownloadTicket AuthorizeArtifact(
+    DownloadTicketVerifier verifier, string bearerTicket,
+    string releaseId, string artifactId, string sha256, long byteLength)
+{
+    var ticket = verifier.Verify(bearerTicket);
+    if (ticket.ReleaseId != releaseId || ticket.ArtifactId != artifactId ||
+        ticket.Sha256 != sha256 || ticket.ByteLength != byteLength)
+        throw new UnauthorizedAccessException("Download is not authorized.");
+    return ticket;
+}
+```
 
-## Networking and diagnostics
+Create the verifier once with
+`new DownloadTicketVerifier(appKey, endpointUrl, File.ReadAllBytes("trusted-jwks.json"))`.
+Pass artifact metadata from your own registry to the function. Invalid or expired
+tickets raise `OrbitException` with `OrbitError.Denied` and code
+`invalid_download_ticket`. Times are immutable `DateTimeOffset` values; the
+optional `Verify` clock argument accepts a trusted application clock.
 
-Production transports require verified HTTPS, disable redirects and bound
-response sizes and retries. Cancellation stops networking. The explicit build
-property `OrbitLocalDevelopment=true` adds `OpenLocalAsync` and
-`Transport.LocalLoopback` for HTTP on a literal loopback address.
+After authorization, serve the matching file or redirect to a short provider URL
+that expires no later than `ticket.ExpiresAt`. Return `Cache-Control: no-store`
+and keep tickets, redirect URLs and provider credentials out of logs. Sellers
+own the storage and bandwidth; Orbit does not store or proxy file bytes. Permanent
+public URLs remain shareable. See the
+[complete Python seller endpoint](../../examples/python/seller-downloads/README.md).
 
-`OrbitException.Error`, `Code` and `RequestId` provide redacted classifications
-and validated references. `orbit.SupportSummary(error)` is serializable metadata
-for support; it contains no credential or account state and grants no access.
-[Run the SDK tests](tests/README.md) when modifying an integration boundary.
+## Customer accounts and backend identity
+
+`RegisterAsync`, `ResendRegistrationAsync`, password recovery and email-change
+methods start flows completed through browser or email proofs. `ClaimLicenceAsync`
+adds an eligible key to a signed-in account. Use `OwnedLicencePage.NextCursor`
+to request more licences. Customer sessions are held only in memory; installed
+activation state uses its separate credential.
+
+`CustomerSessionProof().AuthorizationHeader()` exposes a sensitive Bearer proof
+for your trusted HTTPS backend. Never log, persist or forward it through a
+redirect. Your backend must verify it online at
+`GET /api/client/v1/sessions/current` and then authorize licensed work. See the
+[backend example](../../examples/rust/licensed-backend/README.md).
+
+The SDK returns native result types. Timestamps use `DateTimeOffset`, elapsed
+and offline durations use `TimeSpan`, and `Snapshot.HasFeature` is suitable for
+display logic. Always call `RequireAccessAsync` immediately before protected
+work; `Snapshot()` is informational.
+
+## Access-check performance
+
+Reuse one client per installation. A warm `RequireAccessAsync` checks the
+trusted clock, storage version and feature in local verified state, and contacts
+Orbit only when a refresh is due. On Linux x86-64 with .NET 10 it takes about
+3.5 µs and 200 bytes of allocation, with no network request or storage write.
+
+See [online operations](ONLINE.md) for floating seats, verified update downloads,
+usage reservation and persistent resource allocation.

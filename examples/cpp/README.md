@@ -1,9 +1,11 @@
 # C++ licensing example
 
-Open an installation, activate it on first use, and check `export` access.
-Normal restarts reuse the stored credential without asking for a key.
+This example reads the public `ORBIT_APP_KEY`, opens an installation, asks for a
+licence key only when there is no access, and checks the typed `export`
+entitlement before protected work.
 
-Install the [C++ SDK prerequisites](../../sdk/cpp/README.md), then build:
+Build it from the repository root using the installed C++ prerequisites listed
+in the [SDK README](../../sdk/cpp/README.md):
 
 ```sh
 cmake -S examples/cpp -B build/cpp -DBUILD_TESTING=OFF
@@ -11,13 +13,20 @@ cmake --build build/cpp
 ./build/cpp/orbit-cpp-licensed-export --smoke
 ```
 
-Run with the public values from Orbit's **Integration** page:
+Run against your application by setting `ORBIT_APP_KEY` from Orbit's
+**Integration** page (begin with Test):
 
 ```sh
-./build/cpp/orbit-cpp-licensed-export API_ORIGIN APP_ID ENV_ID ISSUER [STATE_DIRECTORY]
+export ORBIT_APP_KEY='orbit_app_test_…'
+./build/cpp/orbit-cpp-licensed-export
 ```
 
-The optional state directory must be an absolute dedicated path; use a persistent
-volume for containers. The example prompts for the key through stdin only when
-access is unavailable. `--smoke` uses a temporary private installation and makes
-no network request.
+The optional `--smoke` mode opens a temporary installation and makes no network
+request.
+
+For a policy with an `exports` usage limit, run
+`./build/cpp/orbit-cpp-licensed-export --metered-export export_job_000001`.
+The example reserves one unit before printing a report. Reuse that job ID when a
+reply is uncertain; a new ID is a new debit. See the
+[online operations guide](../../sdk/cpp/online.md) for resource tracking, direct
+updates and authoritative backend metering.

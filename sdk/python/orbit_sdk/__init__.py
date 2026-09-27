@@ -1,29 +1,55 @@
-"""Native Python client for the Orbit installed-client protocol."""
+"""Native Python SDK for the Orbit installed-client protocol."""
 
+from .app_key import AppKey
 from .client import (
-    AppConfig,
+    AccessStatus,
+    Account,
     Cancellation,
     Client,
-    Config,
+    DeviceBinding,
+    OwnedLicence,
+    OwnedLicencePage,
     PendingRegistration,
     RegistrationResult,
     SensitiveAuthorization,
+    Snapshot,
+    SessionMetadata,
     StorageMode,
 )
 from .device import installation_id_new, machine_fingerprint, native_fingerprint
-from .errors import OrbitError
+from .downloads import DownloadTicket, DownloadTicketVerifier
+from .errors import FeatureUnavailableError, NotActivatedError, OrbitError
+from .offline import OfflineRequest
+from .online import (Artifact, Release, Update, UpdateTarget, DownloadAuthorization, UsageCounter,
+                     UsageConsumption, ResourceCounter, ResourceAllocation, UsageLimit, ResourceLimit,
+                     LimitReachedError, MutationUncertainError)
+from .download_file import download_file
 
 __all__ = [
-    "AppConfig",
+    "AccessStatus",
+    "Account",
+    "AppKey",
     "Cancellation",
     "Client",
-    "Config",
+    "DeviceBinding",
+    "DownloadTicket",
+    "DownloadTicketVerifier",
+    "FeatureUnavailableError",
+    "NotActivatedError",
     "OrbitError",
+    "OfflineRequest",
+    "OwnedLicence",
+    "OwnedLicencePage",
     "PendingRegistration",
     "RegistrationResult",
     "SensitiveAuthorization",
+    "Snapshot",
+    "SessionMetadata",
     "StorageMode",
     "installation_id_new",
     "machine_fingerprint",
     "native_fingerprint",
+    "Artifact", "Release", "Update", "UpdateTarget", "DownloadAuthorization", "UsageCounter",
+    "UsageConsumption", "ResourceCounter", "ResourceAllocation", "UsageLimit", "ResourceLimit",
+    "LimitReachedError", "MutationUncertainError", "download_file",
 ]

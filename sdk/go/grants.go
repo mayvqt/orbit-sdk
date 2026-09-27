@@ -29,8 +29,8 @@ type grantClaims struct {
 	ActivationID        string          `json:"activation_id"`
 	InstallationID      string          `json:"installation_id"`
 	BindingMode         string          `json:"binding_mode"`
-	Fingerprint         *string         `json:"fingerprint"`
-	FingerprintProvider *string         `json:"fingerprint_provider"`
+	Fingerprint         *string         `json:"fingerprint,omitempty"`
+	FingerprintProvider *string         `json:"fingerprint_provider,omitempty"`
 	PolicyVersion       int32           `json:"policy_version"`
 	Entitlements        map[string]bool `json:"entitlements"`
 	RefreshAfter        int64           `json:"refresh_after"`
@@ -149,6 +149,7 @@ func parseKeys(data []byte) (grantKeys, error) {
 type expectedGrant struct {
 	issuer, application, environment, licence, activation, installation string
 	fingerprint, fingerprintProvider                                    *string
+	allowUnboundFingerprint                                             bool
 	credentialExpiresAt                                                 int64
 	credentialPersistent                                                bool
 	licenceExpiresAt                                                    *int64
@@ -168,6 +169,22 @@ func verifyGrant(token string, keys grantKeys, expected expectedGrant) (*grantCl
 	if err := decodeJSON(payload, &claims); err != nil {
 		return nil, err
 	}
+	claimObject, err := uniqueJSON(payload)
+	if err != nil {
+		return nil, ErrInvalidResponse
+	}
+	claimFields, ok := claimObject.(map[string]any)
+	if !ok {
+		return nil, ErrInvalidResponse
+	}
+	if claims.BindingMode == "none" {
+		if _, present := claimFields["fingerprint"]; present {
+			return nil, ErrInvalidResponse
+		}
+		if _, present := claimFields["fingerprint_provider"]; present {
+			return nil, ErrInvalidResponse
+		}
+	}
 	// The maintained JOSE implementation owns signature verification. Dates and
 	// scope are evaluated below against the suspend-aware verified server clock.
 	verified, err := jwt.ParseWithClaims(token, jwt.MapClaims{}, func(parsed *jwt.Token) (any, error) {
@@ -179,9 +196,13 @@ func verifyGrant(token string, keys grantKeys, expected expectedGrant) (*grantCl
 	if err != nil || verified == nil || !verified.Valid {
 		return nil, ErrInvalidResponse
 	}
-	bound := claims.BindingMode == "none" && claims.Fingerprint == nil && claims.FingerprintProvider == nil && expected.fingerprint == nil && expected.fingerprintProvider == nil
-	if expected.fingerprint != nil && expected.fingerprintProvider != nil {
-		bound = claims.BindingMode == "hwid" && equalString(claims.Fingerprint, expected.fingerprint) && equalString(claims.FingerprintProvider, expected.fingerprintProvider)
+	bound := false
+	switch claims.BindingMode {
+	case "none":
+		bound = claims.Fingerprint == nil && claims.FingerprintProvider == nil &&
+			(expected.fingerprint == nil && expected.fingerprintProvider == nil || expected.allowUnboundFingerprint && expected.fingerprint != nil && expected.fingerprintProvider != nil)
+	case "hwid":
+		bound = expected.fingerprint != nil && expected.fingerprintProvider != nil && equalString(claims.Fingerprint, expected.fingerprint) && equalString(claims.FingerprintProvider, expected.fingerprintProvider)
 	}
 	allowance := int64(300)
 	if claims.OfflineAllowed {

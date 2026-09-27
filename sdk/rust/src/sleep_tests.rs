@@ -16,6 +16,10 @@ fn awake_clock() -> Duration {
     {
         orbit_sdk_native::awake_clock()
     }
+    #[cfg(target_os = "macos")]
+    {
+        orbit_sdk_native::awake_clock()
+    }
     #[cfg(target_os = "linux")]
     {
         let value = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -65,7 +69,7 @@ fn reply(offline: bool) -> String {
 fn assert_expired(snapshot: Snapshot) {
     assert_eq!(snapshot.access, Access::Expired);
     assert!(snapshot.entitlements.is_empty());
-    assert_eq!(snapshot.remaining_offline_seconds, 0);
+    assert_eq!(snapshot.remaining_offline, std::time::Duration::ZERO);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -107,7 +111,8 @@ async fn native_grant_expires_across_suspend() {
     let active_start = awake_clock();
     let elapsed_start = clock::elapsed_clock().unwrap();
     for (offline, client, fixture) in &mut contexts {
-        let operation = client.activate("synthetic licence", "sleep_operation_1234", &cancel);
+        let operation =
+            client.activate_with_cancel("synthetic licence", "sleep_operation_1234", &cancel);
         let serve = async {
             let activation = fixture.next().await;
             assert!(
@@ -130,7 +135,7 @@ async fn native_grant_expires_across_suspend() {
     for (_, client, fixture) in &mut contexts {
         assert_eq!(
             client
-                .require_access("export", &cancel)
+                .require_access_with_cancel("export", &cancel)
                 .await
                 .unwrap()
                 .access,
@@ -164,7 +169,7 @@ async fn native_grant_expires_across_suspend() {
     );
     for (_, client, fixture) in &mut contexts {
         assert_expired(client.snapshot().unwrap());
-        let denied = client.require_access("export", &cancel);
+        let denied = client.require_access_with_cancel("export", &cancel);
         tokio::pin!(denied);
         let mut blocked = 0;
         let result = loop {

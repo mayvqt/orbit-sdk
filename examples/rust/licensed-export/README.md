@@ -1,30 +1,36 @@
 # Rust licensed export example
 
-A small console application that remembers activation across restarts and checks the
-`export` entitlement before creating a synthetic report.
+This console app remembers activation, checks the `export` entitlement before each
+synthetic report, and asks for a key only when activation is missing.
 
-Use Rust/Cargo 1.98.1 or newer. From this repository's root:
+From the repository root, set the public app key from your dashboard's
+**Integration** page and run:
 
 ```sh
-cargo run -p orbit-licensed-export -- \
-  https://orbit.example.com APP_ID ENVIRONMENT_ID https://orbit.example.com
+export ORBIT_APP_KEY='orbit_app_test_…'
+cargo run -p orbit-licensed-export
 ```
 
-Copy the four public values from **Integration** in your dashboard. The policy must
-include `export`. The example checks existing access first, then asks for a key only
-when activation is unavailable. Purchase keys are entered locally, never passed on the
-command line. Try `export`, `status`, then `quit`; launch again to reuse the activation.
+The policy must include `export`. Type the licence key at the prompt, then try
+`export`, `status`, and `quit`. Launch again to reuse the activation. Purchase keys are
+entered locally and never passed on the command line or saved by the SDK.
 
-The SDK owns refresh scheduling and installation identity. State uses the OS user state
-directory by default. Add an absolute dedicated directory as the final argument for a
-service or persistent container volume. Only one process can open that directory;
-share a client within your application. `quit` closes the client without releasing its
-device slot. An eligible original offline grant can cover a recognized outage after
-an online recovery attempt. Security failures and strict-online licences fail closed.
+The client owns refresh scheduling and uses the OS state directory by default. An
+eligible offline grant can cover a recognized outage after online recovery is tried;
+strict-online licences and security failures fail closed. Configure a dedicated state
+directory through `Client::open_with_options` when hosting a service or persistent
+container volume.
 
-For an isolated local Orbit fixture, build with `--features local-development` and use
-an HTTP literal loopback address. HTTPS certificate checks remain enabled otherwise.
+See the [SDK guide](../../../sdk/rust/README.md) and [advanced APIs](../../../sdk/rust/advanced.md).
+For long-disconnected installations, those guides also cover trusted offline keys,
+installation requests and importing seller-issued `.orbit` files.
 
-See the [SDK guide](../../../sdk/rust/README.md) for integration and the
-[account APIs](../../../sdk/rust/advanced.md#customer-accounts) for optional customer
-registration and username/password sign-in.
+Use `idle` and `resume` for explicit floating-seat release and acquisition.
+`updates` checks stable releases for the current target; `download` prompts for a
+new destination, verifies at most 128 MiB and never runs an installer. The example
+uses installed release number `0`; embed your actual release number in your app.
+
+`metered-export` requires an `exports` usage limit and asks for a stable job ID.
+Reuse that ID after an uncertain response. Quota is reserved before the synthetic
+export; later business failure does not refund it. Gate authoritative metering and
+actual work on your trusted backend.

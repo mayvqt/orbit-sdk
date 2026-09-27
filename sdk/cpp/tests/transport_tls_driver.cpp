@@ -1,5 +1,8 @@
 #include "error.hpp"
 #include "transport.hpp"
+#include "online.hpp"
+#include <filesystem>
+#include <fstream>
 
 #include <chrono>
 #include <functional>
@@ -52,25 +55,113 @@ void expect_route_rejections(std::string_view origin) {
     }
 }
 
-void run(std::string_view scenario, std::string_view origin,
-         std::string_view ca_file) {
+void test_downloads(std::string_view origin, std::string_view ca_file) {
+    using namespace orbit;
+    const auto directory = std::filesystem::temp_directory_path() / ("orbit-stream-" + new_installation_id());
+    std::filesystem::create_directory(directory);
+    const auto path = (directory / "artifact.bin").string();
+    const std::atomic_bool ready{false};
+    auto authorization = [&](std::string_view route, bool protect = false) {
+        DownloadAuthorization result;
+        result.artifact = {"artifact",
+                           "release",
+                           {"linux", "x64"},
+                           "ignored.bin",
+                           3,
+                           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                           protect ? DeliveryMode::protected_endpoint : DeliveryMode::public_url,
+                           std::string(origin) + std::string(route),
+                           std::nullopt};
+        if (protect) {
+            result.ticket = "e30.e30.c2ln";
+            result.expires_at =
+                std::chrono::time_point_cast<std::chrono::seconds>(std::chrono::system_clock::now()) +
+                std::chrono::seconds(120);
+        }
+        return result;
+    };
+    auto read = [&] {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    auto intact = [&] {
+        require(read() == "abc", "failed download changed existing destination");
+        require(std::distance(std::filesystem::directory_iterator(directory),
+                              std::filesystem::directory_iterator{}) == 1,
+                "download left a temporary file");
+    };
+    auto failure = [&](std::string_view route) {
+        try {
+            detail::download_stream(authorization(route), path, 3, true, ready, ca_file);
+        } catch (const Error &) {
+            intact();
+            return;
+        }
+        throw std::runtime_error("invalid download was accepted");
+    };
+    try {
+        expect_error(
+            [&] { detail::download_stream(authorization("/download/bytes"), path, 3, false, ready); },
+            ErrorKind::transport_security);
+        require(!std::filesystem::exists(path), "untrusted TLS exposed an artifact");
+        detail::download_stream(authorization("/download/redirect/5", true), path, 3, false, ready, ca_file);
+        intact();
+        expect_error(
+            [&] {
+                detail::download_stream(authorization("/download/bytes"), path, 3, false, ready, ca_file);
+            },
+            ErrorKind::storage);
+        for (const auto route :
+             {"/download/redirect/6", "/download/downgrade", "/download/encoded", "/download/length",
+              "/download/oversize", "/download/short", "/download/wrong"})
+            failure(route);
+        std::atomic_bool cancelled{false};
+        std::thread cancel([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            cancelled = true;
+        });
+        try {
+            expect_error(
+                [&] {
+                    detail::download_stream(authorization("/download/slow"), path, 3, true, cancelled,
+                                            ca_file);
+                },
+                ErrorKind::cancelled);
+        } catch (...) {
+            cancel.join();
+            throw;
+        }
+        cancel.join();
+        intact();
+        detail::download_stream(authorization("/download/chunked"), path, 3, true, ready, ca_file);
+        intact();
+    } catch (...) {
+        std::filesystem::remove_all(directory);
+        throw;
+    }
+    std::filesystem::remove_all(directory);
+}
+
+void run(std::string_view scenario, std::string_view origin, std::string_view ca_file) {
     const std::atomic_bool not_cancelled{false};
+    if (scenario == "downloads") {
+        test_downloads(origin, ca_file);
+        return;
+    }
     if (scenario == "routes") {
         expect_route_rejections(origin);
         return;
     }
     if (scenario == "refused") {
         const Transport transport(origin);
-        expect_error([&] {
-            (void)transport.get("/api/client/v1/status", not_cancelled);
-        }, ErrorKind::transient);
+        expect_error([&] { (void)transport.get("/api/client/v1/status", not_cancelled); },
+                     ErrorKind::transient);
         return;
     }
     if (scenario == "untrusted") {
         const Transport transport(origin);
-        expect_error([&] {
-            (void)transport.get("/api/client/v1/status/success", not_cancelled);
-        }, ErrorKind::transport_security);
+        expect_error([&] { (void)transport.get("/api/client/v1/status/success", not_cancelled); },
+                     ErrorKind::transport_security);
         return;
     }
 
@@ -184,6 +275,9 @@ int main(int argc, char** argv) {
         require(argc == 4, "expected scenario, origin, and test CA path");
         run(argv[1], argv[2], argv[3]);
         return 0;
+    } catch (const orbit::Error& error) {
+        std::cerr << "transport_tls_driver: kind=" << static_cast<int>(error.kind()) << " code=" << error.code() << '\n';
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "transport_tls_driver: " << error.what() << '\n';
         return 1;

@@ -47,15 +47,26 @@ struct GrantExpected {
     std::optional<std::int64_t> credential_expires_at;
     std::optional<std::int64_t> licence_expires_at;
     std::int64_t now = 0;
+    bool allow_unbound_fingerprint = false;
+    std::optional<std::string_view> expected_binding_mode;
 };
 
 class GrantKeys {
 public:
     static GrantKeys parse(const Json::Value& jwks);
     bool contains(std::string_view token) const;
+    bool contains_session(std::string_view token) const;
     std::size_t size() const noexcept { return keys_.size(); }
     Json::Value jwks_for(std::string_view token) const;
     GrantClaims verify(std::string_view token, const GrantExpected& expected) const;
+
+    struct SignedOfflinePayload { std::string key_id; Json::Value claims; };
+    // Signature/purpose validation only. OfflineKeys owns the full offline
+    // claim, binding, lifetime and renewal-sequence checks.
+    SignedOfflinePayload verify_offline_signature(std::string_view token) const;
+    // Signature/purpose validation only. DownloadTicketVerifier checks claims.
+    Json::Value verify_download_signature(std::string_view token) const;
+    Json::Value verify_session_signature(std::string_view token) const;
 
 private:
     std::map<std::string, std::shared_ptr<EVP_PKEY>> keys_;

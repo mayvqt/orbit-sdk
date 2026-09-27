@@ -52,17 +52,27 @@ public sealed class Transport : IDisposable
     /// <summary>Available only in an explicit local development build; accepts literal loopback addresses.</summary>
     public static Transport LocalLoopback(string origin)
     {
+        _ = ValidateOrigin(origin, allowLoopbackHttp: true);
         var uri = ParseOrigin(origin, "http");
-        var authority = origin[(origin.IndexOf("://", StringComparison.Ordinal) + 3)..].TrimEnd('/');
-        var host = authority.StartsWith('[') ? authority[1..authority.IndexOf(']')] : authority.Split(':')[0];
-        if (!IPAddress.TryParse(host, out var address) || !IPAddress.IsLoopback(address) ||
-            (address.AddressFamily == AddressFamily.InterNetwork &&
-             (host.Split('.').Length != 4 || host.Split('.').Any(part => part.Length == 0 ||
-                 !part.All(char.IsAsciiDigit) || (part.Length > 1 && part[0] == '0')))))
-            throw new OrbitException(OrbitError.Configuration);
         return new Transport(uri, true);
     }
 #endif
+
+    internal static string ValidateOrigin(string value, bool allowLoopbackHttp = false)
+    {
+        var uri = ParseOrigin(value, allowLoopbackHttp ? "http" : "https");
+        if (allowLoopbackHttp)
+        {
+            var authority = value[(value.IndexOf("://", StringComparison.Ordinal) + 3)..].TrimEnd('/');
+            var host = authority.StartsWith('[') ? authority[1..authority.IndexOf(']')] : authority.Split(':')[0];
+            if (!IPAddress.TryParse(host, out var address) || !IPAddress.IsLoopback(address) ||
+                (address.AddressFamily == AddressFamily.InterNetwork &&
+                 (host.Split('.').Length != 4 || host.Split('.').Any(part => part.Length == 0 ||
+                     !part.All(char.IsAsciiDigit) || (part.Length > 1 && part[0] == '0')))))
+                throw new OrbitException(OrbitError.Configuration);
+        }
+        return uri.GetLeftPart(UriPartial.Authority);
+    }
 
     private static Uri ParseOrigin(string value, string scheme)
     {
@@ -111,7 +121,7 @@ public sealed class Transport : IDisposable
     internal Task<JsonElement?> DeleteAsync(string path, string bearer, CancellationToken cancellationToken) =>
         RequestAsync(HttpMethod.Delete, path, null, bearer, false, cancellationToken);
 
-    internal Task<JsonElement?> PostAsync(string path, Dictionary<string, object?> body, bool retrySafe, CancellationToken cancellationToken)
+    internal Task<JsonElement?> PostAsync(string path, Dictionary<string, object?> body, bool retrySafe, CancellationToken cancellationToken, int? expectedStatus = null)
     {
         OrbitException.CheckCancellation(cancellationToken);
         byte[] bytes;
@@ -122,13 +132,13 @@ public sealed class Transport : IDisposable
             bytes = stream.ToArray();
         }
         catch (JsonException) { throw new OrbitException(OrbitError.Configuration); }
-        return RequestAsync(HttpMethod.Post, path, bytes, null, retrySafe, cancellationToken);
+        return RequestAsync(HttpMethod.Post, path, bytes, null, retrySafe, cancellationToken, expectedStatus);
     }
 
-    private async Task<JsonElement?> RequestAsync(HttpMethod method, string path, byte[]? body, string? bearer, bool retrySafe, CancellationToken cancellationToken)
+    private async Task<JsonElement?> RequestAsync(HttpMethod method, string path, byte[]? body, string? bearer, bool retrySafe, CancellationToken cancellationToken, int? expectedStatus = null)
     {
         if (InstallationCancellation is not { } lifetime)
-            return await RequestCoreAsync(method, path, body, bearer, retrySafe, cancellationToken).ConfigureAwait(false);
+            return await RequestCoreAsync(method, path, body, bearer, retrySafe, cancellationToken, expectedStatus).ConfigureAwait(false);
         lock (installedGate)
         {
             if (installedClosed)
@@ -139,13 +149,13 @@ public sealed class Transport : IDisposable
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime);
-            return await RequestCoreAsync(method, path, body, bearer, retrySafe, linked.Token).ConfigureAwait(false);
+            return await RequestCoreAsync(method, path, body, bearer, retrySafe, linked.Token, expectedStatus).ConfigureAwait(false);
         }
         finally { lock (installedGate) { if (--installedRequests == 0) installedIdle.TrySetResult(); } }
     }
 
     private async Task<JsonElement?> RequestCoreAsync(HttpMethod method, string path, byte[]? body, string? bearer,
-        bool retrySafe, CancellationToken cancellationToken)
+        bool retrySafe, CancellationToken cancellationToken, int? expectedStatus)
     {
         OrbitException.CheckCancellation(cancellationToken);
         var endpoint = Endpoint(path);
@@ -162,7 +172,7 @@ public sealed class Transport : IDisposable
             {
                 try
                 {
-                    var result = await AttemptAsync(method, endpoint, body, bearer, operation.Token).ConfigureAwait(false);
+                    var result = await AttemptAsync(method, endpoint, body, bearer, operation.Token, expectedStatus).ConfigureAwait(false);
                     OrbitException.CheckCancellation(cancellationToken);
                     return result;
                 }
@@ -195,7 +205,7 @@ public sealed class Transport : IDisposable
     }
 
     private async Task<JsonElement?> AttemptAsync(HttpMethod method, Uri endpoint, byte[]? body, string? bearer,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, int? expectedStatus)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(TimeSpan.FromSeconds(10));
@@ -221,6 +231,7 @@ public sealed class Transport : IDisposable
                 buffer.Write(chunk, 0, count);
             }
             var bytes = buffer.ToArray();
+            if (response.IsSuccessStatusCode && expectedStatus != null && (int)response.StatusCode != expectedStatus) throw JsonWire.Invalid();
             if (response.StatusCode == HttpStatusCode.NoContent)
                 return bytes.Length == 0 ? null : throw JsonWire.Invalid();
             var status = (int)response.StatusCode;
@@ -246,7 +257,8 @@ public sealed class Transport : IDisposable
                         ? TimeSpan.FromSeconds(seconds) : TimeSpan.FromSeconds(30);
             }
             var transient = status == 429 && code == "rate_limited" || status == 503 && code == "service_unavailable";
-            throw new AttemptFailure(new OrbitException(transient ? OrbitError.Transient : OrbitError.Denied, code, requestId), retryAfter);
+            throw new AttemptFailure(new OrbitException(transient ? OrbitError.Transient : OrbitError.Denied, code, requestId)
+            { WireError = envelope, HttpStatus = status }, retryAfter);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         { throw new AttemptFailure(new OrbitException(OrbitError.Transient)); }
