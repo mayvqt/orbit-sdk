@@ -45,22 +45,31 @@ type Snapshot struct {
 	OfflineFileMode          bool
 	RemainingOffline         time.Duration
 	StorageCapability        StorageCapability
+	Session                  *SessionMetadata
 }
 
 // HasFeature reports whether the snapshot's current access includes feature.
 func (s Snapshot) HasFeature(feature string) bool { return s.Entitlements[feature] }
 
 type accessState struct {
-	generation     uint64
-	storageVersion uint64
-	account        *accountSession
-	credential     *StoredCredential
-	claims         *grantClaims
-	anchor         *timeAnchor
-	transient      bool
-	nextRetry      int64
-	retryAt        time.Time // Monotonic pacing only; never grants access.
-	offline        *offlineRuntime
+	generation              uint64
+	storageVersion          uint64
+	account                 *accountSession
+	credential              *StoredCredential
+	claims                  *grantClaims
+	anchor                  *timeAnchor
+	transient               bool
+	nextRetry               int64
+	retryAt                 time.Time // Monotonic pacing only; never grants access.
+	offline                 *offlineRuntime
+	sessionRequired         bool
+	sessionPolicyKnown      bool
+	sessionDisabled         bool
+	session                 *sessionRuntime
+	pendingSessionID        string
+	pendingSessionSince     time.Time
+	sessionRetryAt          time.Time
+	sessionLicenceExpiresAt *int64
 }
 
 // Client is safe for concurrent use. Create a separate context for each selected
@@ -79,6 +88,7 @@ type Client struct {
 	closed            bool
 	keys              grantKeys // Accessed only while holding the serial operation gate.
 	offlineKeys       grantKeys
+	sessionKeys       sessionVerifierKeys
 }
 
 func (*Client) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte("[Orbit client]")) }
@@ -142,13 +152,20 @@ func clearAccess(state *accessState) {
 	state.transient = false
 	state.nextRetry = 0
 	state.retryAt = time.Time{}
+	state.sessionRequired = false
+	state.sessionPolicyKnown = false
+	state.sessionDisabled = false
+	state.session = nil
+	state.pendingSessionID = ""
+	state.sessionRetryAt = time.Time{}
+	state.sessionLicenceExpiresAt = nil
 	if state.offline != nil {
 		state.offline.authorized = false
 	}
 }
 func clearState(state *accessState) { clearAccess(state); state.account = nil }
 func (c *Client) syncStorageLocked() error {
-	if c.closed {
+	if c.closed || c.lifecycle != nil && c.lifecycle.context.Err() != nil {
 		return ErrCancelled
 	}
 	version, err := c.storage.Version()
@@ -231,6 +248,9 @@ func (c *Client) checkedSnapshotLocked() (Snapshot, error) {
 		offline.uncertain = false
 		return c.offlineSnapshotLocked(offline, now, true), nil
 	}
+	if c.state.sessionRequired {
+		return c.sessionSnapshotLocked(), nil
+	}
 	if c.state.anchor != nil {
 		now, err := c.state.anchor.now()
 		if err != nil {
@@ -262,6 +282,9 @@ func (c *Client) snapshotLocked() Snapshot {
 		}
 		offline.uncertain = false
 		return c.offlineSnapshotLocked(offline, now, true)
+	}
+	if c.state.sessionRequired {
+		return c.sessionSnapshotLocked()
 	}
 	if c.state.anchor == nil {
 		return c.snapshotLockedAt(0, false)
@@ -336,15 +359,29 @@ func (c *Client) snapshotLockedAt(now int64, clockValid bool) Snapshot {
 	return snapshot
 }
 
-// Logout clears local access and customer session immediately. It neither
-// revokes the remote session nor releases the occupied device slot.
+// Logout clears local access and customer session immediately and best-effort
+// releases any floating seat. It never deactivates the installation.
 func (c *Client) Logout() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.syncStorageLocked(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	release, id := cloneCredential(c.state.credential), ""
+	if c.state.session != nil {
+		id = c.state.session.metadata.id
+	} else {
+		id = c.state.pendingSessionID
+	}
 	checkpointErr := c.checkpointOfflineLocked(true)
 	clearState(&c.state)
 	if err := c.invalidateLocked(); err != nil {
+		c.mu.Unlock()
 		return err
+	}
+	c.mu.Unlock()
+	if release != nil && id != "" {
+		c.bestEffortEnd(release, id)
 	}
 	return checkpointErr
 }
@@ -450,7 +487,7 @@ func (c *Client) activate(ctx context.Context, key, licence, previousCredential,
 	if budget.Err() != nil && ctx.Err() == nil {
 		responseError = ErrTransient
 	}
-	return c.accept(ctx, budget, response, responseError, generation, nil, licence, started)
+	return c.acceptAndAcquire(ctx, budget, response, responseError, generation, nil, licence, started)
 }
 
 // Refresh validates the existing credential without extending its fixed expiry.
@@ -459,6 +496,14 @@ func (c *Client) Refresh(ctx context.Context) (Snapshot, error) {
 }
 
 func (c *Client) refresh(ctx context.Context, respectRetry bool) (Snapshot, error) {
+	return c.refreshMode(ctx, respectRetry, true)
+}
+
+func (c *Client) refreshWithoutSessionAcquire(ctx context.Context) (Snapshot, error) {
+	return c.refreshMode(ctx, false, false)
+}
+
+func (c *Client) refreshMode(ctx context.Context, respectRetry, acquireSession bool) (Snapshot, error) {
 	ctx, stop := c.operationContext(ctx)
 	defer stop()
 	generation, err := c.generation()
@@ -505,6 +550,9 @@ func (c *Client) refresh(ctx context.Context, respectRetry bool) (Snapshot, erro
 	response, responseError := c.transport.Post(budget, clientPrefix+"activations/"+saved.ActivationID+"/validate", c.credentialBody(saved), true)
 	if budget.Err() != nil && ctx.Err() == nil {
 		responseError = ErrTransient
+	}
+	if acquireSession {
+		return c.acceptAndAcquire(ctx, budget, response, responseError, generation, saved, "", started)
 	}
 	return c.accept(ctx, budget, response, responseError, generation, saved, "", started)
 }
@@ -584,10 +632,20 @@ func (c *Client) EnsureAccess(ctx context.Context, feature string, askForKey fun
 	if strings.TrimSpace(key) == "" {
 		return Snapshot{}, ErrNotActivated
 	}
-	if _, err := c.Activate(ctx, key); err != nil {
+	snapshot, err = c.Activate(ctx, key)
+	if err != nil {
 		return Snapshot{}, err
 	}
-	return c.RequireAccess(ctx, feature)
+	if ctx.Err() != nil {
+		return Snapshot{}, ErrCancelled
+	}
+	if snapshot.Access != AccessOnline && snapshot.Access != AccessOffline {
+		return Snapshot{}, ErrNotActivated
+	}
+	if !snapshot.HasFeature(feature) {
+		return Snapshot{}, ErrFeatureUnavailable
+	}
+	return snapshot, nil
 }
 
 // RequireAccess refreshes when needed, rechecks invalidation and expiry, and
@@ -621,6 +679,46 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 		}
 		c.mu.Unlock()
 		return snapshot, nil
+	}
+	if c.state.sessionRequired {
+		if snapshot.Access == AccessOnline {
+			if !snapshot.HasFeature(feature) {
+				c.mu.Unlock()
+				return Snapshot{}, ErrFeatureUnavailable
+			}
+			final, finalErr := c.checkedSnapshotLocked()
+			if finalErr != nil {
+				c.mu.Unlock()
+				return Snapshot{}, finalErr
+			}
+			if ctx.Err() != nil {
+				c.mu.Unlock()
+				return Snapshot{}, ErrCancelled
+			}
+			if final.Access != AccessOnline {
+				c.mu.Unlock()
+				return Snapshot{}, ErrSessionRequired
+			}
+			if !final.HasFeature(feature) {
+				c.mu.Unlock()
+				return Snapshot{}, ErrFeatureUnavailable
+			}
+			c.mu.Unlock()
+			return final, nil
+		}
+		if c.state.sessionDisabled {
+			c.mu.Unlock()
+			return Snapshot{}, ErrSessionRequired
+		}
+		c.mu.Unlock()
+		session, err := c.StartSession(ctx)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		if !session.HasFeature(feature) {
+			return Snapshot{}, ErrFeatureUnavailable
+		}
+		return session, nil
 	}
 	if snapshot.Access == AccessOnline {
 		if !snapshot.HasFeature(feature) {
@@ -669,6 +767,20 @@ func (c *Client) RequireAccess(ctx context.Context, feature string) (Snapshot, e
 	return snapshot, nil
 }
 
+func (c *Client) acceptAndAcquire(ctx, budget context.Context, response json.RawMessage, responseError error, generation uint64, previous *StoredCredential, licence string, started requestStart) (Snapshot, error) {
+	snapshot, err := c.accept(ctx, budget, response, responseError, generation, previous, licence, started)
+	if err != nil {
+		return snapshot, err
+	}
+	c.mu.Lock()
+	required, disabled, currentGeneration := c.state.sessionRequired, c.state.sessionDisabled, c.state.generation
+	c.mu.Unlock()
+	if required && !disabled {
+		return c.startSessionSerialized(ctx, currentGeneration, false)
+	}
+	return snapshot, nil
+}
+
 func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, responseError error, generation uint64, previous *StoredCredential, licence string, started requestStart) (Snapshot, error) {
 	if err := c.checkGeneration(generation); err != nil {
 		return Snapshot{}, err
@@ -676,10 +788,25 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 	var saved *StoredCredential
 	var claims *grantClaims
 	var anchor *timeAnchor
+	floating := false
 	err := responseError
 	verifying := err == nil
 	if err == nil {
-		saved, claims, anchor, err = c.verifyReply(budget, response, previous, licence, started)
+		saved, claims, anchor, floating, err = c.verifyReply(budget, response, previous, licence, started)
+	}
+	var sessionLicenceExpiry *int64
+	if err == nil && floating {
+		var reply grantReply
+		if decodeJSON(response, &reply) != nil {
+			err = ErrInvalidResponse
+		} else if reply.LicenceExpiresAt != nil {
+			value, parseErr := timestamp(*reply.LicenceExpiresAt)
+			if parseErr != nil || value > 253402300799 {
+				err = ErrInvalidResponse
+			} else {
+				sessionLicenceExpiry = &value
+			}
+		}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -701,7 +828,11 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 		} else {
 			var saveErr error
 			if c.installed != nil {
-				saveErr = c.installed.commit(c.state.storageVersion, saved, response, c.keys, anchor)
+				if floating {
+					saveErr = c.installed.commitCredential(c.state.storageVersion, saved)
+				} else {
+					saveErr = c.installed.commit(c.state.storageVersion, saved, response, c.keys, anchor)
+				}
 			} else {
 				saveErr = c.storage.Save(c.state.storageVersion, *saved)
 			}
@@ -715,6 +846,20 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 			c.state.credential = cloneCredential(saved)
 			c.state.claims = claims
 			c.state.anchor = anchor
+			preserveSession := floating && previous != nil && c.state.sessionRequired &&
+				previous.ActivationID == saved.ActivationID && previous.LicenceID == saved.LicenceID &&
+				previous.InstallationID == saved.InstallationID
+			c.state.sessionRequired = floating
+			c.state.sessionPolicyKnown = true
+			if !preserveSession {
+				c.state.session = nil
+				c.state.pendingSessionID = ""
+				c.state.sessionRetryAt = time.Time{}
+			}
+			c.state.sessionLicenceExpiresAt = sessionLicenceExpiry
+			if !floating {
+				c.state.sessionDisabled = false
+			}
 			c.state.transient = false
 			if c.lifecycle != nil {
 				c.lifecycle.restoring = false
@@ -795,54 +940,79 @@ type grantReply struct {
 	FingerprintProvider *string `json:"fingerprint_provider"`
 	LicenceExpiresAt    *string `json:"licence_expires_at"`
 	SecretReplayExpired bool    `json:"secret_replay_expired"`
+	LicenceID           *string `json:"licence_id,omitempty"`
+	SessionRequired     *bool   `json:"session_required,omitempty"`
 }
 
-func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous *StoredCredential, licence string, started requestStart) (*StoredCredential, *grantClaims, *timeAnchor, error) {
+func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous *StoredCredential, licence string, started requestStart) (*StoredCredential, *grantClaims, *timeAnchor, bool, error) {
 	var reply grantReply
 	var fields map[string]json.RawMessage
 	if decodeJSON(data, &reply) != nil || json.Unmarshal(data, &fields) != nil || fields["credential_expires_at"] == nil {
-		return nil, nil, nil, ErrInvalidResponse
+		return nil, nil, nil, false, ErrInvalidResponse
 	}
 	if reply.SecretReplayExpired {
-		return nil, nil, nil, ErrReauthenticationRequired
+		return nil, nil, nil, false, ErrReauthenticationRequired
 	}
-	if !opaque(reply.ActivationID) || reply.InstallationID != c.device.InstallationID || !equalString(reply.FingerprintProvider, c.device.FingerprintProvider) || (reply.BindingMode != "none" && reply.BindingMode != "hwid") || reply.BindingMode == "hwid" && c.device.Fingerprint == nil || reply.Grant == nil {
-		return nil, nil, nil, ErrInvalidResponse
+	if !opaque(reply.ActivationID) || reply.InstallationID != c.device.InstallationID || !equalString(reply.FingerprintProvider, c.device.FingerprintProvider) || (reply.BindingMode != "none" && reply.BindingMode != "hwid") || reply.BindingMode == "hwid" && c.device.Fingerprint == nil {
+		return nil, nil, nil, false, ErrInvalidResponse
+	}
+	floating := false
+	if raw, present := fields["session_required"]; present {
+		if json.Unmarshal(raw, &floating) != nil || !floating || reply.LicenceID == nil || !opaque(*reply.LicenceID) || reply.Grant != nil || string(fields["grant"]) != "null" {
+			return nil, nil, nil, false, ErrInvalidResponse
+		}
+	} else if reply.LicenceID != nil || reply.Grant == nil || fields["licence_id"] != nil {
+		return nil, nil, nil, false, ErrInvalidResponse
+	}
+	if floating && ((licence != "" && *reply.LicenceID != licence) || (previous != nil && *reply.LicenceID != previous.LicenceID)) {
+		return nil, nil, nil, false, ErrInvalidResponse
 	}
 	server, err := timestamp(reply.ServerTime)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	anchor := &timeAnchor{server: server, requestStart: started}
 	now, err := anchor.now()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	expiry := int64(0)
 	if reply.CredentialExpiresAt != nil {
 		expiry, err = timestamp(*reply.CredentialExpiresAt)
 		if err != nil || expiry <= now || expiry > saturatingAdd(now, 30*86400) {
-			return nil, nil, nil, ErrInvalidResponse
+			return nil, nil, nil, false, ErrInvalidResponse
 		}
 	}
 	if previous == nil && ((c.installed != nil && expiry != 0) || (c.installed == nil && expiry == 0)) {
-		return nil, nil, nil, ErrInvalidResponse
+		return nil, nil, nil, false, ErrInvalidResponse
 	}
 	if previous != nil && (reply.ActivationID != previous.ActivationID || expiry != previous.CredentialExpiresAt || reply.Credential != nil) {
-		return nil, nil, nil, ErrInvalidResponse
+		return nil, nil, nil, false, ErrInvalidResponse
+	}
+	if floating {
+		credential := ""
+		if reply.Credential != nil {
+			credential = *reply.Credential
+		} else if previous != nil {
+			credential = previous.Credential
+		}
+		if !bearer(credential) {
+			return nil, nil, nil, false, ErrInvalidResponse
+		}
+		return &StoredCredential{ApplicationID: c.key.applicationID, EnvironmentID: c.key.environmentID, ActivationID: reply.ActivationID, LicenceID: *reply.LicenceID, InstallationID: c.device.InstallationID, Credential: credential, CredentialExpiresAt: expiry, Fingerprint: cloneString(c.device.Fingerprint), FingerprintProvider: cloneString(c.device.FingerprintProvider)}, nil, nil, true, nil
 	}
 	header, _, err := parseHeader(*reply.Grant)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	if _, known := c.keys[header.KeyID]; !known {
 		data, err := c.transport.Get(ctx, c.accountPath(jwksPath, ""))
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		keys, err := parseKeys(data)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		c.keys = keys
 	}
@@ -850,23 +1020,23 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 	if reply.LicenceExpiresAt != nil {
 		value, err := timestamp(*reply.LicenceExpiresAt)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		licenceExpiry = &value
 	}
 	now, err = anchor.now()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	if licence == "" && previous != nil {
 		licence = previous.LicenceID
 	}
 	claims, err := verifyGrant(*reply.Grant, c.keys, expectedGrant{issuer: c.key.issuer, application: c.key.applicationID, environment: c.key.environmentID, licence: licence, activation: reply.ActivationID, installation: c.device.InstallationID, fingerprint: c.device.Fingerprint, fingerprintProvider: c.device.FingerprintProvider, allowUnboundFingerprint: true, credentialExpiresAt: expiry, credentialPersistent: expiry == 0, licenceExpiresAt: licenceExpiry, now: now})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	if claims.BindingMode != reply.BindingMode {
-		return nil, nil, nil, ErrInvalidResponse
+		return nil, nil, nil, false, ErrInvalidResponse
 	}
 	credential := ""
 	if reply.Credential != nil {
@@ -875,10 +1045,10 @@ func (c *Client) verifyReply(ctx context.Context, data json.RawMessage, previous
 		credential = previous.Credential
 	}
 	if !bearer(credential) {
-		return nil, nil, nil, ErrInvalidResponse
+		return nil, nil, nil, false, ErrInvalidResponse
 	}
 	saved := &StoredCredential{ApplicationID: c.key.applicationID, EnvironmentID: c.key.environmentID, ActivationID: reply.ActivationID, LicenceID: claims.Subject, InstallationID: c.device.InstallationID, Credential: credential, CredentialExpiresAt: expiry, Fingerprint: cloneString(c.device.Fingerprint), FingerprintProvider: cloneString(c.device.FingerprintProvider)}
-	return saved, claims, anchor, nil
+	return saved, claims, anchor, false, nil
 }
 func bearer(value string) bool { return len(value) == 43 && asciiToken(value) }
 func validOperationID(value string) bool {

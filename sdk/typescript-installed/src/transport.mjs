@@ -2,7 +2,8 @@ import https from "node:https";
 import { lookup as dnsLookup } from "node:dns";
 import { randomInt } from "node:crypto";
 import { validateOrigin } from "./app-key.mjs";
-import { fail, ErrorKind } from "./errors.mjs";
+import { fail, ErrorKind, LimitReachedError } from "./errors.mjs";
+import { parseCapacity } from "./online.mjs";
 import { uniqueJson, isText } from "./json.mjs";
 
 const PREFIX = "/api/client/v1/";
@@ -154,6 +155,10 @@ export class HttpTransport {
         response.on("end", () => {
           const bytes = Buffer.concat(chunks, received);
           const status = response.statusCode ?? 0;
+          const onlineRoute = /^\/api\/client\/v1\/activations\/[A-Za-z0-9_-]+\/(?:updates|downloads\/authorize|usage\/[a-z][a-z0-9_]*(?:\/consume)?|resources\/[a-z][a-z0-9_]*(?:\/acquire|\/allocations\/[A-Za-z0-9_-]+\/release)?)$/.test(target);
+          if (onlineRoute && status >= 200 && status < 300 && status !== 200) {
+            finish(fail(ErrorKind.INVALID_RESPONSE, "unexpected_status")); return;
+          }
           if (status === 204) {
             finish(bytes.length ? fail(ErrorKind.INVALID_RESPONSE, "invalid_response") : null, null);
             return;
@@ -176,6 +181,13 @@ export class HttpTransport {
             if (typeof item.code !== "string" || !/^[a-z0-9_]{1,128}$/.test(item.code) ||
                 typeof item.message !== "string" || !item.message || typeof item.request_id !== "string" ||
                 !/^[A-Za-z0-9_-]{1,64}$/.test(item.request_id)) throw fail(ErrorKind.INVALID_RESPONSE, "invalid_error_response");
+            if (["usage_limit_reached", "resource_limit_reached"].includes(item.code)) {
+              try {
+                if (status !== 409) throw new TypeError();
+                const details = parseCapacity(item, target, uniqueJson(body));
+                finish(new LimitReachedError(item.code, item.request_id, details)); return;
+              } catch { throw fail(ErrorKind.INVALID_RESPONSE, "invalid_online_response"); }
+            }
             if ((status === 429 && item.code === "rate_limited") || (status === 503 && item.code === "service_unavailable")) {
               const retryAfter = parseRetryAfter(response.headers["retry-after"]);
               finish(fail(ErrorKind.TRANSIENT, item.code, item.request_id, status), undefined, retryAfter);

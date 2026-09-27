@@ -40,6 +40,7 @@ class SessionGrant:
     licence_id: str
     activation_id: str
     installation_id: str
+    binding_mode: str
     token_id: str
     issued_at: int
     expires_at: int
@@ -55,6 +56,16 @@ class SessionGrant:
 class SessionKeys:
     def __init__(self, keys: Keys) -> None:
         self._keys = keys
+
+    def contains(self, token: str) -> bool:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return False
+            header = fields(unique_json(_canonical_b64(parts[0])), {"alg": str, "typ": str, "kid": str}, exact=True)
+            return header["alg"] == "ES256" and header["typ"] == "orbit-session+jwt" and header["kid"] in self._keys._entries
+        except (OrbitError, ValueError, TypeError):
+            return False
 
     @classmethod
     def parse(cls, value: Any, environment: str) -> SessionKeys:
@@ -154,6 +165,6 @@ def _verify(token: str, keys: SessionKeys, expected: Expected) -> SessionGrant:
         _invalid()
     return SessionGrant(
         claims["session_id"], claims["session_sequence"], claims["sub"], claims["activation_id"],
-        claims["installation_id"], claims["jti"], issued, expires, refresh, licence_expiry,
+        claims["installation_id"], claims["binding_mode"], claims["jti"], issued, expires, refresh, licence_expiry,
         claims["policy_version"], MappingProxyType(dict(claims["entitlements"])),
     )

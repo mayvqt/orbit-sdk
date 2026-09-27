@@ -162,3 +162,80 @@ users before issuing long-term access. See [offline storage details](ADVANCED.md
 Customer accounts belong to people using your software, separately from your Orbit dashboard account. After a buyer registers and confirms the email link, call `Login`, `OwnedLicences`, and `ActivateAccount`, then use `RequireAccess` before the first protected operation. `EnsureAccess` is for the purchase-key activation flow; it does not perform customer sign-in or licence selection.
 
 Sign-in alone does not grant licensed access. Sessions remain in memory; installed access uses a separate saved credential. See the [console example](../../examples/go/licensed-export/README.md) for registration, recovery, claiming keys and account logout, and [advanced APIs](ADVANCED.md) for explicit storage, custom binding and caller-supplied mutation IDs.
+
+## Floating seats
+
+Floating policies acquire a seat automatically after activation and renew it in
+memory. `RequireAccess` checks the current signed interval locally. The snapshot’s `Session`
+contains read-only session metadata. A seat limit, expired seat or temporary outage
+does not ask for another licence key.
+
+Call `EndSession(ctx)` when your app becomes idle and `StartSession(ctx)` when it
+resumes. Ending clears local access before contacting Orbit and disables automatic
+reacquisition. These calls are local no-ops for a confirmed ordinary licence; an
+unknown policy is checked online first. Offline-file mode stays offline.
+
+`Close` attempts a bounded seat release while keeping the installation credential.
+Restart acquires a fresh seat online. A crash or failed release can occupy the old
+seat until its remaining interval expires, at most 120 seconds. An outage permits
+only the current verified interval; remote revocation can take effect locally at
+that interval's deadline. Session IDs and grants are never restored from disk.
+
+## Licensed updates
+
+```go
+update, err := client.CheckForUpdates(ctx, installedReleaseNumber)
+if err != nil { return err }
+if update != nil {
+    authorization, err := client.AuthorizeDownload(ctx, update.Release.ID, update.Artifact.ID)
+    if err != nil { return err }
+    if err := authorization.Download(ctx, "update.bin", 128*1024*1024); err != nil { return err }
+}
+```
+
+Use the increasing release number stored with your application, rather than comparing
+display versions. Discovery defaults to `stable` and the running supported desktop
+target. Pass `UpdateOptions{Channel: "beta", Platform: "linux", Architecture: "arm64"}`
+for an explicit target. There is no fallback to another target.
+
+Authorization checks current licence access separately from discovery. Downloading
+streams directly from the seller over verified HTTPS, strips bearer credentials on
+every redirect, requests identity encoding, and checks the exact length and SHA-256.
+The destination appears atomically after verification. Existing files are refused
+unless you pass `DownloadOptions{ReplaceExisting: true}`; failures preserve them.
+Cancellation removes the temporary file. Nothing executes or unpacks the download.
+Keep authorizations in memory and out of logs. A public delivery URL is shareable;
+protected seller endpoints must verify the short-lived ticket or broker an expiring
+storage URL. See the [seller endpoint example](../../examples/python/seller-downloads/README.md).
+
+## Usage and resources
+
+Configure an `exports` usage limit, then reserve one unit before doing an export:
+
+```go
+result, err := client.Consume(ctx, "exports", 1, exportJobID)
+if err != nil { return err }
+fmt.Println("Remaining exports:", result.Remaining)
+// Perform the export and record its result with exportJobID.
+```
+
+`Usage(ctx, name)` and `Resources(ctx, name)` read current authoritative counters.
+`AcquireResource(ctx, name, resourceID, units, operationID...)` returns an allocation;
+release it with `ReleaseResource(ctx, name, allocationID, operationID...)` when the
+actual resource is removed. Close, logout and outages do not release resources.
+
+Mutation IDs are optional and generated securely when omitted. Pass a stable job ID
+of 16–128 characters for retries across restarts. `*MutationError` retains `OperationID`
+and `Uncertain`; retry an uncertain outcome with that same ID and identical input.
+Capacity denials expose validated `Usage` or `Resources` counters. Do not retry a
+capacity denial using a new ID unless the user intends a new operation.
+
+Usage retries preserve the original debit or denial across period boundaries. Resource
+retries preserve allocation identity and charged units but report its current state
+and current counter; an old acquire may return `State == "released"`. It never
+reactivates that allocation. An export failure does not refund consumed quota.
+
+These calls always require online activation proof and do not acquire floating seats.
+Offline files cannot authorize them. `RequireAccess` never consumes units or acquires
+resources. Installed software can be modified or bypass reporting: for authoritative
+metering, put the capacity check and actual work on your trusted backend.

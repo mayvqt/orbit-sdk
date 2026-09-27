@@ -168,6 +168,27 @@ impl Transport {
         .await
     }
 
+    /// A bounded best-effort session release used only after local authority
+    /// has already been cleared (including during close after owner cancellation).
+    pub(crate) async fn post_cleanup(&self, path: &str, body: &Value) -> Result<Option<Value>> {
+        if !path.starts_with(CLIENT_PREFIX)
+            || !path.contains("/sessions/")
+            || !path.ends_with("/end")
+        {
+            return Err(Error::Configuration);
+        }
+        let url = self.endpoint(path)?;
+        let mut encoded = LimitedBody(Vec::new());
+        serde_json::to_writer(&mut encoded, body).map_err(|_| Error::Configuration)?;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.attempt(Method::POST, url, Some(&encoded.0), None),
+        )
+        .await
+        .map_err(|_| Error::transient())?
+        .map_err(|failure| failure.error)
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -299,7 +320,7 @@ impl Transport {
     ) -> std::result::Result<Option<Value>, AttemptFailure> {
         let mut request = self
             .client
-            .request(method, url)
+            .request(method, url.clone())
             .header(header::ACCEPT, "application/json");
         if let Some(authorization) = authorization {
             request = request.header(header::AUTHORIZATION, authorization.clone());
@@ -330,6 +351,10 @@ impl Transport {
             }
             bytes.extend_from_slice(&chunk);
         }
+        if crate::limits::service_route(url.path()) && status.is_success() && status.as_u16() != 200
+        {
+            return Err(AttemptFailure::invalid());
+        }
         if status.as_u16() == 204 {
             return if bytes.is_empty() {
                 Ok(None)
@@ -338,8 +363,11 @@ impl Transport {
             };
         }
         if status.is_success() {
-            return serde_json::from_slice(&bytes)
-                .map(Some)
+            if crate::limits::service_route(url.path()) && has_orbit_error_member(&bytes) {
+                return Err(AttemptFailure::invalid());
+            }
+            return serde_json::from_slice::<crate::sessions::UniqueJson>(&bytes)
+                .map(|value| Some(value.0))
                 .map_err(|_| AttemptFailure::invalid());
         }
         if matches!(status.as_u16(), 502..=504) && !has_orbit_error_member(&bytes) {
@@ -363,6 +391,26 @@ impl Transport {
             || !crate::diagnostics::valid_request_id(&error.request_id)
         {
             return Err(AttemptFailure::invalid());
+        }
+        if crate::limits::service_route(url.path())
+            && status.as_u16() != 409
+            && matches!(
+                error.code.as_str(),
+                "usage_limit_reached" | "resource_limit_reached"
+            )
+        {
+            return Err(AttemptFailure::invalid());
+        }
+        if crate::limits::service_route(url.path())
+            && status.as_u16() == 409
+            && matches!(
+                error.code.as_str(),
+                "usage_limit_reached" | "resource_limit_reached"
+            )
+        {
+            return serde_json::from_slice::<crate::sessions::UniqueJson>(&bytes)
+                .map(|value| Some(value.0))
+                .map_err(|_| AttemptFailure::invalid());
         }
         Err(AttemptFailure {
             error: if (status.as_u16() == 429 && error.code == "rate_limited")
@@ -479,13 +527,12 @@ pub(crate) fn download_endpoint(value: &str) -> Result<Url> {
             None => None,
         }
     };
-    if let Some(port) = port {
-        if port.is_empty()
+    if let Some(port) = port
+        && (port.is_empty()
             || !port.bytes().all(|byte| byte.is_ascii_digit())
-            || !port.parse::<u16>().is_ok_and(|number| number != 0)
-        {
-            return Err(Error::Configuration);
-        }
+            || !port.parse::<u16>().is_ok_and(|number| number != 0))
+    {
+        return Err(Error::Configuration);
     }
     let parsed = Url::parse(value).map_err(|_| Error::Configuration)?;
     if parsed.scheme() != "https"

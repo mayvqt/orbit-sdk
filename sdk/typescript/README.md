@@ -187,6 +187,77 @@ an uncertain write, plus the safe failure metadata.
 display message, response body, request credentials or full URL. Do not log
 customer sessions, management tokens, licence keys or request bodies.
 
+## Release management and licensed update discovery
+
+Use `createRelease({ channel, version, notes })`, then
+`createArtifact(releaseId, { platform, architecture, filename, byteLength, sha256,
+deliveryMode, url, requiredFeature })`, and `publishRelease(releaseId)`.
+`deliveryMode` is `public` or `protected`; the latter requires a seller endpoint
+that verifies Orbit tickets. Public URLs remain shareable. Sellers host files;
+these calls send only metadata to Orbit. `listReleases`, `getRelease`,
+`updateRelease`, `updateArtifact`, `deleteArtifact` and `unpublishRelease` complete
+the metadata surface. Edits supply the complete metadata or artifact input and
+are permitted only before first publication. Published bytes and URLs are
+immutable; publish another release for changes. Unpublishing prevents new
+authorization and does not downgrade installed software.
+
+Mutations accept `{ idempotencyKey, signal }` and return `idempotencyKey` alongside
+the typed result; uncertain mutations expose that same ID on the error.
+`listReleases({ channel, after, limit })` returns `{ items, nextCursor }`; pass
+that opaque cursor unchanged as `after`. Page size defaults to 50, maximum 100.
+Reading and writing metadata require `releases:read` and `releases:write`.
+
+`checkForUpdate(licenceId, installedReleaseNumber, { channel, target, signal })`
+returns a typed update or `null`. It defaults to `stable` and the server runtime's
+target, so a backend distributing client updates should pass the client's
+explicit `{ platform, architecture }`. It selects the exact target and a greater
+release number; display version text is not ordered. Call
+`authorizeDownload(licenceId, releaseId, artifactId, { signal })` separately for
+fresh delivery authorization. Both calls require `licences:read` and
+`releases:read` and check current licence eligibility. Authenticate your user and
+verify ownership of the selected licence before calling these trusted methods.
+Do not log or cache authorization responses or put management tokens in clients.
+
+## Usage and resource limits
+
+After authenticating your user and binding their selected licence, reserve the
+usage before doing valuable work on your backend:
+
+```js
+const consumption = await orbit.consume(licenceId, "exports", 1, {
+  idempotencyKey: durableJobId,
+});
+// Record consumption with this job, then perform the export once.
+```
+
+`usage(licenceId, name)` reads a counter; `consume` requires `usage:write` and
+returns the counter after that operation. `resources(licenceId, name)` reads
+allocated units; `acquireResource(licenceId, name, resourceId, units, options)`
+reserves them, and `releaseResource(licenceId, name, allocationId, options)`
+releases that exact allocation. Reads require `usage:read` or `resources:read`;
+resource mutations require `resources:write`. `listResourceAllocations` accepts
+`{ state, after, limit, signal }` and returns a bounded `{ items, nextCursor }` page.
+The optional state is `active` or `released`.
+
+These methods accept cancellation and securely generate optional operation IDs.
+Use a durable job ID when a retry may survive a process restart.
+`OrbitLimitReachedError` exposes validated `counter`, `idempotencyKey` and
+`requestedUnits`; `OrbitMutationUncertainError.idempotencyKey` preserves the
+operation to resume if its response is lost, invalid or cancelled. Never start a
+new operation just to retry an unknown outcome. Usage retries retain the original
+period and debit/denial; resource retries retain identity and units but report the
+allocation's current state and current counter. Retrying a released acquire cannot
+reactivate it. Resources persist until an explicit release and do not expire on a
+process heartbeat. Read counters are not reservations.
+
+Consumption is not automatically refunded if the business operation fails, and
+Orbit's transaction is separate from your job database. Record the result with
+your job to coordinate retries. Installed executables can bypass reporting;
+authoritative metering requires gating the actual work here on your trusted
+backend. Numeric `usage_limits` and `resource_limits` in licence metadata describe
+policy, not currently available capacity. See the
+[backend example](../../examples/typescript/online-operations.mts).
+
 ## Run the backend example
 
 Set `ORBIT_APP_KEY`, `ORBIT_MANAGEMENT_TOKEN`, `ORBIT_CUSTOMER_SESSION`,
@@ -210,4 +281,6 @@ cd sdk/typescript
 npm test
 ```
 
-Tests mock Fetch and never contact Orbit.
+Tests use mocked Fetch and verified local TLS fixtures; they do not contact a
+live Orbit service. The seller verifier also runs the shared download-ticket
+security corpus.

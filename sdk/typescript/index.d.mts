@@ -1,3 +1,5 @@
+import type * as Online from "./online.mjs";
+export type * from "./online.mjs";
 export type AppKeyEnvironment = "test" | "live";
 
 /**
@@ -114,6 +116,8 @@ export type LicenceState = "unused" | "active" | "expired" | "suspended" | "revo
 export type LicenceExpiryMode = "perpetual" | "fixed" | "first_activation" | "payment";
 
 export interface OrbitLicence {
+  readonly usage_limits: Readonly<Record<string, Online.UsageLimit>>;
+  readonly resource_limits: Readonly<Record<string, Online.ResourceLimit>>;
   readonly id: string;
   readonly policy_id: string;
   readonly policy_name: string;
@@ -159,6 +163,11 @@ export class OrbitApiError extends Error {
   readonly code: string;
   readonly requestId: string | null;
 }
+export class OrbitLimitReachedError extends OrbitApiError {
+  readonly counter: Online.UsageCounter | Online.ResourceCounter;
+  readonly idempotencyKey: string;
+  readonly requestedUnits: number;
+}
 
 export class OrbitTransportError extends Error {
   readonly status: null;
@@ -181,6 +190,23 @@ export class OrbitAccessDeniedError extends Error {
 }
 
 export class OrbitBackendClient {
+  checkForUpdate(licenceId: string, installedReleaseNumber: number, options?: Online.UpdateCheckOptions): Promise<Online.Update | null>;
+  authorizeDownload(licenceId: string, releaseId: string, artifactId: string, options?: Online.OnlineOptions): Promise<Online.DownloadAuthorization>;
+  usage(licenceId: string, name: string, options?: Online.OnlineOptions): Promise<Online.UsageCounter>;
+  consume(licenceId: string, name: string, units?: number, options?: Online.MutationOptions): Promise<Online.UsageConsumption>;
+  resources(licenceId: string, name: string, options?: Online.OnlineOptions): Promise<Online.ResourceCounter>;
+  acquireResource(licenceId: string, name: string, resourceId: string, units?: number, options?: Online.MutationOptions): Promise<Online.ResourceAllocation>;
+  releaseResource(licenceId: string, name: string, allocationId: string, options?: Online.MutationOptions): Promise<Online.ResourceAllocation>;
+  listResourceAllocations(licenceId: string, name: string, options?: Online.AllocationListOptions): Promise<Online.AllocationPage>;
+  listReleases(options?: Online.ReleaseListOptions): Promise<Online.ReleasePage>;
+  getRelease(releaseId: string, options?: Online.OnlineOptions): Promise<Online.Release>;
+  createRelease(input: Online.ReleaseInput, options?: Online.MutationOptions): Promise<Online.Release & Online.MutationReceipt>;
+  updateRelease(releaseId: string, input: Online.ReleaseInput, options?: Online.MutationOptions): Promise<Online.Release & Online.MutationReceipt>;
+  createArtifact(releaseId: string, input: Online.ArtifactInput, options?: Online.MutationOptions): Promise<Online.Artifact & Online.MutationReceipt>;
+  updateArtifact(releaseId: string, artifactId: string, input: Online.ArtifactInput, options?: Online.MutationOptions): Promise<Online.Artifact & Online.MutationReceipt>;
+  deleteArtifact(releaseId: string, artifactId: string, options?: Online.MutationOptions): Promise<Online.MutationReceipt>;
+  publishRelease(releaseId: string, options?: Online.MutationOptions): Promise<Online.Release & Online.MutationReceipt>;
+  unpublishRelease(releaseId: string, options?: Online.MutationOptions): Promise<Online.Release & Online.MutationReceipt>;
   constructor(config: OrbitBackendConfig, options?: OrbitBackendOptions);
 
   verifyCurrentCustomerSession(customerSession: string): Promise<CurrentCustomerSession>;

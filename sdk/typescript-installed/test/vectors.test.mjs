@@ -6,10 +6,12 @@ import { AppKey } from "../src/app-key.mjs";
 import { parseJwks, verifyGrant } from "../src/grants.mjs";
 import { HttpTransport } from "../src/transport.mjs";
 import { parseOfflineKeys, verifyOfflineFile } from "../src/offline.mjs";
+import { parseSessionKeys, verifySessionGrant } from "../src/sessions.mjs";
 
 const appKeyVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/app-keys.json", import.meta.url), "utf8"));
 const grantVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/grants.json", import.meta.url), "utf8"));
 const offlineVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/offline-files.json", import.meta.url), "utf8"));
+const sessionVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/session-grants.json", import.meta.url), "utf8"));
 const signingKey = createPrivateKey(await readFile(new URL("../../rust/tests/fixtures/es256-test-private.pem", import.meta.url)));
 
 test("all shared app-key vectors", () => {
@@ -72,6 +74,46 @@ test("all shared signed offline-file vectors", () => {
   }
   assert.equal(offlineVectors.cases.length, 104);
   assert.equal(accepted, offlineVectors.cases.filter((item) => item.valid).length);
+});
+
+test("all shared signed floating-session vectors", () => {
+  let accepted = 0;
+  for (const item of sessionVectors.cases) {
+    let valid = false;
+    try {
+      const value = { ...sessionVectors.expected, ...item.expected };
+      const { session_id: sessionId, sequence, key_environment: keyEnvironment, ...expected } = value;
+      const keys = parseSessionKeys(item.jwks ?? sessionVectors.jwks, keyEnvironment);
+      const verified = verifySessionGrant(item.token, keys, {
+        issuer: expected.issuer,
+        application: expected.application,
+        environment: expected.environment,
+        licence: expected.licence,
+        activation: expected.activation,
+        installation: expected.installation,
+        fingerprint: expected.fingerprint ?? null,
+        fingerprintProvider: expected.fingerprint_provider ?? null,
+        credentialExpiresAt: expected.credential_expires_at ?? null,
+        licenceExpiresAt: expected.licence_expires_at ?? null,
+        now: expected.now,
+        sessionId,
+        sequence,
+        keyEnvironment,
+        allowUnboundFingerprint: expected.allow_unbound_fingerprint ?? false,
+      });
+      valid = true;
+      assert.equal(verified.sessionId, sessionId, item.name);
+      assert.equal(verified.sequence, sequence, item.name);
+      assert.ok(verified.expiresAt > expected.now, item.name);
+      assert.ok(verified.expiresAt - verified.issuedAt <= 120, item.name);
+    } catch (error) {
+      if (item.valid) assert.fail(`${item.name}: ${error.code ?? error.message}`);
+    }
+    assert.equal(valid, item.valid, item.name);
+    accepted += Number(valid);
+  }
+  assert.equal(sessionVectors.cases.length, 184);
+  assert.equal(accepted, sessionVectors.cases.filter((item) => item.valid).length);
 });
 
 test("long valid origin and maximum app-key IDs verify without individual-field truncation", () => {

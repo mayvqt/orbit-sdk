@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { AppKey, DownloadTicketVerifier, OrbitDownloadTicketError } from "../index.mjs";
+import { createPrivateKey, sign } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { downloadFileInternal } from "../../typescript-installed/src/download-file.mjs";
+import { parseAuthorization } from "../../typescript-installed/src/online.mjs";
+import { artifact, payload, tlsServer } from "../../typescript-installed/test/online-fixtures.mjs";
 
 const corpus = JSON.parse(readFileSync(new URL("../../../contracts/sdk/download-tickets.json", import.meta.url)));
 const config = {
@@ -85,4 +92,42 @@ test("invalid bearer errors disclose no token or claims and verification uses cu
   }
   now = Date.parse(ticket.expiresAt) / 1000;
   assert.throws(() => verifier.verify(token), OrbitDownloadTicketError);
+});
+
+test("seller verifier authorizes a real TLS download and strips ticket on cross-origin storage redirect", async (t) => {
+  const storageRequests = [];
+  const storage = await tlsServer(t, (request, response) => {
+    storageRequests.push(request.headers);
+    response.writeHead(200, { "content-length": payload.length }); response.end(payload);
+  });
+  let verifier;
+  const seller = await tlsServer(t, (request, response) => {
+    try {
+      const metadata = verifier.verify((request.headers.authorization ?? "").replace(/^Bearer /, ""));
+      const selected = artifact();
+      if (metadata.artifactId !== selected.id || metadata.releaseId !== selected.release_id ||
+          metadata.byteLength !== selected.byte_length || metadata.sha256 !== selected.sha256) throw new Error();
+      response.writeHead(302, { location: storage.origin + "/private-object?expires=short-lived" }); response.end();
+    } catch { response.writeHead(401); response.end(); }
+  });
+  const endpoint = seller.origin + "/download";
+  verifier = new DownloadTicketVerifier({ ...config, endpoint });
+  const selected = artifact(endpoint, { delivery_mode: "protected" });
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { ver: 1, iss: "https://orbit.example.test", aud: endpoint, sub: "licence", jti: "ticket",
+    iat: now, nbf: now, exp: now + 120, application_id: "app", environment_id: "test", release_id: "release",
+    artifact_id: "artifact", sha256: selected.sha256, byte_length: payload.length };
+  const encode = (v) => Buffer.from(JSON.stringify(v)).toString("base64url");
+  const input = `${encode({ alg: "ES256", typ: "orbit-download+jwt", kid: "test-fixture" })}.${encode(claims)}`;
+  const signingKey = createPrivateKey(await readFile(new URL("../../rust/tests/fixtures/es256-test-private.pem", import.meta.url)));
+  const token = `${input}.${sign("sha256", Buffer.from(input), { key: signingKey, dsaEncoding: "ieee-p1363" }).toString("base64url")}`;
+  const authorization = parseAuthorization({ artifact: selected, ticket: token, expires_at: new Date((now + 120) * 1000).toISOString() }, "release", "artifact");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "orbit-seller-download-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const destination = path.join(directory, "chosen.bin");
+  await downloadFileInternal(authorization, destination, { maxBytes: payload.length }, seller);
+  assert.deepEqual(await readFile(destination), payload);
+  assert.equal(storageRequests.length, 1);
+  assert.equal(storageRequests[0].authorization, undefined);
+  assert.equal(storageRequests[0].cookie, undefined);
 });

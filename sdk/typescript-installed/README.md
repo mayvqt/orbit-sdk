@@ -15,6 +15,15 @@ Node.js 22 or newer is required. The package uses Koffi for native clocks,
 identity, and protected storage. Linux and macOS use private leased files; the
 Linux profile has automated coverage. Native macOS and Windows execution is
 unverified.
+Koffi builds its native binding during installation. If your npm version blocks
+dependency install scripts, approve and rebuild Koffi from the application
+directory before opening a client:
+
+```sh
+npm install-scripts approve koffi
+npm rebuild koffi
+```
+
 Windows uses current-user DPAPI plus private DACLs, pinned parent handles, and
 an exclusive lease. The default POSIX record is not encrypted. Windows DPAPI
 protects it from other Windows users, while same-user applications remain inside
@@ -60,6 +69,39 @@ retries reuse a durable operation ID and require the same input. An
 `AbortSignal` can cancel an operation; `close()` cancels in-flight work and
 releases the exclusive installation lease.
 
+## Floating sessions
+
+When the licence policy enables concurrent sessions, activation automatically
+acquires a short online session and the SDK renews it while the client is open.
+`Snapshot.session` contains immutable session metadata. Session grants and IDs
+are never restored from disk; after a restart the client acquires a fresh
+session using its saved activation credential. During an outage, a running
+client can use its current grant only until the exact signed expiry.
+
+Applications can release a seat while idle and explicitly acquire it again:
+
+```js
+import { Client } from "@orbit/installed-sdk";
+
+const client = await Client.open(process.env.ORBIT_APP_KEY);
+try {
+  const access = await client.ensureAccess("export", async () => process.env.ORBIT_LICENCE_KEY ?? null);
+  if (access.session) {
+    console.log("Session expires at", access.session.expiresAt);
+    await client.endSession();
+    await client.startSession();
+  }
+  await client.requireAccess("export");
+} finally {
+  await client.close();
+}
+```
+
+`endSession()` clears local authority before asking Orbit to release the seat
+and disables automatic reacquisition until `startSession()` is called.
+Ordinary licences and offline-file mode make both methods no-ops. A seat-limit
+denial keeps the activation credential and never prompts for another key.
+
 For a policy reset that requires proof of the prior credential, pass
 `previousCredential` to `activate` or `activateAccount`. The retry proof stores
 only its digest; the credential is sent in the activation request and is not
@@ -67,7 +109,8 @@ written to installation state.
 
 The account surface includes `login`, `account`, `ownedLicences`,
 `claimLicence`, registration/resend, email-change/password-recovery requests,
-and `logoutAccount`. Customer sessions and pending registration credentials
+and `logoutAccount`. An `OwnedLicence.concurrentSessionLimit` is separate from
+its device limit. Customer sessions and pending registration credentials
 stay in memory and are cleared when their handles or client are closed. Access
 grants and the persistent activation credential are protected by the selected
 installation-storage profile.
@@ -115,6 +158,48 @@ evidence is inconsistent, the SDK denies access and preserves the file for
 recovery or renewal. Desktop files and clocks cannot detect restoration of a
 complete old state-and-clock snapshot; this storage profile does not provide a
 hardware-backed rollback counter.
+
+## Updates and online limits
+
+```js
+const update = await client.checkForUpdate(1);
+if (update) {
+  const authorization = await client.authorizeDownload(update.release.id, update.artifact.id);
+  await client.download(authorization, "./chosen-update.bin", { maxBytes: 200_000_000 });
+}
+```
+
+Discovery defaults to channel `stable` and this runtime's OS/architecture. Set
+`{ channel, target: { platform: "windows", architecture: "arm64" } }` explicitly
+when needed. It selects only that target and a greater release number; display
+versions are labels. Authorization is a separate online check. Files stream over
+verified HTTPS with at most five redirects, and the Orbit ticket is stripped on
+every redirect, including one to the same origin. The helper requests identity
+encoding, verifies exact length and SHA-256, then atomically exposes the file.
+Choose the destination and byte limit explicitly. Set `replace: true` to replace
+an existing file; failed transfers preserve it. No installer is run. The exported
+`downloadFile` helper also accepts an authorization without a client. Public
+delivery URLs can be shared; protected seller endpoints must verify the ticket.
+Do not cache or log authorizations; obtain a new one for a later download attempt.
+
+`usage(name)` and `resources(name)` read typed online counters.
+`consume(name, units, { idempotencyKey })` reserves usage before work.
+`acquireResource(name, resourceId, units, { idempotencyKey })` returns an allocation;
+`releaseResource(name, allocationId, { idempotencyKey })` releases it explicitly.
+Operation IDs are optional and generated securely; use your durable job ID for
+restart-safe retries. `LimitReachedError` exposes the validated `counter`,
+`idempotencyKey` and `requestedUnits`. An uncertain write throws
+`MutationUncertainError` with the same ID to use for recovery. A new invocation
+without that ID starts a new operation. All calls accept an `AbortSignal`.
+
+Usage replay returns the original period and outcome. Resource replay returns the
+same allocation identity and units with its current state and current counter;
+an old acquire never reactivates a released allocation. Close and logout do not
+release resources. Read counters are not reservations, and `requireAccess` never
+consumes usage or acquires a resource. Offline files cannot authorize these calls.
+Installed clients cannot provide tamper-proof metering: gate valuable work on your
+trusted backend when reporting must be enforced. A failed business operation does
+not refund consumed usage. See the [installed example](../../examples/typescript-installed/online-operations.mts).
 
 ## Electron main process
 

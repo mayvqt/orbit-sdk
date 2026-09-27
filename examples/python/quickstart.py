@@ -32,7 +32,12 @@ with Client.open(required("ORBIT_APP_KEY"), state_path=state_path) as orbit:
             print(f"Signed in as {account.username}")
             page = orbit.owned_licences()
             for licence in page.items:
-                print(licence.id, licence.policy_name, licence.state)
+                print(
+                    licence.id,
+                    licence.policy_name,
+                    licence.state,
+                    f"concurrent sessions={licence.concurrent_session_limit}",
+                )
             licence_id = input("Licence ID to activate: ").strip()
             orbit.activate_account(licence_id)
             snapshot = orbit.require_access("export")
@@ -40,3 +45,5 @@ with Client.open(required("ORBIT_APP_KEY"), state_path=state_path) as orbit:
         raise SystemExit("ORBIT_MODE must be 'key' or 'account'")
 
     print(f"Access: {snapshot.access.value}; export={snapshot.has('export')}")
+    if snapshot.session is not None:
+        print(f"Session {snapshot.session.session_id} expires at {snapshot.session.expires_at.isoformat()}")

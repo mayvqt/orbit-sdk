@@ -106,3 +106,25 @@ The benchmark checks that every warm call still reads the storage version, sends
 | `Snapshot` | 6.01 µs/op, 792 B/op, 12 allocs/op | 5.93 µs/op, 808 B/op, 12 allocs/op |
 
 The warm `RequireAccess` path now uses one checked snapshot rather than checking it twice. Each snapshot samples the native time anchor once. The small `Snapshot` timing difference is within this single-host benchmark's noise; no cross-platform performance guarantee is implied.
+
+## Explicit online services
+
+Update discovery, download authorization and usage/resource operations authenticate
+with the currently installed activation proof. They do not need an active floating
+seat and never silently leave offline-file mode. Their replies are fenced against
+logout, close and credential replacement. Mutation transport retries have a bounded
+attempt budget and retain the same operation ID and input.
+
+`MutationError.Uncertain` means the service may have committed the mutation. Preserve
+`OperationID` and retry the original action. Capacity counters on an error are exposed
+only after checking their kind, name, numeric bounds, arithmetic and operation fields.
+Resource allocation IDs refer to one allocation lifetime; use that allocation ID for
+release, even if a later resource reuses the same application resource ID.
+
+The download helper owns a fresh HTTP transport with no cookie jar or ambient
+credentials. It allows five HTTPS redirects, forwards no authorization after the
+first request, and writes a temporary file beside the explicit destination. It
+checks streaming bounds independently of `Content-Length`, refuses transformed
+content encoding, and checks exact byte length and digest before the atomic move.
+Caller cancellation removes staging. The size limit and destination are always
+caller choices; the seller's filename is display metadata.

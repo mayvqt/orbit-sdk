@@ -482,6 +482,9 @@ class Transport:
                 raise _AttemptError(error(INVALID_RESPONSE, "response_too_large"))
             data = bytes(chunks)
             status = response.status
+            online_route = __import__("re").fullmatch(r"/api/client/v1/activations/[A-Za-z0-9_-]+/(?:updates|downloads/authorize|usage/[a-z][a-z0-9_]*(?:/consume)?|resources/[a-z][a-z0-9_]*(?:/acquire|/allocations/[A-Za-z0-9_-]+/release)?)", target)
+            if online_route and 200 <= status < 300 and status != 200:
+                raise _AttemptError(error(INVALID_RESPONSE, "unexpected_status"))
             retry_after = _retry_after(response.getheader("Retry-After"))
             if status == 204:
                 if data:
@@ -508,7 +511,12 @@ class Transport:
                 or status == 503 and failure["code"] == "service_unavailable"
             ):
                 raise _AttemptError(error(TRANSIENT, failure["code"], failure["request_id"]), retry_after)
-            raise _AttemptError(error(DENIED, failure["code"], failure["request_id"]))
+            if failure["code"] in ("usage_limit_reached", "resource_limit_reached"):
+                if status != 409:
+                    raise _AttemptError(error(INVALID_RESPONSE, "invalid_error_response"))
+                from .online import capacity_error
+                raise _AttemptError(capacity_error(failure, target, unique_json(body)))
+            raise _AttemptError(OrbitError(DENIED, failure["code"], failure["request_id"], status))
         except _AttemptError:
             raise
         except ssl.SSLError as exc:

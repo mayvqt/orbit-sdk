@@ -627,9 +627,34 @@ func installedTick(reference weak.Pointer[Client]) (bool, time.Duration) {
 	}
 	_ = c.checkpointLocked(false)
 	snapshot := c.snapshotLocked()
-	due := c.state.credential != nil && (snapshot.Access == AccessRefreshRequired || snapshot.Access == AccessExpired || snapshot.Access == AccessOffline) && !time.Now().Before(c.state.retryAt)
+	generation := c.state.generation
+	sessionDue, sessionStartDue := false, false
+	if c.state.sessionRequired && !c.state.sessionDisabled {
+		if c.state.session != nil {
+			if now, err := c.state.session.anchor.now(); err == nil {
+				if now >= c.state.session.grant.ExpiresAt {
+					c.state.session = nil
+					c.state.pendingSessionID = ""
+					c.state.sessionRetryAt = time.Now()
+					sessionStartDue = true
+				} else {
+					sessionDue = now >= c.state.session.grant.RefreshAfter && (c.state.sessionRetryAt.IsZero() || !time.Now().Before(c.state.sessionRetryAt))
+				}
+			}
+		} else if !c.state.sessionRetryAt.IsZero() && !time.Now().Before(c.state.sessionRetryAt) {
+			sessionStartDue = true
+		}
+	}
+	due := !c.state.sessionRequired && !c.state.sessionDisabled && c.state.credential != nil && (snapshot.Access == AccessRefreshRequired || snapshot.Access == AccessExpired || snapshot.Access == AccessOffline) && !time.Now().Before(c.state.retryAt)
 	c.mu.Unlock()
-	if due {
+	if sessionDue {
+		_, _ = c.renewSession(c.lifecycle.context, generation)
+	} else if sessionStartDue {
+		if err := c.lockOperation(c.lifecycle.context, generation); err == nil {
+			_, _ = c.startSessionSerialized(c.lifecycle.context, generation, false)
+			c.unlockOperation()
+		}
+	} else if due {
 		_, _ = c.refresh(c.lifecycle.context, true)
 	}
 	c.mu.Lock()
@@ -643,6 +668,36 @@ func installedTick(reference weak.Pointer[Client]) (bool, time.Duration) {
 			delay = time.Second
 		}
 		return true, delay
+	}
+	if c.state.sessionRequired {
+		if c.state.sessionDisabled {
+			return true, -1
+		}
+		if c.state.session != nil {
+			now, err := c.state.session.anchor.now()
+			if err != nil || now >= c.state.session.grant.ExpiresAt {
+				return true, time.Second
+			}
+			delay := time.Duration(c.state.session.grant.RefreshAfter-now) * time.Second
+			if !c.state.sessionRetryAt.IsZero() {
+				retryDelay := time.Until(c.state.sessionRetryAt)
+				if retryDelay > 0 && retryDelay < delay {
+					delay = retryDelay
+				}
+			}
+			if delay < time.Second {
+				delay = time.Second
+			}
+			return true, delay
+		}
+		if !c.state.sessionRetryAt.IsZero() {
+			delay := time.Until(c.state.sessionRetryAt)
+			if delay <= 0 {
+				delay = time.Second
+			}
+			return true, delay
+		}
+		return true, -1
 	}
 	if c.state.credential == nil {
 		return true, -1
@@ -669,6 +724,20 @@ func installedTick(reference weak.Pointer[Client]) (bool, time.Duration) {
 // releases the exclusive installation lease. It never deactivates the licence.
 func (c *Client) Close() error {
 	if c.lifecycle == nil {
+		c.mu.Lock()
+		var release *StoredCredential
+		var releaseID string
+		if c.state.session != nil {
+			release, releaseID = cloneCredential(c.state.credential), c.state.session.metadata.id
+		} else if c.state.pendingSessionID != "" {
+			release, releaseID = cloneCredential(c.state.credential), c.state.pendingSessionID
+		}
+		clearState(&c.state)
+		c.closed = true
+		c.mu.Unlock()
+		if release != nil && releaseID != "" {
+			c.bestEffortEnd(release, releaseID)
+		}
 		c.transport.CloseIdleConnections()
 		return nil
 	}
@@ -680,10 +749,26 @@ func (c *Client) Close() error {
 		c.serial <- struct{}{}
 		c.mu.Lock()
 		c.lifecycle.closeErr = c.checkpointLocked(true)
+		var release *StoredCredential
+		releaseID := ""
+		if c.state.session != nil {
+			release, releaseID = cloneCredential(c.state.credential), c.state.session.metadata.id
+		} else if c.state.pendingSessionID != "" {
+			release, releaseID = cloneCredential(c.state.credential), c.state.pendingSessionID
+		}
 		c.closed = true
 		clearState(&c.state)
 		c.mu.Unlock()
 		c.unlockOperation()
+		if release != nil && releaseID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			path := clientPrefix + "activations/" + release.ActivationID + "/sessions/" + releaseID + "/end"
+			_, releaseErr := c.transport.postCleanup(ctx, path, c.sessionProof(release))
+			cancel()
+			if c.lifecycle.closeErr == nil && releaseErr != nil {
+				c.lifecycle.closeErr = releaseErr
+			}
+		}
 		c.transport.settleInstalledRequests()
 		if err := c.installed.close(); c.lifecycle.closeErr == nil {
 			c.lifecycle.closeErr = err

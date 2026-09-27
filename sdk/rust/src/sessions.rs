@@ -27,6 +27,22 @@ impl SessionKeys {
     pub(crate) fn parse(data: &[u8], environment: &str) -> Result<Self> {
         Ok(Self(Keys::parse_connected(data, environment)?))
     }
+    pub(crate) fn contains(&self, key_id: &str) -> bool {
+        self.0.decoding_key(key_id).is_some()
+    }
+}
+
+pub(crate) fn key_id(token: &str) -> Result<String> {
+    if token.is_empty() || token.len() > MAX_BYTES || !token.is_ascii() {
+        return Err(Error::InvalidResponse);
+    }
+    let (header, _) = token.split_once('.').ok_or(Error::InvalidResponse)?;
+    let bytes = canonical(header)?;
+    let value: Header = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
+    if value.alg != "ES256" || value.typ != "orbit-session+jwt" || !access::opaque(&value.kid) {
+        return Err(Error::InvalidResponse);
+    }
+    Ok(value.kid)
 }
 
 pub(crate) struct Expected<'a> {
@@ -50,15 +66,8 @@ pub(crate) struct Expected<'a> {
 pub(crate) struct SessionGrant {
     pub(crate) session_id: String,
     pub(crate) sequence: u64,
-    pub(crate) licence_id: String,
-    pub(crate) activation_id: String,
-    pub(crate) installation_id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) issued_at: i64,
     pub(crate) expires_at: i64,
     pub(crate) refresh_after: i64,
-    pub(crate) licence_expires_at: Option<i64>,
-    pub(crate) policy_version: i32,
     pub(crate) entitlements: BTreeMap<String, bool>,
 }
 
@@ -107,7 +116,7 @@ struct Claims {
 
 /// A JSON value that rejects duplicate keys at every object depth. Parsing
 /// into `serde_json::Value` alone would silently keep only the last value.
-struct UniqueJson(Value);
+pub(crate) struct UniqueJson(pub(crate) Value);
 
 impl<'de> Deserialize<'de> for UniqueJson {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -362,15 +371,8 @@ pub(crate) fn verify(
     Ok(SessionGrant {
         session_id: claims.session_id,
         sequence: claims.session_sequence,
-        licence_id: claims.sub,
-        activation_id: claims.activation_id,
-        installation_id: claims.installation_id,
-        ticket_id: claims.jti,
-        issued_at: claims.iat,
         expires_at: claims.exp,
         refresh_after: claims.refresh_after,
-        licence_expires_at: claims.licence_expires_at,
-        policy_version: claims.policy_version,
         entitlements: claims.entitlements,
     })
 }

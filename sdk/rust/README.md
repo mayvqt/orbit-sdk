@@ -154,3 +154,81 @@ See the [console example](../../examples/rust/licensed-export/README.md) for an 
 flow and the [backend example](../../examples/rust/licensed-backend/README.md) for
 server-side customer authentication. Storage and clock behavior is described in the
 [advanced guide](advanced.md#storage-and-clock-guarantees).
+
+## Floating seats
+
+Floating policies acquire a seat automatically after activation and renew it in
+memory. `require_access` checks the current signed interval locally. The snapshot's
+`session` exposes its ID, sequence and deadlines for display. A full seat pool,
+expired seat or outage never asks for another licence key.
+
+Use `end_session().await` while idle and `start_session().await` on resume. Ending
+clears authority before the network request and disables automatic reacquisition.
+Confirmed ordinary licences use these calls as local no-ops; unknown policy is checked
+online first. Offline-file mode never switches online implicitly.
+
+`close().await` attempts a bounded seat release without deleting the installation
+credential. Restart obtains a new seat online. A crash or failed release can hold
+capacity for the old interval's remaining lifetime, at most 120 seconds. An outage
+permits only the current verified interval; remote revocation can take effect locally
+at that deadline. Session IDs and grants are never restored from disk.
+
+## Licensed updates
+
+```rust,ignore
+if let Some(update) = client.check_for_updates(installed_release_number).await? {
+    let authorization = client
+        .authorize_download(&update.release.id, &update.artifact.id).await?;
+    authorization.download("update.bin", 128 * 1024 * 1024).await?;
+}
+```
+
+Use the increasing release number embedded in your app, rather than comparing display
+versions. Discovery defaults to `stable` and the actual supported desktop target.
+`check_for_updates_with(number, UpdateOptions { .. })` accepts an explicit channel,
+platform and architecture. There is no target fallback.
+
+Authorization checks current licence eligibility separately from discovery. The
+file streams directly from the seller over verified HTTPS. Every redirect strips
+bearer credentials; identity encoding, exact length and SHA-256 are checked before
+the temporary file is atomically exposed. Existing destinations are refused unless
+`download_with(path, max_size, DownloadOptions { replace_existing: true })` is used.
+A failed or cancelled download preserves an existing destination. Dropping the future
+removes its temporary file. Nothing executes or unpacks an installer.
+
+Keep authorizations in memory and out of logs. Public URLs are shareable. Protected
+seller endpoints must verify the short ticket or broker an expiring storage URL;
+see the [seller example](../../examples/python/seller-downloads/README.md).
+
+## Usage and resources
+
+Configure an `exports` usage limit and reserve a unit before performing work:
+
+```rust,ignore
+let result = client.consume_with_id("exports", 1, export_job_id).await?;
+println!("Remaining exports: {}", result.counter.remaining);
+// Perform the export and record its result with export_job_id.
+```
+
+`usage(name)` and `resources(name)` read current authoritative counters.
+`acquire_resource(name, resource_id, units)` returns an allocation; remove the actual
+resource before `release_resource(name, allocation_id)`. These mutations also have
+`_with_id` variants. Close, logout and outages do not release allocations.
+
+`consume`, `acquire_resource` and `release_resource` generate secure operation IDs.
+`MutationError` retains `operation_id`, `uncertain`, `cause` and a validated capacity
+`counter` when applicable. Recover uncertain outcomes with the same ID and identical
+input. Use a stable job ID of 16–128 characters for restarts or when you may drop an
+in-flight future: a dropped future cannot return an automatically generated ID.
+An auto-generated ID stays the same throughout that invocation's bounded retries.
+
+Usage replays retain their original debit or denial across UTC period boundaries.
+Resource replays retain allocation identity and charged units, with the current
+state and counter. An old acquire can return `ResourceState::Released`; it does not
+reactivate that allocation. A later business failure does not refund usage.
+
+These explicit online operations require the current activation credential. They do
+not acquire floating seats, and offline files cannot authorize them. `require_access`
+never consumes quota or allocates a resource. Installed executables can be modified
+or bypass reporting; put the metering check and actual work on your trusted backend
+when you need authoritative enforcement.

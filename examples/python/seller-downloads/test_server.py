@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
+import http.server
 from pathlib import Path
+import sys
+import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import boto3
@@ -15,6 +19,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from server import create_app
+from orbit_sdk import DownloadAuthorization, download_file
+from orbit_sdk.online import parse_artifact
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "sdk/python/tests"))
+from test_transport import _trusted_tls_server
 
 
 class SellerDownloadTests(unittest.TestCase):
@@ -139,6 +148,55 @@ class SellerDownloadTests(unittest.TestCase):
         response = self.client(storage).get(self.path, headers={"Authorization": "Bearer " + self.token()})
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.data, b"")
+
+    def test_installed_downloader_verifies_real_tls_seller_and_private_storage_redirect(self):
+        payload = b"seller-owned artifact bytes\n" * 2000
+        digest = hashlib.sha256(payload).hexdigest()
+        requests = []
+        app = None
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+
+            def do_GET(self):
+                requests.append((self.path, dict(self.headers)))
+                if self.path.startswith("/storage?"):
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                reply = app.test_client().get(self.path, headers=dict(self.headers))
+                self.send_response(reply.status_code)
+                for name, value in reply.headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(reply.data)
+
+        with _trusted_tls_server(Handler) as (origin, context), tempfile.TemporaryDirectory() as directory:
+            endpoint = origin + "/download"
+            self.configuration["endpoint"] = endpoint
+            self.artifact.update(sha256=digest, byte_length=len(payload))
+            storage = Mock()
+            storage.generate_presigned_url.return_value = (
+                origin + "/storage?X-Amz-Date=" + self.now.strftime("%Y%m%dT%H%M%SZ") + "&X-Amz-Expires=60"
+            )
+            app = create_app(self.configuration, storage=storage, clock=lambda: self.now)
+            ticket = self.token(sha256=digest, byte_length=len(payload))
+            artifact = parse_artifact(dict(id="artifact_1", release_id="release_1", platform="linux", architecture="x64",
+                                          filename="app.bin", byte_length=len(payload), sha256=digest, delivery_mode="protected",
+                                          url=endpoint, required_feature=None))
+            authorization = DownloadAuthorization(artifact, ticket, self.now + timedelta(seconds=120))
+            target = Path(directory, "chosen.bin")
+            with patch("orbit_sdk.download_file.ssl.create_default_context", return_value=context):
+                download_file(authorization, target, max_bytes=len(payload))
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(requests[0][1]["Authorization"], "Bearer " + ticket)
+            self.assertNotIn("Authorization", requests[1][1])
+            storage.generate_presigned_url.assert_called_once_with(
+                "get_object", Params={"Bucket": self.artifact["bucket"], "Key": self.artifact["object_key"]},
+                ExpiresIn=60, HttpMethod="GET",
+            )
 
 
 if __name__ == "__main__":

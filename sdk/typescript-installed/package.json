@@ -32,7 +32,7 @@
   },
   "scripts": {
     "test": "node --test --test-reporter=spec",
-    "typecheck": "tsc --noEmit --strict --target es2022 --module nodenext --lib es2022,dom index.d.mts electron.d.mts ../../examples/typescript-installed/client.mts ../../examples/typescript-installed/offline-import.mts"
+    "typecheck": "tsc --noEmit --strict --target es2022 --module nodenext --lib es2022,dom index.d.mts electron.d.mts ../../examples/typescript-installed/client.mts ../../examples/typescript-installed/offline-import.mts ../../examples/typescript-installed/online-operations.mts ../../examples/typescript/online-operations.mts"
   },
   "dependencies": {
     "koffi": "^3.1.6"

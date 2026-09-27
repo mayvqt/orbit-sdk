@@ -156,12 +156,17 @@ func TestInstalledOfflineImportRestartRenewalLogoutAndNoNetwork(t *testing.T) {
 	if _, err = client.RequireAccess(context.Background(), "export"); err != nil {
 		t.Fatal(err)
 	}
+	client.mu.Lock()
 	beforeReimport := client.state.offline.saved.TimeHighWater
+	client.mu.Unlock()
 	time.Sleep(1100 * time.Millisecond)
 	if _, err = client.ImportOfflineFile(context.Background(), first); err != nil {
 		t.Fatalf("same-file reimport: %v", err)
 	}
-	if client.state.offline.saved.TimeHighWater <= beforeReimport {
+	client.mu.Lock()
+	currentHighWater := client.state.offline.saved.TimeHighWater
+	client.mu.Unlock()
+	if currentHighWater <= beforeReimport {
 		t.Fatal("elapsed time was reset by same-file reimport")
 	}
 	if requests.Load() != 0 {
@@ -216,22 +221,31 @@ func TestInstalledOfflineClockUncertaintyCannotBeResetByReimport(t *testing.T) {
 	if _, err := client.ImportOfflineFile(context.Background(), token); err != nil {
 		t.Fatal(err)
 	}
+	client.mu.Lock()
 	anchor := *client.state.offline.anchor
 	client.state.offline.anchor.wall += 60
+	client.mu.Unlock()
 	if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, ErrClockUncertain) {
 		t.Fatalf("clock rollback decision: %v", err)
 	}
+	client.mu.Lock()
 	before := *client.state.offline.anchor
+	client.mu.Unlock()
 	if _, err := client.ImportOfflineFile(context.Background(), token); !errors.Is(err, ErrClockUncertain) {
 		t.Fatalf("reimport reset uncertain clock: %v", err)
 	}
-	if client.state.offline.anchor.wall != before.wall || client.state.offline.anchor.elapsed != before.elapsed || anchor.server != before.server {
+	client.mu.Lock()
+	changed := client.state.offline.anchor.wall != before.wall || client.state.offline.anchor.elapsed != before.elapsed || anchor.server != before.server
+	client.mu.Unlock()
+	if changed {
 		t.Fatal("clock uncertainty replaced the original continuous anchor")
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("offline clock check made %d HTTP requests", requests.Load())
 	}
+	client.mu.Lock()
 	*client.state.offline.anchor = anchor
+	client.mu.Unlock()
 	if err := client.Logout(); err != nil {
 		t.Fatalf("logout after clock recovery: %v", err)
 	}
@@ -278,7 +292,9 @@ func TestInstalledOfflineExpiryDoesNotPromptOrRefresh(t *testing.T) {
 	if _, err := client.ImportOfflineFile(context.Background(), token); err != nil {
 		t.Fatal(err)
 	}
+	client.mu.Lock()
 	client.state.offline.anchor.server = client.state.offline.claims.ExpiresAt
+	client.mu.Unlock()
 	if _, err := client.RequireAccess(context.Background(), "export"); !errors.Is(err, offlineError("offline_file_expired")) {
 		t.Fatalf("expiry result: %v", err)
 	}

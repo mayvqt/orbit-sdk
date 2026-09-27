@@ -1,3 +1,5 @@
+import type * as Online from "./src/online.mjs";
+export type * from "./src/online.mjs";
 export type ErrorKindName =
   | "configuration" | "cancelled" | "denied" | "invalid_response"
   | "reauthentication_required" | "stale_response" | "storage"
@@ -12,6 +14,13 @@ export declare class OrbitError extends Error {
 }
 export declare class NotActivatedError extends OrbitError {}
 export declare class FeatureUnavailableError extends OrbitError {}
+export declare class LimitReachedError extends OrbitError {
+  readonly counter: Online.UsageCounter | Online.ResourceCounter;
+  readonly idempotencyKey: string;
+  readonly requestedUnits: number;
+}
+export declare class MutationUncertainError extends OrbitError { readonly idempotencyKey: string }
+export declare function downloadFile(authorization: Online.DownloadAuthorization, destination: string, options: Online.DownloadOptions): Promise<string>;
 
 export declare class AppKey {
   readonly api_origin: string;
@@ -48,7 +57,14 @@ export interface Snapshot {
   readonly offlineAllowed: boolean;
   readonly remainingOffline: Readonly<{ seconds: number }>;
   readonly remainingOfflineSeconds: number;
+  readonly session: SessionMetadata | null;
   has(feature: string): boolean;
+}
+export interface SessionMetadata {
+  readonly sessionId: string;
+  readonly sequence: number;
+  readonly expiresAt: ImmutableDate;
+  readonly refreshAfter: ImmutableDate;
 }
 
 export interface OperationOptions { readonly signal?: AbortSignal }
@@ -100,6 +116,8 @@ export interface Account {
   readonly sessionExpiresAt: ImmutableDate;
 }
 export interface OwnedLicence {
+  readonly usageLimits: Readonly<Record<string, Online.UsageLimit>>;
+  readonly resourceLimits: Readonly<Record<string, Online.ResourceLimit>>;
   readonly id: string;
   readonly policyName: string;
   readonly state: "active" | "unused" | "expired" | "suspended" | "revoked";
@@ -108,6 +126,7 @@ export interface OwnedLicence {
   readonly expiresAt: ImmutableDate | null;
   readonly duration: Readonly<{ seconds: number }> | null;
   readonly deviceLimit: number;
+  readonly concurrentSessionLimit: number;
   readonly hwidLocked: boolean;
   readonly offlineAllowed: boolean;
   readonly offlineDuration: Readonly<{ seconds: number }>;
@@ -136,6 +155,14 @@ export declare const Access: Readonly<{
 }>;
 
 export declare class Client {
+  checkForUpdate(installedReleaseNumber: number, options?: Online.UpdateCheckOptions): Promise<Online.Update | null>;
+  authorizeDownload(releaseId: string, artifactId: string, options?: OperationOptions): Promise<Online.DownloadAuthorization>;
+  download(authorization: Online.DownloadAuthorization, destination: string, options: Online.DownloadOptions): Promise<string>;
+  usage(name: string, options?: OperationOptions): Promise<Online.UsageCounter>;
+  consume(name: string, units?: number, options?: Online.MutationOptions): Promise<Online.UsageConsumption>;
+  resources(name: string, options?: OperationOptions): Promise<Online.ResourceCounter>;
+  acquireResource(name: string, resourceId: string, units?: number, options?: Online.MutationOptions): Promise<Online.ResourceAllocation>;
+  releaseResource(name: string, allocationId: string, options?: Online.MutationOptions): Promise<Online.ResourceAllocation>;
   private constructor();
   static open(appKey: string | AppKey, options?: ClientOptions): Promise<Client>;
   readonly installationId: string;
@@ -150,6 +177,8 @@ export declare class Client {
   activate(licenceKey: string, options?: ActivationOptions): Promise<Snapshot>;
   activateAccount(licenceId: string, options?: ActivationOptions): Promise<Snapshot>;
   refresh(options?: OperationOptions): Promise<Snapshot>;
+  startSession(options?: OperationOptions): Promise<Snapshot>;
+  endSession(options?: OperationOptions): Promise<Snapshot>;
   deactivate(options?: ActivationOptions): Promise<void>;
   logout(options?: OperationOptions): Promise<void>;
   account(): Account | null;

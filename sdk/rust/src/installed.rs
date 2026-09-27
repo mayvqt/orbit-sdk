@@ -631,6 +631,33 @@ impl InstalledStorage {
         }
         s.commit(record)
     }
+    pub(crate) fn commit_floating(
+        &self,
+        version: u64,
+        credential: &StoredCredential,
+        activation: bool,
+    ) -> Result<()> {
+        let mut s = self.0.lock().map_err(|_| Error::Storage)?;
+        s.check()?;
+        if s.record.generation != version {
+            return Err(Error::StaleResponse);
+        }
+        let mut record = s.record.clone();
+        record.credential = Some(Credential {
+            activation_id: credential.activation_id.clone(),
+            licence_id: credential.licence_id.clone(),
+            bearer: credential.credential.clone(),
+            expires_at: credential.credential_expires_at,
+        });
+        record.installation.fingerprint = credential.fingerprint.clone();
+        record.installation.fingerprint_provider = credential.fingerprint_provider.clone();
+        record.access = None;
+        clear_offline_authority(&mut record);
+        if activation {
+            record.pending_activation = None;
+        }
+        s.commit(record)
+    }
     pub(crate) fn clear_cached(&self, clear_pending: bool, clear_credential: bool) -> Result<u64> {
         let mut s = self.0.lock().map_err(|_| Error::Storage)?;
         s.check()?;
@@ -786,16 +813,15 @@ impl InstalledStorage {
         if state.record.generation != version {
             return Err(Error::StaleResponse);
         }
-        if let Some(previous) = &state.record.offline {
-            if offline.sequence < previous.sequence
+        if let Some(previous) = &state.record.offline
+            && (offline.sequence < previous.sequence
                 || offline.sequence == previous.sequence
                     && (offline.issuance_id != previous.issuance_id
                         || offline.content_digest != previous.content_digest)
                 || offline.time_high_water < previous.time_high_water
-                || offline.wall_high_water < previous.wall_high_water
-            {
-                return Err(crate::offline::stale());
-            }
+                || offline.wall_high_water < previous.wall_high_water)
+        {
+            return Err(crate::offline::stale());
         }
         let mut record = state.record.clone();
         record.generation = record
@@ -1054,13 +1080,24 @@ impl Client {
                 if client.0.closed.load(Ordering::Acquire) {
                     break;
                 }
-                let offline_active = client.0.state.lock().ok().is_some_and(|state| {
-                    state
-                        .offline
-                        .as_ref()
-                        .is_some_and(|offline| offline.authorized)
-                });
-                if !offline_active {
+                let (offline_active, session_required, session_disabled) = client
+                    .0
+                    .state
+                    .lock()
+                    .ok()
+                    .map_or((false, false, false), |state| {
+                        (
+                            state
+                                .offline
+                                .as_ref()
+                                .is_some_and(|offline| offline.authorized),
+                            state.session_required,
+                            state.session_disabled,
+                        )
+                    });
+                if session_required {
+                    client.maintain_session(&cancel).await;
+                } else if !offline_active && !session_disabled {
                     let _ = client.refresh_if_needed(&cancel).await;
                 }
                 if let Ok(mut state) = client.0.state.lock() {
@@ -1136,36 +1173,35 @@ impl Client {
         if wall.saturating_add(30) < old_wall {
             return Err(Error::ClockUncertain);
         }
-        if let Some(runtime) = state.offline.as_mut() {
-            if let Some(anchor) = &runtime.anchor {
-                match anchor.now_with_wall() {
-                    Ok((estimate, anchor_wall)) => {
-                        if anchor_wall.saturating_add(30) < old_wall {
-                            runtime.uncertain = true;
-                            return Err(Error::ClockUncertain);
-                        };
-                        if estimate < old_time {
-                            runtime.uncertain = true;
-                            return Err(Error::ClockUncertain);
-                        }
-                        runtime.uncertain = false;
-                        now = now.max(estimate)
-                    }
-                    Err(error) => {
+        if let Some(runtime) = state.offline.as_mut()
+            && let Some(anchor) = &runtime.anchor
+        {
+            match anchor.now_with_wall() {
+                Ok((estimate, anchor_wall)) => {
+                    if anchor_wall.saturating_add(30) < old_wall {
                         runtime.uncertain = true;
-                        return Err(error);
+                        return Err(Error::ClockUncertain);
+                    };
+                    if estimate < old_time {
+                        runtime.uncertain = true;
+                        return Err(Error::ClockUncertain);
                     }
+                    runtime.uncertain = false;
+                    now = now.max(estimate)
+                }
+                Err(error) => {
+                    runtime.uncertain = true;
+                    return Err(error);
                 }
             }
         }
         let verified = crate::offline::verify(file, keys, key, &self.0.device, now, minimum)?;
-        if let Some(saved) = &previous {
-            if verified.sequence == saved.sequence
-                && (verified.issuance_id != saved.issuance_id
-                    || verified.content_digest != saved.content_digest)
-            {
-                return Err(crate::offline::stale());
-            }
+        if let Some(saved) = &previous
+            && verified.sequence == saved.sequence
+            && (verified.issuance_id != saved.issuance_id
+                || verified.content_digest != saved.content_digest)
+        {
+            return Err(crate::offline::stale());
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -1275,20 +1311,35 @@ impl Client {
         }
         let _serial = self.0.serial.lock().await;
         if let Some(storage) = &self.0.installed {
-            let checkpoint =
+            let (checkpoint, release) =
                 self.0
                     .state
                     .lock()
                     .map_err(|_| Error::Storage)
-                    .and_then(|mut state| {
-                        if let Some(offline) = state.offline.as_mut().filter(|item| item.authorized)
+                    .map(|mut state| {
+                        let release = state
+                            .session
+                            .as_ref()
+                            .map(|session| session.metadata.id().to_owned())
+                            .or_else(|| state.pending_session_id.clone())
+                            .and_then(|id| state.credential.clone().map(|saved| (saved, id)));
+                        let checkpoint = if let Some(offline) =
+                            state.offline.as_mut().filter(|item| item.authorized)
                         {
                             storage.checkpoint_offline(offline, true)
                         } else {
                             storage.checkpoint(state.anchor.as_ref(), true)
-                        }
-                    });
+                        };
+                        state.session = None;
+                        state.pending_session_id = None;
+                        state.session_required = false;
+                        state.generation = state.generation.wrapping_add(1);
+                        (checkpoint, release)
+                    })?;
             storage.close();
+            if let Some((saved, id)) = release {
+                self.send_session_end_cleanup(&saved, &id).await;
+            }
             checkpoint
         } else {
             Ok(())
@@ -1303,6 +1354,8 @@ mod tests {
     use crate::Access;
     #[cfg(feature = "local-development")]
     use crate::Cancellation;
+    #[cfg(feature = "local-development")]
+    use crate::MemoryStorage;
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
@@ -1882,6 +1935,133 @@ mod tests {
         json!({"activation_id":"activation","installation_id":installation,"credential":if refresh {None}else{Some("a".repeat(43))},"credential_expires_at":null,"grant":token,"server_time":server,"binding_mode":binding_mode,"fingerprint_provider":fingerprint_provider,"licence_expires_at":null,"secret_replay_expired":false}).to_string()
     }
     #[cfg(feature = "local-development")]
+    fn floating_reply(installation: &str) -> String {
+        let now = clock::wall().unwrap();
+        let date = time::OffsetDateTime::from_unix_timestamp(now).unwrap();
+        let server = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            date.year(),
+            u8::from(date.month()),
+            date.day(),
+            date.hour(),
+            date.minute(),
+            date.second()
+        );
+        json!({"activation_id":"activation","installation_id":installation,"credential":"a".repeat(43),"credential_expires_at":null,"grant":null,"server_time":server,"binding_mode":"none","fingerprint_provider":null,"licence_expires_at":null,"secret_replay_expired":false,"licence_id":"licence","session_required":true}).to_string()
+    }
+    #[cfg(feature = "local-development")]
+    fn floating_refresh_reply(installation: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&floating_reply(installation)).unwrap();
+        value["credential"] = serde_json::Value::Null;
+        value.to_string()
+    }
+    #[cfg(feature = "local-development")]
+    fn signed_session_reply(session_id: &str, sequence: u64, installation: &str) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        let now = clock::wall().unwrap();
+        let claims = json!({
+            "iss":"https://orbit.example.test", "aud":"orbit-session:app:test",
+            "sub":"licence", "jti":format!("session_grant_{sequence}"),
+            "iat":now, "nbf":now, "exp":now + 120, "application_id":"app",
+            "environment_id":"test", "activation_id":"activation",
+            "installation_id":installation, "binding_mode":"none", "policy_version":1,
+            "entitlements":{"export":true}, "refresh_after":now + 60,
+            "offline_allowed":false, "licence_expires_at":null,
+            "session_id":session_id, "session_sequence":sequence
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("orbit-session+jwt".into());
+        header.kid = Some("test-fixture".into());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(include_bytes!("../tests/fixtures/es256-test-private.pem"))
+                .unwrap(),
+        )
+        .unwrap();
+        let expires = time::OffsetDateTime::from_unix_timestamp(now + 120).unwrap();
+        let server = time::OffsetDateTime::from_unix_timestamp(now).unwrap();
+        let format = |date: time::OffsetDateTime| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                date.year(),
+                u8::from(date.month()),
+                date.day(),
+                date.hour(),
+                date.minute(),
+                date.second()
+            )
+        };
+        json!({
+            "session_id":session_id, "sequence":sequence,
+            "expires_at":format(expires), "server_time":format(server), "grant":token
+        })
+        .to_string()
+    }
+    #[cfg(feature = "local-development")]
+    fn session_jwks() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/sdk/session-grants.json");
+        let corpus: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        corpus["jwks"].to_string()
+    }
+    #[cfg(feature = "local-development")]
+    async fn activate_floating_fixture(
+        dir: &Directory,
+        fixture: &mut crate::transport::tests::Fixture,
+    ) -> (Client, String, String) {
+        let client = Client::open_with_transport(app(), Some(&dir.0), fixture.transport.clone())
+            .await
+            .unwrap();
+        let activating = client.clone();
+        let activation = tokio::spawn(async move { activating.activate("synthetic-key").await });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let installation = body["installation_id"].as_str().unwrap().to_owned();
+        request.respond(200, &floating_reply(&installation));
+        let start = fixture.next().await;
+        let start_body: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let id = start_body["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(start_body["credential"], "a".repeat(43));
+        let persisted = std::fs::read_to_string(dir.0.join("orbit-storage.json")).unwrap();
+        assert!(persisted.contains(&"a".repeat(43)));
+        assert!(!persisted.contains(&id));
+        start.respond(200, &signed_session_reply(&id, 1, &installation));
+        fixture.next().await.respond(200, &session_jwks());
+        let snapshot = activation.await.unwrap().unwrap();
+        assert_eq!(snapshot.access, Access::Online);
+        assert_eq!(snapshot.session.as_ref().unwrap().id(), id);
+        (client, installation, id)
+    }
+    #[cfg(feature = "local-development")]
+    struct DelaySecondVersion {
+        inner: Arc<dyn Storage>,
+        armed: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[cfg(feature = "local-development")]
+    impl Storage for DelaySecondVersion {
+        fn version(&self) -> Result<u64> {
+            if self.armed.load(Ordering::SeqCst)
+                && self.calls.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                std::thread::sleep(Duration::from_millis(1200));
+            }
+            self.inner.version()
+        }
+        fn load(&self) -> Result<(u64, Option<StoredCredential>)> {
+            self.inner.load()
+        }
+        fn save(&self, version: u64, credential: StoredCredential) -> Result<()> {
+            self.inner.save(version, credential)
+        }
+        fn invalidate(&self) -> Result<u64> {
+            self.inner.invalidate()
+        }
+    }
+    #[cfg(feature = "local-development")]
     fn jwks() -> serde_json::Value {
         let path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/sdk/grants.json");
@@ -1919,6 +2099,508 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap().access, Access::Online);
         client
     }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_activation_persists_only_credential_and_warm_access_is_local() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let client = Client::open_with_transport(app(), Some(&dir.0), fixture.transport.clone())
+            .await
+            .unwrap();
+        let activating = client.clone();
+        let activation = tokio::spawn(async move { activating.activate("synthetic-key").await });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let installation = body["installation_id"].as_str().unwrap().to_owned();
+        request.respond(200, &floating_reply(&installation));
+
+        let start = fixture.next().await;
+        assert!(
+            start
+                .head
+                .starts_with("POST /api/client/v1/activations/activation/sessions ")
+        );
+        let start_body: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let session_id = start_body["session_id"].as_str().unwrap().to_owned();
+        assert_eq!(start_body["credential"], "a".repeat(43));
+        let persisted = std::fs::read_to_string(dir.0.join("orbit-storage.json")).unwrap();
+        assert!(persisted.contains(&"a".repeat(43)));
+        assert!(!persisted.contains(&session_id));
+        start.respond(200, &signed_session_reply(&session_id, 1, &installation));
+        let keys = fixture.next().await;
+        assert!(keys.head.starts_with(
+            "GET /.well-known/orbit-jwks.json?application_id=app&environment_id=test "
+        ));
+        keys.respond(200, &session_jwks());
+        let snapshot = activation.await.unwrap().unwrap();
+        assert_eq!(snapshot.access, Access::Online);
+        assert!(snapshot.has_feature("export"));
+        let metadata = snapshot.session.as_ref().unwrap();
+        assert_eq!(metadata.id(), session_id);
+        assert_eq!(metadata.sequence(), 1);
+
+        let repeated = client.start_session().await.unwrap();
+        assert_eq!(repeated.session.as_ref().unwrap().id(), session_id);
+        assert_eq!(
+            client.require_access("export").await.unwrap().access,
+            Access::Online
+        );
+        let cancelled = Cancellation::new();
+        cancelled.cancel();
+        assert!(matches!(
+            client
+                .require_access_with_cancel("export", &cancelled)
+                .await,
+            Err(Error::Cancelled)
+        ));
+
+        let refreshing = client.clone();
+        let refresh_task = tokio::spawn(async move { refreshing.refresh().await });
+        let validation = fixture.next().await;
+        assert!(
+            validation
+                .head
+                .starts_with("POST /api/client/v1/activations/activation/validate ")
+        );
+        validation.respond(200, &floating_refresh_reply(&installation));
+        let validated = refresh_task.await.unwrap().unwrap();
+        assert_eq!(validated.session.as_ref().unwrap().id(), session_id);
+        assert_eq!(validated.access, Access::Online);
+        fixture.assert_idle();
+
+        let ending = client.clone();
+        let end_task = tokio::spawn(async move { ending.end_session().await });
+        let end = fixture.next().await;
+        assert!(end.head.starts_with(&format!(
+            "POST /api/client/v1/activations/activation/sessions/{session_id}/end "
+        )));
+        end.respond(204, "");
+        end_task.await.unwrap().unwrap();
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::SessionRequired)
+        ));
+        fixture.assert_idle();
+
+        let restarting = client.clone();
+        let start_task = tokio::spawn(async move { restarting.start_session().await });
+        let start = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let resumed_id = body["session_id"].as_str().unwrap().to_owned();
+        assert_ne!(resumed_id, session_id);
+        start.respond(200, &signed_session_reply(&resumed_id, 1, &installation));
+        let resumed = start_task.await.unwrap().unwrap();
+        assert_eq!(resumed.session.as_ref().unwrap().id(), resumed_id);
+        assert_eq!(resumed.access, Access::Online);
+        let closing = client.clone();
+        let close_task = tokio::spawn(async move { closing.close().await });
+        let close_release = fixture.next().await;
+        assert!(close_release.head.starts_with(&format!(
+            "POST /api/client/v1/activations/activation/sessions/{resumed_id}/end "
+        )));
+        close_release.respond(204, "");
+        close_task.await.unwrap().unwrap();
+
+        let path = dir.0.clone();
+        let transport = fixture.transport.clone();
+        let reopening = tokio::spawn(async move {
+            Client::open_with_transport(app(), Some(&path), transport).await
+        });
+        let validation = fixture.next().await;
+        assert!(
+            validation
+                .head
+                .starts_with("POST /api/client/v1/activations/activation/validate ")
+        );
+        validation.respond(200, &floating_refresh_reply(&installation));
+        let start = fixture.next().await;
+        assert!(
+            start
+                .head
+                .starts_with("POST /api/client/v1/activations/activation/sessions ")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let new_id = body["session_id"].as_str().unwrap().to_owned();
+        assert_ne!(new_id, resumed_id);
+        assert_eq!(body["credential"], "a".repeat(43));
+        start.respond(200, &signed_session_reply(&new_id, 1, &installation));
+        let keys = fixture.next().await;
+        keys.respond(200, &session_jwks());
+        let reopened = reopening.await.unwrap().unwrap();
+        let after_restart = reopened.snapshot().unwrap();
+        assert_eq!(after_restart.session.as_ref().unwrap().id(), new_id);
+        assert_eq!(after_restart.access, Access::Online);
+
+        let closing = reopened.clone();
+        let close_task = tokio::spawn(async move { closing.close().await });
+        let close_release = fixture.next().await;
+        assert!(close_release.head.starts_with(&format!(
+            "POST /api/client/v1/activations/activation/sessions/{new_id}/end "
+        )));
+        close_release.respond(204, "");
+        close_task.await.unwrap().unwrap();
+        fixture.assert_idle();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_renewal_retries_exact_sequence_and_denial_clears_authority() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, installation, session_id) =
+            activate_floating_fixture(&dir, &mut fixture).await;
+        let generation = client.generation().unwrap();
+        let cancellation = client.0.transport.owner_cancel.clone();
+        let renewing = client.clone();
+        let renew =
+            tokio::spawn(async move { renewing.renew_session(&cancellation, generation).await });
+        for _ in 0..3 {
+            let request = fixture.next().await;
+            assert!(request.head.starts_with(&format!(
+                "POST /api/client/v1/activations/activation/sessions/{session_id}/renew "
+            )));
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["sequence"], 2);
+            request.respond(503, crate::transport::tests::TRANSIENT);
+        }
+        assert!(matches!(renew.await.unwrap(), Err(Error::Transient { .. })));
+        let retained = client.require_access("export").await.unwrap();
+        assert_eq!(retained.access, Access::Online);
+        assert_eq!(retained.session.as_ref().unwrap().id(), session_id);
+        assert_eq!(retained.session.as_ref().unwrap().sequence(), 1);
+
+        let cancellation = client.0.transport.owner_cancel.clone();
+        let renewing = client.clone();
+        let renew =
+            tokio::spawn(async move { renewing.renew_session(&cancellation, generation).await });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["sequence"], 2);
+        request.respond(200, &signed_session_reply(&session_id, 2, &installation));
+        let renewed = renew.await.unwrap().unwrap();
+        assert_eq!(renewed.session.as_ref().unwrap().sequence(), 2);
+        assert_eq!(renewed.access, Access::Online);
+
+        let cancellation = client.0.transport.owner_cancel.clone();
+        let renewing = client.clone();
+        let generation = client.generation().unwrap();
+        let renew =
+            tokio::spawn(async move { renewing.renew_session(&cancellation, generation).await });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["sequence"], 3);
+        request.respond(
+            403,
+            r#"{"error":{"code":"session_ended","message":"Denied","request_id":"fixture"}}"#,
+        );
+        assert!(matches!(renew.await.unwrap(), Err(Error::Denied { .. })));
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::SessionRequired)
+        ));
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_late_renewal_cannot_restore_authority_after_logout() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, installation, session_id) =
+            activate_floating_fixture(&dir, &mut fixture).await;
+        let generation = client.generation().unwrap();
+        let cancellation = client.0.transport.owner_cancel.clone();
+        let renewing = client.clone();
+        let renew =
+            tokio::spawn(async move { renewing.renew_session(&cancellation, generation).await });
+        let request = fixture.next().await;
+        assert!(request.head.starts_with(&format!(
+            "POST /api/client/v1/activations/activation/sessions/{session_id}/renew "
+        )));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["sequence"], 2);
+        client.logout().unwrap();
+        request.respond(200, &signed_session_reply(&session_id, 2, &installation));
+        assert!(matches!(renew.await.unwrap(), Err(Error::StaleResponse)));
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.access, Access::Denied);
+        assert!(snapshot.session.is_none());
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn cancelled_session_start_releases_known_id_without_authorizing() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, installation, session_id) =
+            activate_floating_fixture(&dir, &mut fixture).await;
+        let ending = client.clone();
+        let end = tokio::spawn(async move { ending.end_session().await });
+        let request = fixture.next().await;
+        assert!(
+            request
+                .head
+                .contains(&format!("/sessions/{session_id}/end "))
+        );
+        request.respond(204, "");
+        end.await.unwrap().unwrap();
+
+        let cancel = Cancellation::new();
+        let starting = client.clone();
+        let cancel_for_task = cancel.clone();
+        let start =
+            tokio::spawn(async move { starting.start_session_with_cancel(&cancel_for_task).await });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let pending_id = body["session_id"].as_str().unwrap().to_owned();
+        assert_ne!(pending_id, session_id);
+        cancel.cancel();
+        request.respond(200, &signed_session_reply(&pending_id, 1, &installation));
+        assert!(matches!(start.await.unwrap(), Err(Error::Cancelled)));
+        let cleanup = fixture.next().await;
+        assert!(
+            cleanup
+                .head
+                .contains(&format!("/sessions/{pending_id}/end "))
+        );
+        cleanup.respond(204, "");
+        assert_ne!(client.snapshot().unwrap().access, Access::Online);
+        fixture.assert_idle();
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_warm_guard_resamples_after_expiry_and_rejects_cancellation() {
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let storage = Arc::new(DelaySecondVersion {
+            inner: Arc::new(MemoryStorage::default()),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = Client::with_storage(
+            Config {
+                application_id: "app".into(),
+                environment_id: "test".into(),
+                issuer: "https://orbit.example.test".into(),
+            },
+            Device {
+                installation_id: "installation_1234".into(),
+                fingerprint: None,
+                fingerprint_provider: None,
+            },
+            fixture.transport.clone(),
+            storage.clone(),
+        )
+        .unwrap();
+        let activating = client.clone();
+        let mut activation = tokio::spawn(async move {
+            activating
+                .activate_with_id("synthetic-key", "floating_operation_123")
+                .await
+        });
+        let request = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let installation = body["installation_id"].as_str().unwrap().to_owned();
+        let mut reply: serde_json::Value =
+            serde_json::from_str(&floating_reply(&installation)).unwrap();
+        let expiry =
+            time::OffsetDateTime::from_unix_timestamp(clock::wall().unwrap() + 3600).unwrap();
+        reply["credential_expires_at"] = json!(format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            expiry.year(),
+            u8::from(expiry.month()),
+            expiry.day(),
+            expiry.hour(),
+            expiry.minute(),
+            expiry.second()
+        ));
+        request.respond(200, &reply.to_string());
+        let start = fixture.next().await;
+        let body: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let session_id = body["session_id"].as_str().unwrap().to_owned();
+        start.respond(200, &signed_session_reply(&session_id, 1, &installation));
+        let keys = tokio::select! {
+            request = fixture.next() => request,
+            result = &mut activation => panic!("floating activation failed before JWKS lookup: {result:?}"),
+        };
+        keys.respond(200, &session_jwks());
+        let snapshot = activation.await.unwrap().unwrap();
+        assert_eq!(snapshot.access, Access::Online);
+
+        {
+            let mut state = client.0.state.lock().unwrap();
+            state.session.as_mut().unwrap().grant.expires_at = clock::wall().unwrap() + 1;
+        }
+        storage.calls.store(0, Ordering::SeqCst);
+        storage.armed.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::SessionRequired)
+        ));
+        assert_eq!(storage.calls.load(Ordering::SeqCst), 2);
+        let cancelled = Cancellation::new();
+        cancelled.cancel();
+        assert!(matches!(
+            client
+                .require_access_with_cancel("export", &cancelled)
+                .await,
+            Err(Error::Cancelled)
+        ));
+        fixture.assert_idle();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_blocked_renewal_is_fenced_immediately_by_end() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, installation, id) = activate_floating_fixture(&dir, &mut fixture).await;
+        let generation = client.generation().unwrap();
+        let renewing = client.clone();
+        let renew = tokio::spawn(async move {
+            renewing
+                .renew_session(&Cancellation::new(), generation)
+                .await
+        });
+        let request = fixture.next().await;
+        let ending = client.clone();
+        let end = tokio::spawn(async move { ending.end_session().await });
+        fixture.next().await.respond(204, "");
+        end.await.unwrap().unwrap();
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::SessionRequired)
+        ));
+        request.respond(200, &signed_session_reply(&id, 2, &installation));
+        assert!(matches!(renew.await.unwrap(), Err(Error::StaleResponse)));
+        assert_ne!(client.snapshot().unwrap().access, Access::Online);
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn dropping_floating_start_future_releases_the_pending_id() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, _, _) = activate_floating_fixture(&dir, &mut fixture).await;
+        let ending = client.clone();
+        let end = tokio::spawn(async move { ending.end_session().await });
+        fixture.next().await.respond(204, "");
+        end.await.unwrap().unwrap();
+        let starting = client.clone();
+        let start = tokio::spawn(async move { starting.start_session().await });
+        let request = fixture.next().await;
+        let input: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        start.abort();
+        assert!(start.await.unwrap_err().is_cancelled());
+        let cleanup = fixture.next().await;
+        assert!(cleanup.head.contains(&format!(
+            "/sessions/{}/end ",
+            input["session_id"].as_str().unwrap()
+        )));
+        cleanup.respond(204, "");
+        drop(request);
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::SessionRequired)
+        ));
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn floating_credential_replacement_clears_old_session_before_request() {
+        let dir = Directory::new();
+        let mut fixture = crate::transport::tests::Fixture::new().await;
+        let (client, installation, old_id) = activate_floating_fixture(&dir, &mut fixture).await;
+        let replacing = client.clone();
+        let task = tokio::spawn(async move { replacing.activate("replacement-key").await });
+        let request = fixture.next().await;
+        let snapshot = client.snapshot().unwrap();
+        assert_ne!(snapshot.access, Access::Online);
+        assert!(snapshot.session.is_none());
+        assert!(matches!(
+            client.usage("exports").await,
+            Err(Error::PendingActivation)
+        ));
+        let mutation = client
+            .consume_with_id("exports", 1, "replacement_job_1234")
+            .await
+            .unwrap_err();
+        assert!(matches!(mutation.cause, Error::PendingActivation));
+        assert!(!mutation.uncertain);
+        request.respond(200, &floating_reply(&installation));
+        let start = fixture.next().await;
+        let input: serde_json::Value = serde_json::from_slice(&start.body).unwrap();
+        let id = input["session_id"].as_str().unwrap();
+        assert_ne!(id, old_id);
+        start.respond(200, &signed_session_reply(id, 1, &installation));
+        task.await.unwrap().unwrap();
+        let closing = client.clone();
+        let close = tokio::spawn(async move { closing.close().await });
+        fixture.next().await.respond(204, "");
+        close.await.unwrap().unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn end_during_initial_activation_preserves_end_intent() {
+        for account in [false, true] {
+            let dir = Directory::new();
+            let mut fixture = crate::transport::tests::Fixture::new().await;
+            let client =
+                Client::open_with_transport(app(), Some(&dir.0), fixture.transport.clone())
+                    .await
+                    .unwrap();
+            if account {
+                login_fixture_account(&client, &mut fixture, "alice").await;
+            }
+            let activating = client.clone();
+            let task = tokio::spawn(async move {
+                if account {
+                    activating.activate_account("licence").await
+                } else {
+                    activating.activate("synthetic-key").await
+                }
+            });
+            let request = fixture.next().await;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let installation = body["installation_id"].as_str().unwrap().to_owned();
+            client.end_session().await.unwrap();
+            request.respond(200, &floating_reply(&installation));
+            let snapshot = task.await.unwrap().unwrap();
+            assert_ne!(snapshot.access, Access::Online);
+            assert!(snapshot.session.is_none());
+            assert!(client.0.state.lock().unwrap().credential.is_some());
+            assert!(client.0.state.lock().unwrap().session_disabled);
+            fixture.assert_idle();
+            let starting = client.clone();
+            let task = tokio::spawn(async move { starting.start_session().await });
+            let request = fixture.next().await;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let id = body["session_id"].as_str().unwrap();
+            request.respond(200, &signed_session_reply(id, 1, &installation));
+            fixture.next().await.respond(200, &session_jwks());
+            assert_eq!(task.await.unwrap().unwrap().access, Access::Online);
+            let ending = client.clone();
+            let task = tokio::spawn(async move { ending.end_session().await });
+            fixture.next().await.respond(204, "");
+            task.await.unwrap().unwrap();
+            let activating = client.clone();
+            let task = tokio::spawn(async move { activating.activate("replacement-key").await });
+            fixture
+                .next()
+                .await
+                .respond(200, &floating_reply(&installation));
+            let request = fixture.next().await;
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            request.respond(
+                200,
+                &signed_session_reply(body["session_id"].as_str().unwrap(), 1, &installation),
+            );
+            assert_eq!(task.await.unwrap().unwrap().access, Access::Online);
+            let task = tokio::spawn(async move { client.close().await });
+            fixture.next().await.respond(204, "");
+            task.await.unwrap().unwrap();
+        }
+    }
+
     #[cfg(feature = "local-development")]
     async fn login_fixture_account(
         client: &Client,
@@ -3595,6 +4277,7 @@ mod tests {
             Error::Denied { .. } => "denied",
             Error::NotActivated => "not activated",
             Error::FeatureUnavailable => "feature",
+            Error::SessionRequired => "session required",
             Error::InvalidResponse => "invalid response",
             Error::TransportSecurity => "transport security",
             Error::ReauthenticationRequired => "reauthentication",

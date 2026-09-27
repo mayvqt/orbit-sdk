@@ -86,6 +86,12 @@ pub struct OwnedLicence {
     )]
     pub duration: Option<Duration>,
     pub device_limit: i32,
+    #[serde(deserialize_with = "deserialize_concurrent_session_limit")]
+    pub concurrent_session_limit: u16,
+    #[serde(deserialize_with = "crate::limits::deserialize_usage_limits")]
+    pub usage_limits: BTreeMap<String, crate::limits::UsageLimit>,
+    #[serde(deserialize_with = "crate::limits::deserialize_resource_limits")]
+    pub resource_limits: BTreeMap<String, crate::limits::ResourceLimit>,
     pub hwid_locked: bool,
     pub offline_allowed: bool,
     #[serde(rename = "offline_seconds", deserialize_with = "deserialize_duration")]
@@ -722,6 +728,16 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+fn deserialize_concurrent_session_limit<'de, D>(
+    deserializer: D,
+) -> std::result::Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    u16::try_from(value).map_err(|_| serde::de::Error::custom("invalid concurrent session limit"))
+}
+
 fn deserialize_offline_file_duration<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Duration, D::Error>
@@ -761,7 +777,7 @@ mod tests {
             "id":"licence", "policy_name":"Export", "state":"active",
             "expiry_mode":"duration", "first_used_at":"2026-01-01T00:00:00Z",
             "expires_at":"2026-01-02T00:00:00Z", "duration_seconds":3600,
-            "device_limit":1, "hwid_locked":false, "offline_allowed":true,
+            "device_limit":1, "concurrent_session_limit":3, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false, "offline_allowed":true,
             "offline_seconds":900, "offline_file_seconds":86400, "entitlements":{"export":true}
         }))
         .unwrap();
@@ -776,7 +792,7 @@ mod tests {
             "items":[{
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
-                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "duration_seconds":null, "device_limit":1, "concurrent_session_limit":0, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false,
                 "offline_allowed":true, "offline_seconds":900,
                 "offline_file_seconds":86400, "entitlements":{"export":true}
             }], "next_cursor":null
@@ -790,7 +806,7 @@ mod tests {
             "id":"licence", "policy_name":"Export", "state":"active",
             "expiry_mode":"duration", "first_used_at":"1969-12-31T23:59:59Z",
             "expires_at":"9999-12-31T23:59:59Z", "duration_seconds":i64::MAX,
-            "device_limit":1, "hwid_locked":false, "offline_allowed":true,
+            "device_limit":1, "concurrent_session_limit":65535, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false, "offline_allowed":true,
             "offline_seconds":i64::MAX, "offline_file_seconds":31622400, "entitlements":{"export":true}
         }))
         .unwrap();
@@ -815,7 +831,7 @@ mod tests {
             serde_json::from_value::<OwnedLicence>(json!({
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
-                "duration_seconds":-1, "device_limit":1, "hwid_locked":false,
+                "duration_seconds":-1, "device_limit":1, "concurrent_session_limit":0, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false,
                 "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":0, "entitlements":{}
             }))
             .is_err()
@@ -824,7 +840,7 @@ mod tests {
             serde_json::from_value::<OwnedLicence>(json!({
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
-                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "duration_seconds":null, "device_limit":1, "concurrent_session_limit":0, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false,
                 "offline_allowed":false, "offline_seconds":-1, "offline_file_seconds":0, "entitlements":{}
             }))
             .is_err()
@@ -833,7 +849,7 @@ mod tests {
             let value = json!({
                 "id":"licence", "policy_name":"Export", "state":"active",
                 "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
-                "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+                "duration_seconds":null, "device_limit":1, "concurrent_session_limit":0, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false,
                 "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":seconds,
                 "entitlements":{}
             });
@@ -842,10 +858,18 @@ mod tests {
         let mut missing_file_duration = json!({
             "id":"licence", "policy_name":"Export", "state":"active",
             "expiry_mode":"duration", "first_used_at":null, "expires_at":null,
-            "duration_seconds":null, "device_limit":1, "hwid_locked":false,
+            "duration_seconds":null, "device_limit":1, "concurrent_session_limit":0, "usage_limits":{}, "resource_limits":{}, "hwid_locked":false,
             "offline_allowed":false, "offline_seconds":0, "offline_file_seconds":0,
             "entitlements":{}
         });
+        for field in ["usage_limits", "resource_limits"] {
+            let mut missing = missing_file_duration.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<OwnedLicence>(missing).is_err());
+            let mut null = missing_file_duration.clone();
+            null[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<OwnedLicence>(null).is_err());
+        }
         missing_file_duration
             .as_object_mut()
             .unwrap()

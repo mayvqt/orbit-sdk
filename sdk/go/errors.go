@@ -100,6 +100,10 @@ func errorGuidance(code string) string {
 		return "The device limit is reached. Release an existing device or contact application support."
 	case "device_mismatch", "device_identity_unavailable":
 		return "This device could not be verified. Contact application support."
+	case "concurrent_session_limit_reached":
+		return "All floating seats are in use. Try again later or contact application support."
+	case "session_required":
+		return "Start a floating session before continuing."
 	case "reset_cooldown":
 		return "Device changes are temporarily limited. Wait before trying again."
 	case "application_maintenance":
@@ -123,6 +127,7 @@ var (
 	ErrCancelled                = &Error{Kind: Cancelled}
 	ErrTransient                = &Error{Kind: Transient}
 	ErrDenied                   = &Error{Kind: Denied}
+	ErrSessionRequired          = &Error{Kind: Denied, Code: "session_required"}
 	ErrNotActivated             = &Error{Kind: NotActivated, Code: "access_unavailable"}
 	ErrFeatureUnavailable       = &Error{Kind: FeatureUnavailable, Code: "feature_unavailable"}
 	ErrInvalidResponse          = &Error{Kind: InvalidResponse}

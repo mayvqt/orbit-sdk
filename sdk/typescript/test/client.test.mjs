@@ -58,7 +58,7 @@ function licenceShape(overrides = {}) {
     first_used_at: null,
     expires_at: null,
     device_limit: 2,
-    concurrent_session_limit: 0,
+    concurrent_session_limit: 0, usage_limits: {}, resource_limits: {},
     hwid_locked: false,
     offline_allowed: true,
     offline_seconds: 900,

@@ -80,6 +80,7 @@ impl Error {
             Self::Denied { .. } => "denied",
             Self::NotActivated => "access_unavailable",
             Self::FeatureUnavailable => "feature_unavailable",
+            Self::SessionRequired => "session_required",
             Self::InvalidResponse => "invalid_response",
             Self::TransportSecurity => "transport_security",
             Self::ReauthenticationRequired => "reauthentication_required",

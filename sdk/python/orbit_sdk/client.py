@@ -37,7 +37,9 @@ from .jsonutil import fields, strict_int, text, unique_json
 from .storage import MemoryStorage, StoredCredential, WindowsStorage, SecretServiceStorage, valid_credential
 from .persistent_storage import AccessState, InstallationStorage, OfflineState, PendingActivation, canonical_scope
 from .offline import Expected as OfflineExpected, OfflineFile, OfflineKeys, OfflineRequest, request as offline_request, verify as verify_offline_file
+from .sessions import Expected as SessionExpected, SessionGrant, SessionKeys, verify as verify_session_grant
 from .transport import CLIENT_PREFIX, JWKS_PATH, Transport, _safe_origin
+from . import online
 
 
 class StorageMode(str, Enum):
@@ -94,6 +96,7 @@ class _AppScope:
     issuer: str
     fingerprint: str | None = None
     fingerprint_provider: str | None = None
+    environment: str = "test"
 
 
 class AccessStatus(str, Enum):
@@ -119,6 +122,7 @@ class Snapshot:
     reauthentication_required: bool
     offline_allowed: bool
     remaining_offline: dt.timedelta
+    session: SessionMetadata | None = None
 
     def has(self, feature: str) -> bool:
         """Return whether ``feature`` is a currently granted entitlement."""
@@ -147,11 +151,22 @@ class OwnedLicence:
     expires_at: dt.datetime | None
     duration: dt.timedelta | None
     device_limit: int
+    concurrent_session_limit: int
     hwid_locked: bool
     offline_allowed: bool
     offline_duration: dt.timedelta
     offline_file_duration: dt.timedelta
     entitlements: Mapping[str, bool]
+    usage_limits: Mapping[str, online.UsageLimit]
+    resource_limits: Mapping[str, online.ResourceLimit]
+
+
+@dataclass(frozen=True)
+class SessionMetadata:
+    session_id: str
+    sequence: int
+    expires_at: dt.datetime
+    refresh_after: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -180,11 +195,11 @@ class DeviceBinding:
 
 
 class _CombinedCancellation:
-    def __init__(self, lifecycle: threading.Event, caller: threading.Event) -> None:
+    def __init__(self, lifecycle: Any, caller: Any) -> None:
         self.lifecycle, self.caller = lifecycle, caller
 
     def is_set(self) -> bool:
-        return self.lifecycle.is_set() or self.caller.is_set()
+        return _cancelled(self.lifecycle) or _cancelled(self.caller)
 
     def wait(self, timeout: float | None = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -192,8 +207,12 @@ class _CombinedCancellation:
             remaining = 0.05 if deadline is None else min(0.05, deadline - time.monotonic())
             if remaining <= 0:
                 return self.is_set()
-            self.lifecycle.wait(remaining)
+            time.sleep(remaining)
         return True
+
+
+def _cancelled(value: Any) -> bool:
+    return value is not None and value.is_set()
 
 
 class Cancellation:
@@ -390,6 +409,16 @@ class Client:
         self._credential = credential
         self._claims: dict[str, Any] | None = None
         self._anchor: Anchor | None = None
+        self._session_required = False
+        self._session_keys: SessionKeys | None = None
+        self._floating: tuple[SessionGrant, Anchor] | None = None
+        self._pending_session_id: str | None = None
+        self._session_disabled = False
+        self._session_cancel = threading.Event()
+        self._session_retry_deadline: float | None = None
+        self._session_licence_expiry: int | None = None
+        self._session_binding_mode: str | None = None
+        self._session_lock = threading.Lock()
         self._transient = False
         self._retry_deadline: float | None = None
         self._account: _AccountSession | None = None
@@ -398,6 +427,7 @@ class Client:
         self._keys_lock = threading.Lock()
         self._persisted_access: AccessState | None = None
         self._app_key = app_key
+        self._environment = app_key.environment if app_key is not None else "test"
         self._offline_keys = offline_keys
         self._offline_file: OfflineFile | None = None
         self._offline_state: OfflineState | None = None
@@ -448,6 +478,7 @@ class Client:
             application_id=parsed.application_id,
             environment_id=parsed.environment_id,
             issuer=parsed.issuer,
+            environment=parsed.environment,
             fingerprint=None if binding is None else binding.fingerprint,
             fingerprint_provider=None if binding is None else binding.provider,
         )
@@ -534,12 +565,17 @@ class Client:
                 fingerprint_provider=app_scope.fingerprint_provider or "",
             )
             _validate_config(config)
+            if app_key is None:
+                app_key_environment = app_scope.environment
+            else:
+                app_key_environment = app_key.environment
             client = cls(config, live_transport, storage, persistent=True, app_key=app_key, offline_keys=offline_keys)
+            client._environment = app_key_environment
             if storage.pending_activation is None and not client._offline_mode():
                 try:
                     client._refresh(None, respect_retry=False)
                 except OrbitError as exc:
-                    if exc.kind not in (TRANSIENT, REAUTHENTICATION_REQUIRED):
+                    if exc.kind not in (TRANSIENT, REAUTHENTICATION_REQUIRED) and not (exc.kind == DENIED and exc.code == "concurrent_session_limit_reached"):
                         raise
             client._checkpoint_persistent_cache(force=True)
             if start_worker:
@@ -764,7 +800,22 @@ class Client:
                         self._checkpoint_persistent_cache()
                         snapshot = self._snapshot()
                         pending_activation = self._persistent_storage is not None and self._persistent_storage.pending_activation is not None
-                        needs_refresh = not pending_activation and not snapshot.get("offline_file_mode", False) and snapshot["access"] in ("refresh_required", "expired", "offline")
+                        with self._state_lock:
+                            session_mode = self._session_required and not self._session_disabled and not snapshot.get("offline_file_mode", False)
+                            if session_mode:
+                                if self._floating is None:
+                                    session_remaining = 0.0
+                                else:
+                                    grant, session_anchor = self._floating
+                                    try:
+                                        session_remaining = max(0.0, grant.refresh_after - session_anchor.now())
+                                    except OrbitError:
+                                        session_remaining = 0.0
+                                session_retry = self._session_retry_deadline
+                            else:
+                                session_remaining = 60.0
+                                session_retry = None
+                        needs_refresh = not pending_activation and not snapshot.get("offline_file_mode", False) and snapshot["access"] in ("refresh_required", "expired", "offline") and not session_mode
                         with self._state_lock:
                             if needs_refresh and self._anchor is not None and self._claims is not None:
                                 try:
@@ -775,6 +826,23 @@ class Client:
                                 refresh_remaining = 60.0
                             retry = self._retry_deadline
                         now = time.monotonic()
+                        session_retry_remaining = None if session_retry is None else max(0.0, session_retry - now)
+                        if session_mode and session_retry_remaining is not None and session_retry_remaining > 0.0:
+                            timeout = min(timeout, session_retry_remaining)
+                        elif session_mode and session_remaining <= 0.0:
+                            try:
+                                self._advance_session(self._lifecycle_stop)
+                            except OrbitError as exc:
+                                if exc.kind not in (TRANSIENT, DENIED, CANCELLED, STALE_RESPONSE, CLOCK_UNCERTAIN, STORAGE):
+                                    pass
+                            with self._state_lock:
+                                session_retry = self._session_retry_deadline
+                            if session_retry is not None:
+                                timeout = min(timeout, max(0.0, session_retry - time.monotonic()))
+                            else:
+                                timeout = min(timeout, 1.0)
+                        elif session_mode:
+                            timeout = min(timeout, session_remaining)
                         retry_remaining = None if retry is None else max(0.0, retry - now)
                         if needs_refresh and (retry_remaining is None or retry_remaining <= 0.0):
                             try:
@@ -848,6 +916,7 @@ class Client:
                 return
 
     def _clear_access_locked(self) -> None:
+        self._drop_floating_locked(release=True, clear_profile=True)
         self._generation += 1
         self._credential = None
         self._claims = None
@@ -857,6 +926,40 @@ class Client:
         self._offline_state = None
         self._transient = False
         self._retry_deadline = None
+
+    def _drop_floating_locked(self, *, release: bool, clear_profile: bool) -> None:
+        current = self._floating
+        session_id = current[0].session_id if current is not None else self._pending_session_id
+        credential = self._credential
+        self._session_cancel.set()
+        self._session_cancel = threading.Event()
+        self._floating = None
+        self._pending_session_id = None
+        self._session_retry_deadline = None
+        if clear_profile:
+            self._session_required = False
+            self._session_disabled = False
+            self._session_keys = None
+            self._session_licence_expiry = None
+            self._session_binding_mode = None
+        if release and session_id and credential is not None:
+            self._schedule_session_release(session_id, credential)
+
+    def _schedule_session_release(self, session_id: str, credential: StoredCredential) -> None:
+        def release() -> None:
+            cancelled = threading.Event()
+            timer = threading.Timer(2.0, cancelled.set)
+            timer.daemon = True
+            timer.start()
+            try:
+                route = f"{CLIENT_PREFIX}activations/{credential.activation_id}/sessions/{session_id}/end"
+                self.transport.post(route, self._credential_body(credential), True, cancelled)
+            except BaseException:
+                pass
+            finally:
+                timer.cancel()
+
+        threading.Thread(target=release, name="orbit-session-release", daemon=True).start()
 
     def _clear_all_locked(self) -> None:
         self._clear_access_locked()
@@ -938,6 +1041,7 @@ class Client:
             "reauthentication_required": self._credential is None,
             "offline_allowed": False,
             "remaining_offline_seconds": 0,
+            "session": None,
         }
         if self._offline_mode():
             result["offline_file_mode"] = True
@@ -957,6 +1061,34 @@ class Client:
             if remaining > 0:
                 result["entitlements"] = dict(self._offline_file.entitlements)
                 result["remaining_offline_seconds"] = remaining
+            return result
+        if self._session_required:
+            if self._floating is None:
+                if self._credential is not None and self._credential.credential_expires_at is not None:
+                    result["reauthentication_required"] = self._credential.credential_expires_at <= wall_seconds() + 86400
+                return result
+            grant, anchor = self._floating
+            try:
+                session_now = anchor.now()
+            except OrbitError:
+                self._drop_floating_locked(release=False, clear_profile=False)
+                return result
+            if self._credential is not None and self._credential.credential_expires_at is not None:
+                result["reauthentication_required"] = self._credential.credential_expires_at <= session_now + 86400
+            session = {
+                "session_id": grant.session_id,
+                "sequence": grant.sequence,
+                "expires_at": grant.expires_at,
+                "refresh_after": grant.refresh_after,
+            }
+            result["session"] = session
+            result["expires_at"] = grant.expires_at
+            result["next_check_at"] = grant.refresh_after
+            if grant.expires_at > session_now:
+                result["access"] = "online"
+                result["entitlements"] = dict(grant.entitlements)
+            else:
+                result["access"] = "expired"
             return result
         if self._claims is None or self._anchor is None:
             return result
@@ -1110,7 +1242,11 @@ class Client:
                 response_error = None
             except OrbitError as exc:
                 response, response_error = None, exc
-            return self._accept(response, response_error, generation, None, licence if principal == "account" else None, started, cancel)
+            snapshot = self._accept(response, response_error, generation, None, licence if principal == "account" else None, started, cancel)
+            if self._session_required and not self._session_disabled:
+                self._start_session_internal(cancel, explicit=False)
+                return self._snapshot()
+            return snapshot
         finally:
             self._serial.release()
 
@@ -1142,7 +1278,11 @@ class Client:
                 response_error = None
             except OrbitError as exc:
                 response, response_error = None, exc
-            return self._accept(response, response_error, generation, saved, None, started, cancel)
+            snapshot = self._accept(response, response_error, generation, saved, None, started, cancel)
+            if self._session_required and not self._session_disabled:
+                self._start_session_internal(cancel, explicit=False)
+                return self._snapshot()
+            return snapshot
         finally:
             self._serial.release()
 
@@ -1156,10 +1296,325 @@ class Client:
             "fingerprint_provider": self.config.fingerprint_provider or None,
         }
 
+    def start_session(self, *, cancellation: Cancellation | None = None) -> Snapshot:
+        """Acquire or reuse the current floating seat; ordinary/offline policy is a no-op."""
+        with self._operation(cancellation) as cancel:
+            self._sync_storage()
+            if self._offline_mode():
+                return _to_snapshot(self._snapshot())
+            with self._state_lock:
+                if self._credential is None:
+                    raise NotActivatedError()
+                self._session_disabled = False
+                known = self._session_required or self._claims is not None
+            if not known:
+                self._refresh(cancel, respect_retry=False)
+            if not self._session_required:
+                return _to_snapshot(self._snapshot())
+            return _to_snapshot(self._start_session_internal(cancel, explicit=True))
+
+    def end_session(self, *, cancellation: Cancellation | None = None) -> Snapshot:
+        """Release the current floating seat and disable automatic reacquisition."""
+        with self._operation(cancellation) as cancel:
+            self._sync_storage()
+            if self._offline_mode():
+                return _to_snapshot(self._snapshot())
+            with self._state_lock:
+                known = self._session_required or self._claims is not None
+                if known and not self._session_required:
+                    return _to_snapshot(self._snapshot_locked())
+                # Preserve end intent even while the first activation is in
+                # flight and its credential and policy have not arrived.
+                self._session_disabled = True
+                if self._credential is None:
+                    return _to_snapshot(self._snapshot_locked())
+            if not known:
+                self._refresh(cancel, respect_retry=False)
+            if not self._session_required:
+                return _to_snapshot(self._snapshot())
+            with self._state_lock:
+                self._session_disabled = True
+                self._generation += 1
+                current = self._floating
+                session_id = current[0].session_id if current is not None else self._pending_session_id
+                credential = self._credential
+                self._drop_floating_locked(release=False, clear_profile=False)
+            if session_id and credential is not None:
+                self._best_effort_session_release(session_id, credential, 2.0)
+            return _to_snapshot(self._snapshot())
+
+    def _start_session_internal(self, cancel: Any, *, explicit: bool) -> dict[str, Any]:
+        generation = self._generation_now()
+        while not self._session_lock.acquire(timeout=0.05):
+            _check_cancel(cancel)
+            self._check_generation(generation)
+        sent = False
+        session_id: str | None = None
+        credential: StoredCredential | None = None
+        session_cancel: threading.Event | None = None
+        try:
+            self._check_generation(generation)
+            _check_cancel(cancel)
+            self._sync_storage()
+            with self._state_lock:
+                if self._offline_mode():
+                    return self._snapshot_locked()
+                if not self._session_required:
+                    return self._snapshot_locked()
+                if self._session_disabled and not explicit:
+                    raise error(DENIED, "session_explicitly_ended")
+                credential = self._credential
+                if credential is None:
+                    raise NotActivatedError()
+                if explicit:
+                    self._session_disabled = False
+                current = self._floating
+                if current is not None:
+                    try:
+                        if current[1].now() < current[0].expires_at:
+                            return self._snapshot_locked()
+                    except OrbitError as exc:
+                        self._drop_floating_locked(release=False, clear_profile=False)
+                        raise exc
+                    self._drop_floating_locked(release=False, clear_profile=False)
+                if self._pending_session_id is None:
+                    self._pending_session_id = secrets.token_urlsafe(24)
+                session_id = self._pending_session_id
+                session_cancel = self._session_cancel
+            combined = _CombinedCancellation(cancel, session_cancel)
+            started = Start.capture()
+            route = f"{CLIENT_PREFIX}activations/{credential.activation_id}/sessions"
+            sent = True
+            response = self.transport.post(route, {**self._credential_body(credential), "session_id": session_id}, True, combined)
+            grant, anchor = self._verify_session_reply(response, session_id, 1, credential, started, combined)
+            self._check_generation(generation)
+            _check_cancel(combined)
+            with self._state_lock:
+                if self._generation != generation or self._credential != credential or not self._session_required:
+                    raise error(STALE_RESPONSE, "stale_response")
+                self._floating = (grant, anchor)
+                self._pending_session_id = None
+                self._session_retry_deadline = None
+                result = self._snapshot_locked()
+            with self._lifecycle_condition:
+                self._lifecycle_condition.notify_all()
+            return result
+        except OrbitError as exc:
+            retry = exc.kind == TRANSIENT or exc.kind == DENIED and exc.code == "concurrent_session_limit_reached"
+            with self._state_lock:
+                if self._generation != generation or sent and self._credential != credential:
+                    if sent and session_id and credential:
+                        self._queue_session_release(session_id, credential)
+                    if exc.kind == CANCELLED:
+                        raise
+                    raise error(STALE_RESPONSE, "stale_response") from exc
+                if sent and session_id and credential:
+                    if retry:
+                        self._session_retry_deadline = time.monotonic() + random.randrange(15, 45)
+                    else:
+                        if self._pending_session_id == session_id:
+                            self._pending_session_id = None
+                        self._queue_session_release(session_id, credential)
+                        if exc.code == "licence_revoked":
+                            self._invalidate(clear_account=False)
+                        elif exc.kind not in (CANCELLED, STALE_RESPONSE):
+                            self._session_disabled = True
+                            self._session_retry_deadline = None
+            if sent and retry:
+                with self._lifecycle_condition:
+                    self._lifecycle_condition.notify_all()
+            raise
+        finally:
+            self._session_lock.release()
+
+    def _renew_session_internal(self, cancel: Any) -> dict[str, Any]:
+        with self._state_lock:
+            current = self._floating
+        if current is None:
+            return self._start_session_internal(cancel, explicit=False)
+        generation = self._generation_now()
+        while not self._session_lock.acquire(timeout=0.05):
+            _check_cancel(cancel)
+            self._check_generation(generation)
+        sent = False
+        acquired = True
+        credential: StoredCredential | None = None
+        try:
+            self._check_generation(generation)
+            _check_cancel(cancel)
+            self._sync_storage()
+            with self._state_lock:
+                credential = self._credential
+                if credential is None or not self._session_required or self._session_disabled or self._floating is not current:
+                    raise error(STALE_RESPONSE, "stale_response")
+                try:
+                    if current[1].now() >= current[0].expires_at:
+                        self._floating = None
+                        self._pending_session_id = None
+                        expired = True
+                    else:
+                        expired = False
+                except OrbitError:
+                    self._floating = None
+                    raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+                if not expired:
+                    sequence = current[0].sequence + 1
+                    if not strict_int(sequence, minimum=1, maximum=(1 << 53) - 1):
+                        raise error(STORAGE, "storage_failed")
+                    session_cancel = self._session_cancel
+                    session_id = current[0].session_id
+            if expired:
+                self._session_lock.release()
+                acquired = False
+                return self._start_session_internal(cancel, explicit=False)
+            combined = _CombinedCancellation(cancel, session_cancel)
+            started = Start.capture()
+            route = f"{CLIENT_PREFIX}activations/{credential.activation_id}/sessions/{session_id}/renew"
+            sent = True
+            response = self.transport.post(route, {**self._credential_body(credential), "sequence": sequence}, True, combined)
+            grant, anchor = self._verify_session_reply(response, session_id, sequence, credential, started, combined)
+            self._check_generation(generation)
+            _check_cancel(combined)
+            with self._state_lock:
+                if self._generation != generation or self._credential != credential or self._floating is not current:
+                    raise error(STALE_RESPONSE, "stale_response")
+                self._floating = (grant, anchor)
+                self._session_retry_deadline = None
+                result = self._snapshot_locked()
+            with self._lifecycle_condition:
+                self._lifecycle_condition.notify_all()
+            return result
+        except OrbitError as exc:
+            if sent and current[0].session_id and credential and exc.kind in (CANCELLED, STALE_RESPONSE):
+                self._queue_session_release(current[0].session_id, credential)
+            with self._state_lock:
+                if self._generation != generation or self._credential != credential or self._floating is not current:
+                    raise error(STALE_RESPONSE, "stale_response") from exc
+                if exc.code == "licence_revoked":
+                    revoke_credential = True
+                else:
+                    revoke_credential = False
+                    # A terminal or malformed renewal response cannot keep
+                    # authorizing the current interval or trigger a tight
+                    # background retry. Explicit start_session can recover.
+                    if exc.kind not in (TRANSIENT, CANCELLED, STALE_RESPONSE):
+                        self._drop_floating_locked(release=False, clear_profile=False)
+                        self._session_disabled = True
+                        self._session_retry_deadline = None
+            if revoke_credential:
+                self._invalidate(clear_account=False)
+                raise
+            if exc.kind == TRANSIENT:
+                with self._state_lock:
+                    if self._generation != generation or self._credential != credential or self._floating is not current:
+                        raise error(STALE_RESPONSE, "stale_response") from exc
+                    self._session_retry_deadline = time.monotonic() + random.randrange(15, 45)
+                    try:
+                        snapshot = self._snapshot_locked()
+                        if (snapshot["access"] == "online" and snapshot["session"] is not None
+                                and snapshot["session"]["session_id"] == current[0].session_id
+                                and snapshot["session"]["sequence"] == current[0].sequence):
+                            return snapshot
+                    except OrbitError:
+                        pass
+            raise
+        finally:
+            if acquired:
+                self._session_lock.release()
+
+    def _advance_session(self, cancel: Any) -> dict[str, Any]:
+        self._sync_storage()
+        should_start = False
+        should_renew = False
+        with self._state_lock:
+            if self._offline_mode() or not self._session_required or self._session_disabled:
+                return self._snapshot_locked()
+            current = self._floating
+            if self._credential is None:
+                raise NotActivatedError()
+            retry = self._session_retry_deadline
+            if retry is not None and time.monotonic() < retry:
+                return self._snapshot_locked()
+            if current is None:
+                should_start = True
+            else:
+                try:
+                    if current[1].now() < current[0].refresh_after:
+                        return self._snapshot_locked()
+                    should_renew = True
+                except OrbitError:
+                    self._floating = None
+                    raise error(CLOCK_UNCERTAIN, "clock_uncertain")
+        if should_start:
+            return self._start_session_internal(cancel, explicit=False)
+        if should_renew:
+            return self._renew_session_internal(cancel)
+        return self._snapshot()
+
+    def _verify_session_reply(
+        self, data: bytes | None, session_id: str, sequence: int, credential: StoredCredential,
+        started: Start, cancel: Any,
+    ) -> tuple[SessionGrant, Anchor]:
+        value = unique_json(data if data is not None else b"")
+        value = fields(value, {"session_id": str, "sequence": int, "expires_at": str, "server_time": str, "grant": str}, exact=True)
+        if value["session_id"] != session_id or value["sequence"] != sequence or not opaque(session_id) or len(session_id) < 16:
+            raise error(INVALID_RESPONSE, "invalid_session_response")
+        expires = timestamp(value["expires_at"])
+        anchor = Anchor(timestamp(value["server_time"]), started)
+        keys = self._session_keys
+        try:
+            key_known = keys is not None and keys.contains(value["grant"])
+        except (AttributeError, ValueError, OrbitError):
+            key_known = False
+        if not key_known:
+            _check_cancel(cancel)
+            route = f"{JWKS_PATH}?application_id={self.config.application_id}&environment_id={self.config.environment_id}"
+            raw = self.transport.get(route, cancel)
+            if raw is None:
+                raise error(INVALID_RESPONSE, "missing_session_jwks")
+            keys = SessionKeys.parse(raw, self._environment)
+            self._session_keys = keys
+        expected_grant = Expected(
+            issuer=self.config.issuer,
+            application=self.config.application_id,
+            environment=self.config.environment_id,
+            licence=credential.licence_id,
+            activation=credential.activation_id,
+            installation=self.config.installation_id,
+            fingerprint=self.config.fingerprint or None,
+            fingerprint_provider=self.config.fingerprint_provider or None,
+            credential_expires_at=credential.credential_expires_at,
+            licence_expires_at=self._session_licence_expiry,
+            now=anchor.now(),
+            allow_unbound_fingerprint=True,
+        )
+        grant = verify_session_grant(value["grant"], keys, SessionExpected(expected_grant, session_id, sequence))
+        if grant.expires_at != expires or grant.binding_mode != self._session_binding_mode:
+            raise error(INVALID_RESPONSE, "invalid_session_response")
+        return grant, anchor
+
+    def _queue_session_release(self, session_id: str, credential: StoredCredential) -> None:
+        def release() -> None:
+            self._best_effort_session_release(session_id, credential, 2.0)
+        threading.Thread(target=release, name="orbit-session-release", daemon=True).start()
+
+    def _best_effort_session_release(self, session_id: str, credential: StoredCredential, timeout: float) -> None:
+        cancelled = threading.Event()
+        timer = threading.Timer(timeout, cancelled.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            route = f"{CLIENT_PREFIX}activations/{credential.activation_id}/sessions/{session_id}/end"
+            self.transport.post(route, self._credential_body(credential), True, cancelled)
+        except BaseException:
+            pass
+        finally:
+            timer.cancel()
+
     def _accept(self, response: bytes | None, response_error: OrbitError | None, generation: int, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> dict[str, Any]:
         self._check_generation(generation)
         verifying = response_error is None
-        result: tuple[StoredCredential, dict[str, Any], Anchor, AccessState | None] | None = None
+        result: tuple[StoredCredential, dict[str, Any] | None, Anchor | None, AccessState | None, bool, int | None, str] | None = None
         failure = response_error
         if failure is None:
             try:
@@ -1171,7 +1626,7 @@ class Client:
         self._check_generation(generation)
         _check_cancel(cancel)
         if result is not None:
-            saved, claims, anchor, access = result
+            saved, claims, anchor, access, session_required, licence_expiry, binding_mode = result
             self._check_generation(generation)
             with self._state_lock:
                 try:
@@ -1187,8 +1642,6 @@ class Client:
                 _check_cancel(cancel)
                 try:
                     if self._persistent_storage is not None:
-                        if access is None:
-                            raise error(STORAGE, "storage_failed")
                         self._persistent_storage.save_verified(self._storage_version, saved, access)
                     else:
                         self._storage.save(self._storage_version, saved)
@@ -1200,8 +1653,15 @@ class Client:
                 except BaseException as exc:
                     self._clear_all_locked()
                     raise error(STORAGE, "storage_failed") from exc
+                if not session_required:
+                    self._drop_floating_locked(release=True, clear_profile=True)
                 self._credential, self._claims, self._anchor = saved, claims, anchor
                 self._persisted_access = access
+                self._session_required = session_required
+                self._session_licence_expiry = licence_expiry if session_required else None
+                self._session_binding_mode = binding_mode if session_required else None
+                if session_required and self._floating is not None and self._floating[0].activation_id != saved.activation_id:
+                    self._drop_floating_locked(release=True, clear_profile=False)
                 self._transient = False
                 self._retry_deadline = None
                 return self._snapshot_locked()
@@ -1245,8 +1705,9 @@ class Client:
                 raise error(STORAGE, "storage_failed") from exc
         raise failure
 
-    def _verify_reply(self, data: bytes, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> tuple[StoredCredential, dict[str, Any], Anchor, AccessState | None]:
+    def _verify_reply(self, data: bytes, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> tuple[StoredCredential, dict[str, Any] | None, Anchor | None, AccessState | None, bool, int | None, str]:
         reply = unique_json(data)
+        had_session_flag = isinstance(reply, dict) and "session_required" in reply
         expected_fields = {
             "activation_id": str,
             "installation_id": str,
@@ -1258,8 +1719,10 @@ class Client:
             "fingerprint_provider": (str, type(None)),
             "licence_expires_at": (str, type(None)),
             "secret_replay_expired": bool,
+            "session_required": (bool, type(None)),
+            "licence_id": (str, type(None)),
         }
-        optional = ("credential", "grant", "fingerprint_provider", "licence_expires_at")
+        optional = ("credential", "grant", "fingerprint_provider", "licence_expires_at", "session_required", "licence_id")
         if not self._persistent:
             optional += ("credential_expires_at",)
         reply = fields(reply, expected_fields, optional=optional)
@@ -1270,9 +1733,12 @@ class Client:
             or reply["installation_id"] != self.config.installation_id
             or reply["fingerprint_provider"] != (self.config.fingerprint_provider or None)
             or reply["binding_mode"] not in ("hwid", "none")
-            or reply["grant"] is None
+            or had_session_flag and reply["session_required"] is not True
+            or (reply["session_required"] is True and reply["grant"] is not None)
+            or (reply["session_required"] is not True and reply["grant"] is None)
         ):
             raise error(INVALID_RESPONSE, "invalid_activation_response")
+        session_required = reply["session_required"] is True
         anchor = Anchor(timestamp(reply["server_time"]), started)
         now = anchor.now()
         expiry = None if reply["credential_expires_at"] is None else timestamp(reply["credential_expires_at"])
@@ -1287,6 +1753,29 @@ class Client:
         ):
             raise error(INVALID_RESPONSE, "invalid_activation_response")
         token = reply["grant"]
+        licence_expiry = timestamp(reply["licence_expires_at"]) if reply["licence_expires_at"] is not None else None
+        if session_required and (
+            not opaque(reply["licence_id"])
+            or expected_licence is not None and reply["licence_id"] != expected_licence
+            or previous is not None and reply["licence_id"] != previous.licence_id
+        ):
+            raise error(INVALID_RESPONSE, "invalid_activation_response")
+        bearer = reply["credential"] if reply["credential"] is not None else previous.credential if previous is not None else None
+        if bearer is None or not _bearer(bearer):
+            raise error(INVALID_RESPONSE, "invalid_activation_response")
+        if session_required:
+            stored = StoredCredential(
+                application_id=self.config.application_id,
+                environment_id=self.config.environment_id,
+                activation_id=reply["activation_id"],
+                licence_id=reply["licence_id"],
+                installation_id=self.config.installation_id,
+                credential=bearer,
+                credential_expires_at=expiry,
+                fingerprint=self.config.fingerprint or None,
+                fingerprint_provider=self.config.fingerprint_provider or None,
+            )
+            return stored, None, None, None, True, licence_expiry, reply["binding_mode"]
         with self._keys_lock:
             known = self._keys is not None and self._keys.contains(token)
         if not known:
@@ -1301,7 +1790,7 @@ class Client:
         with self._keys_lock:
             keys = self._keys
         assert keys is not None
-        licence_expiry = timestamp(reply["licence_expires_at"]) if reply["licence_expires_at"] is not None else None
+        token = reply["grant"]
         expected = Expected(
             issuer=self.config.issuer,
             application=self.config.application_id,
@@ -1319,14 +1808,7 @@ class Client:
         claims = verify(token, keys, expected)
         if claims["binding_mode"] != reply["binding_mode"]:
             raise error(INVALID_RESPONSE, "invalid_activation_response")
-        credential = (
-            reply["credential"]
-            if reply["credential"] is not None
-            else previous.credential if previous is not None
-            else None
-        )
-        if credential is None or not _bearer(credential):
-            raise error(INVALID_RESPONSE, "invalid_activation_response")
+        credential = bearer
         stored = StoredCredential(
             application_id=self.config.application_id,
             environment_id=self.config.environment_id,
@@ -1351,10 +1833,11 @@ class Client:
                 server_high_water=server_high_water,
                 wall_high_water=wall_high_water,
             )
-        return stored, claims, anchor, access
+        return stored, claims, anchor, access, False, None, reply["binding_mode"]
 
     def require_access(self, feature: str, *, cancellation: Cancellation | None = None) -> Snapshot:
         with self._operation(cancellation) as cancel:
+            _check_cancel(cancel)
             snapshot = self._snapshot()
             if snapshot.get("offline_file_mode", False):
                 _check_cancel(cancel)
@@ -1365,6 +1848,40 @@ class Client:
                 if not snapshot["entitlements"].get(feature, False):
                     raise FeatureUnavailableError()
                 return _to_snapshot(snapshot)
+            if self._session_required:
+                with self._state_lock:
+                    current = self._floating
+                    disabled = self._session_disabled
+                if current is not None:
+                    try:
+                        if current[1].now() < current[0].expires_at:
+                            if not current[0].entitlements.get(feature, False):
+                                raise FeatureUnavailableError()
+                            final = self._snapshot()
+                            _check_cancel(cancel)
+                            if final["access"] != "online" or not final["entitlements"].get(feature, False):
+                                raise error(DENIED, "session_access_unavailable")
+                            return _to_snapshot(final)
+                    except OrbitError as exc:
+                        if exc.kind != CLOCK_UNCERTAIN:
+                            raise
+                        with self._state_lock:
+                            self._drop_floating_locked(release=False, clear_profile=False)
+                if disabled:
+                    raise error(DENIED, "session_explicitly_ended")
+                _check_cancel(cancel)
+                snapshot = self._start_session_internal(cancel, explicit=False)
+                if snapshot["access"] == "online":
+                    if not snapshot["entitlements"].get(feature, False):
+                        raise FeatureUnavailableError()
+                    final = self._snapshot()
+                    _check_cancel(cancel)
+                    if final["access"] != "online":
+                        raise error(DENIED, "session_access_unavailable")
+                    if not final["entitlements"].get(feature, False):
+                        raise FeatureUnavailableError()
+                    return _to_snapshot(final)
+                raise error(DENIED, "session_access_unavailable")
             if snapshot["access"] in ("refresh_required", "expired", "offline"):
                 try:
                     self._refresh(cancel, respect_retry=True)
@@ -1424,6 +1941,80 @@ class Client:
             self._check_generation(generation)
             if result is not None:
                 raise error(INVALID_RESPONSE, "unexpected_response_body")
+
+    def check_for_update(self, installed_release_number: int, *, channel: str = "stable",
+                         target: online.UpdateTarget | None = None, cancellation: Cancellation | None = None) -> online.Update | None:
+        body = online.update_input(installed_release_number, channel, target)
+        return self._online_request("updates", body, lambda v: online.parse_update(v, body), cancellation)
+
+    def authorize_download(self, release_id: str, artifact_id: str, *, cancellation: Cancellation | None = None) -> online.DownloadAuthorization:
+        online.require(release_id, online.identifier)
+        online.require(artifact_id, online.identifier)
+        return self._online_request("downloads/authorize", dict(release_id=release_id, artifact_id=artifact_id),
+                                    lambda v: online.parse_authorization(v, release_id, artifact_id), cancellation)
+
+    def download(self, authorization: online.DownloadAuthorization, destination: str | os.PathLike[str], *,
+                 max_bytes: int, replace: bool = False, cancellation: Cancellation | None = None) -> os.PathLike[str]:
+        """Stream directly from the seller and atomically expose verified bytes."""
+        from .download_file import download_file
+        with self._operation(cancellation) as cancel:
+            return download_file(authorization, destination, max_bytes=max_bytes, replace=replace, cancellation=cancel)
+
+    def usage(self, name: str, *, cancellation: Cancellation | None = None) -> online.UsageCounter:
+        online.require(name, online.name)
+        return self._online_request(f"usage/{name}", {}, lambda v: online.parse_counter(v, name, True), cancellation)
+
+    def consume(self, name: str, units: int = 1, idempotency_key: str | None = None, *,
+                cancellation: Cancellation | None = None) -> online.UsageConsumption:
+        online.require(name, online.name)
+        online.require(units, lambda v: online.integer(v, 1))
+        key = online.operation_id(idempotency_key)
+        return self._online_request(f"usage/{name}/consume", dict(units=units, idempotency_key=key),
+                                    lambda v: online.parse_consumption(v, name, key, units), cancellation, key)
+
+    def resources(self, name: str, *, cancellation: Cancellation | None = None) -> online.ResourceCounter:
+        online.require(name, online.name)
+        return self._online_request(f"resources/{name}", {}, lambda v: online.parse_counter(v, name, False), cancellation)
+
+    def acquire_resource(self, name: str, resource_id: str, units: int = 1, idempotency_key: str | None = None, *,
+                         cancellation: Cancellation | None = None) -> online.ResourceAllocation:
+        online.require(name, online.name)
+        online.require(resource_id, online.identifier)
+        online.require(units, lambda v: online.integer(v, 1))
+        key = online.operation_id(idempotency_key)
+        return self._online_request(f"resources/{name}/acquire", dict(resource_id=resource_id, units=units, idempotency_key=key),
+                                    lambda v: online.parse_allocation(v, name, key, resource_id=resource_id, units=units), cancellation, key)
+
+    def release_resource(self, name: str, allocation_id: str, idempotency_key: str | None = None, *,
+                         cancellation: Cancellation | None = None) -> online.ResourceAllocation:
+        online.require(name, online.name)
+        online.require(allocation_id, online.identifier)
+        key = online.operation_id(idempotency_key)
+        return self._online_request(f"resources/{name}/allocations/{allocation_id}/release", dict(idempotency_key=key),
+                                    lambda v: online.parse_allocation(v, name, key, allocation_id=allocation_id), cancellation, key)
+
+    def _online_request(self, route: str, extra: dict[str, Any], parse: Callable[..., Any],
+                        cancellation: Cancellation | None, key: str | None = None) -> Any:
+        with self._operation(cancellation) as cancel:
+            _check_cancel(cancel)
+            generation = self._generation_now()
+            with self._state_lock:
+                saved = self._credential
+                if saved is None or self._offline_mode():
+                    raise NotActivatedError()
+            try:
+                response = self.transport.post(f"{CLIENT_PREFIX}activations/{saved.activation_id}/{route}",
+                                               self._credential_body(saved) | extra, True, cancel)
+                self._check_response_generation(generation, cancel)
+                return parse(unique_json(response))
+            except OrbitError as exc:
+                try:
+                    self._check_response_generation(generation, cancel)
+                except OrbitError as changed:
+                    exc = changed
+                if key is not None and (exc.kind != DENIED or exc.status >= 500):
+                    raise online.MutationUncertainError(key, exc) from None
+                raise exc
 
     def account(self, *, cancellation: Cancellation | None = None) -> Account | None:
         with self._operation(cancellation) as cancel:
@@ -1650,6 +2241,7 @@ class Client:
 
     def close(self) -> None:
         thread: threading.Thread | None
+        release: tuple[str, StoredCredential] | None = None
         with self._condition:
             if self._closed:
                 return
@@ -1659,11 +2251,21 @@ class Client:
                 self._lifecycle_condition.notify_all()
             thread = self._lifecycle_thread
             from_lifecycle = thread is threading.current_thread()
+            with self._state_lock:
+                current = self._floating
+                session_id = current[0].session_id if current is not None else self._pending_session_id
+                credential = self._credential
+                if session_id and credential is not None:
+                    release = (session_id, credential)
+                self._drop_floating_locked(release=False, clear_profile=False)
             while self._active and not from_lifecycle:
                 self._condition.wait()
             if from_lifecycle:
                 self._close_deferred = True
-                return
+        if release is not None:
+            self._best_effort_session_release(release[0], release[1], 2.0)
+        if from_lifecycle:
+            return
         if thread is not None:
             thread.join()
         self._finish_close()
@@ -1763,6 +2365,12 @@ def _to_snapshot(value: dict[str, Any]) -> Snapshot:
         reauthentication_required=value["reauthentication_required"],
         offline_allowed=value["offline_allowed"],
         remaining_offline=dt.timedelta(seconds=value["remaining_offline_seconds"]),
+        session=None if value.get("session") is None else SessionMetadata(
+            session_id=value["session"]["session_id"],
+            sequence=value["session"]["sequence"],
+            expires_at=_instant(value["session"]["expires_at"]),
+            refresh_after=_instant(value["session"]["refresh_after"]),
+        ),
     )
 
 
@@ -1788,11 +2396,14 @@ def _to_owned_licence(value: dict[str, Any]) -> OwnedLicence:
         expires_at=None if value["expires_at"] is None else _instant(value["expires_at"]),
         duration=None if value["duration_seconds"] is None else dt.timedelta(seconds=value["duration_seconds"]),
         device_limit=value["device_limit"],
+        concurrent_session_limit=value["concurrent_session_limit"],
         hwid_locked=value["hwid_locked"],
         offline_allowed=value["offline_allowed"],
         offline_duration=dt.timedelta(seconds=value["offline_seconds"]),
         offline_file_duration=dt.timedelta(seconds=value["offline_file_seconds"]),
         entitlements=MappingProxyType(dict(value["entitlements"])),
+        usage_limits=online.parse_definitions(value["usage_limits"], True),
+        resource_limits=online.parse_definitions(value["resource_limits"], False),
     )
 
 
@@ -1830,6 +2441,8 @@ def _validate_config(config: _Config) -> None:
 def _validate_app_scope(scope: _AppScope) -> None:
     if not isinstance(scope, _AppScope):
         raise TypeError("app scope must be an internal _AppScope")
+    if scope.environment not in ("test", "live"):
+        raise error(CONFIGURATION, "invalid_app_key")
     values = (scope.api_origin, scope.application_id, scope.environment_id, scope.issuer)
     if any(not isinstance(value, str) for value in values):
         raise TypeError("Orbit SDK configuration values must be strings")
@@ -1923,16 +2536,22 @@ def _check_licence(value: Any) -> dict[str, Any]:
         "expires_at": (str, type(None)),
         "duration_seconds": (int, type(None)),
         "device_limit": int,
+        "concurrent_session_limit": int,
         "hwid_locked": bool,
         "offline_allowed": bool,
         "offline_seconds": int,
         "offline_file_seconds": int,
         "entitlements": dict,
+        "usage_limits": dict,
+        "resource_limits": dict,
     }, optional=("first_used_at", "expires_at", "duration_seconds"))
     features = licence["entitlements"]
+    online.parse_definitions(licence["usage_limits"], True)
+    online.parse_definitions(licence["resource_limits"], False)
     if (
         not opaque(licence["id"])
         or not 1 <= licence["device_limit"] <= 100
+        or not strict_int(licence["concurrent_session_limit"], minimum=0, maximum=65535)
         or len(licence["policy_name"]) > 80
         or len(features) > 64
         or any(not isinstance(name, str) or not isinstance(enabled, bool) for name, enabled in features.items())
@@ -1950,7 +2569,7 @@ def _check_licence(value: Any) -> dict[str, Any]:
             timestamp(date)
     return {name: licence[name] for name in (
         "id", "policy_name", "state", "expiry_mode", "first_used_at", "expires_at",
-        "duration_seconds", "device_limit", "hwid_locked", "offline_allowed", "offline_seconds", "offline_file_seconds", "entitlements",
+        "duration_seconds", "device_limit", "concurrent_session_limit", "hwid_locked", "offline_allowed", "offline_seconds", "offline_file_seconds", "entitlements", "usage_limits", "resource_limits",
     )}
 
 

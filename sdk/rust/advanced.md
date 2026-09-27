@@ -174,3 +174,27 @@ Automated validation covers Linux. Native macOS compilation, filesystem behavior
 and sleep across expiry are unverified. Validate lease contention, copied or
 replaced state, durable-write failures and sleep across expiry on macOS before
 distributing a Mac application.
+
+## Explicit online services
+
+Update discovery, download authorization and metering use the current installed
+activation proof. They never acquire a floating seat or switch out of offline-file
+mode implicitly. Generation checks reject both late success and late failure after
+credential replacement, logout or close.
+
+Metering returns `MutationResult<T>`. An uncertain failure retains the operation ID;
+retry the same action and input. Dropping an async future cannot return an ID, so
+supply your own durable job ID when cancellation or process restart must be
+recoverable. Capacity denial details are exposed only after validating their kind,
+name, safe integer bounds, arithmetic, operation ID and units.
+
+Downloads own a fresh verified-HTTPS client with no cookie jar or ambient credentials.
+They allow five redirects and forward no bearer after the initial endpoint. Byte
+limits apply while streaming, independently of response length headers. Identity
+encoding, exact length and SHA-256 are checked before an atomic destination change.
+Temporary files are created beside the destination and removed on errors or future
+drop. The seller's filename never chooses a destination path.
+
+The Linux download regression fixture uses Python 3 and synthetic TLS certificates
+under `tests/fixtures`. It verifies HTTPS trust, credential stripping, chunked bodies,
+cancellation and preservation of an existing destination after failure.

@@ -670,7 +670,7 @@ test("account retry proof stays bound to its verified customer", async (context)
       return Buffer.from(JSON.stringify({ items: [{
         id: "licence-1", policy_name: "Desktop", state: "active", expiry_mode: "first_activation",
         first_used_at: new Date(Math.floor(Date.now() / 1000) * 1000).toISOString(), expires_at: null, duration_seconds: 3600,
-        device_limit: 1, hwid_locked: false, offline_allowed: true, offline_seconds: 3600,
+        device_limit: 1, concurrent_session_limit: 0, usage_limits: {}, resource_limits: {}, hwid_locked: false, offline_allowed: true, offline_seconds: 3600,
         offline_file_seconds: 86400, entitlements: { export: true },
       }], next_cursor: null }));
     },

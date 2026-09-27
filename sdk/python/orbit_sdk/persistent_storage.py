@@ -685,7 +685,7 @@ class InstallationStorage:
                 raise error(STALE_RESPONSE, "stale_response")
             self._commit(replace(self._state, credential=credential, access=None, pending_activation=None))
 
-    def save_verified(self, version: int, credential: Any, access: AccessState) -> None:
+    def save_verified(self, version: int, credential: Any, access: AccessState | None) -> None:
         with self._lock:
             self._check()
             if version != self._state.generation:

@@ -5,6 +5,9 @@ export async function useInstalledClient(appKey: string, readKeyInTrustedUi: () 
   try {
     const access = await client.ensureAccess("export", readKeyInTrustedUi);
     if (!access.has("export")) throw new FeatureUnavailableError();
+    if (access.session) {
+      console.info("Floating session expires at", access.session.expiresAt.toISOString());
+    }
     return access;
   } catch (error) {
     if (error instanceof NotActivatedError) return null;

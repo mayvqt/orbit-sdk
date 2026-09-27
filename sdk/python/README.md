@@ -38,6 +38,33 @@ It does not prompt after an outage, a denied request or a missing feature.
 Always call `require_access()` or `ensure_access()` before protected work;
 `snapshot()` is for display.
 
+## Floating sessions
+
+When the licence policy enables concurrent sessions, activation automatically
+acquires a short online session and the SDK renews it while the client is open.
+`Snapshot.session` exposes immutable session metadata. Session grants and IDs
+are never restored from disk; after a restart the client acquires a fresh
+session using its saved activation credential. During an outage, a running
+client can use its current grant only until the exact signed expiry.
+
+Applications can release a seat while idle and explicitly acquire it again:
+
+```python
+with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
+    snapshot = orbit.ensure_access("export", lambda: getpass("Licence key: "))
+    if snapshot.session is not None:
+        print("Session expires at", snapshot.session.expires_at)
+        orbit.end_session()
+        orbit.start_session()
+    orbit.require_access("export")
+```
+
+`end_session()` clears local authority before asking Orbit to release the seat
+and disables automatic reacquisition until `start_session()` is called.
+Ordinary licences and offline-file mode make both methods no-ops. A seat-limit
+denial keeps the activation credential and never prompts for another key. See
+[advanced session details](advanced.md#floating-sessions).
+
 State uses a private directory on Linux and current-user DPAPI on Windows.
 Pass `state_path` to use a dedicated directory for a service or container.
 Share one client per installation and close it at shutdown; the `with` block
@@ -55,17 +82,62 @@ link before signing in.
 with Client.open(os.environ["ORBIT_APP_KEY"]) as orbit:
     account = orbit.login(username, password)
     page = orbit.owned_licences()
-    licence = choose_licence(page.items)  # Your application's selection UI.
-    orbit.activate_account(licence.id)
+    for licence in page.items:
+        print(licence.id, licence.policy_name, licence.state)
+    licence_id = input("Licence ID to activate: ").strip()
+    orbit.activate_account(licence_id)
     orbit.require_access("export")
 ```
 
 `login()` returns an `Account`, and `owned_licences()` returns an
-`OwnedLicencePage`. Claiming a licence does not activate it. Mutation IDs such
-as the optional ID for `claim_licence()` are generated securely when omitted;
-provide and reuse an ID when your application needs explicit retry control.
+`OwnedLicencePage`; each `OwnedLicence.concurrent_session_limit` reports the
+licence's session capacity separately from its device limit. Claiming a licence
+does not activate it. Mutation IDs such as the optional ID for `claim_licence()`
+are generated securely when omitted; provide and reuse an ID when your
+application needs explicit retry control.
 `logout()` clears local activation and customer state. `logout_account()` also
 asks Orbit to revoke the remote customer session.
+
+## Updates and online limits
+
+Discover the newest eligible release for this runtime, then authorize the exact
+artifact separately. Release numbers order updates; display versions are labels.
+
+```python
+update = orbit.check_for_update(installed_release_number=1)
+if update is not None:
+    authorization = orbit.authorize_download(update.release.id, update.artifact.id)
+    orbit.download(authorization, "./chosen-update.bin", max_bytes=200_000_000)
+```
+
+The default channel is `stable`; pass `target=UpdateTarget("windows", "arm64")`
+for an explicit target. Downloads use verified HTTPS, strip the Orbit ticket
+from every redirect, and expose the destination atomically after exact length
+and SHA-256 checks. An existing file requires `replace=True`; failed downloads
+preserve it. The SDK never runs an installer. Public delivery URLs are shareable;
+protected seller endpoints must verify the short-lived ticket. Keep authorization
+responses out of logs and request fresh authorization for a later attempt.
+
+`usage(name)` and `resources(name)` read authoritative counters. `consume(name,
+units, idempotency_key)` reserves usage before work; `acquire_resource(name,
+resource_id, units, idempotency_key)` records a resource until explicit
+`release_resource(name, allocation_id, idempotency_key)`. Each mutation's ID is
+optional and generated securely. Use your durable job ID to retry across restarts.
+`LimitReachedError` contains the validated counter, `idempotency_key` and
+`requested_units`. `MutationUncertainError.idempotency_key` identifies the same
+operation to resume after a lost or invalid response; omitting it on a new call
+starts a new operation.
+
+Usage retries return the original debit or denial, including its original period.
+Resource retries preserve allocation identity and units, with the allocation's
+current state and current counter; retrying an old acquire cannot reactivate a
+released resource. Closing or logging out does not release tracked resources.
+Reads are display information, not a reservation; only successful consume/acquire
+admits the requested units. Ordinary `require_access` never consumes or acquires.
+Offline files cannot authorize these online operations. Installed metering depends
+on your software reporting the work; gate valuable work on your trusted backend
+when users must not bypass reporting. Usage is not automatically refunded if work
+fails. See the [complete installed example](../../examples/python/online_operations.py).
 
 ## Advanced integration
 

@@ -51,6 +51,14 @@ owned licences and activates the selected licence. `ORBIT_MODE` defaults to
 
 ## Seller-hosted downloads
 
+Run `python examples/python/online_operations.py 1 ./chosen-update.bin` to discover
+and verify an update after activation. The arguments are your installed release
+number and an explicit destination. The example never executes the file and
+refuses to overwrite an existing destination. Its reusable functions also show
+usage consumption before report creation and explicit project allocation/release.
+Use durable job IDs for retries and store each allocation ID beside its project.
+Configure the policy's `exports` usage limit and `projects` resource limit first.
+
 The [seller backend example](seller-downloads/README.md) demonstrates verifying
 Orbit download tickets before returning an expiring URL from the seller's
 private S3-compatible storage. Ticket verification runs on the seller's backend,

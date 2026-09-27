@@ -28,3 +28,13 @@ enabled for HTTPS.
 See the [SDK guide](../../../sdk/rust/README.md) and [advanced APIs](../../../sdk/rust/advanced.md).
 For long-disconnected installations, those guides also cover trusted offline keys,
 installation requests and importing seller-issued `.orbit` files.
+
+Use `idle` and `resume` for explicit floating-seat release and acquisition.
+`updates` checks stable releases for the current target; `download` prompts for a
+new destination, verifies at most 128 MiB and never runs an installer. The example
+uses installed release number `0`; embed your actual release number in your app.
+
+`metered-export` requires an `exports` usage limit and asks for a stable job ID.
+Reuse that ID after an uncertain response. Quota is reserved before the synthetic
+export; later business failure does not refund it. Gate authoritative metering and
+actual work on your trusted backend.

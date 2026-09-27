@@ -23,6 +23,22 @@ export class FeatureUnavailableError extends OrbitError {
   }
 }
 
+export class LimitReachedError extends OrbitError {
+  constructor(code, requestId, details) {
+    super("denied", code, requestId, 409);
+    this.name = "LimitReachedError";
+    Object.assign(this, details);
+  }
+}
+
+export class MutationUncertainError extends OrbitError {
+  constructor(idempotencyKey, cause) {
+    super(cause.kind ?? "invalid_response", cause.code ?? "invalid_online_response", cause.requestId, cause.status);
+    this.name = "MutationUncertainError";
+    this.idempotencyKey = idempotencyKey;
+  }
+}
+
 export function fail(kind, code, requestId, status) {
   return new OrbitError(kind, code, requestId, status);
 }

@@ -1,10 +1,13 @@
 import { randomBytes, createHash, randomInt } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { validateAppKey, canonicalScope, isOpaqueId } from "./app-key.mjs";
-import { fail, ErrorKind, NotActivatedError, FeatureUnavailableError } from "./errors.mjs";
+import { fail, ErrorKind, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
+import * as online from "./online.mjs";
+import { downloadFile } from "./download-file.mjs";
 import { validEntitlements, parseJwks, verifyGrant } from "./grants.mjs";
 import { isInteger, isText, uniqueJson } from "./json.mjs";
 import { makeOfflineRequest, parseOfflineKeys, verifyOfflineFile } from "./offline.mjs";
+import { parseSessionKeys, verifySessionGrant } from "./sessions.mjs";
 import { PrivateFileStore } from "./storage/private-files.mjs";
 import { elapsedNs, machineFingerprint, wallSeconds } from "./platform/native.mjs";
 import { HttpTransport } from "./transport.mjs";
@@ -52,6 +55,15 @@ export class Client extends EventEmitter {
   #store;
   #transport;
   #session;
+  #sessionRequired;
+  #sessionKeys;
+  #floating;
+  #pendingSessionId;
+  #sessionDisabled;
+  #sessionController;
+  #sessionRetryAt;
+  #sessionLicenceExpiry;
+  #sessionBindingMode;
   #keys;
   #offlineKeys;
   #generation;
@@ -94,7 +106,8 @@ export class Client extends EventEmitter {
         try {
           await client.refresh();
         } catch (error) {
-          if (![ErrorKind.TRANSIENT, ErrorKind.REAUTHENTICATION_REQUIRED].includes(error?.kind)) throw error;
+          if (![ErrorKind.TRANSIENT, ErrorKind.REAUTHENTICATION_REQUIRED].includes(error?.kind) &&
+              !(error?.kind === ErrorKind.DENIED && error?.code === "concurrent_session_limit_reached")) throw error;
         }
       }
       if (client.#lifecycle) client.#scheduleRefresh();
@@ -114,6 +127,16 @@ export class Client extends EventEmitter {
     this.#state = null;
     this.#store = null;
     this.#transport = null;
+    this.#session = null;
+    this.#sessionRequired = false;
+    this.#sessionKeys = null;
+    this.#floating = null;
+    this.#pendingSessionId = null;
+    this.#sessionDisabled = false;
+    this.#sessionController = null;
+    this.#sessionRetryAt = 0;
+    this.#sessionLicenceExpiry = null;
+    this.#sessionBindingMode = null;
     this.#generation = 0;
     this.#intentEpoch = Symbol("intent");
     this.#claims = null;
@@ -150,6 +173,7 @@ export class Client extends EventEmitter {
     this.#state = state;
     this.#queueCheckpoint(false);
     if (state.offline?.jws !== null) return this.#offlineSnapshot(state);
+    if (this.#sessionRequired) return this.#sessionSnapshot(state);
     const now = this.#nowOrNull();
     let access = state.credential ? "refresh_required" : "denied";
     let entitlements = Object.create(null);
@@ -192,6 +216,31 @@ export class Client extends EventEmitter {
         if (snapshot.access !== "offline") throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
         if (!snapshot.has(feature)) throw new FeatureUnavailableError();
         return snapshot;
+      }
+      if (this.#sessionRequired) {
+        if (this.#floating) {
+          const now = this.#sessionNow();
+          if (now < this.#floating.grant.expiresAt) {
+            if (!this.#floating.grant.entitlements[feature]) throw new FeatureUnavailableError();
+            const final = this.snapshot();
+            throwIfAborted(combined);
+            if (final.access !== "online") throw fail(ErrorKind.DENIED, "session_access_unavailable");
+            if (!final.has(feature)) throw new FeatureUnavailableError();
+            return final;
+          }
+        }
+        await this.#startFloating(combined, false);
+        snapshot = this.snapshot();
+        throwIfAborted(combined);
+        if (snapshot.access === "online" && snapshot.has(feature)) {
+          const final = this.snapshot();
+          throwIfAborted(combined);
+          if (final.access === "online" && final.has(feature)) return final;
+          if (final.access === "online") throw new FeatureUnavailableError();
+          throw fail(ErrorKind.DENIED, "session_access_unavailable");
+        }
+        if (snapshot.access === "online") throw new FeatureUnavailableError();
+        throw fail(ErrorKind.DENIED, "session_access_unavailable");
       }
       if (["refresh_required", "expired", "offline"].includes(snapshot.access)) {
         try {
@@ -329,8 +378,21 @@ export class Client extends EventEmitter {
         return { ...state, credential: result.credential, access: result.access, pending_activation: null };
       }, () => generation === this.#generation && !this.#closed && !signal.aborted);
       this.#checkGeneration(generation);
-      this.#claims = result.claims;
-      this.#anchor = result.anchor;
+      this.#sessionRequired = result.sessionRequired;
+      if (result.sessionRequired) {
+        this.#claims = null;
+        this.#anchor = null;
+        this.#sessionLicenceExpiry = result.licenceExpiry;
+        this.#sessionBindingMode = result.bindingMode;
+        if (!this.#sessionDisabled) await this.#startFloating(signal, false);
+      } else {
+        this.#dropFloating({ release: true });
+        this.#sessionRequired = false;
+        this.#claims = result.claims;
+        this.#anchor = result.anchor;
+        this.#sessionLicenceExpiry = null;
+        this.#sessionBindingMode = null;
+      }
       this.#transient = false;
       this.#retryAt = 0;
       this.#scheduleRefresh();
@@ -343,6 +405,40 @@ export class Client extends EventEmitter {
 
   async refresh({ signal } = {}) {
     return this.#run(signal, (combined) => this.#refresh(combined, false));
+  }
+
+  async startSession({ signal } = {}) {
+    return this.#run(signal, async (combined) => {
+      if (this.#state.offline?.jws !== null) return this.snapshot();
+      await this.#store.sync();
+      this.#state = this.#store.state;
+      if (!this.#state.credential) throw new NotActivatedError();
+      this.#sessionDisabled = false;
+      if (!this.#sessionRequired) {
+        if (!this.#claims) await this.#refresh(combined, false);
+        if (!this.#sessionRequired) return this.snapshot();
+      }
+      return this.#startFloating(combined, true);
+    });
+  }
+
+  async endSession({ signal } = {}) {
+    return this.#run(signal, async (combined) => {
+      if (this.#state.offline?.jws !== null) return this.snapshot();
+      await this.#store.sync();
+      this.#state = this.#store.state;
+      if (this.#claims && !this.#sessionRequired) return this.snapshot();
+      this.#advanceIntent();
+      this.#sessionDisabled = true;
+      if (!this.#state.credential) return this.snapshot();
+      if (!this.#sessionRequired) {
+        if (!this.#claims) await this.#refresh(combined, false);
+        if (!this.#sessionRequired) return this.snapshot();
+      }
+      this.#generation = Symbol("generation");
+      this.#dropFloating({ release: true, clearProfile: false });
+      return this.snapshot();
+    });
   }
 
   offlineRequest() {
@@ -486,13 +582,20 @@ export class Client extends EventEmitter {
         return { ...state, credential: result.credential, access: result.access };
       }, () => generation === this.#generation && !this.#closed && !signal.aborted);
       this.#checkGeneration(generation);
-      this.#claims = result.claims;
-      this.#anchor = result.anchor;
-      this.#transient = false;
-      this.#retryAt = 0;
-      this.#scheduleRefresh();
-      this.#safeEmit("state", this.snapshot());
-      return this.snapshot();
+      if (result.sessionRequired) {
+        this.#sessionRequired = true;
+        this.#claims = null;
+        this.#anchor = null;
+        this.#sessionLicenceExpiry = result.licenceExpiry;
+        this.#sessionBindingMode = result.bindingMode;
+      } else {
+        if (this.#sessionRequired || this.#floating || this.#pendingSessionId) this.#dropFloating({ release: true });
+        this.#sessionRequired = false;
+        this.#claims = result.claims;
+        this.#anchor = result.anchor;
+        this.#sessionLicenceExpiry = null;
+        this.#sessionBindingMode = null;
+      }
     } catch (error) {
       this.#checkGeneration(generation);
       if (signal.aborted) throw fail(ErrorKind.CANCELLED, "operation_cancelled");
@@ -502,28 +605,313 @@ export class Client extends EventEmitter {
         this.#retryAt = Date.now() + randomInt(15000, 45001);
         this.#scheduleRefresh();
         const snapshot = this.snapshot();
-        if (snapshot.access === "offline") return snapshot;
+        if (snapshot.access === "offline" || snapshot.access === "online" && this.#sessionRequired) return snapshot;
         throw error;
       }
       await this.#invalidate({ preservePending: Boolean(this.#store.state.pending_activation) &&
         error?.kind !== ErrorKind.DENIED && error?.kind !== ErrorKind.REAUTHENTICATION_REQUIRED });
       throw error;
     }
+    this.#transient = false;
+    this.#retryAt = 0;
+    if (this.#sessionRequired && !this.#sessionDisabled) await this.#startFloating(signal, false);
+    this.#scheduleRefresh();
+    this.#safeEmit("state", this.snapshot());
+    return this.snapshot();
+  }
+
+  async #startFloating(signal, explicit) {
+    if (this.#state.offline?.jws !== null) return this.snapshot();
+    if (!this.#sessionRequired) return this.snapshot();
+    if (this.#sessionDisabled && !explicit) throw fail(ErrorKind.DENIED, "session_explicitly_ended");
+    const intentEpoch = this.#intentEpoch;
+    const operation = await this.#mutex("sessionQueue", signal);
+    let sent = false;
+    let sessionId;
+    let credential;
+    const generation = this.#generation;
+    const controller = new AbortController();
+    try {
+      this.#checkGeneration(generation);
+      if (intentEpoch !== this.#intentEpoch) throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+      throwIfAborted(signal);
+      await this.#store.sync();
+      this.#state = this.#store.state;
+      credential = this.#state.credential;
+      if (!credential) throw new NotActivatedError();
+      if (!this.#sessionRequired) return this.snapshot();
+      if (this.#sessionDisabled && !explicit) throw fail(ErrorKind.DENIED, "session_explicitly_ended");
+      if (this.#floating) {
+        if (this.#sessionNow() < this.#floating.grant.expiresAt) return this.snapshot();
+        this.#dropFloating({ release: false, clearProfile: false });
+      }
+      this.#pendingSessionId ??= randomBytes(24).toString("base64url");
+      sessionId = this.#pendingSessionId;
+      this.#sessionController = controller;
+      const requestSignal = AbortSignal.any([signal, controller.signal]);
+      const started = startClock();
+      sent = true;
+      const response = await this.#transport.post(`${CLIENT_PREFIX}activations/${credential.activation_id}/sessions`,
+        { ...this.#credentialBody(credential), session_id: sessionId }, true, requestSignal);
+      const verified = await this.#verifySessionReply(response, sessionId, 1, credential, started, requestSignal);
+      this.#checkGeneration(generation);
+      throwIfAborted(requestSignal);
+      this.#floating = verified;
+      this.#pendingSessionId = null;
+      this.#sessionRetryAt = 0;
+      this.#scheduleRefresh();
+      const snapshot = this.snapshot();
+      this.#safeEmit("state", snapshot);
+      return snapshot;
+    } catch (error) {
+      if (generation !== this.#generation || sent && this.#state?.credential?.bearer !== credential?.bearer) {
+        if (sent && sessionId && credential) this.#scheduleSessionRelease(sessionId, credential);
+        if (error?.kind === ErrorKind.CANCELLED) throw error;
+        throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+      }
+      if (sent && sessionId && credential) {
+        if (error?.kind === ErrorKind.TRANSIENT ||
+            error?.kind === ErrorKind.DENIED && error?.code === "concurrent_session_limit_reached") {
+          this.#sessionRetryAt = Date.now() + randomInt(15000, 45001);
+          this.#scheduleRefresh();
+        } else {
+          if (this.#pendingSessionId === sessionId) this.#pendingSessionId = null;
+          this.#scheduleSessionRelease(sessionId, credential);
+          if (error?.code === "licence_revoked") {
+            await this.#invalidate();
+          } else if (![ErrorKind.CANCELLED, ErrorKind.STALE_RESPONSE].includes(error?.kind)) {
+            this.#sessionDisabled = true;
+            this.#sessionRetryAt = 0;
+            clearTimeout(this.#refreshTimer);
+          }
+        }
+      }
+      throw error;
+    } finally {
+      if (this.#sessionController === controller) this.#sessionController = null;
+      operation.release();
+    }
+  }
+
+  async #renewFloating(signal) {
+    const current = this.#floating;
+    if (!current) return this.#startFloating(signal, false);
+    const operation = await this.#mutex("sessionQueue", signal);
+    const generation = this.#generation;
+    let sent = false;
+    let credential;
+    const controller = new AbortController();
+    try {
+      this.#checkGeneration(generation);
+      throwIfAborted(signal);
+      await this.#store.sync();
+      this.#state = this.#store.state;
+      credential = this.#state.credential;
+      if (!credential || !this.#sessionRequired || this.#sessionDisabled || this.#floating !== current) {
+        throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+      }
+      const now = this.#sessionNow();
+      if (now >= current.grant.expiresAt) {
+        this.#dropFloating({ release: false, clearProfile: false });
+        operation.release();
+        return this.#startFloating(signal, false);
+      }
+      const sequence = current.grant.sequence + 1;
+      if (!isInteger(sequence, 1)) throw fail(ErrorKind.STORAGE, "storage_failed");
+      this.#sessionController = controller;
+      const requestSignal = AbortSignal.any([signal, controller.signal]);
+      const started = startClock();
+      sent = true;
+      const route = `${CLIENT_PREFIX}activations/${credential.activation_id}/sessions/${current.grant.sessionId}/renew`;
+      const response = await this.#transport.post(route, { ...this.#credentialBody(credential), sequence }, true, requestSignal);
+      const verified = await this.#verifySessionReply(response, current.grant.sessionId, sequence, credential, started, requestSignal);
+      this.#checkGeneration(generation);
+      throwIfAborted(requestSignal);
+      if (this.#floating !== current) throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+      this.#floating = verified;
+      this.#sessionRetryAt = 0;
+      this.#scheduleRefresh();
+      const snapshot = this.snapshot();
+      this.#safeEmit("state", snapshot);
+      return snapshot;
+    } catch (error) {
+      if (sent && [ErrorKind.CANCELLED, ErrorKind.STALE_RESPONSE].includes(error?.kind)) {
+        this.#scheduleSessionRelease(current.grant.sessionId, credential);
+      }
+      const stillCurrent = generation === this.#generation && this.#floating === current &&
+        this.#state?.credential?.bearer === credential?.bearer && this.#sessionRequired;
+      if (!stillCurrent) {
+        if (error?.kind === ErrorKind.CANCELLED) throw error;
+        throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
+      }
+      if (error?.code === "licence_revoked") {
+        await this.#invalidate();
+        throw error;
+      }
+      if (error?.kind === ErrorKind.TRANSIENT) {
+        this.#sessionRetryAt = Date.now() + randomInt(15000, 45001);
+        this.#scheduleRefresh();
+        const snapshot = this.snapshot();
+        if (snapshot.access === "online" && snapshot.session?.sessionId === current.grant.sessionId &&
+            snapshot.session.sequence === current.grant.sequence) return snapshot;
+        throw error;
+      }
+      if (error?.kind !== ErrorKind.CANCELLED && error?.kind !== ErrorKind.STALE_RESPONSE) {
+        this.#dropFloating({ release: false, clearProfile: false });
+        this.#sessionDisabled = true;
+        this.#sessionRetryAt = 0;
+      }
+      throw error;
+    } finally {
+      if (this.#sessionController === controller) this.#sessionController = null;
+      operation.release();
+    }
+  }
+
+  async #verifySessionReply(bytes, sessionId, sequence, credential, started, signal) {
+    const reply = checkFields(uniqueJson(bytes ?? Buffer.alloc(0)), {
+      session_id: isString, sequence: Number.isSafeInteger, expires_at: isString, server_time: isString, grant: isString,
+    });
+    if (reply.session_id !== sessionId || reply.sequence !== sequence || !/^[A-Za-z0-9_-]{16,128}$/.test(sessionId)) {
+      invalid("invalid_session_response");
+    }
+    const expiresAt = parseTimestamp(reply.expires_at);
+    const serverTime = parseTimestamp(reply.server_time);
+    const anchor = { server: serverTime, ...started };
+    if (!this.#sessionKeys || !this.#sessionKeys.keys.has(parseTokenKid(reply.grant))) {
+      throwIfAborted(signal);
+      const suffix = `application_id=${this.#key.application_id}&environment_id=${this.#key.environment_id}`;
+      const jwksBytes = await this.#transport.get(`${JWKS_PATH}?${suffix}`, signal);
+      if (!jwksBytes) invalid("missing_session_jwks");
+      this.#sessionKeys = parseSessionKeys(jwksBytes, this.#key.environment);
+    }
+    const grant = verifySessionGrant(reply.grant, this.#sessionKeys, {
+      issuer: this.#key.issuer,
+      application: this.#key.application_id,
+      environment: this.#key.environment_id,
+      licence: credential.licence_id,
+      activation: credential.activation_id,
+      installation: this.#state.installation.id,
+      fingerprint: this.#binding.fingerprint,
+      fingerprintProvider: this.#binding.provider,
+      credentialExpiresAt: credential.expires_at,
+      licenceExpiresAt: this.#sessionLicenceExpiry,
+      now: anchorNow(anchor),
+      sessionId,
+      sequence,
+      keyEnvironment: this.#key.environment,
+      allowUnboundFingerprint: true,
+    });
+    if (grant.expiresAt !== expiresAt || grant.bindingMode !== this.#sessionBindingMode) invalid("invalid_session_response");
+    return Object.freeze({ grant, anchor });
+  }
+
+  async #sendSessionEnd(sessionId, credential, signal) {
+    const route = `${CLIENT_PREFIX}activations/${credential.activation_id}/sessions/${sessionId}/end`;
+    const response = await this.#transport.post(route, { ...this.#credentialBody(credential) }, true, signal);
+    if (response !== null) invalid("invalid_session_response");
+  }
+
+  #credentialBody(credential) {
+    return {
+      application_id: this.#key.application_id,
+      environment_id: this.#key.environment_id,
+      credential: credential.bearer,
+      installation_id: this.#state.installation.id,
+      fingerprint: this.#binding.fingerprint,
+      fingerprint_provider: this.#binding.provider,
+    };
+  }
+
+  #sessionSnapshot(state) {
+    const credential = state.credential;
+    const current = this.#floating;
+    let now = null;
+    if (current) {
+      try { now = anchorNow(current.anchor); }
+      catch { now = null; }
+    }
+    let access = credential ? "refresh_required" : "denied";
+    let entitlements = Object.create(null);
+    const grant = current?.grant;
+    if (grant && now !== null) {
+      access = grant.expiresAt > now ? "online" : "expired";
+      if (access === "online") entitlements = grant.entitlements;
+    }
+    const session = grant ? Object.freeze({
+      sessionId: grant.sessionId,
+      sequence: grant.sequence,
+      expiresAt: dateFromSeconds(grant.expiresAt),
+      refreshAfter: dateFromSeconds(grant.refreshAfter),
+    }) : null;
+    return freezeSnapshot({
+      access,
+      entitlements,
+      expiresAt: grant ? dateFromSeconds(grant.expiresAt) : null,
+      nextCheckAt: grant ? dateFromSeconds(grant.refreshAfter) : null,
+      credentialExpiresAt: credential?.expires_at === null || credential?.expires_at === undefined ? null : dateFromSeconds(credential.expires_at),
+      reauthenticationRequired: !credential || credential.expires_at !== null && now !== null && credential.expires_at <= now + 86400,
+      offlineAllowed: false,
+      remainingOfflineSeconds: 0,
+      session,
+    });
+  }
+
+  #sessionNow() {
+    if (!this.#floating) throw fail(ErrorKind.CLOCK_UNCERTAIN, "clock_uncertain");
+    return anchorNow(this.#floating.anchor);
+  }
+
+  #dropFloating({ release = true, clearProfile = true } = {}) {
+    clearTimeout(this.#refreshTimer);
+    const current = this.#floating;
+    const sessionId = current?.grant.sessionId ?? this.#pendingSessionId;
+    const credential = this.#state?.credential;
+    this.#sessionController?.abort();
+    this.#sessionController = null;
+    this.#floating = null;
+    this.#pendingSessionId = null;
+    this.#sessionRetryAt = 0;
+    if (clearProfile) {
+      this.#sessionRequired = false;
+      this.#sessionDisabled = false;
+      this.#sessionKeys = null;
+      this.#sessionLicenceExpiry = null;
+      this.#sessionBindingMode = null;
+    }
+    if (release && sessionId && credential) this.#scheduleSessionRelease(sessionId, credential);
+  }
+
+  #scheduleSessionRelease(sessionId, credential) {
+    if (!credential || !sessionId || !this.#transport) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    const task = this.#sendSessionEnd(sessionId, credential, controller.signal).catch(() => {}).finally(() => clearTimeout(timer));
+    this.#background.add(task);
+    void task.finally(() => this.#background.delete(task));
   }
 
   async #verifyActivation(bytes, previous, expectedLicence, started, signal) {
     const reply = uniqueJson(bytes);
     const fields = {
       activation_id: isString, installation_id: isString,
+      licence_id: (v) => v === null || isString(v),
       credential: (v) => v === null || isString(v), credential_expires_at: (v) => v === null || isString(v),
       grant: (v) => v === null || isString(v), server_time: isString, binding_mode: isString,
       fingerprint_provider: (v) => v === null || isString(v), licence_expires_at: (v) => v === null || isString(v),
-      secret_replay_expired: (v) => typeof v === "boolean",
+      secret_replay_expired: (v) => typeof v === "boolean", session_required: (v) => v === null || typeof v === "boolean",
     };
-    const value = checkFields(reply, fields, ["credential", "grant", "fingerprint_provider", "licence_expires_at"]);
+    const value = checkFields(reply, fields, ["credential", "grant", "fingerprint_provider", "licence_expires_at", "session_required", "licence_id"]);
+    const sessionRequired = value.session_required === true;
     if (value.secret_replay_expired) throw fail(ErrorKind.REAUTHENTICATION_REQUIRED, "secret_replay_expired");
     if (!isOpaqueId(value.activation_id) || value.installation_id !== this.#state.installation.id ||
-        value.fingerprint_provider !== this.#binding.provider || !["hwid", "none"].includes(value.binding_mode) || value.grant === null) {
+        value.fingerprint_provider !== this.#binding.provider || !["hwid", "none"].includes(value.binding_mode) ||
+        value.session_required !== null && !sessionRequired || (sessionRequired ? value.grant !== null : value.grant === null)) {
+      throw fail(ErrorKind.INVALID_RESPONSE, "invalid_activation_response");
+    }
+    if (sessionRequired && (!isOpaqueId(value.licence_id) ||
+        expectedLicence !== null && value.licence_id !== expectedLicence ||
+        previous !== null && value.licence_id !== previous.licence_id)) {
       throw fail(ErrorKind.INVALID_RESPONSE, "invalid_activation_response");
     }
     const serverTime = parseTimestamp(value.server_time);
@@ -535,6 +923,13 @@ export class Client extends EventEmitter {
         previous === null && credentialExpiry !== null || previous && (value.activation_id !== previous.activation_id ||
           credentialExpiry !== previous.expires_at || value.credential !== null)) {
       throw fail(ErrorKind.INVALID_RESPONSE, "invalid_activation_response");
+    }
+    if (sessionRequired) {
+      const licenceId = value.licence_id;
+      const bearer = value.credential ?? previous?.bearer ?? null;
+      if (!isOpaqueId(licenceId) || !validBearer(bearer)) throw fail(ErrorKind.INVALID_RESPONSE, "invalid_activation_response");
+      const credential = { activation_id: value.activation_id, licence_id: licenceId, bearer, expires_at: credentialExpiry };
+      return { credential, claims: null, anchor: null, access: null, sessionRequired: true, licenceExpiry, bindingMode: value.binding_mode };
     }
     const token = value.grant;
     if (!this.#keys || !this.#keys.has(parseTokenKid(token))) {
@@ -578,7 +973,7 @@ export class Client extends EventEmitter {
       wall_high_water: readWallSeconds(),
     };
     now = anchorNow(anchor);
-    return { credential, claims, anchor, access };
+    return { credential, claims, anchor, access, sessionRequired: false, licenceExpiry: null, bindingMode: value.binding_mode };
   }
 
   async deactivate({ idempotencyKey, signal } = {}) {
@@ -607,6 +1002,89 @@ export class Client extends EventEmitter {
     return this.#run(signal, async () => {
       await this.#invalidate();
     });
+  }
+
+  checkForUpdate(installedReleaseNumber, { channel, target, signal } = {}) {
+    const body = online.updateInput(installedReleaseNumber, { channel, target });
+    return this.#online("updates", body, (v) => online.parseUpdate(v, body), signal);
+  }
+
+  authorizeDownload(releaseId, artifactId, { signal } = {}) {
+    online.requireInput(releaseId, online.identifier);
+    online.requireInput(artifactId, online.identifier);
+    return this.#online("downloads/authorize", { release_id: releaseId, artifact_id: artifactId },
+      (v) => online.parseAuthorization(v, releaseId, artifactId), signal);
+  }
+
+  download(authorization, destination, { maxBytes, replace, signal } = {}) {
+    return this.#run(signal, (inner) => downloadFile(authorization, destination, { maxBytes, replace, signal: inner }));
+  }
+
+  usage(name, { signal } = {}) {
+    online.requireInput(name, online.limitName);
+    return this.#online(`usage/${name}`, {}, (v) => online.parseCounter(v, name, true), signal);
+  }
+
+  consume(name, units = 1, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName);
+    online.requireInput(units, (v) => online.integer(v, 1));
+    const key = onlineOperationId(idempotencyKey);
+    return this.#online(`usage/${name}/consume`, { units, idempotency_key: key },
+      (v) => online.parseConsumption(v, name, key, units), signal, key);
+  }
+
+  resources(name, { signal } = {}) {
+    online.requireInput(name, online.limitName);
+    return this.#online(`resources/${name}`, {}, (v) => online.parseCounter(v, name, false), signal);
+  }
+
+  acquireResource(name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName);
+    online.requireInput(resourceId, online.identifier);
+    online.requireInput(units, (v) => online.integer(v, 1));
+    const key = onlineOperationId(idempotencyKey);
+    return this.#online(`resources/${name}/acquire`, { resource_id: resourceId, units, idempotency_key: key },
+      (v) => online.parseAllocation(v, name, key, { resourceId, units }), signal, key);
+  }
+
+  releaseResource(name, allocationId, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName);
+    online.requireInput(allocationId, online.identifier);
+    const key = onlineOperationId(idempotencyKey);
+    return this.#online(`resources/${name}/allocations/${allocationId}/release`, { idempotency_key: key },
+      (v) => online.parseAllocation(v, name, key, { allocationId }), signal, key);
+  }
+
+  async #online(route, extra, parse, externalSignal, key = undefined) {
+    // Catch outside #run so cancellation after a sent mutation retains its ID.
+    let sent = false;
+    try {
+      return await this.#run(externalSignal, async (signal) => {
+        await this.#store.sync();
+        this.#state = this.#store.state;
+        const generation = this.#generation;
+        const credential = this.#state.credential;
+        if (!credential || this.#offlineFile) throw new NotActivatedError();
+        throwIfAborted(signal);
+        sent = true;
+        let bytes;
+        try {
+          bytes = await this.#transport.post(`${CLIENT_PREFIX}activations/${credential.activation_id}/${route}`,
+            { ...this.#credentialBody(credential), ...extra }, true, signal);
+        } catch (error) {
+          throwIfAborted(signal);
+          this.#checkGeneration(generation);
+          throw error;
+        }
+        throwIfAborted(signal);
+        this.#checkGeneration(generation);
+        try { return parse(uniqueJson(bytes)); }
+        catch (error) { if (error?.kind) throw error; invalid("invalid_online_response"); }
+      });
+    } catch (error) {
+      if (key && sent && (error?.kind !== ErrorKind.DENIED || error.status >= 500)) throw new MutationUncertainError(key, error);
+      throw error;
+    }
   }
 
   account() {
@@ -824,6 +1302,7 @@ export class Client extends EventEmitter {
     this.#generation = Symbol("generation");
     clearTimeout(this.#refreshTimer);
     clearTimeout(this.#retryTimer);
+    this.#dropFloating({ release: true, clearProfile: true });
     return this.#generation;
   }
 
@@ -1033,6 +1512,26 @@ export class Client extends EventEmitter {
     clearTimeout(this.#refreshTimer);
     clearTimeout(this.#retryTimer);
     if (this.#closed || !this.#lifecycle || !this.#state?.credential || this.#state?.offline?.jws !== null) return;
+    if (this.#sessionRequired) {
+      if (this.#sessionDisabled) return;
+      let due = 0;
+      if (this.#sessionRetryAt > Date.now()) due = (this.#sessionRetryAt - Date.now()) / 1000;
+      else if (this.#floating) {
+        try { due = Math.max(0, this.#floating.grant.refreshAfter - this.#sessionNow()); }
+        catch { due = 0; }
+      }
+      this.#refreshTimer = setTimeout(() => {
+        if (this.#closed || this.#sessionDisabled) return;
+        this.#run(undefined, (signal) => this.#advanceSession(signal)).catch((error) => {
+          if (error?.kind !== ErrorKind.CANCELLED && error?.kind !== ErrorKind.STORAGE && error?.kind !== ErrorKind.STALE_RESPONSE) {
+            this.#safeEmit("error", publicError(error));
+          }
+          if (!this.#closed && this.#sessionRequired) this.#scheduleRefresh();
+        });
+      }, Math.min(Math.max(250, due * 1000), 0x7fffffff));
+      this.#refreshTimer.unref?.();
+      return;
+    }
     const now = this.#nowOrNull();
     const due = this.#claims && now !== null ? this.#claims.refresh_after - now : 0;
     const delay = this.#transient ? Math.max(1000, this.#retryAt - Date.now()) : Math.max(1000, due * 1000);
@@ -1057,6 +1556,19 @@ export class Client extends EventEmitter {
       this.#anchor = null;
       return null;
     }
+  }
+
+  async #advanceSession(signal) {
+    this.#assertStorageHealthy();
+    await this.#store.sync();
+    this.#state = this.#store.state;
+    if (this.#state.offline?.jws !== null || !this.#sessionRequired || this.#sessionDisabled) return this.snapshot();
+    if (!this.#state.credential) throw new NotActivatedError();
+    if (!this.#floating) return this.#startFloating(signal, false);
+    const now = this.#sessionNow();
+    if (now >= this.#floating.grant.refreshAfter) return this.#renewFloating(signal);
+    this.#scheduleRefresh();
+    return this.snapshot();
   }
 
   #offlineSnapshot(state) {
@@ -1131,6 +1643,15 @@ export class Client extends EventEmitter {
   }
 
   #clearMemory() {
+    this.#sessionController?.abort();
+    this.#floating = null;
+    this.#pendingSessionId = null;
+    this.#sessionRequired = false;
+    this.#sessionDisabled = false;
+    this.#sessionKeys = null;
+    this.#sessionLicenceExpiry = null;
+    this.#sessionBindingMode = null;
+    this.#sessionRetryAt = 0;
     this.#claims = null;
     this.#anchor = null;
     this.#offlineFile = null;
@@ -1315,6 +1836,7 @@ function freezeSnapshot(value) {
     offlineAllowed: value.offlineAllowed,
     remainingOffline: remaining,
     remainingOfflineSeconds: value.remainingOfflineSeconds,
+    session: value.session ?? null,
     has(feature) { return entitlements[feature] === true; },
   });
 }
@@ -1348,16 +1870,20 @@ function parseLicence(value) {
     expiry_mode: (v) => ["perpetual", "payment", "fixed", "first_activation"].includes(v),
     first_used_at: (v) => v === null || typeof v === "string", expires_at: (v) => v === null || typeof v === "string",
     duration_seconds: (v) => v === null || Number.isSafeInteger(v), device_limit: Number.isSafeInteger,
+    concurrent_session_limit: Number.isSafeInteger,
     hwid_locked: (v) => typeof v === "boolean", offline_allowed: (v) => typeof v === "boolean",
     offline_seconds: Number.isSafeInteger, offline_file_seconds: Number.isSafeInteger, entitlements: isObject,
+    usage_limits: isObject, resource_limits: isObject,
   }, ["first_used_at", "expires_at", "duration_seconds"]);
-  if (!isOpaqueId(licence.id) || !isInteger(licence.device_limit, 1, 100) ||
+  if (!isOpaqueId(licence.id) || !isInteger(licence.device_limit, 1, 100) || !isInteger(licence.concurrent_session_limit, 0, 65535) ||
       Buffer.byteLength(licence.policy_name) > 80 || !validEntitlements(licence.entitlements) ||
       !isInteger(licence.offline_seconds, -2147483648, 2147483647) ||
       !(licence.offline_file_seconds === 0 || isInteger(licence.offline_file_seconds, 86400, 31_622_400)) ||
       (licence.offline_allowed ? !isInteger(licence.offline_seconds, 300, 86400) : licence.offline_seconds !== 0) ||
       licence.duration_seconds !== null && !isInteger(licence.duration_seconds, 0)) invalid("invalid_licence");
   for (const date of [licence.first_used_at, licence.expires_at]) if (date !== null) parseTimestamp(date);
+  try { online.parseDefinitions(licence.usage_limits, true); online.parseDefinitions(licence.resource_limits, false); }
+  catch { invalid("invalid_licence"); }
   return licence;
 }
 
@@ -1371,11 +1897,14 @@ function ownedLicence(value) {
     expiresAt: value.expires_at === null ? null : dateFromSeconds(parseTimestamp(value.expires_at)),
     duration: value.duration_seconds === null ? null : Object.freeze({ seconds: value.duration_seconds }),
     deviceLimit: value.device_limit,
+    concurrentSessionLimit: value.concurrent_session_limit,
     hwidLocked: value.hwid_locked,
     offlineAllowed: value.offline_allowed,
     offlineDuration: Object.freeze({ seconds: value.offline_seconds }),
     offlineFileDuration: Object.freeze({ seconds: value.offline_file_seconds }),
     entitlements: Object.freeze(Object.assign(Object.create(null), value.entitlements)),
+    usageLimits: online.parseDefinitions(value.usage_limits, true),
+    resourceLimits: online.parseDefinitions(value.resource_limits, false),
   });
 }
 
@@ -1383,6 +1912,11 @@ function parseAccepted(value) {
   const reply = checkFields(value ? uniqueJson(value) : null, { accepted: (v) => typeof v === "boolean" });
   if (!reply.accepted) invalid("invalid_response");
   return reply;
+}
+
+function onlineOperationId(value) {
+  return value === undefined ? randomBytes(24).toString("base64url") :
+    online.requireInput(value, (v) => typeof v === "string" && /^[!-~]{16,128}$/.test(v));
 }
 
 function checkFields(value, fields, optional = []) {

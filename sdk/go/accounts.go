@@ -54,36 +54,42 @@ type loginReply struct {
 }
 
 type OwnedLicence struct {
-	ID                  string          `json:"id"`
-	PolicyName          string          `json:"policy_name"`
-	State               string          `json:"state"`
-	ExpiryMode          string          `json:"expiry_mode"`
-	FirstUsedAt         *time.Time      `json:"first_used_at"`
-	ExpiresAt           *time.Time      `json:"expires_at"`
-	Duration            *time.Duration  `json:"-"`
-	DeviceLimit         int32           `json:"device_limit"`
-	HWIDLocked          bool            `json:"hwid_locked"`
-	OfflineAllowed      bool            `json:"offline_allowed"`
-	OfflineDuration     time.Duration   `json:"-"`
-	OfflineFileDuration time.Duration   `json:"-"`
-	Entitlements        map[string]bool `json:"entitlements"`
+	ID                     string                   `json:"id"`
+	PolicyName             string                   `json:"policy_name"`
+	State                  string                   `json:"state"`
+	ExpiryMode             string                   `json:"expiry_mode"`
+	FirstUsedAt            *time.Time               `json:"first_used_at"`
+	ExpiresAt              *time.Time               `json:"expires_at"`
+	Duration               *time.Duration           `json:"-"`
+	DeviceLimit            int32                    `json:"device_limit"`
+	ConcurrentSessionLimit int32                    `json:"concurrent_session_limit"`
+	HWIDLocked             bool                     `json:"hwid_locked"`
+	OfflineAllowed         bool                     `json:"offline_allowed"`
+	OfflineDuration        time.Duration            `json:"-"`
+	OfflineFileDuration    time.Duration            `json:"-"`
+	Entitlements           map[string]bool          `json:"entitlements"`
+	UsageLimits            map[string]UsageLimit    `json:"usage_limits"`
+	ResourceLimits         map[string]ResourceLimit `json:"resource_limits"`
 }
 
 func (licence *OwnedLicence) UnmarshalJSON(data []byte) error {
 	var wire struct {
-		ID                 string          `json:"id"`
-		PolicyName         string          `json:"policy_name"`
-		State              string          `json:"state"`
-		ExpiryMode         string          `json:"expiry_mode"`
-		FirstUsedAt        *string         `json:"first_used_at"`
-		ExpiresAt          *string         `json:"expires_at"`
-		DurationSeconds    *int64          `json:"duration_seconds"`
-		DeviceLimit        int32           `json:"device_limit"`
-		HWIDLocked         bool            `json:"hwid_locked"`
-		OfflineAllowed     bool            `json:"offline_allowed"`
-		OfflineSeconds     int64           `json:"offline_seconds"`
-		OfflineFileSeconds int64           `json:"offline_file_seconds"`
-		Entitlements       map[string]bool `json:"entitlements"`
+		ID                     string                    `json:"id"`
+		PolicyName             string                    `json:"policy_name"`
+		State                  string                    `json:"state"`
+		ExpiryMode             string                    `json:"expiry_mode"`
+		FirstUsedAt            *string                   `json:"first_used_at"`
+		ExpiresAt              *string                   `json:"expires_at"`
+		DurationSeconds        *int64                    `json:"duration_seconds"`
+		DeviceLimit            int32                     `json:"device_limit"`
+		ConcurrentSessionLimit int32                     `json:"concurrent_session_limit"`
+		HWIDLocked             bool                      `json:"hwid_locked"`
+		OfflineAllowed         bool                      `json:"offline_allowed"`
+		OfflineSeconds         int64                     `json:"offline_seconds"`
+		OfflineFileSeconds     int64                     `json:"offline_file_seconds"`
+		Entitlements           map[string]bool           `json:"entitlements"`
+		UsageLimits            *map[string]UsageLimit    `json:"usage_limits"`
+		ResourceLimits         *map[string]ResourceLimit `json:"resource_limits"`
 	}
 	if err := decodeJSON(data, &wire); err != nil {
 		return ErrInvalidResponse
@@ -116,17 +122,35 @@ func (licence *OwnedLicence) UnmarshalJSON(data []byte) error {
 		value := time.Duration(seconds) * time.Second
 		duration = &value
 	}
-	if wire.OfflineSeconds < 0 || wire.OfflineSeconds > math.MaxInt64/int64(time.Second) {
+	if wire.ConcurrentSessionLimit < 0 || wire.ConcurrentSessionLimit > 65535 || wire.OfflineSeconds < 0 || wire.OfflineSeconds > math.MaxInt64/int64(time.Second) {
 		return ErrInvalidResponse
 	}
 	if wire.OfflineFileSeconds != 0 && (wire.OfflineFileSeconds < 86400 || wire.OfflineFileSeconds > 366*86400) {
 		return ErrInvalidResponse
 	}
+	if wire.UsageLimits == nil || wire.ResourceLimits == nil {
+		return ErrInvalidResponse
+	}
+	usageLimits := *wire.UsageLimits
+	resourceLimits := *wire.ResourceLimits
+	if len(usageLimits) > 32 || len(resourceLimits) > 32 {
+		return ErrInvalidResponse
+	}
+	for name := range usageLimits {
+		if !limitName(name) {
+			return ErrInvalidResponse
+		}
+	}
+	for name := range resourceLimits {
+		if !limitName(name) {
+			return ErrInvalidResponse
+		}
+	}
 	*licence = OwnedLicence{ID: wire.ID, PolicyName: wire.PolicyName, State: wire.State, ExpiryMode: wire.ExpiryMode,
-		FirstUsedAt: firstUsedAt, ExpiresAt: expiresAt, Duration: duration, DeviceLimit: wire.DeviceLimit,
+		FirstUsedAt: firstUsedAt, ExpiresAt: expiresAt, Duration: duration, DeviceLimit: wire.DeviceLimit, ConcurrentSessionLimit: wire.ConcurrentSessionLimit,
 		HWIDLocked: wire.HWIDLocked, OfflineAllowed: wire.OfflineAllowed, OfflineDuration: time.Duration(wire.OfflineSeconds) * time.Second,
 		OfflineFileDuration: time.Duration(wire.OfflineFileSeconds) * time.Second,
-		Entitlements:        wire.Entitlements}
+		Entitlements:        wire.Entitlements, UsageLimits: usageLimits, ResourceLimits: resourceLimits}
 	return nil
 }
 

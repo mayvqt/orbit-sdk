@@ -6,11 +6,12 @@ Start with [the quickstart](README.md) for normal installed applications.
 
 `Client` has named synchronous methods for `snapshot`, `activate`,
 `activate_previous`, `refresh`, `require_access`, `ensure_access`, `deactivate`,
-`logout`, `register`, `resend_registration`, `login`, `account`,
+`start_session`, `end_session`, `logout`, `register`, `resend_registration`, `login`, `account`,
 `owned_licences`, `claim_licence`, `activate_account`,
 `activate_account_previous`, `logout_account`, `request_email_change`,
 `request_password_recovery`, `customer_session_authorization`, `offline_request`,
-and `import_offline_file`. Network methods accept an optional
+`import_offline_file`, `check_for_update`, `authorize_download`, `download`, `usage`,
+`consume`, `resources`, `acquire_resource`, and `release_resource`. Network methods accept an optional
 `cancellation=Cancellation.create()` keyword argument. Calls may run
 concurrently; activation, refresh, login, and session-authenticated account
 operations serialize when they change or depend on client state. Closing a
@@ -40,6 +41,27 @@ remain in memory. Explicit logout discards local recovery state.
 
 Use `with` or call `close()` on clients, cancellation handles and pending
 registration handles. Finalizers are only a fallback for forgotten closes.
+
+## Floating sessions
+
+When a policy has a positive `concurrent_session_limit`, the activation
+response identifies the authenticated licence and indicates that a session is
+required. The SDK durably saves the activation credential before requesting a
+seat, then starts and renews a short online session automatically. `Snapshot.session`
+contains frozen `SessionMetadata(session_id, sequence, expires_at, refresh_after)`;
+the grant and session ID stay only in process memory. A restart reuses the
+activation credential but creates a fresh session. Seat-limit denial preserves
+the credential so another attempt does not ask for the key again.
+
+Call `end_session()` when the application becomes idle to clear local authority
+and request release of the server seat. It disables automatic reacquisition
+until `start_session()` is called explicitly. `start_session()` returns the
+existing snapshot when the current seat is still valid. For an ordinary
+licence or offline-file installation, both methods are no-ops. A running
+floating client can finish its current signed interval during a network
+outage; it cannot extend that interval without Orbit, and it has no offline
+fallback after exact expiry. The client does not prompt for a new licence key
+for a seat denial, transient failure or expired session.
 
 ## Persistence and hosting
 
@@ -214,6 +236,31 @@ shareable and cannot provide subsequent licence enforcement.
 The [seller backend example](../../examples/python/seller-downloads/README.md)
 shows a protected endpoint backed by private S3-compatible storage.
 
+## Explicit online operations
+
+The [update and limit guide](README.md#updates-and-online-limits) covers the
+installed APIs. Results are frozen dataclasses: `Update`, `Release`, `Artifact`,
+`DownloadAuthorization`, `UsageCounter`, `UsageConsumption`, `ResourceCounter`
+and `ResourceAllocation`. `UpdateTarget` selects an explicit platform and
+architecture; unknown runtimes require it. Timestamps are aware UTC datetimes.
+`OwnedLicence.usage_limits` and `.resource_limits` are immutable maps of policy
+definitions and never represent an offline allowance of units.
+
+Every online method accepts `cancellation=`. Client `download()` combines it with
+client shutdown; standalone `download_file(authorization, destination,
+max_bytes=..., replace=False, cancellation=...)` uses the supplied cancellation.
+Transfers have a five-minute total deadline and use no ambient cookies, HTTP
+credentials or proxy configuration. Temporary files are created privately in
+the destination directory. A destination is exposed only after verification;
+replacement is opt-in. Closing, cancelling or a network failure does not leave
+an incomplete destination.
+
+Generated usage/resource IDs are retained for retries of that call and exposed
+on success, capacity denial and uncertain mutation failure. They are not saved
+as a job journal. Persist your own job ID before calling when restart-safe
+recovery is required. Retry the same normalized input and ID within Orbit's
+24-hour replay window. The SDK never turns an unknown outcome into local quota.
+
 ## macOS platform checks
 
 The macOS bindings read `IOPlatformUUID` through IOKit and use
@@ -267,9 +314,13 @@ coverage; native Windows timing is unmeasured.
 
 ## Errors and sensitive output
 
-`OrbitError` exposes only `kind`, `code`, `request_id` and `status`. Its text
+`OrbitError` exposes `kind`, `code`, `request_id` and `status`. Its text
 omits server messages and caller inputs. Keep the error from the failed
 operation when correlating support requests.
+
+`LimitReachedError` additionally carries validated capacity details;
+`MutationUncertainError` carries the operation ID required to recover a write.
+These values are described under [explicit online operations](#explicit-online-operations).
 
 `customer_session_authorization()` returns a redacted
 `SensitiveAuthorization`. Reveal its bytes only to send the header to your own

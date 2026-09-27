@@ -8,12 +8,10 @@ mod diagnostics;
 pub mod downloads;
 mod grants;
 mod installed;
+pub mod limits;
 mod offline;
 #[cfg(test)]
 mod parser_fuzz;
-// Session verification is internal and its metadata is consumed by the
-// floating lifecycle batch; this batch intentionally adds no public API.
-#[allow(dead_code)]
 mod sessions;
 #[cfg(all(
     test,
@@ -23,8 +21,9 @@ mod sessions;
 mod sleep_tests;
 mod storage;
 pub mod transport;
+pub mod updates;
 
-pub use access::{Access, Client, Snapshot};
+pub use access::{Access, Client, SessionMetadata, Snapshot};
 pub(crate) use access::{Config, Device};
 pub use accounts::{
     Account, Customer, CustomerSessionProof, OwnedLicence, OwnedLicences, PendingRegistration,
@@ -35,12 +34,19 @@ pub use device::{machine_fingerprint, native_fingerprint};
 pub use diagnostics::SupportSummary;
 pub use downloads::{DownloadTicket, DownloadTicketVerifier};
 pub use installed::{MachineBinding, Options};
+pub use limits::{
+    CapacityCounter, Consumption, MutationError, MutationResult, ResourceAllocation,
+    ResourceCounter, ResourceLimit, ResourceState, UsageCounter, UsageLimit, UsagePeriod,
+};
 pub use offline::OfflineRequest;
 #[cfg(test)]
 pub(crate) use storage::MemoryStorage;
 pub(crate) use storage::{Storage, StoredCredential};
 pub(crate) use transport::Cancellation;
 pub use transport::Transport;
+pub use updates::{
+    Artifact, DeliveryMode, DownloadAuthorization, DownloadOptions, Release, Update, UpdateOptions,
+};
 
 #[derive(Clone)]
 pub enum Error {
@@ -56,6 +62,7 @@ pub enum Error {
     },
     NotActivated,
     FeatureUnavailable,
+    SessionRequired,
     InvalidResponse,
     TransportSecurity,
     ReauthenticationRequired,
@@ -80,6 +87,7 @@ impl std::fmt::Display for Error {
                 .unwrap_or("Orbit denied access. Contact application support."),
             Self::NotActivated => "Activate a licence to continue.",
             Self::FeatureUnavailable => "This licence does not include the requested feature.",
+            Self::SessionRequired => "Start a floating session before continuing.",
             Self::InvalidResponse => "Orbit response verification failed",
             Self::TransportSecurity => "Secure connection failed",
             Self::ReauthenticationRequired => "Fresh licence authentication is required",

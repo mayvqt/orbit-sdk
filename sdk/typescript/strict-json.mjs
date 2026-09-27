@@ -1,17 +1,17 @@
 const MAX_JSON_BYTES = 16 * 1024;
 const MAX_DEPTH = 32;
 
-export function uniqueJson(input) {
+export function uniqueJson(input, limit = MAX_JSON_BYTES) {
   let text;
   if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-    if (input.byteLength < 1 || input.byteLength > MAX_JSON_BYTES) invalid();
+    if (input.byteLength < 1 || input.byteLength > limit) invalid();
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(input);
     } catch {
       invalid();
     }
   } else if (typeof input === "string") {
-    if (Buffer.byteLength(input, "utf8") < 1 || Buffer.byteLength(input, "utf8") > MAX_JSON_BYTES) invalid();
+    if (Buffer.byteLength(input, "utf8") < 1 || Buffer.byteLength(input, "utf8") > limit) invalid();
     text = input;
   } else {
     invalid();

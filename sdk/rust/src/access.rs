@@ -5,6 +5,7 @@ use crate::{
     accounts::Session,
     clock::{self, Anchor},
     grants::{self, Claims, Expected, Keys},
+    sessions::{self, Expected as SessionExpected, SessionGrant, SessionKeys},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -58,11 +59,41 @@ pub struct Snapshot {
     pub offline_allowed: bool,
     pub offline_file_mode: bool,
     pub remaining_offline: Duration,
+    pub session: Option<SessionMetadata>,
 }
 impl Snapshot {
     pub fn has_feature(&self, feature: &str) -> bool {
         self.entitlements.get(feature).copied().unwrap_or(false)
     }
+}
+/// Read-only display metadata for the current connected floating seat.
+/// The signed session grant and its identifier are never persisted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMetadata {
+    id: String,
+    sequence: u64,
+    expires_at: std::time::SystemTime,
+    refresh_after: std::time::SystemTime,
+}
+impl SessionMetadata {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn expires_at(&self) -> std::time::SystemTime {
+        self.expires_at
+    }
+    pub fn refresh_after(&self) -> std::time::SystemTime {
+        self.refresh_after
+    }
+}
+pub(crate) struct SessionRuntime {
+    pub(crate) metadata: SessionMetadata,
+    pub(crate) grant: SessionGrant,
+    pub(crate) anchor: Anchor,
+    pub(crate) pending_sequence: Option<u64>,
 }
 pub(crate) struct State {
     pub(crate) generation: u64,
@@ -72,6 +103,14 @@ pub(crate) struct State {
     pub(crate) claims: Option<Claims>,
     pub(crate) anchor: Option<Anchor>,
     pub(crate) offline: Option<crate::offline::Runtime>,
+    pub(crate) session_policy_known: bool,
+    pub(crate) session_required: bool,
+    pub(crate) session_disabled: bool,
+    pub(crate) session: Option<SessionRuntime>,
+    pub(crate) pending_session_id: Option<String>,
+    pub(crate) pending_session_since: Option<Instant>,
+    pub(crate) session_retry_deadline: Option<Instant>,
+    pub(crate) session_licence_expires_at: Option<i64>,
     pub(crate) restored: bool,
     transient: bool,
     retry_deadline: Option<Instant>,
@@ -86,6 +125,7 @@ pub(crate) struct Inner {
     pub(crate) state: Mutex<State>,
     pub(crate) serial: tokio::sync::Mutex<()>,
     pub(crate) keys: Mutex<Keys>,
+    pub(crate) session_keys: Mutex<Option<SessionKeys>>,
     pub(crate) offline_keys: Option<Keys>,
     pub(crate) installed: Option<Arc<crate::installed::InstalledStorage>>,
     pub(crate) worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -109,6 +149,37 @@ impl Drop for Inner {
 }
 #[derive(Clone)]
 pub struct Client(pub(crate) Arc<Inner>);
+struct SessionAttemptGuard {
+    client: Client,
+    saved: StoredCredential,
+    id: String,
+    generation: u64,
+    armed: bool,
+}
+impl Drop for SessionAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut state) = self.client.0.state.lock()
+            && state.generation == self.generation
+        {
+            state.session = None;
+            state.pending_session_id = None;
+            state.session_disabled = true;
+            state.session_retry_deadline = None;
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            let saved = self.saved.clone();
+            let id = self.id.clone();
+            runtime.spawn(async move {
+                client.send_session_end_cleanup(&saved, &id).await;
+            });
+        }
+    }
+}
 #[derive(Clone, Copy)]
 pub(crate) enum ActivationPrincipal<'a> {
     Key(&'a str),
@@ -127,6 +198,22 @@ struct Reply {
     fingerprint_provider: Option<String>,
     licence_expires_at: Option<String>,
     secret_replay_expired: bool,
+    #[serde(default)]
+    licence_id: Option<String>,
+    #[serde(default)]
+    session_required: Option<bool>,
+}
+enum VerifiedReply {
+    Floating {
+        credential: StoredCredential,
+        licence_expires_at: Option<i64>,
+    },
+    Ordinary {
+        credential: StoredCredential,
+        claims: Box<Claims>,
+        anchor: Anchor,
+        cache: crate::installed::Cache,
+    },
 }
 pub(crate) fn timestamp(value: &str) -> Result<i64> {
     let date = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| Error::InvalidResponse)?;
@@ -266,6 +353,14 @@ impl Client {
                 claims: None,
                 anchor: None,
                 offline: None,
+                session_policy_known: false,
+                session_required: false,
+                session_disabled: false,
+                session: None,
+                pending_session_id: None,
+                pending_session_since: None,
+                session_retry_deadline: None,
+                session_licence_expires_at: None,
                 restored: false,
                 transient: false,
                 retry_deadline: None,
@@ -273,6 +368,7 @@ impl Client {
             }),
             serial: tokio::sync::Mutex::new(()),
             keys: Mutex::new(Keys::default()),
+            session_keys: Mutex::new(None),
             offline_keys: None,
             installed: None,
             worker: Mutex::new(None),
@@ -286,6 +382,9 @@ impl Client {
         self.checked_snapshot_locked(&mut state)
     }
     fn checked_snapshot_locked(&self, state: &mut State) -> Result<Snapshot> {
+        if state.session_required {
+            return Self::session_snapshot(state);
+        }
         if let Some(offline) = state.offline.as_mut().filter(|offline| offline.authorized) {
             let Some(anchor) = &offline.anchor else {
                 return Self::offline_snapshot(offline, None);
@@ -320,6 +419,9 @@ impl Client {
         Self::snapshot_state_at(state, now)
     }
     fn snapshot_state(state: &State) -> Result<Snapshot> {
+        if state.session_required {
+            return Self::session_snapshot(state);
+        }
         if let Some(offline) = state.offline.as_ref().filter(|offline| offline.authorized) {
             let now = offline
                 .anchor
@@ -350,6 +452,7 @@ impl Client {
             offline_allowed: true,
             offline_file_mode: true,
             remaining_offline: Duration::ZERO,
+            session: None,
         };
         let (Some(claims), Some(now)) = (&offline.verified, now.filter(|_| !offline.uncertain))
         else {
@@ -387,6 +490,7 @@ impl Client {
             offline_allowed: false,
             offline_file_mode: false,
             remaining_offline: Duration::ZERO,
+            session: None,
         };
         if let Some(claims) = &state.claims {
             let Some(now) = now else {
@@ -423,6 +527,598 @@ impl Client {
                 }
             }
         }
+        Ok(snapshot)
+    }
+    /// Start a floating seat when the confirmed licence policy requires one.
+    /// Ordinary and long-term offline licences keep their existing access mode.
+    pub async fn start_session(&self) -> Result<Snapshot> {
+        self.start_session_with_cancel(&self.0.transport.owner_cancel.clone())
+            .await
+    }
+    pub(crate) async fn start_session_with_cancel(
+        &self,
+        cancel: &Cancellation,
+    ) -> Result<Snapshot> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let (known, saved) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if state
+                .offline
+                .as_ref()
+                .is_some_and(|offline| offline.authorized)
+            {
+                return self.checked_snapshot_locked(&mut state);
+            }
+            if state.session_required {
+                let current = Self::session_snapshot(&state)?;
+                if current.access == Access::Online {
+                    return Ok(current);
+                }
+            }
+            (state.session_policy_known, state.credential.clone())
+        };
+        if !known {
+            if saved.is_none() {
+                return Err(Error::NotActivated);
+            }
+            self.refresh_with_cancel(cancel).await?;
+        }
+        let generation = self.generation()?;
+        let _serial = tokio::select! {
+            guard = self.0.serial.lock() => guard,
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+        };
+        self.start_session_serialized(cancel, generation, true)
+            .await
+    }
+
+    async fn start_session_serialized(
+        &self,
+        cancel: &Cancellation,
+        generation: u64,
+        explicit: bool,
+    ) -> Result<Snapshot> {
+        let (saved, id, licence_expiry, body) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if state.generation != generation {
+                return Err(Error::StaleResponse);
+            }
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if state
+                .offline
+                .as_ref()
+                .is_some_and(|offline| offline.authorized)
+            {
+                return self.checked_snapshot_locked(&mut state);
+            }
+            if state.session_policy_known && !state.session_required {
+                return Self::snapshot_state(&state);
+            }
+            if explicit {
+                state.session_disabled = false;
+                state.session_retry_deadline = None;
+            }
+            if state.session.is_some() {
+                let snapshot = Self::session_snapshot(&state)?;
+                if snapshot.access == Access::Online {
+                    return Ok(snapshot);
+                }
+                state.session = None;
+                state.pending_session_id = None;
+            }
+            if state.session_disabled {
+                return Err(Error::SessionRequired);
+            }
+            let saved = state.credential.clone().ok_or(Error::NotActivated)?;
+            if state
+                .pending_session_since
+                .is_some_and(|since| since.elapsed() >= Duration::from_secs(120))
+            {
+                state.pending_session_id = None;
+            }
+            let id = match state.pending_session_id.clone() {
+                Some(id) => id,
+                None => {
+                    let id = Device::new_installation()?.installation_id;
+                    state.pending_session_id = Some(id.clone());
+                    state.pending_session_since = Some(Instant::now());
+                    id
+                }
+            };
+            let mut body = self.credential_body(&saved);
+            body["session_id"] = json!(id);
+            (saved, id, state.session_licence_expires_at, body)
+        };
+
+        let mut attempt_guard = SessionAttemptGuard {
+            client: self.clone(),
+            saved: saved.clone(),
+            id: id.clone(),
+            generation,
+            armed: true,
+        };
+        let started = clock::Start::capture()?;
+        let path = format!(
+            "/api/client/v1/activations/{}/sessions",
+            saved.activation_id
+        );
+        let response = self
+            .0
+            .transport
+            .post_with_cancel(&path, &body, true, cancel)
+            .await;
+        let verified = match response {
+            Ok(Some(value)) => {
+                self.verify_session_reply(value, &saved, (&id, 1), started, licence_expiry, cancel)
+                    .await
+            }
+            Ok(None) => Err(Error::InvalidResponse),
+            Err(error) => Err(error),
+        };
+        let (outcome, cleanup) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            if let Err(error) = self.sync_storage(&mut state) {
+                (Err(error), true)
+            } else if state.generation != generation {
+                (Err(Error::StaleResponse), true)
+            } else if cancel.is_cancelled() {
+                state.pending_session_id = None;
+                (Err(Error::Cancelled), true)
+            } else {
+                match verified {
+                    Err(error @ Error::Transient { .. }) => {
+                        state.session_retry_deadline =
+                            Some(Instant::now() + transient_retry_delay());
+                        (Err(error), false)
+                    }
+                    Err(error @ Error::Denied { .. }) => {
+                        state.session_retry_deadline = None;
+                        if matches!(
+                            error.code(),
+                            "session_expired" | "session_ended" | "session_sequence_conflict"
+                        ) {
+                            state.pending_session_id = None;
+                        }
+                        (Err(error), false)
+                    }
+                    Err(Error::Cancelled) => {
+                        state.pending_session_id = None;
+                        (Err(Error::Cancelled), true)
+                    }
+                    Err(error) => {
+                        state.pending_session_id = None;
+                        (Err(error), true)
+                    }
+                    Ok(runtime) => {
+                        state.session = Some(runtime);
+                        state.pending_session_id = None;
+                        state.session_retry_deadline = None;
+                        match Self::session_snapshot(&state) {
+                            Ok(snapshot) if snapshot.access == Access::Online => {
+                                (Ok(snapshot), false)
+                            }
+                            Ok(_) => {
+                                state.session = None;
+                                (Err(Error::SessionRequired), true)
+                            }
+                            Err(error) => {
+                                state.session = None;
+                                (Err(error), true)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        attempt_guard.armed = false;
+        if cleanup {
+            self.send_session_end_cleanup(&saved, &id).await;
+        }
+        outcome
+    }
+
+    async fn verify_session_reply(
+        &self,
+        value: serde_json::Value,
+        saved: &StoredCredential,
+        expected_session: (&str, u64),
+        started: clock::Start,
+        licence_expiry: Option<i64>,
+        cancel: &Cancellation,
+    ) -> Result<SessionRuntime> {
+        let (id, sequence) = expected_session;
+        let object = value.as_object().ok_or(Error::InvalidResponse)?;
+        if object.len() != 5
+            || [
+                "session_id",
+                "sequence",
+                "expires_at",
+                "server_time",
+                "grant",
+            ]
+            .iter()
+            .any(|field| !object.contains_key(*field))
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let reply_id = object["session_id"]
+            .as_str()
+            .ok_or(Error::InvalidResponse)?;
+        let reply_sequence = object["sequence"].as_u64().ok_or(Error::InvalidResponse)?;
+        let expires = timestamp(
+            object["expires_at"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?,
+        )?;
+        let server = timestamp(
+            object["server_time"]
+                .as_str()
+                .ok_or(Error::InvalidResponse)?,
+        )?;
+        let token = object["grant"].as_str().ok_or(Error::InvalidResponse)?;
+        if reply_id != id
+            || reply_sequence != sequence
+            || !opaque(reply_id)
+            || reply_id.len() < 16
+            || token.is_empty()
+            || token.len() > 16 * 1024
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let anchor = Anchor::from_request(server, started);
+        let kid = sessions::key_id(token)?;
+        let need_keys = self
+            .0
+            .session_keys
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .as_ref()
+            .is_none_or(|keys| !keys.contains(&kid));
+        if need_keys {
+            let data = self
+                .0
+                .transport
+                .get_with_cancel(
+                    &format!(
+                        "/.well-known/orbit-jwks.json?application_id={}&environment_id={}",
+                        self.0.config.application_id, self.0.config.environment_id
+                    ),
+                    cancel,
+                )
+                .await?
+                .ok_or(Error::InvalidResponse)?;
+            let bytes = serde_json::to_vec(&data).map_err(|_| Error::InvalidResponse)?;
+            *self.0.session_keys.lock().map_err(|_| Error::Storage)? = Some(SessionKeys::parse(
+                &bytes,
+                self.0
+                    .app_key
+                    .as_ref()
+                    .map_or(self.0.config.environment_id.as_str(), |key| {
+                        key.environment()
+                    }),
+            )?);
+        }
+        let now = anchor.now()?;
+        let expected = SessionExpected {
+            issuer: &self.0.config.issuer,
+            application: &self.0.config.application_id,
+            environment: &self.0.config.environment_id,
+            licence: Some(&saved.licence_id),
+            activation: &saved.activation_id,
+            installation: &saved.installation_id,
+            fingerprint: saved.fingerprint.as_deref(),
+            fingerprint_provider: saved.fingerprint_provider.as_deref(),
+            allow_unbound_fingerprint: true,
+            credential_expires_at: saved.credential_expires_at,
+            licence_expires_at: licence_expiry,
+            now,
+            session_id: id,
+            sequence,
+        };
+        let keys = self.0.session_keys.lock().map_err(|_| Error::Storage)?;
+        let grant = sessions::verify(
+            token,
+            keys.as_ref().ok_or(Error::InvalidResponse)?,
+            &expected,
+        )?;
+        if grant.expires_at != expires || grant.sequence != sequence || grant.session_id != id {
+            return Err(Error::InvalidResponse);
+        }
+        Ok(SessionRuntime {
+            metadata: SessionMetadata {
+                id: id.to_owned(),
+                sequence,
+                expires_at: crate::accounts::from_unix_seconds(expires)
+                    .ok_or(Error::InvalidResponse)?,
+                refresh_after: crate::accounts::from_unix_seconds(grant.refresh_after)
+                    .ok_or(Error::InvalidResponse)?,
+            },
+            grant,
+            anchor,
+            pending_sequence: None,
+        })
+    }
+
+    fn session_body(&self, saved: &StoredCredential) -> serde_json::Value {
+        self.credential_body(saved)
+    }
+    pub(crate) async fn send_session_end_cleanup(&self, saved: &StoredCredential, id: &str) {
+        let path = format!(
+            "/api/client/v1/activations/{}/sessions/{}/end",
+            saved.activation_id, id
+        );
+        let _ = self
+            .0
+            .transport
+            .post_cleanup(&path, &self.session_body(saved))
+            .await;
+    }
+
+    /// End the current floating seat after first clearing all local authority.
+    pub async fn end_session(&self) -> Result<()> {
+        self.end_session_with_cancel(&self.0.transport.owner_cancel.clone())
+            .await
+    }
+    async fn end_session_with_cancel(&self, cancel: &Cancellation) -> Result<()> {
+        let (known, saved) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if state
+                .offline
+                .as_ref()
+                .is_some_and(|offline| offline.authorized)
+            {
+                return Ok(());
+            }
+            if !state.session_policy_known {
+                state.session_disabled = true;
+            }
+            (state.session_policy_known, state.credential.clone())
+        };
+        if !known {
+            if saved.is_none() {
+                return Ok(());
+            }
+            self.refresh_policy_without_acquire(cancel).await?;
+        }
+        let (saved, id) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if state.session_policy_known && !state.session_required {
+                return Ok(());
+            }
+            let saved = state.credential.clone().ok_or(Error::NotActivated)?;
+            let id = state
+                .session
+                .as_ref()
+                .map(|value| value.metadata.id.clone())
+                .or_else(|| state.pending_session_id.clone());
+            state.session = None;
+            state.pending_session_id = None;
+            state.session_disabled = true;
+            state.session_retry_deadline = None;
+            state.generation = state.generation.wrapping_add(1);
+            (saved, id)
+        };
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let path = format!(
+            "/api/client/v1/activations/{}/sessions/{}/end",
+            saved.activation_id, id
+        );
+        let response = self
+            .0
+            .transport
+            .post_with_cancel(&path, &self.session_body(&saved), false, cancel)
+            .await?;
+        if response.is_some() {
+            Err(Error::InvalidResponse)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn renew_session(
+        &self,
+        cancel: &Cancellation,
+        generation: u64,
+    ) -> Result<Snapshot> {
+        let _serial = tokio::select! { guard=self.0.serial.lock()=>guard, _=cancel.cancelled()=>return Err(Error::Cancelled) };
+        let (saved, id, sequence, licence_expiry, body) = {
+            let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            self.sync_storage(&mut state)?;
+            if state.generation != generation {
+                return Err(Error::StaleResponse);
+            }
+            let saved = state
+                .credential
+                .clone()
+                .ok_or(Error::ReauthenticationRequired)?;
+            let session = state.session.as_mut().ok_or(Error::SessionRequired)?;
+            let sequence = session
+                .pending_sequence
+                .unwrap_or(session.grant.sequence + 1);
+            session.pending_sequence = Some(sequence);
+            let id = session.metadata.id.clone();
+            let mut body = self.session_body(&saved);
+            body["sequence"] = json!(sequence);
+            (saved, id, sequence, state.session_licence_expires_at, body)
+        };
+        let mut attempt_guard = SessionAttemptGuard {
+            client: self.clone(),
+            saved: saved.clone(),
+            id: id.clone(),
+            generation,
+            armed: true,
+        };
+        let started = clock::Start::capture()?;
+        let path = format!(
+            "/api/client/v1/activations/{}/sessions/{}/renew",
+            saved.activation_id, id
+        );
+        let response = self
+            .0
+            .transport
+            .post_with_cancel(&path, &body, true, cancel)
+            .await;
+        let verified = match response {
+            Ok(Some(value)) => {
+                self.verify_session_reply(
+                    value,
+                    &saved,
+                    (&id, sequence),
+                    started,
+                    licence_expiry,
+                    cancel,
+                )
+                .await
+            }
+            Ok(None) => Err(Error::InvalidResponse),
+            Err(error) => Err(error),
+        };
+        attempt_guard.armed = false;
+        let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+        self.sync_storage(&mut state)?;
+        if state.generation != generation {
+            return Err(Error::StaleResponse);
+        }
+        if cancel.is_cancelled() {
+            state.session = None;
+            state.session_disabled = true;
+            return Err(Error::Cancelled);
+        }
+        let replacement = match verified {
+            Ok(value) => value,
+            Err(error @ Error::Transient { .. }) => {
+                state.session_retry_deadline = Some(Instant::now() + transient_retry_delay());
+                return Err(error);
+            }
+            Err(error) => {
+                state.session = None;
+                state.session_disabled = true;
+                state.session_retry_deadline = None;
+                if error.code() == "session_expired" {
+                    state.pending_session_id = None;
+                    state.session_disabled = false;
+                    state.session_retry_deadline = Some(Instant::now() + transient_retry_delay());
+                }
+                return Err(error);
+            }
+        };
+        if !state.session.as_ref().is_some_and(|session| {
+            session.metadata.id == id && session.pending_sequence == Some(sequence)
+        }) {
+            return Err(Error::StaleResponse);
+        }
+        state.session = Some(replacement);
+        state.session_retry_deadline = None;
+        Self::session_snapshot(&state)
+    }
+
+    pub(crate) async fn maintain_session(&self, cancel: &Cancellation) {
+        let due = {
+            let mut state = match self.0.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if self.sync_storage(&mut state).is_err()
+                || !state.session_required
+                || state.session_disabled
+            {
+                return;
+            }
+            let retry_set = state.session_retry_deadline.is_some();
+            if state
+                .session_retry_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+            {
+                return;
+            }
+            let status = state.session.as_ref().map(|session| {
+                session
+                    .anchor
+                    .now()
+                    .map(|now| (now, session.grant.expires_at, session.grant.refresh_after))
+            });
+            match status {
+                Some(Ok((now, expires, refresh))) if now < expires && now < refresh => return,
+                Some(Ok((now, expires, _))) if now >= expires => {
+                    state.session = None;
+                    state.pending_session_id = None;
+                    state.session_retry_deadline = Some(Instant::now());
+                    Some((false, state.generation))
+                }
+                Some(Err(_)) => {
+                    state.session = None;
+                    state.pending_session_id = None;
+                    state.session_retry_deadline = Some(Instant::now() + transient_retry_delay());
+                    state.last_failure = Some(Error::ClockUncertain);
+                    None
+                }
+                Some(_) => Some((true, state.generation)),
+                None if retry_set => Some((false, state.generation)),
+                None => None,
+            }
+        };
+        if let Some((renew, generation)) = due {
+            if renew {
+                let _ = self.renew_session(cancel, generation).await;
+            } else {
+                let _ = self.start_session_with_cancel(cancel).await;
+            }
+        }
+    }
+    fn session_snapshot(state: &State) -> Result<Snapshot> {
+        let credential_expiry = state
+            .credential
+            .as_ref()
+            .and_then(|value| value.credential_expires_at)
+            .and_then(crate::accounts::from_unix_seconds);
+        let mut snapshot = Snapshot {
+            access: if state.credential.is_some() {
+                Access::RefreshRequired
+            } else {
+                Access::Denied
+            },
+            entitlements: BTreeMap::new(),
+            expires_at: None,
+            next_check_at: None,
+            credential_expires_at: credential_expiry,
+            reauthentication_required: state.credential.is_none(),
+            offline_allowed: false,
+            offline_file_mode: false,
+            remaining_offline: Duration::ZERO,
+            session: None,
+        };
+        let Some(session) = &state.session else {
+            return Ok(snapshot);
+        };
+        snapshot.session = Some(session.metadata.clone());
+        snapshot.expires_at = crate::accounts::from_unix_seconds(session.grant.expires_at);
+        snapshot.next_check_at = crate::accounts::from_unix_seconds(session.grant.refresh_after);
+        let Ok(now) = session.anchor.now() else {
+            return Ok(snapshot);
+        };
+        if session.grant.expires_at <= now {
+            snapshot.access = Access::Expired;
+            return Ok(snapshot);
+        }
+        if state
+            .session_licence_expires_at
+            .is_some_and(|expires| expires <= now)
+        {
+            snapshot.access = Access::Expired;
+            return Ok(snapshot);
+        }
+        snapshot.access = Access::Online;
+        snapshot.entitlements = session.grant.entitlements.clone();
         Ok(snapshot)
     }
     pub(crate) fn sync_storage(&self, state: &mut State) -> Result<()> {
@@ -560,6 +1256,15 @@ impl Client {
                 state.generation = state.generation.wrapping_add(1);
                 state.claims = None;
                 state.anchor = None;
+                state.session = None;
+                state.pending_session_id = None;
+                state.pending_session_since = None;
+                state.session_policy_known = false;
+                state.session_required = false;
+                state.session_disabled = false;
+                state.session_retry_deadline = None;
+                state.session_licence_expires_at = None;
+
                 if let Some(offline) = state.offline.as_mut() {
                     offline.authorized = false;
                 }
@@ -605,7 +1310,7 @@ impl Client {
             .transport
             .post_with_cancel("/api/client/v1/activations", &input, true, cancel)
             .await;
-        self.accept_for_licence(
+        self.accept_with_licence(
             response,
             generation,
             None,
@@ -622,10 +1327,21 @@ impl Client {
     pub(crate) async fn refresh_with_cancel(&self, cancel: &Cancellation) -> Result<Snapshot> {
         self.refresh_inner(cancel, false).await
     }
+    async fn refresh_policy_without_acquire(&self, cancel: &Cancellation) -> Result<Snapshot> {
+        self.refresh_inner_mode(cancel, false, true).await
+    }
     pub(crate) async fn refresh_if_needed(&self, cancel: &Cancellation) -> Result<Snapshot> {
         self.refresh_inner(cancel, true).await
     }
     async fn refresh_inner(&self, cancel: &Cancellation, respect_retry: bool) -> Result<Snapshot> {
+        self.refresh_inner_mode(cancel, respect_retry, false).await
+    }
+    async fn refresh_inner_mode(
+        &self,
+        cancel: &Cancellation,
+        respect_retry: bool,
+        suppress_session_acquire: bool,
+    ) -> Result<Snapshot> {
         let generation = self.generation()?;
         let _serial = tokio::select! {guard=self.0.serial.lock()=>guard,_=cancel.cancelled()=>return Err(Error::Cancelled)};
         self.check_generation(generation)?;
@@ -685,8 +1401,13 @@ impl Client {
                 cancel,
             )
             .await;
-        self.accept(response, generation, Some(saved), started, cancel)
-            .await
+        if suppress_session_acquire {
+            self.accept_for_licence(response, generation, Some(saved), started, cancel, None)
+                .await
+        } else {
+            self.accept(response, generation, Some(saved), started, cancel)
+                .await
+        }
     }
     fn credential_body(&self, saved: &StoredCredential) -> serde_json::Value {
         json!({"application_id":self.0.config.application_id,"environment_id":self.0.config.environment_id,"credential":saved.credential,
@@ -761,7 +1482,7 @@ impl Client {
         feature: &str,
         cancel: &Cancellation,
     ) -> Result<Snapshot> {
-        let refresh_needed = {
+        let (snapshot, session_required, session_disabled, refresh_needed) = {
             let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
             self.sync_storage(&mut state)?;
             if cancel.is_cancelled() {
@@ -783,17 +1504,50 @@ impl Client {
                 }
                 return Ok(snapshot);
             }
-            if snapshot.access == Access::Online {
-                if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
-                    return Err(Error::FeatureUnavailable);
-                }
-                return Ok(snapshot);
-            }
-            matches!(
+            let refresh_needed = matches!(
                 snapshot.access,
                 Access::RefreshRequired | Access::Expired | Access::Offline
+            );
+            (
+                snapshot,
+                state.session_required,
+                state.session_disabled,
+                refresh_needed,
             )
         };
+        if snapshot.access == Access::Online {
+            let final_snapshot = if session_required {
+                let mut state = self.0.state.lock().map_err(|_| Error::Storage)?;
+                self.sync_storage(&mut state)?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                let final_snapshot = self.checked_snapshot_locked(&mut state)?;
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                if final_snapshot.access != Access::Online {
+                    return Err(Error::SessionRequired);
+                }
+                final_snapshot
+            } else {
+                snapshot
+            };
+            if !final_snapshot.has_feature(feature) {
+                return Err(Error::FeatureUnavailable);
+            }
+            return Ok(final_snapshot);
+        }
+        if session_required {
+            if session_disabled {
+                return Err(Error::SessionRequired);
+            }
+            let snapshot = self.start_session_with_cancel(cancel).await?;
+            if !snapshot.has_feature(feature) {
+                return Err(Error::FeatureUnavailable);
+            }
+            return Ok(snapshot);
+        }
         if !refresh_needed {
             return Err(Error::NotActivated);
         }
@@ -821,6 +1575,19 @@ impl Client {
         if !snapshot.entitlements.get(feature).copied().unwrap_or(false) {
             return Err(Error::FeatureUnavailable);
         }
+        if state.session_required {
+            let final_snapshot = Self::session_snapshot(&state)?;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if final_snapshot.access != Access::Online {
+                return Err(Error::SessionRequired);
+            }
+            if !final_snapshot.has_feature(feature) {
+                return Err(Error::FeatureUnavailable);
+            }
+            return Ok(final_snapshot);
+        }
         Ok(snapshot)
     }
     pub async fn ensure_access<F>(&self, feature: &str, ask_for_key: F) -> Result<Snapshot>
@@ -833,8 +1600,14 @@ impl Client {
                 let Some(key) = ask_for_key().filter(|key| !key.trim().is_empty()) else {
                     return Err(Error::NotActivated);
                 };
-                self.activate(&key).await?;
-                self.require_access(feature).await
+                let snapshot = self.activate(&key).await?;
+                if !matches!(snapshot.access, Access::Online | Access::Offline) {
+                    return Err(Error::NotActivated);
+                }
+                if !snapshot.has_feature(feature) {
+                    return Err(Error::FeatureUnavailable);
+                }
+                Ok(snapshot)
             }
             Err(error) => Err(error),
         }
@@ -847,8 +1620,39 @@ impl Client {
         started: clock::Start,
         cancel: &Cancellation,
     ) -> Result<Snapshot> {
-        self.accept_for_licence(response, generation, previous, started, cancel, None)
+        self.accept_with_licence(response, generation, previous, started, cancel, None)
             .await
+    }
+    async fn accept_with_licence(
+        &self,
+        response: Result<Option<serde_json::Value>>,
+        generation: u64,
+        previous: Option<StoredCredential>,
+        started: clock::Start,
+        cancel: &Cancellation,
+        expected_licence: Option<&str>,
+    ) -> Result<Snapshot> {
+        let snapshot = self
+            .accept_for_licence(
+                response,
+                generation,
+                previous,
+                started,
+                cancel,
+                expected_licence,
+            )
+            .await?;
+        let should_start = {
+            let state = self.0.state.lock().map_err(|_| Error::Storage)?;
+            state.session_required && !state.session_disabled && state.session.is_none()
+        };
+        if should_start {
+            let next_generation = self.generation()?;
+            self.start_session_serialized(cancel, next_generation, false)
+                .await
+        } else {
+            Ok(snapshot)
+        }
     }
     async fn accept_for_licence(
         &self,
@@ -878,32 +1682,77 @@ impl Client {
             return Err(Error::Cancelled);
         }
         match result {
-            Ok((credential, claims, anchor, cache)) => {
-                let persisted = if let Some(storage) = &self.0.installed {
-                    storage.commit_access(
-                        state.storage_version,
-                        &credential,
-                        cache,
-                        previous.is_none(),
-                    )
-                } else {
-                    self.0
-                        .storage
-                        .save(state.storage_version, credential.clone())
-                };
-                if let Err(error) = persisted {
-                    clear(&mut state);
-                    return Err(error);
+            Ok(reply) => match reply {
+                VerifiedReply::Floating {
+                    credential,
+                    licence_expires_at,
+                } => {
+                    let persisted = if let Some(storage) = &self.0.installed {
+                        storage.commit_floating(
+                            state.storage_version,
+                            &credential,
+                            previous.is_none(),
+                        )
+                    } else {
+                        self.0
+                            .storage
+                            .save(state.storage_version, credential.clone())
+                    };
+                    if let Err(error) = persisted {
+                        clear(&mut state);
+                        return Err(error);
+                    }
+                    state.credential = Some(credential);
+                    state.claims = None;
+                    state.anchor = None;
+                    state.session_policy_known = true;
+                    state.session_required = true;
+                    state.session_licence_expires_at = licence_expires_at;
+                    state.transient = false;
+                    state.restored = false;
+                    state.retry_deadline = None;
+                    state.last_failure = None;
+                    Self::snapshot_state(&state)
                 }
-                state.credential = Some(credential);
-                state.claims = Some(claims);
-                state.anchor = Some(anchor);
-                state.transient = false;
-                state.restored = false;
-                state.retry_deadline = None;
-                state.last_failure = None;
-                Self::snapshot_state(&state)
-            }
+                VerifiedReply::Ordinary {
+                    credential,
+                    claims,
+                    anchor,
+                    cache,
+                } => {
+                    let persisted = if let Some(storage) = &self.0.installed {
+                        storage.commit_access(
+                            state.storage_version,
+                            &credential,
+                            cache,
+                            previous.is_none(),
+                        )
+                    } else {
+                        self.0
+                            .storage
+                            .save(state.storage_version, credential.clone())
+                    };
+                    if let Err(error) = persisted {
+                        clear(&mut state);
+                        return Err(error);
+                    }
+                    state.credential = Some(credential);
+                    state.claims = Some(*claims);
+                    state.anchor = Some(anchor);
+                    state.session_policy_known = true;
+                    state.session_required = false;
+                    state.session_disabled = false;
+                    state.session = None;
+                    state.pending_session_id = None;
+                    state.session_retry_deadline = None;
+                    state.session_licence_expires_at = None;
+                    state.transient = false;
+                    state.restored = false;
+                    state.retry_deadline = None;
+                    state.last_failure = None;
+                    Self::snapshot_state(&state)
+                }
+            },
             Err(error @ Error::Transient { .. }) => {
                 if verifying {
                     // Without verification the reply cannot refresh access; retain
@@ -938,6 +1787,13 @@ impl Client {
                     state.generation = state.generation.wrapping_add(1);
                     state.claims = None;
                     state.anchor = None;
+                    state.session = None;
+                    state.pending_session_id = None;
+                    state.session_policy_known = false;
+                    state.session_required = false;
+                    state.session_disabled = false;
+                    state.session_retry_deadline = None;
+                    state.session_licence_expires_at = None;
                     state.restored = false;
                     state.transient = false;
                     state.retry_deadline = Some(Instant::now() + transient_retry_delay());
@@ -962,7 +1818,17 @@ impl Client {
         expected_licence: Option<&str>,
         started: clock::Start,
         cancel: &Cancellation,
-    ) -> Result<(StoredCredential, Claims, Anchor, crate::installed::Cache)> {
+    ) -> Result<VerifiedReply> {
+        let object = value.as_object().ok_or(Error::InvalidResponse)?;
+        let floating = match object.get("session_required") {
+            None if !object.contains_key("licence_id") => false,
+            Some(serde_json::Value::Bool(true))
+                if object.get("grant") == Some(&serde_json::Value::Null) =>
+            {
+                true
+            }
+            _ => return Err(Error::InvalidResponse),
+        };
         let reply: Reply = serde_json::from_value(value).map_err(|_| Error::InvalidResponse)?;
         if reply.secret_replay_expired {
             return Err(Error::ReauthenticationRequired);
@@ -992,6 +1858,45 @@ impl Client {
                 || expiry != previous.credential_expires_at
                 || reply.credential.is_some())
         {
+            return Err(Error::InvalidResponse);
+        }
+        if floating {
+            let licence_id = reply.licence_id.as_deref().ok_or(Error::InvalidResponse)?;
+            if !opaque(licence_id)
+                || expected_licence.is_some_and(|expected| expected != licence_id)
+                || previous.is_some_and(|saved| saved.licence_id != licence_id)
+                || reply.grant.is_some()
+            {
+                return Err(Error::InvalidResponse);
+            }
+            let credential = reply
+                .credential
+                .or_else(|| previous.map(|saved| saved.credential.clone()))
+                .ok_or(Error::InvalidResponse)?;
+            if !bearer(&credential) {
+                return Err(Error::InvalidResponse);
+            }
+            let licence_expires_at = reply
+                .licence_expires_at
+                .as_deref()
+                .map(timestamp)
+                .transpose()?;
+            return Ok(VerifiedReply::Floating {
+                credential: StoredCredential {
+                    application_id: self.0.config.application_id.clone(),
+                    environment_id: self.0.config.environment_id.clone(),
+                    activation_id: reply.activation_id,
+                    licence_id: licence_id.to_owned(),
+                    installation_id: self.0.device.installation_id.clone(),
+                    credential,
+                    credential_expires_at: expiry,
+                    fingerprint: self.0.device.fingerprint.clone(),
+                    fingerprint_provider: self.0.device.fingerprint_provider.clone(),
+                },
+                licence_expires_at,
+            });
+        }
+        if reply.session_required.is_some() || reply.licence_id.is_some() {
             return Err(Error::InvalidResponse);
         }
         let token = reply.grant.ok_or(Error::InvalidResponse)?;
@@ -1078,7 +1983,12 @@ impl Client {
             server_high_water: now,
             wall_high_water: clock::wall()?,
         };
-        Ok((saved, claims, anchor, cache))
+        Ok(VerifiedReply::Ordinary {
+            credential: saved,
+            claims: Box::new(claims),
+            anchor,
+            cache,
+        })
     }
 }
 pub(crate) fn clear(state: &mut State) {
@@ -1094,6 +2004,13 @@ fn clear_access(state: &mut State) {
     state.retry_deadline = None;
     state.restored = false;
     state.last_failure = None;
+    state.session_policy_known = false;
+    state.session_required = false;
+    state.session_disabled = false;
+    state.session = None;
+    state.pending_session_id = None;
+    state.session_retry_deadline = None;
+    state.session_licence_expires_at = None;
     if let Some(offline) = state.offline.as_mut() {
         offline.authorized = false;
     }

@@ -181,6 +181,8 @@ def licence_value() -> dict[str, Any]:
         "expires_at": None,
         "duration_seconds": None,
         "device_limit": 2,
+        "concurrent_session_limit": 0,
+        "usage_limits": {}, "resource_limits": {},
         "hwid_locked": False,
         "offline_allowed": True,
         "offline_seconds": 900,

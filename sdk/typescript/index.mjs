@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { downloadVerifier } from "./download-tickets.mjs";
+import { uniqueJson } from "./strict-json.mjs";
+import * as online from "./online.mjs";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -23,6 +25,14 @@ export class OrbitApiError extends Error {
     this.status = status;
     this.code = code;
     this.requestId = requestId;
+  }
+}
+
+export class OrbitLimitReachedError extends OrbitApiError {
+  constructor(code, requestId, details) {
+    super(409, code, requestId);
+    this.name = "OrbitLimitReachedError";
+    Object.assign(this, details);
   }
 }
 
@@ -349,16 +359,159 @@ export class OrbitBackendClient {
     return freezeLicence(value);
   }
 
-  async #request(path, { bearer, method, body }) {
+  checkForUpdate(licenceId, installedReleaseNumber, { channel, target, signal } = {}) {
+    const query = online.updateInput(installedReleaseNumber, { channel, target });
+    return this.#onlineLicence(licenceId, "updates", "GET", undefined, (v) => online.parseUpdate(v, query), { query, signal });
+  }
+
+  authorizeDownload(licenceId, releaseId, artifactId, { signal } = {}) {
+    requireId(releaseId, "releaseId"); requireId(artifactId, "artifactId");
+    return this.#onlineLicence(licenceId, "downloads/authorize", "POST", { release_id: releaseId, artifact_id: artifactId },
+      (v) => online.parseAuthorization(v, releaseId, artifactId), { signal });
+  }
+
+  usage(licenceId, name, { signal } = {}) {
+    online.requireInput(name, online.limitName);
+    return this.#onlineLicence(licenceId, `usage/${name}`, "GET", undefined, (v) => online.parseCounter(v, name, true), { signal });
+  }
+
+  consume(licenceId, name, units = 1, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName); online.requireInput(units, (v) => online.integer(v, 1));
+    const key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineLicence(licenceId, `usage/${name}/consume`, "POST", { units, idempotency_key: key },
+      (v) => online.parseConsumption(v, name, key, units), { signal, key });
+  }
+
+  resources(licenceId, name, { signal } = {}) {
+    online.requireInput(name, online.limitName);
+    return this.#onlineLicence(licenceId, `resources/${name}`, "GET", undefined, (v) => online.parseCounter(v, name, false), { signal });
+  }
+
+  acquireResource(licenceId, name, resourceId, units = 1, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName); requireId(resourceId, "resourceId"); online.requireInput(units, (v) => online.integer(v, 1));
+    const key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineLicence(licenceId, `resources/${name}/acquire`, "POST", { resource_id: resourceId, units, idempotency_key: key },
+      (v) => online.parseAllocation(v, name, key, { resourceId, units }), { signal, key });
+  }
+
+  releaseResource(licenceId, name, allocationId, { idempotencyKey, signal } = {}) {
+    online.requireInput(name, online.limitName); requireId(allocationId, "allocationId");
+    const key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineLicence(licenceId, `resources/${name}/allocations/${allocationId}/release`, "POST", { idempotency_key: key },
+      (v) => online.parseAllocation(v, name, key, { allocationId }), { signal, key });
+  }
+
+  listResourceAllocations(licenceId, name, { state, after, limit, signal } = {}) {
+    online.requireInput(name, online.limitName);
+    const query = pageQuery({ after, limit });
+    if (state !== undefined) query.state = online.requireInput(state, (v) => ["active", "released"].includes(v));
+    return this.#onlineLicence(licenceId, `resources/${name}/allocations`, "GET", undefined, online.parseAllocationPage, { query, signal });
+  }
+
+  listReleases({ channel, after, limit, signal } = {}) {
+    const query = pageQuery({ after, limit });
+    if (channel !== undefined) query.channel = online.requireInput(channel, online.targetName);
+    return this.#onlineCall("/api/management/v1/releases", "GET", undefined, (v) => {
+      online.exact(v, ["items", "next_cursor"]);
+      if (!Array.isArray(v.items) || v.items.length > 100 || v.next_cursor !== null && !online.cursor(v.next_cursor)) online.invalid();
+      const items = v.items.map(online.parseRelease);
+      if (new Set(items.map((x) => x.id)).size !== items.length || channel !== undefined && items.some((x) => x.channel !== channel)) online.invalid();
+      return Object.freeze({ items: Object.freeze(items), nextCursor: v.next_cursor });
+    }, { query, signal });
+  }
+
+  getRelease(releaseId, { signal } = {}) {
+    requireId(releaseId, "releaseId");
+    return this.#onlineCall(`/api/management/v1/releases/${releaseId}`, "GET", undefined, (v) => {
+      const result = online.parseRelease(v); if (result.id !== releaseId) online.invalid(); return result;
+    }, { signal });
+  }
+
+  createRelease(input, { idempotencyKey, signal } = {}) {
+    const body = online.metadataInput(input), key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineCall("/api/management/v1/releases", "POST", { ...body, idempotency_key: key }, (v) => {
+      const result = online.parseRelease(v);
+      if (result.state !== "draft" || result.channel !== body.channel || result.version !== body.version || result.notes !== body.notes) online.invalid();
+      return Object.freeze({ ...result, idempotencyKey: key });
+    }, { signal, key, status: 201 });
+  }
+
+  updateRelease(releaseId, input, { idempotencyKey, signal } = {}) {
+    requireId(releaseId, "releaseId");
+    const body = online.metadataInput(input), key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineCall(`/api/management/v1/releases/${releaseId}`, "PATCH", { ...body, idempotency_key: key }, (v) => {
+      const result = online.parseRelease(v);
+      if (result.id !== releaseId || result.state !== "draft" || result.channel !== body.channel || result.version !== body.version || result.notes !== body.notes) online.invalid();
+      return Object.freeze({ ...result, idempotencyKey: key });
+    }, { signal, key });
+  }
+
+  createArtifact(releaseId, input, options = {}) {
+    return this.#artifactMutation(releaseId, undefined, input, options);
+  }
+
+  updateArtifact(releaseId, artifactId, input, options = {}) {
+    requireId(artifactId, "artifactId");
+    return this.#artifactMutation(releaseId, artifactId, input, options);
+  }
+
+  #artifactMutation(releaseId, artifactId, input, { idempotencyKey, signal }) {
+    requireId(releaseId, "releaseId");
+    const body = online.artifactInput(input), key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineCall(`/api/management/v1/releases/${releaseId}/artifacts${artifactId ? `/${artifactId}` : ""}`,
+      artifactId ? "PATCH" : "POST", { ...body, idempotency_key: key }, (v) => {
+        const result = online.parseArtifact(v);
+        if (result.releaseId !== releaseId || artifactId && result.id !== artifactId || online.artifactFields.some((k) => v[k] !== body[k])) online.invalid();
+        return Object.freeze({ ...result, idempotencyKey: key });
+      }, { signal, key, status: artifactId ? 200 : 201 });
+  }
+
+  deleteArtifact(releaseId, artifactId, { idempotencyKey, signal } = {}) {
+    requireId(releaseId, "releaseId"); requireId(artifactId, "artifactId");
+    const key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineCall(`/api/management/v1/releases/${releaseId}/artifacts/${artifactId}`, "DELETE", { idempotency_key: key },
+      () => Object.freeze({ idempotencyKey: key }), { signal, key, status: 204 });
+  }
+
+  publishRelease(releaseId, options = {}) { return this.#publish(releaseId, true, options); }
+  unpublishRelease(releaseId, options = {}) { return this.#publish(releaseId, false, options); }
+  #publish(releaseId, publish, { idempotencyKey, signal }) {
+    requireId(releaseId, "releaseId");
+    const key = resolveIdempotencyKey(idempotencyKey);
+    return this.#onlineCall(`/api/management/v1/releases/${releaseId}/${publish ? "publish" : "unpublish"}`, "POST", { idempotency_key: key }, (v) => {
+      const result = online.parseRelease(v);
+      if (result.id !== releaseId || !(publish ? ["published"] : ["draft", "unpublished"]).includes(result.state)) online.invalid();
+      return Object.freeze({ ...result, idempotencyKey: key });
+    }, { signal, key });
+  }
+
+  #onlineLicence(licenceId, suffix, method, body, parse, options) {
+    requireId(licenceId, "licenceId");
+    return this.#onlineCall(`/api/management/v1/licences/${licenceId}/${suffix}`, method, body, parse, options);
+  }
+
+  async #onlineCall(path, method, body, parse, { signal, key, query, status = 200 } = {}) {
+    try {
+      const value = await this.#request(path, { bearer: this.#managementToken, method, body, signal, query, expectedStatus: status });
+      try { return parse(value); } catch { throw new OrbitTransportError("invalid_response"); }
+    } catch (error) { throw key ? uncertainMutation(error, key) : error; }
+  }
+
+  async #request(path, { bearer, method, body, signal, query, expectedStatus }) {
     const url = new URL(path, this.#origin);
     url.searchParams.set("application_id", this.#applicationId);
     url.searchParams.set("environment_id", this.#environmentId);
+    for (const [name, value] of Object.entries(query ?? {})) url.searchParams.set(name, String(value));
     const headers = new Headers({
       accept: "application/json",
       authorization: `Bearer ${bearer}`,
     });
     if (body !== undefined) headers.set("content-type", "application/json");
     const controller = new AbortController();
+    const abortExternal = () => controller.abort();
+    signal?.addEventListener("abort", abortExternal, { once: true });
+    if (signal?.aborted) controller.abort();
+    const combined = controller.signal;
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response;
     try {
@@ -368,31 +521,54 @@ export class OrbitBackendClient {
           headers,
           body: body === undefined ? undefined : JSON.stringify(body),
           redirect: "error",
-          signal: controller.signal,
+          credentials: "omit",
+          signal: combined,
         });
       } catch {
-        throw new OrbitTransportError(controller.signal.aborted ? "timeout" : "request_failed");
+        throw new OrbitTransportError(signal?.aborted ? "operation_cancelled" : controller.signal.aborted ? "timeout" : "request_failed");
       }
       let value;
       try {
+        if (expectedStatus === 204 && response.status === 204) {
+          if (combined.aborted) throw new OrbitTransportError(signal?.aborted ? "operation_cancelled" : "timeout");
+          if (response.body !== null) throw new OrbitTransportError("invalid_response");
+          return null;
+        }
         value = await readJsonResponse(response);
       } catch (error) {
-        if (controller.signal.aborted) throw new OrbitTransportError("timeout");
+        if (combined.aborted) throw new OrbitTransportError(signal?.aborted ? "operation_cancelled" : "timeout");
         throw error;
       }
+      if (combined.aborted) throw new OrbitTransportError(signal?.aborted ? "operation_cancelled" : "timeout");
       if (!response.ok) {
         const error = isRecord(value) && isRecord(value.error) ? value.error : null;
+        if (expectedStatus !== undefined && (!error || typeof error.code !== "string" || !SAFE_CODE_PATTERN.test(error.code) ||
+            typeof error.message !== "string" || !error.message || typeof error.request_id !== "string" ||
+            !SAFE_REQUEST_ID_PATTERN.test(error.request_id))) {
+          throw new OrbitTransportError("invalid_response");
+        }
         const code = error && typeof error.code === "string" && SAFE_CODE_PATTERN.test(error.code)
           ? error.code
           : "http_error";
         const requestId = error && typeof error.request_id === "string" && SAFE_REQUEST_ID_PATTERN.test(error.request_id)
           ? error.request_id
           : null;
+        if (["usage_limit_reached", "resource_limit_reached"].includes(code)) {
+          let details;
+          try {
+            if (response.status !== 409 || !requestId || typeof error.message !== "string" || !error.message) online.invalid();
+            details = online.parseCapacity(error, path, body);
+          } catch { throw new OrbitTransportError("invalid_response"); }
+          throw new OrbitLimitReachedError(code, requestId, details);
+        }
         throw new OrbitApiError(response.status, code, requestId);
       }
+      if (combined.aborted) throw new OrbitTransportError(signal?.aborted ? "operation_cancelled" : "timeout");
+      if (expectedStatus !== undefined && response.status !== expectedStatus) throw new OrbitTransportError("unexpected_status");
       return value;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortExternal);
       // Stop any unread response after an early content-type/length rejection.
       controller.abort();
     }
@@ -534,6 +710,8 @@ function isIssuedLicences(value) {
 
 function isLicence(value) {
   if (!isRecord(value)) return false;
+  try { online.parseDefinitions(value.usage_limits, true); online.parseDefinitions(value.resource_limits, false); }
+  catch { return false; }
   const nullableTimestamp = (item) => item === null || isTimestamp(item);
   const nullableDuration = (item) => item === null || isSafeInteger(item, 60, 315_360_000);
   const entitlements = value.entitlements;
@@ -592,6 +770,8 @@ function freezeLicence(value) {
     offline_seconds: value.offline_seconds,
     offline_file_seconds: value.offline_file_seconds,
     entitlements: Object.freeze({ ...value.entitlements }),
+    usage_limits: online.parseDefinitions(value.usage_limits, true),
+    resource_limits: online.parseDefinitions(value.resource_limits, false),
     reference: value.reference,
     note: value.note,
     created_at: value.created_at,
@@ -659,8 +839,15 @@ async function readJsonResponse(response) {
     reader.releaseLock();
   }
   try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size)));
+    return uniqueJson(bytes.subarray(0, size), MAX_RESPONSE_BYTES);
   } catch {
     throw new OrbitTransportError("invalid_response");
   }
+}
+
+function pageQuery({ after, limit }) {
+  const query = {};
+  if (after !== undefined) query.after = online.requireInput(after, online.cursor);
+  if (limit !== undefined) query.limit = online.requireInput(limit, (v) => Number.isInteger(v) && v >= 1 && v <= 100);
+  return query;
 }

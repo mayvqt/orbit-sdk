@@ -14,7 +14,7 @@ import (
 	orbit "github.com/mayvqt/orbit-sdk/sdk/go"
 )
 
-const commands = "Commands: activate, login, licences, more, select, claim, register, resend, recover, email, account-logout, status, export, deactivate, logout, quit"
+const commands = "Commands: activate, login, licences, more, select, claim, register, resend, recover, email, account-logout, status, export, metered-export, updates, download, idle, resume, deactivate, logout, quit"
 
 type console struct {
 	input      *bufio.Scanner
@@ -260,6 +260,53 @@ func (c *console) command(ctx context.Context, command string) error {
 		} else {
 			fmt.Println("Export authorized: synthetic report, rows=3, total=42")
 		}
+	case "idle":
+		return c.client.EndSession(ctx)
+	case "resume":
+		_, err := c.client.StartSession(ctx)
+		return err
+	case "metered-export":
+		if _, err := c.client.RequireAccess(ctx, "export"); err != nil {
+			return err
+		}
+		jobID, err := c.prompt("Export job ID (16–128 characters; reuse for retries): ", false)
+		if err != nil {
+			return err
+		}
+		result, err := c.client.Consume(ctx, "exports", 1, jobID)
+		if err != nil {
+			var mutation *orbit.MutationError
+			if errors.As(err, &mutation) && mutation.Uncertain {
+				fmt.Println("Outcome unknown. Retry this export with the same job ID.")
+			}
+			return err
+		}
+		fmt.Printf("Export authorized: synthetic report. Remaining exports: %d\n", result.Remaining)
+	case "updates", "download":
+		update, err := c.client.CheckForUpdates(ctx, 0)
+		if err != nil {
+			return err
+		}
+		if update == nil {
+			fmt.Println("No eligible update for this target.")
+			return nil
+		}
+		fmt.Printf("Update available: %s\n", update.Release.Version)
+		if command == "updates" {
+			return nil
+		}
+		destination, err := c.prompt("Destination file (must not already exist): ", false)
+		if err != nil {
+			return err
+		}
+		authorized, err := c.client.AuthorizeDownload(ctx, update.Release.ID, update.Artifact.ID)
+		if err != nil {
+			return err
+		}
+		if err := authorized.Download(ctx, destination, 128*1024*1024); err != nil {
+			return err
+		}
+		fmt.Println("Verified download saved. No installer was executed.")
 	case "deactivate":
 		operation, err := operationID()
 		if err != nil {

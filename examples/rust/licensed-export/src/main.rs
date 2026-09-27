@@ -31,7 +31,9 @@ async fn run(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     client
         .ensure_access("export", || prompt("Licence key: ").ok())
         .await?;
-    println!("Activation is remembered. Commands: export, status, quit");
+    println!(
+        "Activation is remembered. Commands: export, metered-export, updates, download, idle, resume, status, quit"
+    );
     loop {
         match prompt("orbit> ")?.as_str() {
             "export" => match client.require_access("export").await {
@@ -41,9 +43,50 @@ async fn run(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Support summary: {}", client.support_summary(&error));
                 }
             },
+            "idle" => {
+                client.end_session().await?;
+            }
+            "resume" => {
+                client.start_session().await?;
+            }
+            "metered-export" => {
+                client.require_access("export").await?;
+                let job = prompt("Export job ID (16–128 characters; reuse for retries): ")?;
+                match client.consume_with_id("exports", 1, &job).await {
+                    Ok(result) => println!(
+                        "Export authorized: synthetic report. Remaining exports: {}",
+                        result.counter.remaining
+                    ),
+                    Err(error) => {
+                        println!("Export denied: {}", error.cause);
+                        if error.uncertain {
+                            println!("Outcome unknown. Retry with the same job ID.");
+                        }
+                    }
+                }
+            }
+            command @ ("updates" | "download") => {
+                if let Some(update) = client.check_for_updates(0).await? {
+                    println!("Update available: {}", update.release.version);
+                    if command == "download" {
+                        let destination = prompt("Destination file (must not already exist): ")?;
+                        let authorization = client
+                            .authorize_download(&update.release.id, &update.artifact.id)
+                            .await?;
+                        authorization
+                            .download(destination, 128 * 1024 * 1024)
+                            .await?;
+                        println!("Verified download saved. No installer was executed.");
+                    }
+                } else {
+                    println!("No eligible update for this target.");
+                }
+            }
             "status" => println!("{:?}", client.snapshot()?),
             "quit" | "" => break,
-            _ => println!("Commands: export, status, quit"),
+            _ => println!(
+                "Commands: export, metered-export, updates, download, idle, resume, status, quit"
+            ),
         }
     }
     Ok(())

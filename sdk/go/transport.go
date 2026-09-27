@@ -169,6 +169,48 @@ func (t *Transport) Post(ctx context.Context, route string, body any, retrySafe 
 	return t.request(ctx, http.MethodPost, route, buffer.Bytes(), "", retrySafe)
 }
 
+// postCleanup performs only an authenticated floating-session release. It is
+// permitted during Close after the installation lifetime has been cancelled;
+// callers must already have discarded local authority.
+func (t *Transport) postCleanup(ctx context.Context, route string, body any) (json.RawMessage, error) {
+	if !strings.Contains(route, "/sessions/") || !strings.HasSuffix(route, "/end") {
+		return nil, ErrConfiguration
+	}
+	var buffer limitedBody
+	if err := json.NewEncoder(&buffer).Encode(body); err != nil {
+		return nil, ErrConfiguration
+	}
+	t.installationMu.Lock()
+	if t.installationClosed {
+		t.installationMu.Unlock()
+		return nil, ErrCancelled
+	}
+	t.installationRequests.Add(1)
+	t.installationMu.Unlock()
+	defer t.installationRequests.Done()
+	endpoint, err := t.endpoint(route)
+	if err != nil {
+		return nil, err
+	}
+	budget, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 2; attempt++ {
+		result, _, requestErr := t.attempt(budget, http.MethodPost, endpoint, buffer.Bytes(), "")
+		if requestErr == nil || !errors.Is(requestErr, ErrTransient) || budget.Err() != nil {
+			if budget.Err() != nil && ctx.Err() == nil {
+				return nil, ErrTransient
+			}
+			return result, requestErr
+		}
+		select {
+		case <-budget.Done():
+			return nil, ErrTransient
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil, ErrTransient
+}
+
 type limitedBody struct{ bytes.Buffer }
 
 func (b *limitedBody) Write(data []byte) (int, error) {
@@ -296,6 +338,9 @@ func (t *Transport) attempt(ctx context.Context, method string, endpoint *url.UR
 	if len(data) > maxBytes {
 		return nil, 0, ErrInvalidResponse
 	}
+	if serviceRoute(endpoint.Path) && response.StatusCode >= 200 && response.StatusCode < 300 && response.StatusCode != http.StatusOK {
+		return nil, 0, ErrInvalidResponse
+	}
 	if response.StatusCode == http.StatusNoContent {
 		if len(data) != 0 {
 			return nil, 0, ErrInvalidResponse
@@ -303,6 +348,9 @@ func (t *Transport) attempt(ctx context.Context, method string, endpoint *url.UR
 		return nil, 0, nil
 	}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		if serviceRoute(endpoint.Path) && hasServiceError(data) {
+			return nil, 0, ErrInvalidResponse
+		}
 		if _, err := uniqueJSON(data); err != nil {
 			return nil, 0, err
 		}
@@ -343,6 +391,12 @@ func (t *Transport) attempt(ctx context.Context, method string, endpoint *url.UR
 			}
 		}
 		return nil, after, &Error{Kind: Transient, Code: failure.Code, RequestID: failure.RequestID}
+	}
+	if serviceRoute(endpoint.Path) && status != 409 && (failure.Code == "usage_limit_reached" || failure.Code == "resource_limit_reached") {
+		return nil, 0, ErrInvalidResponse
+	}
+	if serviceRoute(endpoint.Path) && status == 409 && (failure.Code == "usage_limit_reached" || failure.Code == "resource_limit_reached") {
+		return data, 0, nil
 	}
 	return nil, 0, &Error{Kind: Denied, Code: failure.Code, RequestID: failure.RequestID}
 }

@@ -26,3 +26,13 @@ The example module references the local SDK source. For your own project, follow
 
 For long-disconnected installations, the SDK guide explains trusted offline JWKS setup,
 exporting an installation request and importing a seller-issued `.orbit` file.
+
+Use `idle` and `resume` to release and reacquire floating seats. `updates` discovers
+stable releases for this machine; `download` asks for an explicit destination and
+verifies at most 128 MiB without running an installer. This example uses installed
+release number `0`; embed your actual release number in a distributed application.
+
+`metered-export` requires an `exports` usage limit on the licence's policy and asks
+for a stable job ID. Keep that ID when recovering an uncertain result. It reserves
+one unit before printing the synthetic export; a later failure does not refund it.
+Use backend enforcement for work whose metering must be authoritative.

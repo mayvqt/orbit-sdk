@@ -114,7 +114,7 @@ impl DownloadTicketVerifier {
     }
 }
 
-fn valid_endpoint(value: &str) -> bool {
+pub(crate) fn valid_endpoint(value: &str) -> bool {
     if value.is_empty() || value.len() > 2048 || !value.is_ascii() || !value.starts_with("https://")
     {
         return false;

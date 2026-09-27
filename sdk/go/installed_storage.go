@@ -235,6 +235,19 @@ func (s *installedStorage) commit(version uint64, credential *StoredCredential, 
 	r.Access = &installedAccess{JWS: *reply.Grant, JWKS: set, LicenceExpiresAt: licenceExpiry, ReceivedServerTime: anchor.server, ReceivedWallTime: anchor.wall, ServerHighWater: now, WallHighWater: time.Now().Unix()}
 	return s.writeLocked(r)
 }
+func (s *installedStorage) commitCredential(version uint64, credential *StoredCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if version != s.record.Generation {
+		return ErrStaleResponse
+	}
+	r := s.record
+	r.Credential, r.Pending, r.Access = installedCredentialFrom(credential), nil, nil
+	clearOfflineAuthority(&r)
+	r.Installation.Fingerprint = cloneString(credential.Fingerprint)
+	r.Installation.FingerprintProvider = cloneString(credential.FingerprintProvider)
+	return s.writeLocked(r)
+}
 func (s *installedStorage) checkpoint(server, wall int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

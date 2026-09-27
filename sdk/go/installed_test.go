@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -36,7 +37,23 @@ type installedFixture struct {
 	mu                         sync.Mutex
 	operations                 []string
 	previous                   string
+	stateDirectory             string
 	offline                    bool
+	floating                   bool
+	sessionStarts              atomic.Int32
+	sessionRenews              atomic.Int32
+	sessionEnds                atomic.Int32
+	sessionCapacityDenied      atomic.Bool
+	sessionRenewDenied         atomic.Bool
+	sessionRenewTransient      atomic.Bool
+	sessionRenewSequence       []int64
+	sessionRenewIDs            []string
+	sessionRenewEntered        chan struct{}
+	sessionRenewRelease        chan struct{}
+	sessionRenewOnce           sync.Once
+	sessionStartEntered        chan struct{}
+	sessionStartRelease        chan struct{}
+	sessionStartOnce           sync.Once
 }
 
 func installedTestTempDir(t testing.TB) string {
@@ -60,6 +77,11 @@ func newInstalledFixture(t testing.TB, offline bool) *installedFixture {
 	}
 	return &installedFixture{t: t, key: key, offline: offline}
 }
+func newFloatingFixture(t testing.TB) *installedFixture {
+	f := newInstalledFixture(t, false)
+	f.floating = true
+	return f
+}
 func installedOptions(path string) Options {
 	return Options{StatePath: path, BindingMode: BindingDisabled}
 }
@@ -72,7 +94,17 @@ func (f *installedFixture) openWith(path string, options Options) (*Client, erro
 }
 func (f *installedFixture) respond(request *http.Request) (*http.Response, error) {
 	if request.URL.Path == jwksPath {
-		data, _ := json.Marshal(map[string]any{"keys": []jsonWebKey{{KeyType: "EC", Curve: "P-256", Algorithm: "ES256", Purpose: "sig", KeyID: "installed-test", X: base64.RawURLEncoding.EncodeToString(f.key.X.FillBytes(make([]byte, 32))), Y: base64.RawURLEncoding.EncodeToString(f.key.Y.FillBytes(make([]byte, 32)))}}})
+		if f.floating && f.stateDirectory != "" && runtime.GOOS != "windows" {
+			state, err := os.ReadFile(filepath.Join(f.stateDirectory, "orbit-storage.bin"))
+			if err != nil || !strings.Contains(string(state), strings.Repeat("c", 43)) {
+				f.t.Errorf("floating activation credential was not durable before session JWKS lookup: %v", err)
+			}
+		}
+		kid := "installed-test"
+		if f.floating {
+			kid = "test-fixture"
+		}
+		data, _ := json.Marshal(map[string]any{"keys": []jsonWebKey{{KeyType: "EC", Curve: "P-256", Algorithm: "ES256", Purpose: "sig", KeyID: kid, X: base64.RawURLEncoding.EncodeToString(f.key.X.FillBytes(make([]byte, 32))), Y: base64.RawURLEncoding.EncodeToString(f.key.Y.FillBytes(make([]byte, 32)))}}})
 		return testResponse(request, 200, string(data)), nil
 	}
 	if request.Method == http.MethodGet && request.URL.Path == clientPrefix+"licences" {
@@ -84,6 +116,49 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 	var body map[string]any
 	if json.NewDecoder(request.Body).Decode(&body) != nil {
 		f.t.Error("invalid request")
+	}
+	sessionRoot := clientPrefix + "activations/activation/sessions"
+	if request.URL.Path == sessionRoot {
+		f.sessionStarts.Add(1)
+		if f.sessionStartEntered != nil {
+			f.sessionStartOnce.Do(func() { close(f.sessionStartEntered) })
+			<-f.sessionStartRelease
+		}
+		if f.sessionCapacityDenied.Load() {
+			return testResponse(request, http.StatusForbidden, `{"error":{"code":"concurrent_session_limit_reached","message":"Denied","request_id":"fixture"}}`), nil
+		}
+		id, _ := body["session_id"].(string)
+		return testResponse(request, http.StatusOK, f.signedSessionReply(id, 1, body["installation_id"].(string))), nil
+	}
+	if request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, sessionRoot+"/") {
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/end"):
+			f.sessionEnds.Add(1)
+			return testResponse(request, http.StatusNoContent, ""), nil
+		case strings.HasSuffix(request.URL.Path, "/renew"):
+			f.sessionRenews.Add(1)
+			sequence, _ := body["sequence"].(float64)
+			id := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, sessionRoot+"/"), "/renew")
+			f.mu.Lock()
+			f.sessionRenewSequence = append(f.sessionRenewSequence, int64(sequence))
+			f.sessionRenewIDs = append(f.sessionRenewIDs, id)
+			f.mu.Unlock()
+			if entered, release := f.sessionRenewEntered, f.sessionRenewRelease; entered != nil && release != nil {
+				f.sessionRenewOnce.Do(func() { close(entered) })
+				select {
+				case <-release:
+				case <-request.Context().Done():
+					return nil, request.Context().Err()
+				}
+			}
+			if f.sessionRenewTransient.Load() {
+				return testResponse(request, http.StatusServiceUnavailable, `{"error":{"code":"service_unavailable","message":"Unavailable","request_id":"fixture"}}`), nil
+			}
+			if f.sessionRenewDenied.Load() {
+				return testResponse(request, http.StatusForbidden, `{"error":{"code":"session_ended","message":"Denied","request_id":"fixture"}}`), nil
+			}
+			return testResponse(request, http.StatusOK, f.signedSessionReply(id, int64(sequence), body["installation_id"].(string))), nil
+		}
 	}
 	if request.URL.Path == clientPrefix+"sessions" {
 		if f.loginFailures.Load() > 0 && f.loginFailures.Add(-1) >= 0 {
@@ -156,8 +231,34 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 	if f.mode.Load() == 5 {
 		reply["credential_expires_at"] = time.Unix(now+86400, 0).UTC().Format(time.RFC3339)
 	}
+	if f.floating {
+		reply["grant"] = nil
+		reply["licence_id"] = licenceID
+		reply["session_required"] = true
+	}
 	encoded, _ := json.Marshal(reply)
 	return testResponse(request, 200, string(encoded)), nil
+}
+
+func (f *installedFixture) signedSessionReply(id string, sequence int64, installation string) string {
+	now := time.Now().Unix()
+	claims := jwt.MapClaims{
+		"iss": "https://orbit.example.test", "aud": "orbit-session:app:test", "sub": "licence",
+		"jti": fmt.Sprintf("session_grant_%d", sequence), "iat": now, "nbf": now, "exp": now + 120,
+		"application_id": "app", "environment_id": "test", "activation_id": "activation",
+		"installation_id": installation, "binding_mode": "none", "policy_version": 1,
+		"entitlements": map[string]bool{"export": true}, "refresh_after": now + 60,
+		"offline_allowed": false, "licence_expires_at": nil, "session_id": id,
+		"session_sequence": sequence,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["typ"], token.Header["kid"] = "orbit-session+jwt", "test-fixture"
+	signed, err := token.SignedString(f.key)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return fmt.Sprintf(`{"session_id":%q,"sequence":%d,"expires_at":%q,"server_time":%q,"grant":%q}`,
+		id, sequence, time.Unix(now+120, 0).UTC().Format(time.RFC3339), time.Unix(now, 0).UTC().Format(time.RFC3339), signed)
 }
 func mustInstalledOpen(t *testing.T, f *installedFixture, path string) *Client {
 	t.Helper()
