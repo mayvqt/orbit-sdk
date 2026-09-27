@@ -869,7 +869,10 @@ mod tests {
         snapshot.update_length = 5;
         assert_eq!(snapshot.update_available(), Some("2.5.0"));
         assert_eq!(Error::APP_VERSION_UNSUPPORTED.code(), 26);
-        assert_eq!(Error::APP_VERSION_UNSUPPORTED.name(), "app_version_unsupported");
+        assert_eq!(
+            Error::APP_VERSION_UNSUPPORTED.name(),
+            "app_version_unsupported"
+        );
     }
 
     #[test]
