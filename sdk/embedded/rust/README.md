@@ -33,10 +33,18 @@ let mut buffers = Buffers::<8192>::new(); // or Buffers::<32768>::new()
 let mut client = Client::new(&mut buffers, &mut platform, app.config())?;
 ```
 
+Pass your firmware version with
+`AppKey::parse(ORBIT_APP_KEY)?.with_app_version("2.4.1")`, or set
+`Config::app_version`. `Client::new` rejects an invalid version. A version
+blocked by licence policy returns `Error::APP_VERSION_UNSUPPORTED` with no cached
+or offline fallback, and `Snapshot::update_available()` reports a newer version
+when one is offered. `Platform::begin_request` must send `Request::client` as
+the `Orbit-Client` header.
+
 The default arena is 32 KiB. `Buffers::<8192>` or `CompactBuffers` reserves the
 minimum arena and rejects oversized requests or responses cleanly. The full
-buffer object is 41,776 bytes by default and 17,200 bytes with the compact arena.
-Both sizes include the same 6,960-byte client state and 2,048-byte parser
+buffer object is 41,824 bytes by default and 17,248 bytes with the compact arena.
+Both sizes include the same 7,008-byte client state and 2,048-byte parser
 scratch. Stable caller-owned storage is recommended when the firmware stack is
 smaller than either buffer. Exclusive borrows prevent moving or reusing buffers,
 platform state or parsed origin while a client is active; dropping the client

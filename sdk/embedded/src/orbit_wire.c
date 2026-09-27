@@ -26,6 +26,145 @@ void orbit_write_string(orbit_writer_t *w, orbit_embedded_slice_t value) {
     }
     ORBIT_LITERAL(w, "\"");
 }
+#ifndef ORBIT_EMBEDDED_PLATFORM
+#if defined(__linux__)
+#define ORBIT_PLATFORM_OS "linux"
+#elif defined(_WIN32)
+#define ORBIT_PLATFORM_OS "windows"
+#elif defined(__APPLE__)
+#define ORBIT_PLATFORM_OS "macos"
+#else
+#define ORBIT_PLATFORM_OS "none"
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#define ORBIT_PLATFORM_ARCH "x86_64"
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define ORBIT_PLATFORM_ARCH "aarch64"
+#elif defined(__XTENSA__)
+#define ORBIT_PLATFORM_ARCH "xtensa"
+#elif defined(__riscv)
+#define ORBIT_PLATFORM_ARCH "riscv"
+#elif defined(__arm__) || defined(__thumb__) || defined(_M_ARM)
+#define ORBIT_PLATFORM_ARCH "arm"
+#elif defined(__i386__) || defined(_M_IX86)
+#define ORBIT_PLATFORM_ARCH "x86"
+#else
+#define ORBIT_PLATFORM_ARCH "unknown"
+#endif
+/* Boards may define a more specific value, such as "esp32-xtensa". */
+#define ORBIT_EMBEDDED_PLATFORM ORBIT_PLATFORM_OS "-" ORBIT_PLATFORM_ARCH
+#endif
+static const char client_header[] =
+    "embedded/" ORBIT_EMBEDDED_VERSION " (" ORBIT_EMBEDDED_PLATFORM ")";
+orbit_embedded_slice_t orbit_client_header(void) {
+    orbit_embedded_slice_t value = {(const uint8_t *)client_header,
+                                    (uint32_t)(sizeof(client_header) - 1u)};
+    return value;
+}
+static int version_number(const uint8_t *p, uint32_t n) {
+    uint32_t i;
+    if (n == 0u || (n > 1u && p[0] == '0'))
+        return 0;
+    for (i = 0u; i < n; ++i)
+        if (p[i] < '0' || p[i] > '9')
+            return 0;
+    return 1;
+}
+static int version_identifier(const uint8_t *p, uint32_t n, int prerelease) {
+    uint32_t i;
+    int digits = 1;
+    if (n == 0u)
+        return 0;
+    for (i = 0u; i < n; ++i) {
+        uint8_t c = p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              c == '-'))
+            return 0;
+        if (c < '0' || c > '9')
+            digits = 0;
+    }
+    return !prerelease || !digits || version_number(p, n);
+}
+int orbit_app_version_valid(orbit_embedded_slice_t value) {
+    /* 0: numeric core, 1: pre-release, 2: build. */
+    uint32_t i, start = 0u, parts = 0u;
+    uint8_t section = 0u;
+    if (value.data == NULL || value.length == 0u || value.length > 32u)
+        return 0;
+    for (i = 0u; i <= value.length; ++i) {
+        uint8_t c = i < value.length ? value.data[i] : 0u;
+        int end = i == value.length || c == '.' || (section == 0u && c == '-') ||
+                  (section < 2u && c == '+');
+        if (!end)
+            continue;
+        if (section == 0u ? !version_number(value.data + start, i - start) || ++parts > 4u
+                          : !version_identifier(value.data + start, i - start, section == 1u))
+            return 0;
+        if (c == '-')
+            section = 1u;
+        else if (c == '+')
+            section = 2u;
+        start = i + 1u;
+    }
+    return 1;
+}
+static int header_part(orbit_embedded_slice_t value, uint32_t maximum, int platform) {
+    uint32_t i;
+    if (value.data == NULL || value.length == 0u || value.length > maximum)
+        return 0;
+    for (i = 0u; i < value.length; ++i) {
+        uint8_t c = value.data[i];
+        int lower = c >= 'a' && c <= 'z', digit = c >= '0' && c <= '9';
+        if (i == 0u ? !(lower || (platform && digit))
+                    : !(lower || digit || c == '-' || (platform && (c == '_' || c == '.'))))
+            return 0;
+    }
+    return 1;
+}
+int orbit_client_header_valid(orbit_embedded_slice_t language, orbit_embedded_slice_t version,
+                              orbit_embedded_slice_t platform) {
+    return header_part(language, 16u, 0) && header_part(platform, 32u, 1) &&
+           orbit_app_version_valid(version) &&
+           language.length + version.length + platform.length + 4u <= 128u;
+}
+int orbit_error_code_is(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
+                        const char *code, uint32_t code_length) {
+    orbit_json_parser_t p;
+    orbit_json_span_t key, value;
+    uint32_t base, inner;
+    int first, present, found = 0;
+    orbit_json_init(&p, bytes, length, scratch);
+    if (orbit_json_object_open(&p, 0u, &base, &first) != 0)
+        return 0;
+    for (;;) {
+        if (orbit_json_object_next(&p, base, &first, &key, &present) != 0)
+            return 0;
+        if (!present)
+            break;
+        if (!orbit_json_span_equals_ascii(bytes, key, "error", 5)) {
+            if (orbit_json_skip_value(&p, 1u) != 0)
+                return 0;
+            continue;
+        }
+        if (orbit_json_object_open(&p, 1u, &inner, &first) != 0)
+            return 0;
+        for (;;) {
+            if (orbit_json_object_next(&p, inner, &first, &key, &present) != 0)
+                return 0;
+            if (!present)
+                break;
+            if (orbit_json_span_equals_ascii(bytes, key, "code", 4)) {
+                orbit_json_skip_space(&p);
+                if (orbit_json_scan_string(&p, &value) != 0)
+                    return 0;
+                found = orbit_json_span_equals_ascii(bytes, value, code, code_length);
+            } else if (orbit_json_skip_value(&p, 2u) != 0)
+                return 0;
+        }
+        first = 0;
+    }
+    return found && orbit_json_finish(&p) == 0;
+}
 int orbit_client_opaque(orbit_embedded_slice_t value, uint32_t minimum, uint32_t maximum) {
     uint32_t i;
     if (value.length < minimum || value.length > maximum ||
@@ -181,6 +320,18 @@ int orbit_timestamp(const uint8_t *data, orbit_json_span_t span, int64_t *out) {
     *out = ((int64_t)era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second;
     return 1;
 }
+int32_t orbit_reply_update(const uint8_t *bytes, const orbit_reply_t *reply,
+                           uint8_t version[32], uint32_t *length) {
+    *length = 0u;
+    if (!reply->has_update)
+        return 0;
+    if (orbit_json_decode_span(bytes, reply->update, version, 32u, length, 1) != 0 ||
+        !orbit_app_version_valid((orbit_embedded_slice_t){version, *length})) {
+        *length = 0u;
+        return ORBIT_CLIENT_UNTRUSTED;
+    }
+    return 0;
+}
 int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
                           orbit_reply_t *r) {
     orbit_json_parser_t p;
@@ -216,6 +367,8 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
             bit = 256u;
         else if (orbit_json_span_equals_ascii(bytes, key, "secret_replay_expired", 21))
             bit = 512u;
+        else if (orbit_json_span_equals_ascii(bytes, key, "update_available", 16))
+            bit = 4096u;
 #ifdef ORBIT_ENABLE_SERVICES
         else if (orbit_json_span_equals_ascii(bytes,key,"session_required",16)) bit=1024u;
         else if (orbit_json_span_equals_ascii(bytes,key,"licence_id",10)) bit=2048u;
@@ -229,6 +382,29 @@ int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratc
             return ORBIT_CLIENT_UNTRUSTED;
         seen |= bit;
         orbit_json_skip_space(&p);
+        if (bit == 4096u) {
+            /* {"version": "..."}; other members are ignored. */
+            uint32_t inner;
+            int inner_first;
+            if (orbit_json_object_open(&p, 1u, &inner, &inner_first) != 0)
+                return ORBIT_CLIENT_UNTRUSTED;
+            for (;;) {
+                if (orbit_json_object_next(&p, inner, &inner_first, &key, &present) != 0)
+                    return ORBIT_CLIENT_UNTRUSTED;
+                if (!present)
+                    break;
+                if (orbit_json_span_equals_ascii(bytes, key, "version", 7)) {
+                    orbit_json_skip_space(&p);
+                    if (orbit_json_scan_string(&p, &r->update) != 0)
+                        return ORBIT_CLIENT_UNTRUSTED;
+                    r->has_update = 1u;
+                } else if (orbit_json_skip_value(&p, 2u) != 0)
+                    return ORBIT_CLIENT_UNTRUSTED;
+            }
+            if (!r->has_update)
+                return ORBIT_CLIENT_UNTRUSTED;
+            continue;
+        }
 #ifdef ORBIT_ENABLE_SERVICES
         if (bit == 1024u) {
             if (orbit_json_consume_literal(&p,"true",4)) return ORBIT_CLIENT_UNTRUSTED;

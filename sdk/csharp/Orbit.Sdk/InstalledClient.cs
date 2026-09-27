@@ -7,7 +7,7 @@ namespace Orbit.Sdk;
 internal sealed record AppConfig(string ApiOrigin, string ApplicationId, string EnvironmentId, string Issuer,
     string? StatePath = null, string? Fingerprint = null, string? FingerprintProvider = null,
     OfflineKeys? OfflineKeys = null, SessionKeys? SessionKeys = null,
-    string? PublicAppKey = null, AppKey? ParsedAppKey = null);
+    string? PublicAppKey = null, AppKey? ParsedAppKey = null, string? AppVersion = null);
 
 internal sealed class InstalledLifetime
 {
@@ -77,7 +77,7 @@ public sealed partial class OrbitClient : IAsyncDisposable
             throw new OrbitException(OrbitError.Configuration, "invalid_session_keys");
         return new AppConfig(key.ApiOrigin, key.ApplicationId, key.EnvironmentId, key.Issuer,
             options.StatePath, fingerprint?.Value, fingerprint?.Provider, options.OfflineKeys,
-            options.SessionKeys, key.PublicKey(), key);
+            options.SessionKeys, key.PublicKey(), key, Orbit.Sdk.AppVersion.Configured(options.AppVersion));
     }
     internal static Fingerprint? ResolveFingerprint(AppKey key, OrbitOptions? options)
     {
@@ -147,7 +147,8 @@ public sealed partial class OrbitClient : IAsyncDisposable
                 publicAppKey = app.PublicAppKey,
                 offlineAppKey = app.ParsedAppKey,
                 sessionKeys = app.SessionKeys,
-                environmentName = app.ParsedAppKey?.Environment
+                environmentName = app.ParsedAppKey?.Environment,
+                appVersion = Orbit.Sdk.AppVersion.Configured(app.AppVersion)
             };
             transport.InstallationCancellation = client.lifetime.Cancellation.Token;
             if (record.PendingActivation != null)
@@ -161,7 +162,9 @@ public sealed partial class OrbitClient : IAsyncDisposable
                 {
                     await client.RefreshAsync(cancellationToken).ConfigureAwait(false);
                 }
-                catch (OrbitException error) when (error.Error == OrbitError.Transient) { }
+                // An unsupported application version still opens, so the application
+                // can report the denial and use update checks.
+                catch (OrbitException error) when (error.Error is OrbitError.Transient or OrbitError.AppVersionUnsupported) { }
             }
             var weak = new WeakReference<OrbitClient>(client);
             client.lifetime.Worker = RunInstalledAsync(weak, client.lifetime, storage, transport);

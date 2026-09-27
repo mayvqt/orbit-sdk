@@ -160,7 +160,8 @@ int32_t orbit_service_exchange(orbit_client_state_t *c,
                                orbit_embedded_slice_t path, uint32_t n,
                                const orbit_operation_t *op, uint16_t *http,
                                uint32_t *length) {
-  orbit_http_request_t req = {c->config.api_origin, path, {c->arena, n}, 1};
+  orbit_http_request_t req = {c->config.api_origin, path, {c->arena, n},
+                              orbit_client_header(), 1};
   service_sink_t sink = {c, op, 0, 0};
   uint64_t generation = c->generation;
   int32_t r;

@@ -1,7 +1,8 @@
 import { randomBytes, createHash, randomInt } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { validateAppKey, canonicalScope, isOpaqueId } from "./app-key.mjs";
-import { fail, ErrorKind, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
+import { configuredAppVersion, updateHint } from "./app-version.mjs";
+import { fail, ErrorKind, AppVersionUnsupportedError, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
 import * as online from "./online.mjs";
 import { downloadFile } from "./download-file.mjs";
 import { validEntitlements, parseJwks, verifyGrant } from "./grants.mjs";
@@ -82,6 +83,9 @@ export class Client extends EventEmitter {
   #active;
   #lastCheckpoint;
   #lifecycle;
+  #appVersion = null;
+  #updateAvailable = null;
+  #versionDenial = null;
   #queues = new Map();
   #background = new Set();
   #pendingRegistrations = new Set();
@@ -91,9 +95,11 @@ export class Client extends EventEmitter {
       validateClientOptions(options);
     }
     const key = validateAppKey(appKey);
+    const appVersion = configuredAppVersion(options.appVersion);
     const offlineKeys = options.offlineKeys === undefined ? null : parseOfflineKeys(options.offlineKeys, key.environment);
     const binding = await resolveBinding(key, options);
     const client = new Client(CLIENT_TOKEN, key, binding, options);
+    client.#appVersion = appVersion;
     client.#lifecycle = internal?.lifecycle !== false;
     try {
       client.#store = await PrivateFileStore.open(key, options.statePath, binding, internal?.storageCodec);
@@ -106,7 +112,10 @@ export class Client extends EventEmitter {
         try {
           await client.refresh();
         } catch (error) {
+          // An unsupported application version still opens, so the application
+          // can report the denial and use update checks.
           if (![ErrorKind.TRANSIENT, ErrorKind.REAUTHENTICATION_REQUIRED].includes(error?.kind) &&
+              !(error instanceof AppVersionUnsupportedError) &&
               !(error?.kind === ErrorKind.DENIED && error?.code === "concurrent_session_limit_reached")) throw error;
         }
       }
@@ -203,6 +212,7 @@ export class Client extends EventEmitter {
       reauthenticationRequired: !state.credential || credentialExpiresAt !== null && now !== null && credentialExpiresAt <= now + 86400,
       offlineAllowed,
       remainingOfflineSeconds: remaining,
+      updateAvailable: this.#updateAvailable,
     });
   }
 
@@ -254,6 +264,7 @@ export class Client extends EventEmitter {
       if (snapshot.access !== "online" && snapshot.access !== "offline") {
         if (this.#state.pending_activation) throw fail(ErrorKind.CONFIGURATION, "pending_activation_recovery_required");
         if (this.#state.credential && this.#transient) throw fail(ErrorKind.TRANSIENT, "network_unavailable");
+        if (this.#state.credential && this.#versionDenial) throw new AppVersionUnsupportedError(this.#versionDenial.requestId);
         throw new NotActivatedError();
       }
       if (!snapshot.has(feature)) throw new FeatureUnavailableError();
@@ -346,6 +357,7 @@ export class Client extends EventEmitter {
         previous_credential: previousCredential ?? null,
         idempotency_key: pending.operation_id,
         credential_mode: "persistent",
+        ...(this.#appVersion === null ? {} : { app_version: this.#appVersion }),
         ...(principal === "key" ? { licence_key: licenceKey } : {
           customer_session: this.#session.token,
           licence_id: licenceId,
@@ -395,6 +407,8 @@ export class Client extends EventEmitter {
       }
       this.#transient = false;
       this.#retryAt = 0;
+      this.#updateAvailable = result.updateAvailable;
+      this.#versionDenial = null;
       this.#scheduleRefresh();
       this.#safeEmit("state", this.snapshot());
       return this.snapshot();
@@ -570,6 +584,7 @@ export class Client extends EventEmitter {
       installation_id: this.#state.installation.id,
       fingerprint: this.#binding.fingerprint,
       fingerprint_provider: this.#binding.provider,
+      ...(this.#appVersion === null ? {} : { app_version: this.#appVersion }),
     };
     try {
       const response = await this.#transport.post(`${CLIENT_PREFIX}activations/${credential.activation_id}/validate`, body, true, signal);
@@ -596,10 +611,27 @@ export class Client extends EventEmitter {
         this.#sessionLicenceExpiry = null;
         this.#sessionBindingMode = null;
       }
+      this.#updateAvailable = result.updateAvailable;
+      this.#versionDenial = null;
     } catch (error) {
       this.#checkGeneration(generation);
       if (signal.aborted) throw fail(ErrorKind.CANCELLED, "operation_cancelled");
       if (error?.kind === ErrorKind.CANCELLED) throw error;
+      if (error instanceof AppVersionUnsupportedError) {
+        // Keep the activation for an updated application, but drop cached
+        // access without offline fallback and pace further validation.
+        this.#state = await this.#store.updateState((state) => ({ ...state, access: null }),
+          () => generation === this.#generation && !this.#closed);
+        this.#dropFloating({ release: true });
+        this.#claims = null;
+        this.#anchor = null;
+        this.#transient = false;
+        this.#updateAvailable = null;
+        this.#versionDenial = error;
+        this.#retryAt = Date.now() + randomInt(15000, 45001);
+        this.#scheduleRefresh();
+        throw error;
+      }
       if (error?.kind === ErrorKind.TRANSIENT) {
         this.#transient = true;
         this.#retryAt = Date.now() + randomInt(15000, 45001);
@@ -900,8 +932,10 @@ export class Client extends EventEmitter {
       grant: (v) => v === null || isString(v), server_time: isString, binding_mode: isString,
       fingerprint_provider: (v) => v === null || isString(v), licence_expires_at: (v) => v === null || isString(v),
       secret_replay_expired: (v) => typeof v === "boolean", session_required: (v) => v === null || typeof v === "boolean",
+      update_available: () => true,
     };
-    const value = checkFields(reply, fields, ["credential", "grant", "fingerprint_provider", "licence_expires_at", "session_required", "licence_id"]);
+    const value = checkFields(reply, fields, ["credential", "grant", "fingerprint_provider", "licence_expires_at", "session_required", "licence_id", "update_available"]);
+    const updateAvailable = updateHint(reply);
     const sessionRequired = value.session_required === true;
     if (value.secret_replay_expired) throw fail(ErrorKind.REAUTHENTICATION_REQUIRED, "secret_replay_expired");
     if (!isOpaqueId(value.activation_id) || value.installation_id !== this.#state.installation.id ||
@@ -929,7 +963,7 @@ export class Client extends EventEmitter {
       const bearer = value.credential ?? previous?.bearer ?? null;
       if (!isOpaqueId(licenceId) || !validBearer(bearer)) throw fail(ErrorKind.INVALID_RESPONSE, "invalid_activation_response");
       const credential = { activation_id: value.activation_id, licence_id: licenceId, bearer, expires_at: credentialExpiry };
-      return { credential, claims: null, anchor: null, access: null, sessionRequired: true, licenceExpiry, bindingMode: value.binding_mode };
+      return { credential, claims: null, anchor: null, access: null, sessionRequired: true, licenceExpiry, bindingMode: value.binding_mode, updateAvailable };
     }
     const token = value.grant;
     if (!this.#keys || !this.#keys.has(parseTokenKid(token))) {
@@ -973,7 +1007,7 @@ export class Client extends EventEmitter {
       wall_high_water: readWallSeconds(),
     };
     now = anchorNow(anchor);
-    return { credential, claims, anchor, access, sessionRequired: false, licenceExpiry: null, bindingMode: value.binding_mode };
+    return { credential, claims, anchor, access, sessionRequired: false, licenceExpiry: null, bindingMode: value.binding_mode, updateAvailable };
   }
 
   async deactivate({ idempotencyKey, signal } = {}) {
@@ -1282,6 +1316,8 @@ export class Client extends EventEmitter {
     await this.#checkpointForTransition(checkpointContext);
     this.#transient = false;
     this.#retryAt = 0;
+    this.#updateAvailable = null;
+    this.#versionDenial = null;
     this.#keys = null;
     if (clearAccount) this.#session = null;
     this.#state = await this.#store.updateState((state) => ({
@@ -1657,6 +1693,8 @@ export class Client extends EventEmitter {
     this.#offlineFile = null;
     this.#offlineAnchor = null;
     this.#transient = false;
+    this.#updateAvailable = null;
+    this.#versionDenial = null;
     this.#session = null;
     this.#keys = null;
     this.#offlineKeys = null;
@@ -1677,9 +1715,9 @@ export function openClientWithStorageCodec(appKey, options, storageCodec) {
 }
 
 export function openClientForTesting(appKey, options = {}) {
-  const { statePath, machineBinding, deviceBinding, offlineKeys, transport, storageCodec,
+  const { statePath, machineBinding, deviceBinding, offlineKeys, appVersion, transport, storageCodec,
     skipInitialRefresh = true, lifecycle = false } = options;
-  return Client.open(appKey, { statePath, machineBinding, deviceBinding, offlineKeys }, CLIENT_TOKEN, {
+  return Client.open(appKey, { statePath, machineBinding, deviceBinding, offlineKeys, appVersion }, CLIENT_TOKEN, {
     transport, storageCodec, skipInitialRefresh, lifecycle,
   });
 }
@@ -1689,7 +1727,7 @@ export function validateClientOptions(options) {
       Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null) {
     throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");
   }
-  const allowed = new Set(["statePath", "machineBinding", "deviceBinding", "offlineKeys"]);
+  const allowed = new Set(["statePath", "machineBinding", "deviceBinding", "offlineKeys", "appVersion"]);
   if (Object.keys(options).some((name) => !allowed.has(name)) ||
       options.machineBinding !== undefined && typeof options.machineBinding !== "boolean") {
     throw fail(ErrorKind.CONFIGURATION, "invalid_client_options");
@@ -1837,6 +1875,7 @@ function freezeSnapshot(value) {
     remainingOffline: remaining,
     remainingOfflineSeconds: value.remainingOfflineSeconds,
     session: value.session ?? null,
+    updateAvailable: value.updateAvailable ?? null,
     has(feature) { return entitlements[feature] === true; },
   });
 }

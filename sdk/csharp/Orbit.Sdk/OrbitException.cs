@@ -3,7 +3,9 @@ namespace Orbit.Sdk;
 public enum OrbitError
 {
     Configuration, Cancelled, Transient, Denied, NotActivated, FeatureUnavailable,
-    InvalidResponse, TransportSecurity, ReauthenticationRequired, StaleResponse, Storage, ClockUncertain
+    InvalidResponse, TransportSecurity, ReauthenticationRequired, StaleResponse, Storage, ClockUncertain,
+    /// <summary>Licence policy blocks this application version. Update the application; cached or offline access is not used.</summary>
+    AppVersionUnsupported
 }
 
 /// <summary>Contains only safe error classification, never server messages or bearer material.</summary>
@@ -25,7 +27,8 @@ public sealed class OrbitException : Exception
     {
         Error = error;
         Code = code;
-        RequestId = (error is OrbitError.Denied or OrbitError.Transient) && ValidRequestId(requestId) ? requestId : null;
+        RequestId = (error is OrbitError.Denied or OrbitError.Transient or OrbitError.AppVersionUnsupported) &&
+            ValidRequestId(requestId) ? requestId : null;
     }
 
     internal static bool ValidRequestId(string? value) => value is { Length: >= 1 and <= 64 } &&
@@ -75,6 +78,7 @@ public sealed class OrbitException : Exception
                 _ => "Credential storage failed. Preserve the state directory and contact application support."
             },
             OrbitError.ClockUncertain => "Online clock validation is required",
+            OrbitError.AppVersionUnsupported => "This application version is no longer supported. Update the application to continue.",
             _ => "Orbit operation failed"
         };
     }

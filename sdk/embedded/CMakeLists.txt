@@ -103,8 +103,22 @@ if(BUILD_TESTING)
     add_test(NAME orbit_embedded_core_bounds COMMAND orbit_embedded_core_tests)
 
     set(ORBIT_TEST_PRIVATE_KEY ${CMAKE_CURRENT_SOURCE_DIR}/../rust/tests/fixtures/es256-test-private.pem CACHE FILEPATH "Public synthetic signing fixture")
+    set(ORBIT_GENERATED_APP_VERSION_VECTORS ${CMAKE_CURRENT_BINARY_DIR}/orbit_generated_app_version_vectors.h)
+    set(ORBIT_APP_VERSION_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-versions.json CACHE FILEPATH "Shared app-version vectors")
+    add_custom_command(
+        OUTPUT ${ORBIT_GENERATED_APP_VERSION_VECTORS}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_version_vectors.py
+            --source ${ORBIT_APP_VERSION_VECTORS}
+            --output ${ORBIT_GENERATED_APP_VERSION_VECTORS}
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_version_vectors.py
+            ${ORBIT_APP_VERSION_VECTORS}
+        VERBATIM
+    )
+    add_custom_target(orbit_embedded_generate_app_version_vectors DEPENDS ${ORBIT_GENERATED_APP_VERSION_VECTORS})
     add_executable(orbit_embedded_client_tests tests/test_client.c tests/openssl_adapter.c adapters/openssl.c)
-    add_dependencies(orbit_embedded_client_tests orbit_embedded_generate_vectors)
+    add_dependencies(orbit_embedded_client_tests orbit_embedded_generate_vectors orbit_embedded_generate_app_version_vectors)
+    target_compile_definitions(orbit_embedded_client_tests PRIVATE ORBIT_TEST_PROJECT_VERSION="${PROJECT_VERSION}")
     target_include_directories(orbit_embedded_client_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_BINARY_DIR})
     target_compile_definitions(orbit_embedded_client_tests PRIVATE ORBIT_TEST_PRIVATE_KEY="${ORBIT_TEST_PRIVATE_KEY}")
     target_link_libraries(orbit_embedded_client_tests PRIVATE orbit_embedded_client OpenSSL::Crypto)
@@ -145,9 +159,9 @@ if(ORBIT_ENABLE_OFFLINE)
 endif()
 if(ORBIT_ENABLE_SERVICES AND BUILD_TESTING)
  add_executable(orbit_embedded_extension_tests tests/test_extensions.c tests/openssl_adapter.c adapters/openssl.c)
- add_dependencies(orbit_embedded_extension_tests orbit_embedded_generate_vectors)
+ add_dependencies(orbit_embedded_extension_tests orbit_embedded_generate_vectors orbit_embedded_generate_app_version_vectors)
  target_include_directories(orbit_embedded_extension_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_BINARY_DIR})
- target_compile_definitions(orbit_embedded_extension_tests PRIVATE ORBIT_TEST_PRIVATE_KEY="${ORBIT_TEST_PRIVATE_KEY}")
+ target_compile_definitions(orbit_embedded_extension_tests PRIVATE ORBIT_TEST_PRIVATE_KEY="${ORBIT_TEST_PRIVATE_KEY}" ORBIT_TEST_PROJECT_VERSION="${PROJECT_VERSION}")
  target_link_libraries(orbit_embedded_extension_tests PRIVATE orbit_embedded_client OpenSSL::Crypto)
  add_test(NAME orbit_embedded_extended_lifecycle COMMAND orbit_embedded_extension_tests)
 endif()

@@ -2,7 +2,8 @@ import https from "node:https";
 import { lookup as dnsLookup } from "node:dns";
 import { randomInt } from "node:crypto";
 import { validateOrigin } from "./app-key.mjs";
-import { fail, ErrorKind, LimitReachedError } from "./errors.mjs";
+import { CLIENT_HEADER } from "./app-version.mjs";
+import { fail, ErrorKind, AppVersionUnsupportedError, LimitReachedError } from "./errors.mjs";
 import { parseCapacity } from "./online.mjs";
 import { uniqueJson, isText } from "./json.mjs";
 
@@ -132,6 +133,7 @@ export class HttpTransport {
           : callback(null, address.address, address.family),
         headers: {
           Accept: "application/json",
+          "Orbit-Client": CLIENT_HEADER,
           ...(body ? { "Content-Type": "application/json" } : {}),
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
@@ -193,6 +195,8 @@ export class HttpTransport {
               finish(fail(ErrorKind.TRANSIENT, item.code, item.request_id, status), undefined, retryAfter);
             } else if (status === 502 || status === 504 || status === 503) {
               finish(Object.assign(fail(ErrorKind.TRANSIENT, "service_unavailable"), { retryAfter: parseRetryAfter(response.headers["retry-after"]) }));
+            } else if (status === 403 && item.code === "app_version_unsupported") {
+              finish(new AppVersionUnsupportedError(item.request_id, status));
             } else if ([401, 403, 404, 409, 422].includes(status) || status === 429 || status >= 500) {
               finish(fail(ErrorKind.DENIED, item.code, item.request_id, status));
             } else {

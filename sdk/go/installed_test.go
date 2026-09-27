@@ -27,7 +27,7 @@ import (
 type installedFixture struct {
 	t                          testing.TB
 	key                        *ecdsa.PrivateKey
-	mode                       atomic.Int32 // 0 online, 1 outage, 2 denied, 3 malformed, 4 missing expiry, 5 finite expiry
+	mode                       atomic.Int32 // 0 online, 1 outage, 2 denied, 3 malformed, 4 missing expiry, 5 finite expiry, 6 app version unsupported
 	validation                 atomic.Int32
 	activation                 atomic.Int32
 	accountActivation          atomic.Int32
@@ -37,6 +37,9 @@ type installedFixture struct {
 	mu                         sync.Mutex
 	operations                 []string
 	previous                   string
+	lastBody                   map[string]any
+	clientHeaders              []string
+	updateAvailable            any
 	stateDirectory             string
 	offline                    bool
 	floating                   bool
@@ -113,10 +116,16 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 		}
 		return testResponse(request, 200, `{"items":[],"next_cursor":null}`), nil
 	}
+	f.mu.Lock()
+	f.clientHeaders = append(f.clientHeaders, request.Header.Get("Orbit-Client"))
+	f.mu.Unlock()
 	var body map[string]any
 	if json.NewDecoder(request.Body).Decode(&body) != nil {
 		f.t.Error("invalid request")
 	}
+	f.mu.Lock()
+	f.lastBody = body
+	f.mu.Unlock()
 	sessionRoot := clientPrefix + "activations/activation/sessions"
 	if request.URL.Path == sessionRoot {
 		f.sessionStarts.Add(1)
@@ -200,6 +209,8 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 		return testResponse(request, 403, `{"error":{"code":"licence_revoked","message":"Denied","request_id":"fixture"}}`), nil
 	case 3:
 		return testResponse(request, 200, `{"malformed":true}`), nil
+	case 6:
+		return testResponse(request, 403, `{"error":{"code":"app_version_unsupported","message":"Update required","request_id":"fixture"}}`), nil
 	}
 	now := time.Now().Unix()
 	refresh := now + 60
@@ -227,6 +238,9 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 	}
 	if f.mode.Load() == 4 {
 		delete(reply, "credential_expires_at")
+	}
+	if f.updateAvailable != nil {
+		reply["update_available"] = f.updateAvailable
 	}
 	if f.mode.Load() == 5 {
 		reply["credential_expires_at"] = time.Unix(now+86400, 0).UTC().Format(time.RFC3339)

@@ -9,12 +9,12 @@ profile below rejects responses larger than its chosen buffer.
 
 | Caller-owned object | Bytes |
 | --- | ---: |
-| Full client state, including keys and active entitlement cache | 6,960 |
+| Full client state, including keys and active entitlement cache | 7,008 |
 | Shared transaction arena, default | 32,768 |
 | Parser scratch | 2,048 |
-| **Default client buffers** | **41,776** |
+| **Default client buffers** | **41,824** |
 | Shared transaction arena, compact | 8,192 |
-| **Compact client buffers** | **17,200** |
+| **Compact client buffers** | **17,248** |
 | App-key decoded origin buffer (additional) | 384 |
 | Verifier-only claims view | 368 |
 | Verifier-only trusted keyset | 1,545 |
@@ -132,16 +132,16 @@ Build commands and linker budgets for each target are in the
 
 Connected builds keep the table and 29,576-byte portable library above unchanged.
 Services and offline files are explicit compile features. On Cortex-M0+, the
-extended client is 6,976 bytes; its external extension is 248 bytes for services
+extended client is 7,024 bytes; its external extension is 248 bytes for services
 or 336 bytes with offline support. The same structs can be larger on a 64-bit
 host. Allocate by `sizeof`, using the same feature definitions as the library.
 
 | C profile | Arena | External extension | Combined file/metadata buffer | Total caller buffers |
 | --- | ---: | ---: | ---: | ---: |
-| Connected compact | 8,192 | 0 | 0 | 17,200 |
-| Services compact | 8,192 | 248 | 0 | 17,464 |
-| Offline compact, 4 KiB file | 8,192 | 336 | 5,120 | 22,672 |
-| Offline full, 16 KiB file | 16,384 | 336 | 17,408 | 43,152 |
+| Connected compact | 8,192 | 0 | 0 | 17,248 |
+| Services compact | 8,192 | 248 | 0 | 17,512 |
+| Offline compact, 4 KiB file | 8,192 | 336 | 5,120 | 22,720 |
+| Offline full, 16 KiB file | 16,384 | 336 | 17,408 | 43,200 |
 
 Totals include client state and 2,048-byte scratch. Offline trust needs an
 additional 1,545-byte keyset, which C may retain in immutable storage; app-key

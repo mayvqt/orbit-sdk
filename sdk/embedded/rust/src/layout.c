@@ -16,6 +16,9 @@ size_t orbit_rust_layout(unsigned index) {
     case 6:return offsetof(orbit_client_services_t,crypto);
     case 7:return offsetof(orbit_http_request_t,post);
     case 8:return offsetof(orbit_access_snapshot_t,allowed);
+    case 21:return offsetof(orbit_client_config_t,app_version);
+    case 22:return offsetof(orbit_http_request_t,client);
+    case 23:return offsetof(orbit_access_snapshot_t,update_available);
 #ifdef ORBIT_ENABLE_SERVICES
     case 9:return sizeof(orbit_client_extension_t);
     case 10:return sizeof(orbit_counter_t);

@@ -44,6 +44,8 @@ requires an HTTPS origin with no path, query, fragment or embedded
 credentials; a malformed key throws `TypeError`. Requests use the origin
 encoded in the key, include both scope IDs as query parameters, reject
 redirects, time out after five seconds and cap JSON responses at 1 MiB.
+Every request identifies the SDK with an `Orbit-Client` header containing its
+language, version and platform.
 Mutations are sent once. If an issue or key replacement response is lost or
 unusable, `OrbitMutationUncertainError.idempotencyKey` gives you the exact
 generated ID to reuse with the same input. The error is safe to log; it omits

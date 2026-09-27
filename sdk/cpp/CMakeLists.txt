@@ -37,6 +37,7 @@ else()
 endif()
 
 set(ORBIT_SDK_SOURCES
+    src/app_version.cpp
     src/core.cpp
     src/downloads.cpp
     src/download_stream.cpp
@@ -68,6 +69,8 @@ target_include_directories(orbit_sdk
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(orbit_sdk PUBLIC cxx_std_17)
+set_property(SOURCE src/app_version.cpp APPEND PROPERTY
+    COMPILE_DEFINITIONS "ORBIT_SDK_VERSION=\"${PROJECT_VERSION}\"")
 set(ORBIT_SDK_LINK_LIBRARIES
     CURL::libcurl OpenSSL::Crypto ${ORBIT_JSONCPP_TARGET} Threads::Threads)
 if(WIN32)
@@ -119,6 +122,8 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_link_libraries(orbit_sdk_tests PRIVATE ${ORBIT_SDK_LINK_LIBRARIES})
     target_compile_definitions(orbit_sdk_tests PRIVATE
         ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
+        ORBIT_APP_VERSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-versions.json"
+        ORBIT_SDK_VERSION="${PROJECT_VERSION}"
         ORBIT_GRANT_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/grants.json"
         ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json"
         ORBIT_SESSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/session-grants.json"

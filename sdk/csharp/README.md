@@ -63,6 +63,24 @@ On macOS, the SDK derives its default `machine_v1` identity from IOKit's
 expiry. It stores only the scoped hash. See
 [advanced integration](ADVANCED.md).
 
+## Application version
+
+Set `new OrbitOptions { AppVersion = "2.4.1" }` so your licence policy can
+require a minimum application version and offer updates. Use one to four
+dot-separated numbers without leading zeros, optionally followed by a
+`-pre-release` and `+build` part, in at most 32 bytes (for example
+`3.0.0-beta.2+build.5`). `OpenAsync` rejects an invalid value with
+`OrbitError.Configuration` and sends a valid one with activation and
+validation.
+
+When the policy blocks this version, access checks throw an `OrbitException`
+with `Error == OrbitError.AppVersionUnsupported`, and cached or offline access
+is not used. Ask the user to update the application; the activation is kept, so
+the updated version continues without a new licence key.
+`Snapshot.UpdateAvailable` contains a newer version when the policy offers one.
+Every request also identifies the SDK with an `Orbit-Client` header containing
+its language, version and platform.
+
 ## Customer accounts
 
 For Account or Both authentication, register and confirm the customer's email,

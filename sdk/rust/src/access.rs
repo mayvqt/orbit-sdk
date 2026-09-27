@@ -60,6 +60,9 @@ pub struct Snapshot {
     pub offline_file_mode: bool,
     pub remaining_offline: Duration,
     pub session: Option<SessionMetadata>,
+    /// Newer application version reported by the last online check, when
+    /// the licence policy offers one.
+    pub update_available: Option<String>,
 }
 impl Snapshot {
     pub fn has_feature(&self, feature: &str) -> bool {
@@ -112,6 +115,7 @@ pub(crate) struct State {
     pub(crate) session_retry_deadline: Option<Instant>,
     pub(crate) session_licence_expires_at: Option<i64>,
     pub(crate) restored: bool,
+    pub(crate) update_available: Option<String>,
     transient: bool,
     retry_deadline: Option<Instant>,
     last_failure: Option<Error>,
@@ -127,6 +131,7 @@ pub(crate) struct Inner {
     pub(crate) keys: Mutex<Keys>,
     pub(crate) session_keys: Mutex<Option<SessionKeys>>,
     pub(crate) offline_keys: Option<Keys>,
+    pub(crate) app_version: Option<String>,
     pub(crate) installed: Option<Arc<crate::installed::InstalledStorage>>,
     pub(crate) worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) close_serial: tokio::sync::Mutex<()>,
@@ -362,6 +367,7 @@ impl Client {
                 session_retry_deadline: None,
                 session_licence_expires_at: None,
                 restored: false,
+                update_available: None,
                 transient: false,
                 retry_deadline: None,
                 last_failure: None,
@@ -370,6 +376,7 @@ impl Client {
             keys: Mutex::new(Keys::default()),
             session_keys: Mutex::new(None),
             offline_keys: None,
+            app_version: None,
             installed: None,
             worker: Mutex::new(None),
             close_serial: tokio::sync::Mutex::new(()),
@@ -453,6 +460,7 @@ impl Client {
             offline_file_mode: true,
             remaining_offline: Duration::ZERO,
             session: None,
+            update_available: None,
         };
         let (Some(claims), Some(now)) = (&offline.verified, now.filter(|_| !offline.uncertain))
         else {
@@ -491,6 +499,7 @@ impl Client {
             offline_file_mode: false,
             remaining_offline: Duration::ZERO,
             session: None,
+            update_available: state.update_available.clone(),
         };
         if let Some(claims) = &state.claims {
             let Some(now) = now else {
@@ -1096,6 +1105,7 @@ impl Client {
             offline_file_mode: false,
             remaining_offline: Duration::ZERO,
             session: None,
+            update_available: state.update_available.clone(),
         };
         let Some(session) = &state.session else {
             return Ok(snapshot);
@@ -1293,6 +1303,9 @@ impl Client {
         if self.0.installed.is_some() {
             input["credential_mode"] = json!("persistent");
         }
+        if let Some(version) = &self.0.app_version {
+            input["app_version"] = json!(version);
+        }
         let expected_licence = match principal {
             ActivationPrincipal::Key(key) => {
                 input["licence_key"] = json!(key);
@@ -1386,7 +1399,10 @@ impl Client {
             .credential
             .clone()
             .ok_or(Error::ReauthenticationRequired)?;
-        let body = self.credential_body(&saved);
+        let mut body = self.credential_body(&saved);
+        if let Some(version) = &self.0.app_version {
+            body["app_version"] = json!(version);
+        }
         let started = clock::Start::capture()?;
         let response = self
             .0
@@ -1682,7 +1698,7 @@ impl Client {
             return Err(Error::Cancelled);
         }
         match result {
-            Ok(reply) => match reply {
+            Ok((reply, update_available)) => match reply {
                 VerifiedReply::Floating {
                     credential,
                     licence_expires_at,
@@ -1708,6 +1724,7 @@ impl Client {
                     state.session_policy_known = true;
                     state.session_required = true;
                     state.session_licence_expires_at = licence_expires_at;
+                    state.update_available = update_available;
                     state.transient = false;
                     state.restored = false;
                     state.retry_deadline = None;
@@ -1746,6 +1763,7 @@ impl Client {
                     state.pending_session_id = None;
                     state.session_retry_deadline = None;
                     state.session_licence_expires_at = None;
+                    state.update_available = update_available;
                     state.transient = false;
                     state.restored = false;
                     state.retry_deadline = None;
@@ -1783,7 +1801,9 @@ impl Client {
             Err(Error::Cancelled) => Err(Error::Cancelled),
             Err(error) => {
                 if let Some(storage) = &self.0.installed {
-                    let definitive = matches!(error, Error::Denied { .. });
+                    let definitive = matches!(error, Error::Denied { .. })
+                        || (previous.is_none()
+                            && matches!(error, Error::AppVersionUnsupported { .. }));
                     state.generation = state.generation.wrapping_add(1);
                     state.claims = None;
                     state.anchor = None;
@@ -1795,6 +1815,7 @@ impl Client {
                     state.session_retry_deadline = None;
                     state.session_licence_expires_at = None;
                     state.restored = false;
+                    state.update_available = None;
                     state.transient = false;
                     state.retry_deadline = Some(Instant::now() + transient_retry_delay());
                     state.last_failure = Some(error.clone());
@@ -1818,8 +1839,9 @@ impl Client {
         expected_licence: Option<&str>,
         started: clock::Start,
         cancel: &Cancellation,
-    ) -> Result<VerifiedReply> {
+    ) -> Result<(VerifiedReply, Option<String>)> {
         let object = value.as_object().ok_or(Error::InvalidResponse)?;
+        let update_available = crate::app_version::update_hint(object)?;
         let floating = match object.get("session_required") {
             None if !object.contains_key("licence_id") => false,
             Some(serde_json::Value::Bool(true))
@@ -1881,20 +1903,23 @@ impl Client {
                 .as_deref()
                 .map(timestamp)
                 .transpose()?;
-            return Ok(VerifiedReply::Floating {
-                credential: StoredCredential {
-                    application_id: self.0.config.application_id.clone(),
-                    environment_id: self.0.config.environment_id.clone(),
-                    activation_id: reply.activation_id,
-                    licence_id: licence_id.to_owned(),
-                    installation_id: self.0.device.installation_id.clone(),
-                    credential,
-                    credential_expires_at: expiry,
-                    fingerprint: self.0.device.fingerprint.clone(),
-                    fingerprint_provider: self.0.device.fingerprint_provider.clone(),
+            return Ok((
+                VerifiedReply::Floating {
+                    credential: StoredCredential {
+                        application_id: self.0.config.application_id.clone(),
+                        environment_id: self.0.config.environment_id.clone(),
+                        activation_id: reply.activation_id,
+                        licence_id: licence_id.to_owned(),
+                        installation_id: self.0.device.installation_id.clone(),
+                        credential,
+                        credential_expires_at: expiry,
+                        fingerprint: self.0.device.fingerprint.clone(),
+                        fingerprint_provider: self.0.device.fingerprint_provider.clone(),
+                    },
+                    licence_expires_at,
                 },
-                licence_expires_at,
-            });
+                update_available,
+            ));
         }
         if reply.session_required.is_some() || reply.licence_id.is_some() {
             return Err(Error::InvalidResponse);
@@ -1983,12 +2008,15 @@ impl Client {
             server_high_water: now,
             wall_high_water: clock::wall()?,
         };
-        Ok(VerifiedReply::Ordinary {
-            credential: saved,
-            claims: Box::new(claims),
-            anchor,
-            cache,
-        })
+        Ok((
+            VerifiedReply::Ordinary {
+                credential: saved,
+                claims: Box::new(claims),
+                anchor,
+                cache,
+            },
+            update_available,
+        ))
     }
 }
 pub(crate) fn clear(state: &mut State) {
@@ -2011,6 +2039,7 @@ fn clear_access(state: &mut State) {
     state.pending_session_id = None;
     state.session_retry_deadline = None;
     state.session_licence_expires_at = None;
+    state.update_available = None;
     if let Some(offline) = state.offline.as_mut() {
         offline.authorized = false;
     }

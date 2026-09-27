@@ -13,6 +13,8 @@ export declare class OrbitError extends Error {
   readonly status: number;
 }
 export declare class NotActivatedError extends OrbitError {}
+/** Licence policy blocks the configured appVersion. Update the application; cached or offline access is not used. */
+export declare class AppVersionUnsupportedError extends OrbitError {}
 export declare class FeatureUnavailableError extends OrbitError {}
 export declare class LimitReachedError extends OrbitError {
   readonly counter: Online.UsageCounter | Online.ResourceCounter;
@@ -58,6 +60,8 @@ export interface Snapshot {
   readonly remainingOffline: Readonly<{ seconds: number }>;
   readonly remainingOfflineSeconds: number;
   readonly session: SessionMetadata | null;
+  /** Newer application version reported by the last online check, when the licence policy offers one. */
+  readonly updateAvailable: string | null;
   has(feature: string): boolean;
 }
 export interface SessionMetadata {
@@ -79,6 +83,8 @@ export interface ClientOptions {
   readonly deviceBinding?: DeviceBindingLike;
   /** Trusted public keys for locally imported long-term offline files. */
   readonly offlineKeys?: string | Uint8Array | OfflineJwkSet;
+  /** Your application's version, such as "2.4.1", sent with activation and validation. */
+  readonly appVersion?: string;
 }
 export interface OfflineJwk {
   readonly kty: "EC";

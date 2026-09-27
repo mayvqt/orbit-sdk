@@ -33,6 +33,10 @@ type Options struct {
 	Fingerprint         string
 	FingerprintProvider string
 	OfflineKeys         []byte
+	// AppVersion is your application's version, such as "2.4.1". When set,
+	// activation and validation send it so licence policy can require a
+	// minimum version and report available updates.
+	AppVersion string
 }
 
 func resolveBinding(key AppKey, options Options) (*string, *string, error) {
@@ -111,6 +115,9 @@ func Open(ctx context.Context, rawAppKey string, options ...Options) (*Client, e
 func openInstalled(ctx context.Context, key AppKey, options Options, transport *Transport) (*Client, error) {
 	if ctx.Err() != nil {
 		return nil, ErrCancelled
+	}
+	if options.AppVersion != "" && !validAppVersion(options.AppVersion) {
+		return nil, ErrConfiguration
 	}
 	var offlineKeys grantKeys
 	if len(options.OfflineKeys) != 0 {
@@ -213,6 +220,7 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 		return nil, err
 	}
 	client.offlineKeys = offlineKeys
+	client.appVersion = options.AppVersion
 	lifetime, cancel := context.WithCancel(context.Background())
 	transport.installationLifetime = lifetime
 	client.installed = storage
@@ -230,8 +238,10 @@ func openInstalled(ctx context.Context, key AppKey, options Options, transport *
 		return nil, err
 	}
 	if record.Credential != nil {
+		// An unsupported application version still opens, so the application
+		// can report the denial and use update checks.
 		_, err = client.Refresh(ctx)
-		if err != nil && !errors.Is(err, ErrTransient) {
+		if err != nil && !errors.Is(err, ErrTransient) && !errors.Is(err, ErrAppVersionUnsupported) {
 			cancel()
 			storage.close()
 			transport.CloseIdleConnections()

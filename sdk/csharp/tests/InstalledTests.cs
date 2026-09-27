@@ -19,6 +19,7 @@ internal static partial class InstalledTests
         (string Name, Func<Task> Run)[] cases =
         [
             ("persistent activation and online restart",OnlineRestart),
+            ("app version is sent and an unsupported version denies without fallback", AppVersionPolicy),
             ("explicit online meters validate replay and uncertain IDs", OnlineOperations),
             ("updates select only the requested target", UpdateOperations),
             ("floating lifecycle acquires renews releases and restarts without cached session authority", FloatingLifecycle),
@@ -207,6 +208,7 @@ internal static partial class InstalledTests
         internal readonly List<long> RenewalSequences = [];
         private readonly Dictionary<string, long> sessionSequences = new(StringComparer.Ordinal);
         internal Func<FixtureRequest, FixtureReply?>? OnlineResponse;
+        internal JsonNode? UpdateAvailable;
         internal bool LoginDenied;
         internal bool Offline = true;
         internal long? FiniteExpiry;
@@ -241,7 +243,8 @@ internal static partial class InstalledTests
         internal InstalledScope Scope => new(Server.Origin, Issuer, "app", "test");
         internal string? CurrentFingerprint, CurrentProvider;
         internal Task<OrbitClient> Open(string? statePath = null, string? fingerprint = null,
-            string? provider = null, bool disableMachineBinding = true, bool withOfflineKeys = true)
+            string? provider = null, bool disableMachineBinding = true, bool withOfflineKeys = true,
+            string? appVersion = null)
         {
             var origin = JsonWire.EncodeBase64(Encoding.UTF8.GetBytes(Server.Origin));
             var appKey = $"orbit_app_test_{origin}.app.test";
@@ -253,7 +256,8 @@ internal static partial class InstalledTests
                 DisableMachineBinding = disableMachineBinding,
                 OfflineKeys = withOfflineKeys ? TrustedOfflineKeys : null,
                 SessionKeys = TrustedSessionKeys,
-                Fingerprint = fingerprint == null ? null : new Fingerprint(fingerprint, provider!)
+                Fingerprint = fingerprint == null ? null : new Fingerprint(fingerprint, provider!),
+                AppVersion = appVersion
             });
         }
         internal string SignOffline(string installation, long sequence, string issuance,
@@ -449,6 +453,8 @@ internal static partial class InstalledTests
                 response["credential_expires_at"] = DateTimeOffset.FromUnixTimeSeconds(now + 86400).ToString("O");
             if (Mode == 7)
                 response["credential"] = new string('r', 43);
+            if (UpdateAvailable != null)
+                response["update_available"] = UpdateAvailable.DeepClone();
             return new(200, response.ToJsonString());
         }
         internal InstalledRecord Record(string? fingerprint = null, string? provider = null)
@@ -721,6 +727,53 @@ internal static partial class InstalledTests
             Require(f.Record().Installation.Id == id && f.Activations == 1 && f.Validations == 1);
             await Expect(OrbitError.FeatureUnavailable, () => c.RequireAccessAsync("missing"), "feature_unavailable");
         }
+    }
+    private static async Task AppVersionPolicy()
+    {
+        await using var f = new Fixture();
+        await Expect(OrbitError.Configuration, async () => { await using var c = await f.Open(appVersion: "01"); });
+        var requests = new List<FixtureRequest>();
+        var deny = false;
+        f.OnlineResponse = request =>
+        {
+            lock (requests) requests.Add(request);
+            return deny && request.Path.EndsWith("/validate", StringComparison.Ordinal)
+                ? new FixtureReply(403, "{\"error\":{\"code\":\"app_version_unsupported\",\"message\":\"Update required\",\"request_id\":\"fixture\"}}")
+                : null;
+        };
+        int Validations() { lock (requests) return requests.Count(r => r.Path.EndsWith("/validate", StringComparison.Ordinal)); }
+        string SentVersion(string suffix)
+        {
+            lock (requests)
+                return JsonNode.Parse(requests.Last(r => r.Path.EndsWith(suffix, StringComparison.Ordinal)).Body)!["app_version"]!.GetValue<string>();
+        }
+        f.UpdateAvailable = JsonNode.Parse("{\"version\":\"2.5.0\"}");
+        await using (var c = await f.Open(appVersion: "2.4.1-beta.2"))
+        {
+            var activated = await c.ActivateAsync("synthetic-key");
+            Require(activated.Access == Access.Online && activated.UpdateAvailable == "2.5.0", "activation must expose the update hint");
+            Require(SentVersion("/activations") == "2.4.1-beta.2", "activation must send the app version");
+            lock (requests)
+                Require(requests.Count > 1 && requests.All(r => r.Headers.TryGetValue("Orbit-Client", out var header) &&
+                    header == AppVersion.ClientHeader), "every request must identify the SDK");
+            deny = true;
+            await Expect(OrbitError.AppVersionUnsupported, () => c.RefreshAsync(), "app_version_unsupported");
+            var validations = Validations();
+            Require(validations == 1 && SentVersion("/validate") == "2.4.1-beta.2", "denied validation must be sent once with the app version");
+            var snapshot = c.Snapshot();
+            Require(snapshot.Access == Access.RefreshRequired && !snapshot.HasFeature("export") && snapshot.UpdateAvailable == null,
+                "an unsupported version must not fall back to cached or offline access");
+            var prompted = false;
+            await Expect(OrbitError.AppVersionUnsupported, () => c.EnsureAccessAsync("export", _ =>
+            {
+                prompted = true;
+                return ValueTask.FromResult<string?>("replacement-key");
+            }));
+            Require(!prompted && Validations() == validations, "paced access checks must not prompt or retry");
+            Require(f.Record().Credential != null && f.Record().Access == null, "the activation must remain without cached access");
+        }
+        await using (var c = await f.Open(appVersion: "2.4.1-beta.2"))
+            await Expect(OrbitError.AppVersionUnsupported, () => c.RequireAccessAsync("export"));
     }
     private static async Task OfflineFiles()
     {
