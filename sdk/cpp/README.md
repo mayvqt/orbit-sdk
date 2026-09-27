@@ -1,8 +1,7 @@
 # Orbit C++ SDK
 
-License a desktop app or customer-hosted service with C++17. The v0.4.0 API in
-this checkout is an unreleased candidate. It requires libcurl 8+ with asynchronous
-DNS, OpenSSL 3+, and JsonCpp 1.9.5+ already installed.
+License a desktop app or customer-hosted service with C++17. The v0.4 API
+requires libcurl 8+ with asynchronous DNS, OpenSSL 3+, and JsonCpp 1.9.5+.
 
 ## Quickstart
 

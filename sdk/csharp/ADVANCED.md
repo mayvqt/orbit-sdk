@@ -45,9 +45,9 @@ current identity differs from saved state, the SDK creates a new installation
 ID and clears the old credential, pending activation and cached grant before
 the new identity can activate.
 
-The macOS native calls and Darwin file ABI were not exercised on Apple hardware
-in this environment. Run the locked grants, security and installed suites on
-macOS before claiming native macOS validation:
+Native macOS calls and the Darwin file ABI are unverified on Apple hardware.
+Run the locked grants, security and installed suites on macOS before
+distributing a Mac application:
 
 ```sh
 dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- contracts/sdk/grants.json
@@ -88,26 +88,21 @@ The last mode verifies grant expiry after at least 45 seconds of actual sleep
 and uses only a local synthetic server. Keep the raw `IOPlatformUUID` local;
 the check needs only the derived expected digest.
 
-The lower-level SDK constructor and storage adapters remain internal for SDK
-fixtures. Application code should use the app-key entry point and the built-in
-installed storage.
-
 ## Long-term offline files
 
-The separate offline-file verifier now consumes the 104 shared security cases.
-The C# installed import, renewal and durable restart workflow is still being
-implemented; ordinary cached access grants are not long-term licence files.
+The offline-file verifier consumes 104 shared security cases covering the
+separate token purpose, trusted keys, scope, binding, expiry and renewal sequence.
+Ordinary cached access grants are not long-term licence files.
 See the [offline contract](../../contracts/sdk/offline.md) and
 [verifier checks](tests/README.md#long-term-offline-file-verification).
 
-## Floating-session verification foundation
+## Floating-session verification
 
 The internal session verifier uses .NET's built-in cryptography and consumes all
 184 shared signed cases. It binds a short grant to the current process session
 and exact renewal sequence, with immutable/redacted results. It never saves a
-session grant. Seat acquisition, renewal, release and server accounting still need
-their lifecycle integration; this component does not enable floating licensing
-in `OrbitClient` yet. See the [session contract](../../contracts/sdk/floating.md)
+session grant. This corpus tests signed-grant verification; session lifecycle
+and seat accounting require integration tests. See the [session contract](../../contracts/sdk/floating.md)
 and [test command](tests/README.md#floating-session-verification).
 
 ## Seller-hosted downloads
@@ -146,8 +141,6 @@ and keep tickets, redirect URLs and provider credentials out of logs. Sellers
 own the storage and bandwidth; Orbit does not store or proxy file bytes. Permanent
 public URLs remain shareable. See the [download contract](../../contracts/sdk/downloads.md)
 and the [complete Python seller endpoint](../../examples/python/seller-downloads/README.md).
-The C# verifier is implemented; Orbit release management and the installed SDK's
-update/download helpers are still pending in this candidate.
 
 ## Customer accounts and backend identity
 

@@ -1,14 +1,14 @@
 # Orbit Python SDK
 
-Add licence activation and feature checks to Python applications on Windows
-and Linux. Requires Python 3.12 or newer. The candidate also includes macOS
-bindings; native macOS validation is still pending. See the
+Add licence activation and feature checks to Python applications on Windows,
+Linux and macOS. Requires Python 3.12 or newer. Native macOS execution is
+unverified; see the
 [platform checks](advanced.md#macos-platform-checks) before adopting that target.
 
 ## Install
 
-This checkout contains the unreleased v0.4 candidate. From its repository
-root, install the SDK into your application's virtual environment:
+To use the SDK from source, run this from the repository root inside your
+application's virtual environment:
 
 ```sh
 python -m pip install ./sdk/python
@@ -70,9 +70,8 @@ asks Orbit to revoke the remote customer session.
 ## Advanced integration
 
 [Offline licence files](advanced.md#offline-licence-files) support installations
-that cannot contact Orbit. This candidate includes local file verification and
-durable import. The matching unreleased Orbit candidate includes authenticated
-issuance and the dashboard's offline-file action; neither candidate is deployed.
+that cannot contact Orbit. The SDK exports an installation request, verifies a
+trusted signed file and stores it durably for local access checks.
 
 [Advanced APIs and storage](advanced.md) cover registration, cancellation,
 custom machine identities, manual storage and recovery.

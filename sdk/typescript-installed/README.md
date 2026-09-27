@@ -1,11 +1,11 @@
-# `@orbit/installed-sdk` candidate
+# `@orbit/installed-sdk`
 
-This directory contains the unreleased v0.4.0 installed JavaScript/TypeScript
-client. It is a separate package from the trusted-backend SDK and does not
-require a management credential. The app key names the API scope; it is not a
-secret. No v0.4 package or release is published from this checkout.
+Add licence activation and local feature checks to Node.js and Electron
+applications. This installed client is separate from the trusted-backend SDK
+and does not require a management credential. The app key names the API scope;
+it is not a secret.
 
-Install this source package locally while evaluating it:
+To use the SDK from source, install it from your application's directory:
 
 ```sh
 npm install --save /path/to/Orbit-SDK/sdk/typescript-installed
@@ -13,11 +13,12 @@ npm install --save /path/to/Orbit-SDK/sdk/typescript-installed
 
 Node.js 22 or newer is required. The package uses Koffi for native clocks,
 identity, and protected storage. Linux and macOS use private leased files; the
-Linux profile is exercised on this host, while macOS awaits a native run.
+Linux profile has automated coverage. Native macOS and Windows execution is
+unverified.
 Windows uses current-user DPAPI plus private DACLs, pinned parent handles, and
-an exclusive lease; it awaits a native Windows run. The default POSIX record is
-not encrypted. Windows DPAPI protects it from other Windows users, while
-same-user applications remain inside DPAPI's documented trust boundary.
+an exclusive lease. The default POSIX record is not encrypted. Windows DPAPI
+protects it from other Windows users, while same-user applications remain inside
+DPAPI's documented trust boundary.
 
 Electron can use asynchronous `safeStorage` from the main process. On Linux the
 adapter requires a recognized protected backend and rejects missing,
@@ -126,13 +127,9 @@ The example under [`examples/typescript-installed`](../../examples/typescript-in
 uses exactly one protected operation and never returns credentials to the
 renderer.
 
-## Current coverage
+## Platform notes
 
-The candidate consumes all 27 shared app-key vectors, 104 connected grant
-vectors and 104 offline-file vectors. Linux runs exercise offline restore,
-expiry across process closure, renewal and replay floors, clock rollback,
-storage replacement and failed/cancelled writes. These synthetic clock tests
-do not replace physical suspend/resume testing. Electron storage boundary tests
-use an encrypted test mock; they do not replace native Electron, macOS or
-Windows execution. Long-term offline files are implemented in this candidate;
-floating sessions, downloads and usage accounting remain outside its API.
+Linux checks cover storage, clock behavior and the Electron storage boundary
+using an encrypted mock. Physical suspend/resume and native Electron, macOS and
+Windows execution are unverified. Test each target's protected storage, clocks,
+TLS and restart behavior on that platform before distributing your application.

@@ -100,8 +100,8 @@ P-256 signature implementation with a separate token purpose, trusted key prefix
 strict claims, binding, expiry and sequence rules. `orbit_offline_tests` runs
 with the ordinary CTest suite, including exact JWKS size and duplicate-key checks.
 
-Installed import, renewal and durable restart integration are still pending.
-Passing the verifier corpus does not establish restored offline access; see the
+The verifier corpus tests signed-file acceptance. Durable import, renewal and
+restart behavior require separate lifecycle checks; see the
 [offline contract](../../contracts/sdk/offline.md).
 
 ## Seller-hosted downloads
@@ -146,9 +146,9 @@ shareable. The [Python seller example](../../examples/python/seller-downloads/RE
 shows the full endpoint and expiring storage redirect.
 
 `orbit_download_tests` checks all 110 shared cases, strict key/endpoint bounds,
-owned configuration, expiry and concurrent verification. Server release management
-and C++ update/download helpers are still being implemented; this verifier alone
-does not provide those workflows. See the [download contract](../../contracts/sdk/downloads.md).
+owned configuration, expiry and concurrent verification. This verifier authorizes
+an artifact request; the application serves the artifact or creates an expiring
+storage URL. See the [download contract](../../contracts/sdk/downloads.md).
 
 ## Warm access benchmark
 

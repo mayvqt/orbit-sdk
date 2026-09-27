@@ -108,11 +108,10 @@ licence's device limit before it can restore access.
 
 ## Offline licence files
 
-The candidate implements local request export, verification and durable import.
-The matching unreleased Orbit candidate includes authenticated server issuance
-and the dashboard workflow. These changes are not deployed. The wire format and
-issuance rules are defined in
-the [offline-file contract](../../contracts/sdk/offline.md).
+The SDK exports a public installation request, verifies a signed offline file
+against a trusted offline-purpose JWKS and durably imports that file. The
+[offline-file guide](../../contracts/sdk/offline.md) describes the file format
+and issuance workflow.
 
 Supply an offline-purpose JWKS from your application's trusted bundle through
 `offline_keys`. Never take verification keys from the licence file or an
@@ -133,11 +132,11 @@ with Client.open(os.environ["ORBIT_APP_KEY"], offline_keys=trusted_keys) as orbi
 
 The request contains public configuration and the installation identity; it is
 not proof of ownership or authority. Transfer it to the seller's authenticated
-issuance workflow. In the matching Orbit candidate, the seller enables an
-offline-file duration on the policy, opens the licence's offline-file action,
-pastes the request and downloads the signed `.orbit` file. The file remains
-usable until its signed expiry even if the seller later revokes the licence.
-When you receive it, import it on that same installation:
+issuance workflow. The seller enables an offline-file duration on the policy,
+opens the licence's offline-file action, pastes the request and downloads the
+signed `.orbit` file. The file remains usable until its signed expiry even if
+the licence is later revoked. When you receive it, import it on that same
+installation:
 
 ```python
 import os
@@ -171,16 +170,15 @@ An offline machine cannot learn about a later server-side revocation until it
 reconnects or imports updated authority. Someone controlling the whole machine
 can restore old files and clocks or patch the program. Private storage, renewal
 sequences and fixed signed expiry do not promise protection against a complete
-machine snapshot rollback. Native Windows/macOS offline runtime checks remain
-pending; Linux behavior and shared signed vectors are covered by the suite.
+machine snapshot rollback. Native Windows and macOS offline runtime behavior is
+unverified; validate it on those platforms before distributing your application.
 
 ## Seller download-ticket verification
 
-`DownloadTicketVerifier` is the first part of the seller-hosted download feature.
-Release discovery, server ticket issuance and the installed streaming helper are
-still pending. The verifier performs no network requests and needs only public
-Orbit keys. Configure the endpoint and app key on your backend; do not derive
-them from an incoming token or an untrusted `Host` header.
+`DownloadTicketVerifier` validates a ticket locally using public Orbit keys. It
+does not retrieve the artifact. Configure the endpoint and app key on your
+backend; do not derive them from an incoming token or an untrusted `Host`
+header.
 
 ```python
 from orbit_sdk import DownloadTicketVerifier
@@ -213,23 +211,12 @@ client must not forward the Orbit bearer to that storage redirect. A ticket is
 replayable until its deadline, at most 120 seconds. A permanent public URL remains
 shareable and cannot provide subsequent licence enforcement.
 
-The [runnable seller backend](../../examples/python/seller-downloads/README.md)
-shows the protected endpoint with private S3-compatible storage and local tests.
-
-## Floating-session verification foundation
-
-The internal session verifier passes the 184 shared signed cases and keeps the
-process session ID and renewal sequence separate from ordinary access grants.
-It returns immutable, redacted metadata without persisting the grant. Tests also
-check strict trusted-key bounds and rejection by ordinary/offline/download verifiers.
-
-Acquisition, renewal, release and the server seat-accounting workflow are still
-being implemented. This internal verifier does not enable floating licensing in
-`Client` yet; see the [floating-session contract](../../contracts/sdk/floating.md).
+The [seller backend example](../../examples/python/seller-downloads/README.md)
+shows a protected endpoint backed by private S3-compatible storage.
 
 ## macOS platform checks
 
-The candidate's macOS bindings read `IOPlatformUUID` through IOKit and use
+The macOS bindings read `IOPlatformUUID` through IOKit and use
 `mach_continuous_time`, including sleep, for elapsed-time checks. Timebase
 resolution is cached; time is sampled for every decision. The SDK synchronizes
 regular state and lease files with `F_FULLFSYNC` and synchronizes the containing
@@ -241,8 +228,8 @@ The platform contract and OS references are in
 the injected framework boundary, overflow, invalid identity and object cleanup,
 plus POSIX restart, exclusive leases and replacement rejection. These simulations
 are not native macOS validation. Neither macOS x64 nor arm64 has been exercised
-on native hardware in this work; both still need native TLS, restart, sleep across
-expiry and filesystem-failure checks before a release claims full support.
+on native hardware. Run native TLS, restart, sleep across expiry and
+filesystem-failure checks before distributing to those architectures.
 
 From the repository root on a Mac with the SDK installed, run:
 
@@ -270,14 +257,13 @@ python3 sdk/python/benchmarks/access.py
 ```
 
 On Linux x86-64 with Python 3.14.7, five batches of 5,000 checks measured a
-median **23.9 µs** per warm `require_access()`, down from **37.5 µs** before
-removing duplicate storage and clock checks. `snapshot()` measured 23.0 µs,
-down from 24.3 µs. These timings exclude activation and network refresh and
-vary with the machine and filesystem; they are not latency guarantees.
-Each call still checks storage validity and trusted elapsed time.
+median **23.9 µs** per warm `require_access()` and **23.0 µs** per `snapshot()`.
+These timings exclude activation and network refresh, vary with the machine and
+filesystem, and are not latency guarantees. Each check still validates storage
+and trusted elapsed time.
 On Windows, the native timer function is resolved once per process, while
 every check reads a fresh timer value. The lookup path has mocked regression
-coverage; native Windows timing has not been measured in this Linux run.
+coverage; native Windows timing is unmeasured.
 
 ## Errors and sensitive output
 

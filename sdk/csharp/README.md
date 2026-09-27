@@ -8,7 +8,6 @@ The SDK uses .NET's built-in cryptography and has no NuGet package dependencies.
 
 ## Quickstart
 
-This `0.4.0` API is an unreleased candidate available in the source checkout.
 From the repository root, add a project reference to the SDK project, then copy
 the public app key from Orbit's **Integration** page. Start with the **Test**
 environment.

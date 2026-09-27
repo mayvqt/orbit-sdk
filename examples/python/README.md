@@ -1,7 +1,7 @@
 # Python quickstart
 
-This checkout contains the unreleased v0.4 candidate. Install from the
-repository root into your application's virtual environment:
+From the repository root, install the SDK into your application's virtual
+environment:
 
 ```sh
 python -m pip install ./sdk/python
@@ -51,7 +51,7 @@ owned licences and activates the selected licence. `ORBIT_MODE` defaults to
 
 ## Seller-hosted downloads
 
-The [seller backend example](seller-downloads/README.md) verifies Orbit download
-tickets and returns an expiring URL for the seller's private S3-compatible
-storage. It runs separately from installed software. Ticket issuance and release
-discovery are still being implemented; its local tests use synthetic tickets.
+The [seller backend example](seller-downloads/README.md) demonstrates verifying
+Orbit download tickets before returning an expiring URL from the seller's
+private S3-compatible storage. Ticket verification runs on the seller's backend,
+separately from the installed application.

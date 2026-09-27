@@ -27,8 +27,8 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --o
 All 104 shared cases exercise the separate offline purpose, keys, scope, binding,
 expiry and sequence floor. Additional checks compare the canonical claim digest
 with Python, reorder signed JSON fields, and enforce immutable entitlements and
-bounded strict keys. This is verifier coverage; installed import, renewal and
-restart integration are still pending and need their own lifecycle checks.
+bounded strict keys. This corpus tests signed-file verification; durable import,
+renewal and restart behavior require separate lifecycle checks.
 
 ## Seller download-ticket verification
 
@@ -49,9 +49,10 @@ dotnet run --project sdk/csharp/tests/Orbit.Sdk.Tests.csproj --no-restore -- --s
 
 All 184 shared cases check exact process/session sequence, scope and machine
 binding, short expiry, refresh timing, retry intervals, key purpose and encodings.
-Additional checks cover owned bounded keys, immutable/redacted metadata, concurrent
-verification and rejection by ordinary, offline and download verifiers. This
-internal component does not implement seat acquisition, renewal or release yet.
+Additional checks cover owned bounded keys, immutable/redacted metadata,
+concurrent verification and rejection by ordinary, offline and download verifiers.
+This corpus tests signed-grant verification; session lifecycle and seat accounting
+require integration tests.
 
 ## Security and lifecycle
 
