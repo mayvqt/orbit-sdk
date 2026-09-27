@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -377,10 +378,10 @@ func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.
 			}
 		}
 		f.mu.Unlock()
+		assertInstalledFileOmits(t, client, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
 		if err := client.Close(); err != nil {
 			t.Fatal(err)
 		}
-		assertInstalledFileOmits(t, path, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
 
 		client = mustInstalledOpen(t, f, path)
 		f.loginFailures.Store(1)
@@ -424,7 +425,7 @@ func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.
 		if len(f.operations) != 4 || f.operations[3] != pendingID {
 			t.Fatalf("restart did not reuse the pending operation ID: %#v", f.operations)
 		}
-		assertInstalledFileOmits(t, path, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
+		assertInstalledFileOmits(t, client, "account-password-marker", strings.Repeat("s", 43), "licence_key_marker")
 	})
 
 	t.Run("different customer cannot reuse pending activation", func(t *testing.T) {
@@ -453,13 +454,15 @@ func TestInstalledAccountActivationRetryIsCustomerBoundAndSecretFree(t *testing.
 			t.Fatalf("conflicting customer caused another network mutation: %d attempts", len(f.operations))
 		}
 		f.mu.Unlock()
-		assertInstalledFileOmits(t, path, "account-password-marker", "another-password-marker", strings.Repeat("s", 43), "licence_key_marker")
+		assertInstalledFileOmits(t, client, "account-password-marker", "another-password-marker", strings.Repeat("s", 43), "licence_key_marker")
 	})
 }
 
-func assertInstalledFileOmits(t *testing.T, path string, secrets ...string) {
+func assertInstalledFileOmits(t *testing.T, client *Client, secrets ...string) {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(path, installedDataName))
+	client.installed.mu.Lock()
+	defer client.installed.mu.Unlock()
+	data, err := client.installed.files.read()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,6 +472,29 @@ func assertInstalledFileOmits(t *testing.T, path string, secrets ...string) {
 		}
 	}
 }
+
+func withInstalledFixtureFiles(t *testing.T, path string, scope installedScope, check func(installedFiles)) {
+	t.Helper()
+	encoded, err := json.Marshal(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	files, _, created, err := openInstalledFiles(path, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := files.close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if created {
+		t.Fatal("expected existing installed state")
+	}
+	check(files)
+}
+
 func TestInstalledExplicitPreviousCredential(t *testing.T) {
 	f := newInstalledFixture(t, true)
 	c := mustInstalledOpen(t, f, filepath.Join(installedTestTempDir(t), "state"))

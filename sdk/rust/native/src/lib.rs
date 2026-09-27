@@ -111,7 +111,7 @@ pub fn awake_clock() -> std::time::Duration {
 }
 
 #[cfg(all(test, target_os = "windows"))]
-mod tests {
+mod windows_tests {
     use super::*;
     use std::io::{self, Write};
     use std::time::Duration;

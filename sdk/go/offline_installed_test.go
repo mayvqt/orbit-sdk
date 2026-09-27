@@ -510,40 +510,45 @@ func TestInstalledOfflineTamperAfterRestartDoesNotResetIdentity(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	statePath := filepath.Join(path, installedDataName)
-	data, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var record map[string]any
-	if err = json.Unmarshal(data, &record); err != nil {
-		t.Fatal(err)
-	}
-	record["offline"].(map[string]any)["jws"] = "a.b.c"
-	corrupted, err := json.Marshal(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(statePath, corrupted, 0600); err != nil {
-		t.Fatal(err)
-	}
+	scope := client.installed.record.Scope
+	withInstalledFixtureFiles(t, path, scope, func(files installedFiles) {
+		data, err := files.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record map[string]any
+		if err = json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		record["offline"].(map[string]any)["jws"] = "a.b.c"
+		corrupted, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = files.write(corrupted); err != nil {
+			t.Fatal(err)
+		}
+	})
 	transport := testTransport(t, func(request *http.Request) (*http.Response, error) {
 		requests.Add(1)
 		return testResponse(request, 503, `{}`), nil
 	})
-	if _, err = openInstalled(context.Background(), testAppKey(), Options{StatePath: path, BindingMode: BindingDisabled, OfflineKeys: jwks}, transport); !errors.Is(err, ErrStorage) {
+	if _, err := openInstalled(context.Background(), testAppKey(), Options{StatePath: path, BindingMode: BindingDisabled, OfflineKeys: jwks}, transport); !errors.Is(err, ErrStorage) {
 		t.Fatalf("tampered saved file reopened: %v", err)
 	}
-	data, err = os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = json.Unmarshal(data, &record); err != nil {
-		t.Fatal(err)
-	}
-	if got := record["installation"].(map[string]any)["id"].(string); got != identity {
-		t.Fatalf("tampered state recreated installation identity: got %q want %q", got, identity)
-	}
+	withInstalledFixtureFiles(t, path, scope, func(files installedFiles) {
+		data, err := files.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record map[string]any
+		if err = json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		if got := record["installation"].(map[string]any)["id"].(string); got != identity {
+			t.Fatalf("tampered state recreated installation identity: got %q want %q", got, identity)
+		}
+	})
 	if requests.Load() != 0 {
 		t.Fatalf("tampered restart made %d HTTP requests", requests.Load())
 	}
@@ -593,7 +598,7 @@ func TestInstalledOfflineReplacedLeaseDeniesGuardWithoutWritingState(t *testing.
 	if _, err := client.ImportOfflineFile(context.Background(), token); err != nil {
 		t.Fatal(err)
 	}
-	statePath := filepath.Join(path, installedDataName)
+	statePath := filepath.Join(path, "orbit-storage.bin")
 	before, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatal(err)
