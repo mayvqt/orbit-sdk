@@ -43,6 +43,9 @@ public sealed partial class OrbitClient : IDisposable
     private long sessionRetryElapsedTicks;
     private long? sessionLicenceExpiry;
     private string? sessionBindingMode;
+    private string? appVersion;
+    private string? updateAvailable;
+    private OrbitException? versionDenial;
 
     public StorageCapability StorageCapability { get; }
 
@@ -182,7 +185,8 @@ public sealed partial class OrbitClient : IDisposable
             false, TimeSpan.Zero)
         {
             PolicyVersion = sessionGrant.PolicyVersion,
-            Session = new SessionInfo(sessionGrant.SessionId, sessionGrant.Sequence)
+            Session = new SessionInfo(sessionGrant.SessionId, sessionGrant.Sequence),
+            UpdateAvailable = updateAvailable
         };
     }
 
@@ -205,7 +209,7 @@ public sealed partial class OrbitClient : IDisposable
             global::Orbit.Sdk.Snapshot.FromUnixSeconds(expiry), expiry != null && expiry <= checkedNow + 86400,
             claims.OfflineAllowed, usable && claims.OfflineAllowed
                 ? TimeSpan.FromSeconds(claims.ExpiresAt - checkedNow) : TimeSpan.Zero)
-        { PolicyVersion = claims.PolicyVersion };
+        { PolicyVersion = claims.PolicyVersion, UpdateAvailable = updateAvailable };
     }
 
     private void SyncStorage()
@@ -279,6 +283,8 @@ public sealed partial class OrbitClient : IDisposable
         sessionRetryElapsedTicks = 0;
         sessionLicenceExpiry = null;
         sessionBindingMode = null;
+        updateAvailable = null;
+        versionDenial = null;
         if (!keepAccount) session = null;
         if (releaseId != null && releaseCredential != null)
             QueueSessionRelease(releaseCredential, releaseId);
@@ -332,6 +338,7 @@ public sealed partial class OrbitClient : IDisposable
             body["idempotency_key"] = idempotencyKey;
             if (account) { body["customer_session"] = customerSession; body["licence_id"] = principal; }
             else body["licence_key"] = principal;
+            if (appVersion != null) body["app_version"] = appVersion;
             return await RequestGrantAsync("/api/client/v1/activations", body, expected, null,
                 account ? principal : null, cancellationToken).ConfigureAwait(false);
         }
@@ -364,7 +371,7 @@ public sealed partial class OrbitClient : IDisposable
             }
             if (floating) return await AdvanceSessionSerializedAsync(cancellationToken).ConfigureAwait(false);
             return await RequestGrantAsync($"/api/client/v1/activations/{saved.ActivationId}/validate",
-                CredentialBody(saved), expected, saved, saved.LicenceId, cancellationToken, acquireSession).ConfigureAwait(false);
+                ValidationBody(saved), expected, saved, saved.LicenceId, cancellationToken, acquireSession).ConfigureAwait(false);
         }
         finally { serial.Release(); }
     }
@@ -421,6 +428,8 @@ public sealed partial class OrbitClient : IDisposable
                 }
                 if (credential != null && transient)
                     throw new OrbitException(OrbitError.Transient);
+                if (credential != null && versionDenial != null)
+                    throw new OrbitException(OrbitError.AppVersionUnsupported, versionDenial.Code, versionDenial.RequestId);
                 throw new OrbitException(OrbitError.NotActivated, "access_unavailable");
             }
             if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
@@ -495,7 +504,7 @@ public sealed partial class OrbitClient : IDisposable
                 return await AdvanceSessionSerializedAsync(cancellationToken).ConfigureAwait(false);
             }
             return await RequestGrantAsync($"/api/client/v1/activations/{saved.ActivationId}/validate",
-                CredentialBody(saved), expected, saved, saved.LicenceId, cancellationToken).ConfigureAwait(false);
+                ValidationBody(saved), expected, saved, saved.LicenceId, cancellationToken).ConfigureAwait(false);
         }
         finally { serial.Release(); }
     }
@@ -568,6 +577,13 @@ public sealed partial class OrbitClient : IDisposable
         return body;
     }
 
+    private Dictionary<string, object?> ValidationBody(StoredCredential saved)
+    {
+        var body = CredentialBody(saved);
+        if (appVersion != null) body["app_version"] = appVersion;
+        return body;
+    }
+
     private string ScopePath(string path, string? after = null) =>
         $"{path}?application_id={config.ApplicationId}&environment_id={config.EnvironmentId}" +
         (after == null ? "" : $"&after={after}");
@@ -587,6 +603,7 @@ public sealed partial class OrbitClient : IDisposable
             var response = await transport.PostAsync(path, body, true, operation.Token).ConfigureAwait(false);
             lock (gate) CheckGeneration(expected);
             verifyingReply = true;
+            var hint = AppVersion.UpdateHint(response ?? throw JsonWire.Invalid());
             var verified = await VerifyReplyAsync(response ?? throw JsonWire.Invalid(), previous, expectedLicence, started, operation.Token)
                 .ConfigureAwait(false);
             lock (gate)
@@ -629,6 +646,8 @@ public sealed partial class OrbitClient : IDisposable
                 sessionBindingMode = verified.SessionRequired ? verified.BindingMode : null;
                 transient = false;
                 nextRetryElapsedTicks = 0;
+                updateAvailable = hint;
+                versionDenial = null;
                 if (lifetime != null)
                 {
                     lifetime.Restoring = false;
@@ -674,10 +693,29 @@ public sealed partial class OrbitClient : IDisposable
                         return snapshot;
                     }
                 }
+                else if (error.Error == OrbitError.AppVersionUnsupported && previous != null)
+                {
+                    // Keep the activation for an updated application, but drop cached
+                    // access without offline fallback and pace further validation.
+                    generation++;
+                    claims = null;
+                    anchor = null;
+                    transient = false;
+                    sessionGrant = null;
+                    sessionAnchor = null;
+                    pendingSessionId = null;
+                    pendingRenewalSequence = null;
+                    updateAvailable = null;
+                    versionDenial = error;
+                    try { nextRetryElapsedTicks = CreateRetryDeadline(Clock.ElapsedTicks()); }
+                    catch (OrbitException) { nextRetryElapsedTicks = long.MaxValue; }
+                    catch (OverflowException) { nextRetryElapsedTicks = long.MaxValue; }
+                    installed?.DropCache();
+                }
                 else if (error.Error != OrbitError.Cancelled)
                 {
                     Clear();
-                    if (installed != null && error.Error != OrbitError.Denied)
+                    if (installed != null && error.Error is not (OrbitError.Denied or OrbitError.AppVersionUnsupported))
                         storageVersion = installed.Invalidate(clearPending: false);
                     else
                         InvalidateStorage();

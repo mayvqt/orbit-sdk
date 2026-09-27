@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { CLIENT_HEADER } from "./client-header.mjs";
 import { downloadVerifier } from "./download-tickets.mjs";
 import { uniqueJson } from "./strict-json.mjs";
 import * as online from "./online.mjs";
@@ -505,6 +506,7 @@ export class OrbitBackendClient {
     const headers = new Headers({
       accept: "application/json",
       authorization: `Bearer ${bearer}`,
+      "orbit-client": CLIENT_HEADER,
     });
     if (body !== undefined) headers.set("content-type", "application/json");
     const controller = new AbortController();

@@ -114,6 +114,10 @@ pub enum MachineBinding {
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub state_directory: Option<PathBuf>,
+    /// Your application's version, such as `2.4.1` or `3.0.0-beta.2`. When
+    /// set, activation and validation send it so licence policy can require
+    /// a minimum version and report available updates.
+    pub app_version: Option<String>,
     pub machine_binding: MachineBinding,
     /// Trusted offline-file JWKS. Keys embedded in imported files are never trusted.
     pub offline_keys: Option<Vec<u8>>,
@@ -1003,6 +1007,7 @@ impl Client {
         transport: Transport,
     ) -> Result<Self> {
         clock::elapsed_clock()?;
+        let app_version = crate::app_version::configured(options.app_version.as_deref())?;
         let offline_keys = options
             .offline_keys
             .as_deref()
@@ -1028,6 +1033,7 @@ impl Client {
             let inner = Arc::get_mut(&mut client.0).ok_or(Error::Storage)?;
             inner.offline_keys = offline_keys;
             inner.app_key = Some(key.clone());
+            inner.app_version = app_version;
         }
         if let Some(offline) = restored_offline {
             client.0.state.lock().map_err(|_| Error::Storage)?.offline = Some(offline);
@@ -1061,7 +1067,9 @@ impl Client {
         if has_credential && !storage.activation_pending()? {
             let cancel = client.0.transport.owner_cancel.clone();
             match client.refresh_with_cancel(&cancel).await {
-                Ok(_) | Err(Error::Transient { .. }) => {}
+                // An unsupported application version still opens, so the
+                // application can report the denial and use update checks.
+                Ok(_) | Err(Error::Transient { .. } | Error::AppVersionUnsupported { .. }) => {}
                 Err(error) => {
                     let _ = client.close().await;
                     return Err(error);
@@ -1541,6 +1549,7 @@ mod tests {
                     state_directory: state_path.map(Path::to_path_buf),
                     machine_binding: MachineBinding::Disabled,
                     offline_keys: None,
+                    app_version: None,
                 },
                 (None, None),
                 transport,
@@ -2753,6 +2762,7 @@ mod tests {
                     provider: provider.clone(),
                 },
                 offline_keys: None,
+                app_version: None,
             },
             (Some(fingerprint), Some(provider)),
             transport,
@@ -3093,6 +3103,117 @@ mod tests {
             assert!(store.record.access.is_none());
             assert!(store.record.credential.is_none());
         }
+        client.close().await.unwrap();
+    }
+    #[cfg(feature = "local-development")]
+    #[tokio::test]
+    async fn app_version_is_sent_and_unsupported_version_denies_without_fallback() {
+        use crate::transport::tests::Fixture;
+        let dir = Directory::new();
+        let mut fixture = Fixture::new().await;
+        let options = |version: &str| Options {
+            state_directory: Some(dir.0.clone()),
+            machine_binding: MachineBinding::Disabled,
+            offline_keys: None,
+            app_version: Some(version.into()),
+        };
+        assert!(matches!(
+            Client::open_parsed(
+                app_key(&app()),
+                options("01"),
+                (None, None),
+                fixture.transport.clone()
+            )
+            .await,
+            Err(Error::Configuration)
+        ));
+        let client = Client::open_parsed(
+            app_key(&app()),
+            options("2.4.1-beta.2"),
+            (None, None),
+            fixture.transport.clone(),
+        )
+        .await
+        .unwrap();
+        let activating = client.clone();
+        let task = tokio::spawn(async move { activating.activate("synthetic-key").await });
+        let request = fixture.next().await;
+        let expected_header = format!("orbit-client: {}\r\n", crate::app_version::this_client());
+        assert!(request.head.to_ascii_lowercase().contains(&expected_header));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["app_version"], "2.4.1-beta.2");
+        let mut reply: serde_json::Value = serde_json::from_str(&signed_reply(
+            body["installation_id"].as_str().unwrap(),
+            true,
+            false,
+        ))
+        .unwrap();
+        reply["update_available"] = json!({"version": "2.5.0"});
+        request.respond(200, &reply.to_string());
+        let corpus: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/sdk/grants.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let keys = fixture.next().await;
+        assert!(keys.head.to_ascii_lowercase().contains(&expected_header));
+        keys.respond(200, &corpus["jwks"].to_string());
+        let snapshot = task.await.unwrap().unwrap();
+        assert_eq!(snapshot.access, Access::Online);
+        assert_eq!(snapshot.update_available.as_deref(), Some("2.5.0"));
+
+        let refreshing = client.clone();
+        let task = tokio::spawn(async move { refreshing.refresh().await });
+        let request = fixture.next().await;
+        assert!(request.head.contains("/validate"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["app_version"], "2.4.1-beta.2");
+        request.respond(
+            403,
+            r#"{"error":{"code":"app_version_unsupported","message":"Update required","request_id":"fixture"}}"#,
+        );
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::AppVersionUnsupported { request_id: Some(id) } if id == "fixture"
+        ));
+        assert_eq!(error.code(), "app_version_unsupported");
+        fixture.assert_idle();
+        // Offline-allowed access is not used as a fallback, and the activation
+        // remains so an updated application validates without a new key.
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.access, Access::RefreshRequired);
+        assert!(snapshot.entitlements.is_empty());
+        assert!(snapshot.update_available.is_none());
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::AppVersionUnsupported { .. })
+        ));
+        {
+            let store = client.0.installed.as_ref().unwrap().0.lock().unwrap();
+            assert!(store.record.access.is_none());
+            assert!(store.record.credential.is_some());
+        }
+        client.close().await.unwrap();
+
+        // Reopening still succeeds, so the application can report the denial.
+        let transport = fixture.transport.clone();
+        let reopen = options("2.4.1-beta.2");
+        let reopening = tokio::spawn(async move {
+            Client::open_parsed(app_key(&app()), reopen, (None, None), transport).await
+        });
+        fixture.next().await.respond(
+            403,
+            r#"{"error":{"code":"app_version_unsupported","message":"Update required","request_id":"fixture"}}"#,
+        );
+        let client = reopening.await.unwrap().unwrap();
+        assert!(matches!(
+            client.require_access("export").await,
+            Err(Error::AppVersionUnsupported { .. })
+        ));
+        fixture.assert_idle();
         client.close().await.unwrap();
     }
     #[cfg(feature = "local-development")]
@@ -3620,6 +3741,7 @@ mod tests {
                 state_directory: Some(directory.0.clone()),
                 machine_binding: MachineBinding::Disabled,
                 offline_keys: Some(jwks),
+                app_version: None,
             },
             (None, None),
             fixture.transport.clone(),
@@ -3725,6 +3847,7 @@ mod tests {
                 state_directory: Some(directory.0.clone()),
                 machine_binding: MachineBinding::Disabled,
                 offline_keys: None,
+                app_version: None,
             },
             (None, None),
             fixture.transport.clone(),
@@ -4052,6 +4175,7 @@ mod tests {
                 state_directory: Some(directory.0.clone()),
                 machine_binding: MachineBinding::Disabled,
                 offline_keys: Some(jwks),
+                app_version: None,
             },
             (None, None),
             fixture.transport.clone(),
@@ -4113,6 +4237,7 @@ mod tests {
                 state_directory: Some(directory.0.clone()),
                 machine_binding: MachineBinding::Disabled,
                 offline_keys: Some(jwks),
+                app_version: None,
             },
             (None, None),
             fixture.transport.clone(),
@@ -4205,6 +4330,7 @@ mod tests {
                     provider: "custom:offline-test".into(),
                 },
                 offline_keys: Some(jwks),
+                app_version: None,
             },
             (Some("a".repeat(64)), Some("custom:offline-test".into())),
             fixture.transport.clone(),
@@ -4275,6 +4401,7 @@ mod tests {
             Error::Cancelled => "cancelled",
             Error::Transient { .. } => "transient",
             Error::Denied { .. } => "denied",
+            Error::AppVersionUnsupported { .. } => "app version unsupported",
             Error::NotActivated => "not activated",
             Error::FeatureUnavailable => "feature",
             Error::SessionRequired => "session required",

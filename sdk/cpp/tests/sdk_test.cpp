@@ -1,5 +1,6 @@
 #include "core.hpp"
 
+#include "app_version.hpp"
 #include "error.hpp"
 #include "storage_windows.hpp"
 
@@ -542,6 +543,9 @@ struct ApiFixture {
     std::shared_ptr<Gate> recovery_gate;
     std::atomic_bool logout_error{false};
     std::atomic_bool deactivation_error{false};
+    std::atomic_bool app_version_denied{false};
+    Json::Value update_available;
+    std::vector<std::string> app_versions;
 
     explicit ApiFixture(Json::Value vectors) : corpus(std::move(vectors)) {}
 
@@ -671,6 +675,10 @@ struct ApiFixture {
                         ? input["previous_credential"].asString() : std::string{};
                 }
                 if (input["credential_mode"] == "persistent") persistent_mode = true;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    app_versions.push_back(input["app_version"].isString() ? input["app_version"].asString() : "");
+                }
                 if (activation_response_lost.load()) return HttpResponse{503, "{}", {}};
                 if (malformed_activation.load()) return HttpResponse{200, R"({"bad":true})", {}};
                 auto reply = activation_reply(corpus, offline_activation.load(), installation,
@@ -682,12 +690,22 @@ struct ApiFixture {
                 }
                 if (missing_expiry.load()) reply.removeMember("credential_expires_at");
                 if (pre_epoch_server_time.load()) reply["server_time"] = "1969-12-31T23:59:59Z";
+                if (!update_available.isNull()) reply["update_available"] = update_available;
                 return HttpResponse{200, encode_json(reply), {}};
             }
             if (route.find("/api/client/v1/activations/") == 0 && route.find("/validate") != std::string_view::npos) {
                 ++validate_calls;
                 if (offline_refresh.load()) return HttpResponse{503, "{}", "0"};
                 Json::Value input_value = parse_json(body);
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    app_versions.push_back(input_value["app_version"].isString()
+                        ? input_value["app_version"].asString() : "");
+                }
+                if (app_version_denied.load()) {
+                    return HttpResponse{403,
+                        R"({"error":{"code":"app_version_unsupported","message":"Update required","request_id":"version_1"}})", {}};
+                }
                 const auto installation = input_value["installation_id"].asString();
                 auto reply = activation_reply(corpus, offline_activation.load(), installation,
                                               persistent_mode.load(), false);
@@ -806,10 +824,12 @@ std::string persistent_test_path() {
 }
 
 Client persistent_client_for(ApiFixture& fixture, const std::string& path,
-                             std::optional<Fingerprint> fingerprint = std::nullopt) {
+                             std::optional<Fingerprint> fingerprint = std::nullopt,
+                             std::optional<std::string> app_version = std::nullopt) {
     auto setup = config();
     setup.installation_id.reset();
     setup.fingerprint = std::move(fingerprint);
+    setup.app_version = std::move(app_version);
     if (fixture.floating_session.load()) {
         setup.session_keys = std::make_shared<const orbit::detail::SessionKeys>(
             orbit::detail::SessionKeys::parse(fixture.corpus["jwks"], "test"));
@@ -2741,6 +2761,101 @@ void test_persistent_online_restart_and_offline_recovery(const Corpus& corpus) {
     std::filesystem::remove_all(path, ignored);
 }
 
+std::size_t test_app_version_vectors() {
+    std::ifstream input(ORBIT_APP_VERSION_VECTORS_PATH, std::ios::binary);
+    require(input.good(), "could not open shared app-version corpus");
+    const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto corpus = parse_json(bytes, 256 * 1024);
+    require(corpus["format_version"].asInt() == 1, "unexpected app-version corpus format");
+    std::size_t count = 0;
+    for (const auto& item : corpus["app_versions"]) {
+        require(valid_app_version(text(item, "value")) == item["valid"].asBool(),
+                "app-version vector mismatch: " + text(item, "value"));
+        ++count;
+    }
+    for (const auto& item : corpus["client_headers"]) {
+        const auto header = format_client_header(text(item, "language"), text(item, "sdk_version"),
+                                                 text(item, "platform"));
+        require(item["header"].isNull() ? !header : header && *header == item["header"].asString(),
+                "client header vector mismatch: " + encode_json(item));
+        ++count;
+    }
+    const auto& own = client_header();
+    const std::string prefix = std::string("cpp/") + ORBIT_SDK_VERSION + " (";
+    require(own.rfind(prefix, 0) == 0 && own.back() == ')' &&
+                format_client_header("cpp", ORBIT_SDK_VERSION,
+                                     own.substr(prefix.size(), own.size() - prefix.size() - 1)) == own,
+            "unexpected SDK client header: " + own);
+    for (const auto& item : corpus["update_available"]) {
+        Json::Value reply(Json::objectValue);
+        reply["activation_id"] = "activation";
+        if (item.isMember("value")) reply["update_available"] = item["value"];
+        try {
+            const auto version = update_hint(reply);
+            require(item["valid"].asBool(), "accepted update hint: " + text(item, "name"));
+            require(item["version"].isNull() ? !version : version && *version == item["version"].asString(),
+                    "update hint mismatch: " + text(item, "name"));
+        } catch (const Error& error) {
+            require(error.kind() == ErrorKind::invalid_response && !item["valid"].asBool(),
+                    "rejected update hint: " + text(item, "name"));
+        }
+        ++count;
+    }
+    Options invalid;
+    invalid.app_version = "01";
+    expect_error([&] {
+        (void)Client::open("orbit_app_test_aHR0cHM6Ly9vcmJpdC5tYXl2aWUuZGV2.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g",
+                           invalid);
+    }, ErrorKind::configuration);
+    return count;
+}
+
+void test_app_version_policy(const Corpus& corpus) {
+    FakeClock clock;
+    const auto path = persistent_test_path();
+    {
+        ApiFixture fixture(corpus.value);
+        fixture.offline_activation = true;
+        fixture.update_available["version"] = "2.5.0";
+        auto client = persistent_client_for(fixture, path, std::nullopt, std::string("2.4.1-beta.2"));
+        const auto activated = client.activate("persistent-license-key");
+        require(activated.access == Access::online && activated.update_available == std::optional<std::string>("2.5.0"),
+                "activation must expose the update hint");
+        fixture.app_version_denied = true;
+        const auto denial = expect_error([&] { (void)client.refresh(); }, ErrorKind::app_version_unsupported);
+        require(denial.code() == "app_version_unsupported" && denial.request_id() == "version_1" &&
+                    fixture.validate_calls == 1,
+                "unsupported version must be a single typed denial");
+        {
+            std::lock_guard<std::mutex> lock(fixture.mutex);
+            require(fixture.app_versions == std::vector<std::string>{"2.4.1-beta.2", "2.4.1-beta.2"},
+                    "activation and validation must send the application version");
+        }
+        const auto state = client.snapshot();
+        require(state.access == Access::refresh_required && !state.has_feature("export") &&
+                    !state.update_available,
+                "unsupported version must not fall back to cached or offline access");
+        bool prompted = false;
+        expect_error([&] {
+            (void)client.ensure_access("export", [&] { prompted = true; return std::optional<std::string>("key"); });
+        }, ErrorKind::app_version_unsupported);
+        require(!prompted && fixture.validate_calls == 1, "paced access checks must not prompt or retry");
+        client.close();
+    }
+    {
+        ApiFixture fixture(corpus.value);
+        fixture.persistent_mode = true;
+        fixture.app_version_denied = true;
+        auto client = persistent_client_for(fixture, path, std::nullopt, std::string("2.4.1-beta.2"));
+        require(fixture.validate_calls == 1 && fixture.activation_calls == 0,
+                "reopening must keep the activation and validate it");
+        expect_error([&] { (void)client.require_access("export"); }, ErrorKind::app_version_unsupported);
+        client.close();
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+}
+
 void test_persistent_uncertain_activation_reuses_identity(const Corpus& corpus) {
     FakeClock clock;
     const auto path = persistent_test_path();
@@ -3233,6 +3348,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto app_key_vectors = test_shared_app_key_vectors();
+        const auto app_version_vectors = test_app_version_vectors();
         test_fingerprint_options();
         test_strict_bounded_json();
         test_shared_grant_vectors(corpus);
@@ -3262,6 +3378,7 @@ int main(int argc, char** argv) {
         test_persistent_close_discards_invalid_clock(corpus);
         test_persistent_strict_outage_is_not_activation_required(corpus);
         test_persistent_online_restart_and_offline_recovery(corpus);
+        test_app_version_policy(corpus);
         test_installed_offline_file_lifecycle(corpus);
         test_installed_floating_session_lifecycle(corpus);
         test_online_meters_and_updates(corpus);
@@ -3276,7 +3393,8 @@ int main(int argc, char** argv) {
         test_jwks_recovery_and_offline_clock(corpus);
         test_logout_generation_fences_late_responses(corpus);
         std::cout << "C++ SDK tests passed (" << app_key_vectors
-                  << " app-key vectors, 104 grant vectors, " << session_vectors
+                  << " app-key vectors, " << app_version_vectors
+                  << " app-version vectors, 104 grant vectors, " << session_vectors
                   << " session vectors, fingerprint options, strict JSON, "
                      "transport, access, account and race cases).\n";
         return 0;

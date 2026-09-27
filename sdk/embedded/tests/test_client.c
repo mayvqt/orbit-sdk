@@ -2,6 +2,7 @@
 #include "openssl_adapter.h"
 #include "orbit_client.h"
 #include "orbit_client_internal.h"
+#include "orbit_generated_app_version_vectors.h"
 #include "orbit_generated_vectors.h"
 #include "orbit_storage.h"
 #include <openssl/ecdsa.h>
@@ -30,7 +31,9 @@ typedef struct mock {
   uint32_t record_length, commits, posts, gets, large_response_length;
   int post_transient, key_transient, denial, bad_signature, storage_failure,
       oversized, oversized_response, offline, reenter, reenter_clock,
-      reenter_commit, grant_hwid_claims, sent_fingerprint, sent_provider;
+      reenter_commit, grant_hwid_claims, sent_fingerprint, sent_provider,
+      version_denied;
+  char client_header[160], app_version[64], update_json[96];
   char installation[129], operation_id[129], previous_operation[129], kid[129];
   char grant_binding_mode[16], reply_binding_mode[16], grant_provider[64],
       reply_provider[64];
@@ -164,7 +167,12 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   if (request->body.length)
     memcpy(body, request->body.data, request->body.length);
   body[request->body.length] = 0;
+  if (request->client.length >= sizeof(m->client_header))
+    return ORBIT_CLIENT_UNTRUSTED;
+  memcpy(m->client_header, request->client.data, request->client.length);
+  m->client_header[request->client.length] = 0;
   if (request->post) {
+    get_string(body, "app_version", m->app_version, sizeof(m->app_version));
     m->sent_fingerprint =
         strstr(body, "\"fingerprint\":\"" TEST_FINGERPRINT "\"") != NULL;
     m->sent_provider =
@@ -205,6 +213,13 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   if (m->denial) {
     *http = 403u;
     return 0;
+  }
+  if (m->version_denied) {
+    static const char denied[] =
+        "{\"error\":{\"code\":\"app_version_unsupported\",\"message\":"
+        "\"Update required\",\"request_id\":\"req_1\"}}";
+    *http = 403u;
+    return receive(sink, (const uint8_t *)denied, sizeof(denied) - 1u);
   }
   if (strstr(path, "/deactivate")) {
     *http = 204u;
@@ -256,11 +271,12 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
            "{\"activation_id\":\"activation_1\",\"installation_id\":\"%s\",%"
            "s\"credential_expires_"
            "at\":null,\"grant\":\"%s\",\"server_time\":\"%s\",\"binding_mode\":"
-           "\"%s\",%s,\"licence_expires_at\":null,\"secret_replay_"
+           "\"%s\",%s,\"licence_expires_at\":null,%s\"secret_replay_"
            "expired\":false}",
            m->installation,
            strstr(path, "/validate") ? "" : "\"credential\":\"credential_1\",",
-           token, timestamp, m->reply_binding_mode, provider_json);
+           token, timestamp, m->reply_binding_mode, provider_json,
+           m->update_json);
   if (m->large_response_length != 0u) {
     uint32_t response_length = (uint32_t)strlen(reply);
     if (m->large_response_length < response_length ||
@@ -528,6 +544,150 @@ static int lifecycle(void) {
   orbit_client_destroy(&client);
   return 0;
 }
+static int app_version_vectors(void) {
+  static const char base[] =
+      "{\"activation_id\":\"a\",\"installation_id\":\"i\","
+      "\"server_time\":\"2027-01-15T08:00:00Z\",\"binding_mode\":\"none\","
+      "\"credential_expires_at\":null,\"secret_replay_expired\":false";
+  char reply[256], header[160];
+  orbit_embedded_slice_t own = orbit_client_header();
+  orbit_reply_t parsed;
+  uint8_t version[32];
+  uint32_t i, length;
+  for (i = 0; i < GENERATED_COUNT(generated_app_version_vectors); ++i) {
+    const generated_app_version_vector_t *v = &generated_app_version_vectors[i];
+    orbit_embedded_slice_t value = {(const uint8_t *)v->value, v->length};
+    orbit_client_config_t versioned = config;
+    mock_t m;
+    CHECK(orbit_app_version_valid(value) == v->valid);
+    reset(&m);
+    versioned.app_version = value;
+    /* An empty value means unset. */
+    CHECK((init_with_config_arena(&m, &versioned, arena, sizeof(arena)) ==
+           0) == (v->valid || v->length == 0u));
+    orbit_client_destroy(&client);
+  }
+  for (i = 0; i < GENERATED_COUNT(generated_client_header_vectors); ++i) {
+    const generated_client_header_vector_t *v =
+        &generated_client_header_vectors[i];
+    int valid = orbit_client_header_valid(
+        (orbit_embedded_slice_t){(const uint8_t *)v->language,
+                                 v->language_length},
+        (orbit_embedded_slice_t){(const uint8_t *)v->sdk_version,
+                                 v->sdk_version_length},
+        (orbit_embedded_slice_t){(const uint8_t *)v->platform,
+                                 v->platform_length});
+    CHECK(valid == (v->header != NULL));
+    if (valid) {
+      snprintf(header, sizeof(header), "%s/%s (%s)", v->language,
+               v->sdk_version, v->platform);
+      CHECK(strcmp(header, v->header) == 0);
+    }
+  }
+  /* The SDK's own header uses the build's version and a valid platform. */
+  CHECK(own.length < sizeof(header));
+  memcpy(header, own.data, own.length);
+  header[own.length] = 0;
+  CHECK(strncmp(header, "embedded/" ORBIT_TEST_PROJECT_VERSION " (",
+                sizeof("embedded/" ORBIT_TEST_PROJECT_VERSION " (") - 1u) ==
+        0);
+  CHECK(strcmp(ORBIT_EMBEDDED_VERSION, ORBIT_TEST_PROJECT_VERSION) == 0);
+  length = (uint32_t)strlen("embedded/" ORBIT_EMBEDDED_VERSION " (");
+  CHECK(header[own.length - 1u] == ')');
+  CHECK(orbit_client_header_valid(
+      S("embedded"), S(ORBIT_EMBEDDED_VERSION),
+      (orbit_embedded_slice_t){own.data + length, own.length - length - 1u}));
+  for (i = 0; i < GENERATED_COUNT(generated_update_vectors); ++i) {
+    const generated_update_vector_t *v = &generated_update_vectors[i];
+    int32_t result;
+    if (v->json)
+      snprintf(reply, sizeof(reply), "%s,\"update_available\":%s}", base,
+               v->json);
+    else
+      snprintf(reply, sizeof(reply), "%s}", base);
+    result = orbit_reply_parse((const uint8_t *)reply, (uint32_t)strlen(reply),
+                               scratch, &parsed);
+    if (result == 0)
+      result = orbit_reply_update((const uint8_t *)reply, &parsed, version,
+                                  &length);
+    if (result != 0 || !v->valid) {
+      if ((result == 0) != v->valid)
+        fprintf(stderr, "update vector: %s\n", v->name);
+      CHECK((result == 0) == v->valid);
+      continue;
+    }
+    CHECK(v->version ? length == strlen(v->version) &&
+                           memcmp(version, v->version, length) == 0
+                     : length == 0u);
+  }
+  return 0;
+}
+static int app_version_policy(void) {
+  mock_t m;
+  uint32_t requests;
+  orbit_access_snapshot_t snapshot;
+  orbit_client_config_t versioned = config;
+  orbit_embedded_slice_t own = orbit_client_header();
+  versioned.app_version = S("2.4.1-beta.2");
+  reset(&m);
+  CHECK(init_with_config_arena(&m, &versioned, arena, sizeof(arena)) == 0);
+  strcpy(m.update_json, "\"update_available\":{\"version\":\"2.5.0\"},");
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  CHECK(strcmp(m.app_version, "2.4.1-beta.2") == 0);
+  CHECK(strlen(m.client_header) == own.length &&
+        memcmp(m.client_header, own.data, own.length) == 0);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && snapshot.allowed &&
+        snapshot.update_available_length == 5u &&
+        memcmp(snapshot.update_available, "2.5.0", 5u) == 0);
+  /* Validation reports the hint only while the server sends it. */
+  m.update_json[0] = 0;
+  m.app_version[0] = 0;
+  elapse(&m, 901);
+  CHECK(orbit_client_require_access(&client, S("export")) == 0);
+  CHECK(strcmp(m.app_version, "2.4.1-beta.2") == 0);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 &&
+        snapshot.update_available_length == 0u);
+  /* A version denial blocks offline-capable access without fallback, keeps
+   * the activation and paces validation. */
+  elapse(&m, 901);
+  m.version_denied = 1;
+  requests = m.posts;
+  CHECK(orbit_client_require_access(&client, S("export")) ==
+        ORBIT_CLIENT_APP_VERSION_UNSUPPORTED);
+  CHECK(m.posts == requests + 1u);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && !snapshot.allowed &&
+        !snapshot.offline && !snapshot.activation_required &&
+        !snapshot.pending);
+  CHECK(orbit_client_require_access(&client, S("export")) ==
+        ORBIT_CLIENT_APP_VERSION_UNSUPPORTED);
+  CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_APP_VERSION_UNSUPPORTED);
+  CHECK(m.posts == requests + 1u);
+  elapse(&m, 61);
+  m.version_denied = 0;
+  CHECK(orbit_client_require_access(&client, S("export")) == 0);
+  CHECK(m.posts == requests + 2u);
+  /* A denied activation is final and leaves no pending retry. */
+  m.version_denied = 1;
+  CHECK(orbit_client_activate(&client, S("other-key")) ==
+        ORBIT_CLIENT_APP_VERSION_UNSUPPORTED);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 &&
+        snapshot.activation_required && !snapshot.pending);
+  orbit_client_destroy(&client);
+  /* The activation retry identity ignores the application version. */
+  reset(&m);
+  CHECK(init_with_config_arena(&m, &versioned, arena, sizeof(arena)) == 0);
+  m.post_transient = 1;
+  CHECK(orbit_client_activate(&client, S("example-key")) ==
+        ORBIT_CLIENT_TRANSIENT);
+  orbit_client_destroy(&client);
+  versioned.app_version = S("2.5.0");
+  CHECK(init_with_config_arena(&m, &versioned, arena, sizeof(arena)) == 0);
+  m.post_transient = 0;
+  CHECK(orbit_client_activate(&client, S("example-key")) == 0);
+  CHECK(strcmp(m.app_version, "2.5.0") == 0);
+  orbit_client_destroy(&client);
+  return 0;
+}
 static int retry_and_storage(void) {
   mock_t m;
   uint32_t requests, writes;
@@ -715,6 +875,8 @@ int main(void) {
   CHECK(runtime_arena_bounds() == 0);
   CHECK(optional_machine_binding() == 0);
   CHECK(lifecycle() == 0);
+  CHECK(app_version_vectors() == 0);
+  CHECK(app_version_policy() == 0);
   CHECK(retry_and_storage() == 0);
   CHECK(journal_faults() == 0);
   EVP_PKEY_free(private_key);

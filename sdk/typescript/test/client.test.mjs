@@ -9,6 +9,7 @@ import {
   OrbitMutationUncertainError,
   OrbitTransportError,
 } from "../index.mjs";
+import { CLIENT_HEADER, SDK_VERSION, formatClientHeader, validVersion } from "../client-header.mjs";
 
 const API_ORIGIN = "https://orbit.example.test";
 const APPLICATION_ID = "app_example";
@@ -148,7 +149,21 @@ test("verifies the customer session using a Bearer header and fixed scope", asyn
   assert.equal(call.url.searchParams.get("environment_id"), ENVIRONMENT_ID);
   assert.equal(call.url.href.includes("customer-session-secret"), false);
   assert.equal(call.options.headers.get("authorization"), "Bearer customer-session-secret");
+  assert.equal(call.options.headers.get("orbit-client"), CLIENT_HEADER);
   assert.equal(call.options.redirect, "error");
+});
+
+test("Orbit-Client header follows the shared grammar and package version", () => {
+  const vectors = JSON.parse(readFileSync(new URL("../../../contracts/sdk/app-versions.json", import.meta.url), "utf8"));
+  for (const item of vectors.app_versions) assert.equal(validVersion(item.value), item.valid, item.value);
+  for (const item of vectors.client_headers) {
+    assert.equal(formatClientHeader(item.language, item.sdk_version, item.platform), item.header, JSON.stringify(item));
+  }
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(SDK_VERSION, pkg.version);
+  const prefix = `typescript/${pkg.version} (`;
+  assert.ok(CLIENT_HEADER.startsWith(prefix), CLIENT_HEADER);
+  assert.equal(formatClientHeader("typescript", pkg.version, CLIENT_HEADER.slice(prefix.length, -1)), CLIENT_HEADER);
 });
 
 test("rejects a session subject outside configured scope", async () => {

@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 def request(op, length=0):
-    return struct.pack("<4sBBHHHI", b"ORB1", op, 0, 0, 0, 0, length)
+    return struct.pack("<4sBBHHBBI", b"ORB1", op, 0, 0, 0, 0, 0, length)
 
 proc = subprocess.run([*sys.argv[1:], "https://example.com"],
                       input=request(3) + request(4, 32) + request(4, 32),

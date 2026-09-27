@@ -78,6 +78,23 @@ The state directory is private to the current user: owner-only files on Linux an
 
 `Options{StatePath: ...}` selects a dedicated absolute directory for a service account or a persistent container volume. Share one `*Client` within a process; another process that opens the same state receives `ErrInstallationInUse`. `Close` stops refresh and saves state without deactivating the licence.
 
+## Application version
+
+Set `Options{AppVersion: "2.4.1"}` so your licence policy can require a minimum
+application version and offer updates. Use one to four dot-separated numbers
+without leading zeros, optionally followed by a `-pre-release` and `+build`
+part, in at most 32 bytes (for example `3.0.0-beta.2+build.5`). `Open` rejects
+an invalid value with `ErrConfiguration` and sends a valid one with activation
+and validation.
+
+When the policy blocks this version, access checks return an error matching
+`ErrAppVersionUnsupported`, and cached or offline access is not used. Ask the
+user to update the application; the activation is kept, so the updated version
+continues without a new licence key. `Snapshot.UpdateAvailable` contains a
+newer version when the policy offers one and is empty otherwise. Every request
+also identifies the SDK with an `Orbit-Client` header containing its language,
+version and platform.
+
 ## Long-term offline files
 
 For an installation that stays disconnected longer than a connected grant allows,

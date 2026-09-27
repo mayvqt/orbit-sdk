@@ -64,7 +64,7 @@ static int32_t receive(void *ctx, const uint8_t *p, uint32_t n) {
 int main(int argc, char **argv) {
   static uint8_t body[ORBIT_CLIENT_ARENA_MAX_BYTES];
   uint8_t h[16], boot[16];
-  char origin[513], path[513], id[37];
+  char origin[513], path[513], client[129], id[37];
   if (argc != 2 || strncmp(argv[1], "https://", 8)) {
     fputs("usage: orbit_bridge_host https://your-orbit-origin\n", stderr);
     return 2;
@@ -89,13 +89,14 @@ int main(int argc, char **argv) {
   if (j != 16 || curl_global_init(CURL_GLOBAL_DEFAULT))
     return 2;
   while (transfer(STDIN_FILENO, h, 16, 0)) {
-    uint32_t a = u16(h + 6), b = u16(h + 8), n = u32(h + 12);
-    if (memcmp(h, "ORB1", 4) || h[5] || h[10] || h[11] || a > 512 || b > 512 ||
-        n > sizeof(body))
+    uint32_t a = u16(h + 6), b = u16(h + 8), c = h[10], n = u32(h + 12);
+    if (memcmp(h, "ORB1", 4) || h[5] || h[11] || a > 512 || b > 512 ||
+        c > 128 || n > sizeof(body))
       return 2;
     if (h[4] == 1 || h[4] == 2) {
       if (!a || !b || !transfer(STDIN_FILENO, origin, a, 0) ||
           !transfer(STDIN_FILENO, path, b, 0) ||
+          !transfer(STDIN_FILENO, client, c, 0) ||
           !transfer(STDIN_FILENO, body, n, 0))
         return 2;
       origin[a] = 0;
@@ -106,6 +107,7 @@ int main(int argc, char **argv) {
       orbit_http_request_t q = {{(uint8_t *)origin, a},
                                 {(uint8_t *)path, b},
                                 {body, n},
+                                {(uint8_t *)client, c},
                                 (uint8_t)(h[4] == 2)};
       uint16_t status = 0;
       sink_t s = {&status, 0};
@@ -115,7 +117,7 @@ int main(int argc, char **argv) {
       if (!send_status(&s) || !output(end, 2) || !result(r))
         return 2;
     } else if (h[4] == 3) {
-      if (a || b || n)
+      if (a || b || c || n)
         return 2;
       int64_t utc;
       uint64_t ticks;
@@ -131,7 +133,7 @@ int main(int argc, char **argv) {
           return 2;
       }
     } else if (h[4] == 4) {
-      if (a || b || n > 256)
+      if (a || b || c || n > 256)
         return 2;
       int32_t r = orbit_posix_entropy(NULL, body, n);
       if (!result(r) || (!r && !output(body, n)))

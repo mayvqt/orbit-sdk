@@ -103,4 +103,9 @@ public sealed record OrbitOptions
     public OfflineKeys? OfflineKeys { get; init; }
     /// <summary>Trusted connected-purpose public keys for floating-session grants.</summary>
     public SessionKeys? SessionKeys { get; init; }
+    /// <summary>
+    /// Your application's version, such as 2.4.1. Activation and validation send it so licence
+    /// policy can require a minimum version and report available updates.
+    /// </summary>
+    public string? AppVersion { get; init; }
 }

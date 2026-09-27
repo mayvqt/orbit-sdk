@@ -108,8 +108,13 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
       !request->path.length || request->path.length > 512 ||
       request->path.data[0] != '/' ||
       request->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES ||
-      (!request->body.data && request->body.length) || request->post > 1)
+      (!request->body.data && request->body.length) || request->post > 1 ||
+      request->client.length > 128 ||
+      (!request->client.data && request->client.length))
     return ORBIT_CLIENT_ARGUMENT;
+  for (uint32_t i = 0; i < request->client.length; ++i)
+    if (request->client.data[i] < 32 || request->client.data[i] >= 127)
+      return ORBIT_CLIENT_ARGUMENT;
   *status = 0;
   authority_len = request->origin.length - 8;
   host_len = 0;
@@ -160,6 +165,10 @@ int32_t orbit_http_exchange(void *opaque, const orbit_http_request_t *request,
   SEND(request->path.data, request->path.length);
   SEND(" HTTP/1.1\r\nHost: ", 17);
   SEND(request->origin.data + 8, authority_len);
+  if (request->client.length) {
+    SEND("\r\nOrbit-Client: ", 16);
+    SEND(request->client.data, request->client.length);
+  }
   {
     static const char h[] =
         "\r\nConnection: close\r\nAccept: application/json\r\nAccept-Encoding: "

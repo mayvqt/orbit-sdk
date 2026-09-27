@@ -35,12 +35,13 @@ static int32_t wr(orbit_bridge_t *b, const uint8_t *p, uint32_t n) {
   return 0;
 }
 static int32_t begin(orbit_bridge_t *b, uint8_t op, uint32_t origin,
-                     uint32_t path, uint32_t body) {
+                     uint32_t path, uint32_t client, uint32_t body) {
   uint8_t h[16] = {0};
   memcpy(h, "ORB1", 4);
   h[4] = op;
   put16(h + 6, origin);
   put16(h + 8, path);
+  h[10] = (uint8_t)client;
   put32(h + 12, body);
   return wr(b, h, sizeof(h));
 }
@@ -67,12 +68,13 @@ static int32_t exchange(void *ctx, const orbit_http_request_t *q,
   uint32_t total = 0;
   int32_t r;
   if (q->origin.length > 512 || q->path.length > 512 ||
-      q->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES)
+      q->client.length > 128 || q->body.length > ORBIT_CLIENT_ARENA_MAX_BYTES)
     return ORBIT_CLIENT_ARGUMENT;
   if (begin(b, q->post ? 2 : 1, q->origin.length, q->path.length,
-            q->body.length) ||
+            q->client.length, q->body.length) ||
       wr(b, q->origin.data, q->origin.length) ||
       wr(b, q->path.data, q->path.length) ||
+      wr(b, q->client.data, q->client.length) ||
       wr(b, q->body.data, q->body.length))
     return ORBIT_CLIENT_UNTRUSTED;
   if (rd(b, h, 2))
@@ -102,7 +104,7 @@ static int32_t now(void *ctx, int64_t *utc, uint64_t *ticks) {
   orbit_bridge_t *b = ctx;
   uint8_t p[32];
   int32_t r;
-  if (begin(b, 3, 0, 0, 0))
+  if (begin(b, 3, 0, 0, 0, 0))
     return ORBIT_CLIENT_UNTRUSTED;
   r = result(b);
   if (r)
@@ -127,7 +129,7 @@ static int32_t entropy(void *ctx, uint8_t *p, uint32_t n) {
   int32_t r;
   if (n > 256)
     return ORBIT_CLIENT_ARGUMENT;
-  if (begin(b, 4, 0, 0, n))
+  if (begin(b, 4, 0, 0, 0, n))
     return ORBIT_CLIENT_UNTRUSTED;
   r = result(b);
   return r ? r : rd(b, p, n);

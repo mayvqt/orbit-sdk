@@ -66,3 +66,11 @@ class FeatureUnavailableError(OrbitError):
 
     def __init__(self, request_id: str | None = None, status: int = 1) -> None:
         super().__init__(DENIED, "feature_unavailable", request_id, status)
+
+
+class AppVersionUnsupportedError(OrbitError):
+    """Licence policy blocks the configured ``app_version``. Ask the user to
+    update the application; cached or offline access is not used."""
+
+    def __init__(self, request_id: str | None = None, status: int = 403) -> None:
+        super().__init__(DENIED, "app_version_unsupported", request_id, status)

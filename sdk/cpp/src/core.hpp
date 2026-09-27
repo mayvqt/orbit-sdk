@@ -55,6 +55,7 @@ struct Config {
     std::optional<std::string> public_app_key;
     std::shared_ptr<const OfflineKeys> offline_keys;
     std::shared_ptr<const SessionKeys> session_keys;
+    std::optional<std::string> app_version;
     Storage storage;
 };
 
@@ -203,6 +204,9 @@ public:
     std::optional<AccountSession> customer;
     bool transient = false;
     std::optional<std::chrono::steady_clock::time_point> retry_deadline;
+    std::optional<std::string> update_available;
+    // Keeps an app_version_unsupported answer while validation retries are paced.
+    std::optional<Error> version_denial;
     GrantKeys keys;
     bool persistent = false;
     std::atomic_bool persistence_failed{false};

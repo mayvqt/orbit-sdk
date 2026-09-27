@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping
 
 from .app_key import AppKey
+from .app_version import configured as app_version_configured, update_hint
 from .clock import Anchor, Start, elapsed_ns, timestamp, wall_seconds
 from .device import installation_id_new, lower_hex, native_fingerprint, opaque, valid_provider
 from .errors import (
@@ -27,6 +28,7 @@ from .errors import (
     STALE_RESPONSE,
     STORAGE,
     TRANSIENT,
+    AppVersionUnsupportedError,
     FeatureUnavailableError,
     NotActivatedError,
     OrbitError,
@@ -123,6 +125,8 @@ class Snapshot:
     offline_allowed: bool
     remaining_offline: dt.timedelta
     session: SessionMetadata | None = None
+    update_available: str | None = None
+    """Newer application version reported by the last online check, when the licence policy offers one."""
 
     def has(self, feature: str) -> bool:
         """Return whether ``feature`` is a currently granted entitlement."""
@@ -389,8 +393,11 @@ class _AccountSession:
 class Client:
     """Synchronous Orbit client. Use ``with Client.open(app_key) as orbit: ...``."""
 
-    def __init__(self, config: _Config, transport: Any, storage: Any, *, persistent: bool = False, app_key: AppKey | None = None, offline_keys: OfflineKeys | None = None) -> None:
+    def __init__(self, config: _Config, transport: Any, storage: Any, *, persistent: bool = False, app_key: AppKey | None = None, offline_keys: OfflineKeys | None = None, app_version: str | None = None) -> None:
         self.config = config
+        self._app_version = app_version_configured(app_version)
+        self._update_available: str | None = None
+        self._version_denial: AppVersionUnsupportedError | None = None
         self.transport = transport
         self._storage = storage
         self._persistent_storage = storage if persistent and isinstance(storage, InstallationStorage) else None
@@ -460,6 +467,7 @@ class Client:
         device_binding: DeviceBinding | None = None,
         machine_binding: bool = True,
         offline_keys: Mapping[str, Any] | str | bytes | None = None,
+        app_version: str | None = None,
     ) -> Client:
         """Open a stable installation with private credential and grant storage.
 
@@ -469,7 +477,10 @@ class Client:
         container). Machine binding uses the native identity by default;
         pass ``machine_binding=False`` for cloned containers, or provide a
         ``DeviceBinding`` when the host supplies a stable custom identity.
+        ``app_version`` is your application's version, sent with activation
+        and validation so licence policy can require a minimum version.
         """
+        app_version_configured(app_version)
         parsed = _parse_app_key(app_key)
         trusted_offline_keys = None if offline_keys is None else OfflineKeys.parse(offline_keys, parsed.environment)
         binding = _resolve_binding(parsed, device_binding, machine_binding)
@@ -482,7 +493,7 @@ class Client:
             fingerprint=None if binding is None else binding.fingerprint,
             fingerprint_provider=None if binding is None else binding.provider,
         )
-        return cls._open_app(scope, state_path, transport=None, start_worker=True, app_key=parsed, offline_keys=trusted_offline_keys)
+        return cls._open_app(scope, state_path, transport=None, start_worker=True, app_key=parsed, offline_keys=trusted_offline_keys, app_version=app_version)
 
     @classmethod
     def open_with_storage(
@@ -532,9 +543,10 @@ class Client:
         transport: Any,
         *,
         start_worker: bool = False,
+        app_version: str | None = None,
     ) -> Client:
         """Private injection point for persistent lifecycle and storage tests."""
-        return cls._open_app(scope, state_path, transport=transport, start_worker=start_worker)
+        return cls._open_app(scope, state_path, transport=transport, start_worker=start_worker, app_version=app_version)
 
     @classmethod
     def _open_app(
@@ -546,6 +558,7 @@ class Client:
         start_worker: bool,
         app_key: AppKey | None = None,
         offline_keys: OfflineKeys | None = None,
+        app_version: str | None = None,
     ) -> Client:
         if not isinstance(app_scope, _AppScope):
             raise TypeError("app scope must be an internal _AppScope")
@@ -569,13 +582,15 @@ class Client:
                 app_key_environment = app_scope.environment
             else:
                 app_key_environment = app_key.environment
-            client = cls(config, live_transport, storage, persistent=True, app_key=app_key, offline_keys=offline_keys)
+            client = cls(config, live_transport, storage, persistent=True, app_key=app_key, offline_keys=offline_keys, app_version=app_version)
             client._environment = app_key_environment
             if storage.pending_activation is None and not client._offline_mode():
                 try:
                     client._refresh(None, respect_retry=False)
                 except OrbitError as exc:
-                    if exc.kind not in (TRANSIENT, REAUTHENTICATION_REQUIRED) and not (exc.kind == DENIED and exc.code == "concurrent_session_limit_reached"):
+                    # An unsupported application version still opens, so the
+                    # application can report the denial and use update checks.
+                    if exc.kind not in (TRANSIENT, REAUTHENTICATION_REQUIRED) and not isinstance(exc, AppVersionUnsupportedError) and not (exc.kind == DENIED and exc.code == "concurrent_session_limit_reached"):
                         raise
             client._checkpoint_persistent_cache(force=True)
             if start_worker:
@@ -926,6 +941,8 @@ class Client:
         self._offline_state = None
         self._transient = False
         self._retry_deadline = None
+        self._update_available = None
+        self._version_denial = None
 
     def _drop_floating_locked(self, *, release: bool, clear_profile: bool) -> None:
         current = self._floating
@@ -1042,6 +1059,7 @@ class Client:
             "offline_allowed": False,
             "remaining_offline_seconds": 0,
             "session": None,
+            "update_available": self._update_available,
         }
         if self._offline_mode():
             result["offline_file_mode"] = True
@@ -1231,6 +1249,8 @@ class Client:
             }
             if self._persistent:
                 body["credential_mode"] = "persistent"
+            if self._app_version is not None:
+                body["app_version"] = self._app_version
             if principal == "key":
                 body["licence_key"] = key
             else:
@@ -1273,6 +1293,8 @@ class Client:
                 raise error(REAUTHENTICATION_REQUIRED, "reauthentication_required")
             started = Start.capture()
             body = self._credential_body(saved)
+            if self._app_version is not None:
+                body["app_version"] = self._app_version
             try:
                 response = self.transport.post(f"{CLIENT_PREFIX}activations/{saved.activation_id}/validate", body, True, cancel)
                 response_error = None
@@ -1620,6 +1642,7 @@ class Client:
             try:
                 if response is None:
                     raise error(INVALID_RESPONSE, "missing_activation_response")
+                hint = update_hint(unique_json(response))
                 result = self._verify_reply(response, previous, expected_licence, started, cancel)
             except OrbitError as exc:
                 failure = exc
@@ -1664,8 +1687,28 @@ class Client:
                     self._drop_floating_locked(release=True, clear_profile=False)
                 self._transient = False
                 self._retry_deadline = None
+                self._update_available = hint
+                self._version_denial = None
                 return self._snapshot_locked()
         assert failure is not None
+        if isinstance(failure, AppVersionUnsupportedError) and previous is not None:
+            # Keep the activation for an updated application, but drop cached
+            # access without offline fallback and pace further validation.
+            with self._state_lock:
+                if self._generation != generation:
+                    raise error(STALE_RESPONSE, "stale_response")
+                self._drop_floating_locked(release=True, clear_profile=False)
+                self._generation += 1
+                self._claims = None
+                self._anchor = None
+                self._persisted_access = None
+                self._transient = False
+                self._update_available = None
+                self._version_denial = failure
+                self._retry_deadline = time.monotonic() + random.randrange(15, 45)
+                if self._persistent_storage is not None:
+                    self._persistent_storage.clear_access()
+            raise failure
         if failure.kind == TRANSIENT:
             with self._state_lock:
                 if self._generation != generation:
@@ -1894,6 +1937,8 @@ class Client:
                 with self._state_lock:
                     if self._credential is not None and self._transient:
                         raise error(TRANSIENT, "network_unavailable")
+                    if self._credential is not None and self._version_denial is not None:
+                        raise AppVersionUnsupportedError(self._version_denial.request_id)
                 raise NotActivatedError()
             if not snapshot["entitlements"].get(feature, False):
                 raise FeatureUnavailableError()
@@ -2365,6 +2410,7 @@ def _to_snapshot(value: dict[str, Any]) -> Snapshot:
         reauthentication_required=value["reauthentication_required"],
         offline_allowed=value["offline_allowed"],
         remaining_offline=dt.timedelta(seconds=value["remaining_offline_seconds"]),
+        update_available=value.get("update_available"),
         session=None if value.get("session") is None else SessionMetadata(
             session_id=value["session"]["session_id"],
             sequence=value["session"]["sequence"],

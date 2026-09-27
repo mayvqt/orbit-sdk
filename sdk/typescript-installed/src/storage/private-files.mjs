@@ -108,12 +108,8 @@ export class PrivateFileStore {
       this.state = initialState(this.key, this.binding, this.provider);
       await this.#commit(this.state);
     } else {
-      const decodedBytes = await this.#decode(raw);
-      let legacyFormat;
-      try { legacyFormat = uniqueJson(decodedBytes).format === 2; }
-      catch { throw fail(ErrorKind.STORAGE, "storage_failed"); }
-      this.state = decodeState(this.key, this.provider, decodedBytes);
-      if (legacyFormat || this.reencryptNeeded) await this.#commit(this.state);
+      this.state = decodeState(this.key, this.provider, await this.#decode(raw));
+      if (this.reencryptNeeded) await this.#commit(this.state);
       if (this.state.installation.fingerprint !== this.binding.fingerprint ||
           this.state.installation.fingerprint_provider !== this.binding.provider) {
         this.state = {
@@ -459,23 +455,20 @@ export function decodeState(key, provider, raw) {
   let state;
   try { state = uniqueJson(raw); }
   catch { throw fail(ErrorKind.STORAGE, "storage_failed"); }
-  const legacy = state && state.format === 2;
-  const names = legacy
-    ? ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access"]
-    : ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access", "offline"];
+  const names = ["sdk", "format", "provider", "scope", "installation", "generation", "credential", "pending_activation", "access", "offline"];
   if (!exactKeys(state, names) ||
-      state.sdk !== "orbit.installed-client" || (state.format !== 2 && state.format !== 3) || !["private_file", "electron_safe_storage", "windows_dpapi"].includes(provider) ||
+      state.sdk !== "orbit.installed-client" || state.format !== 3 || !["private_file", "electron_safe_storage", "windows_dpapi"].includes(provider) ||
       state.provider !== provider || !exactKeys(state.scope, ["api_origin", "issuer", "application_id", "environment_id"]) ||
       !sameJson(state.scope, canonicalScope(key)) || !isInteger(state.generation, 0, Number.MAX_SAFE_INTEGER) ||
       !validInstallation(state.installation) || state.credential !== null && !validCredential(state.credential) ||
       state.pending_activation !== null && !validPending(state.pending_activation) || state.access !== null && !validAccess(state.access) ||
-      !legacy && !validOfflineState(state.offline) ||
+      !validOfflineState(state.offline) ||
       state.access !== null && state.credential === null ||
       state.pending_activation !== null && (state.credential !== null || state.access !== null) ||
-      !legacy && state.offline.jws !== null && (state.credential !== null || state.access !== null || state.pending_activation !== null)) {
+      state.offline.jws !== null && (state.credential !== null || state.access !== null || state.pending_activation !== null)) {
     throw fail(ErrorKind.STORAGE, "storage_failed");
   }
-  return legacy ? { ...state, format: 3, offline: emptyOfflineState() } : state;
+  return state;
 }
 
 function validInstallation(value) {

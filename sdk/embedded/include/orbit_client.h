@@ -19,9 +19,9 @@ extern "C" {
 #error "ORBIT_CLIENT_ARENA_BYTES must be between 8192 and 32768"
 #endif
 #ifdef ORBIT_ENABLE_SERVICES
-#define ORBIT_CLIENT_STORAGE_BYTES 6976u
+#define ORBIT_CLIENT_STORAGE_BYTES 7024u
 #else
-#define ORBIT_CLIENT_STORAGE_BYTES 6960u
+#define ORBIT_CLIENT_STORAGE_BYTES 7008u
 #endif
 #define ORBIT_CLIENT_RECORD_BYTES 1024u
 #define ORBIT_CLIENT_OK ((int32_t)0)
@@ -37,6 +37,11 @@ extern "C" {
 #define ORBIT_CLIENT_RESOURCE_LIMIT ((int32_t)19)
 #define ORBIT_CLIENT_NOT_FOUND ((int32_t)20)
 #define ORBIT_CLIENT_BUSY ((int32_t)21)
+/* Licence policy blocks config.app_version. Update the firmware; cached access
+ * is not used and the stored activation remains for the updated version. */
+#define ORBIT_CLIENT_APP_VERSION_UNSUPPORTED ((int32_t)26)
+/* This SDK's release, sent in the Orbit-Client request header. */
+#define ORBIT_EMBEDDED_VERSION "0.4.0"
 
 /* Caller-owned, aligned state. Zero-initialize before first use. Destroy before
  * initializing again. Treat every byte as private; never copy a live
@@ -52,6 +57,9 @@ typedef struct orbit_client_config {
   orbit_embedded_slice_t environment_id;
   orbit_embedded_slice_t fingerprint; /* empty for an unbound policy */
   orbit_embedded_slice_t fingerprint_provider;
+  /* Optional firmware version, empty when unset: N[.N[.N[.N]]][-PRE][+BUILD]
+   * in at most 32 bytes. Sent with activation and validation. */
+  orbit_embedded_slice_t app_version;
 #ifdef ORBIT_ENABLE_SERVICES
   uint8_t environment_kind; /* Set by orbit_app_key_parse: Test=1, Live=2. */
 #endif
@@ -59,6 +67,9 @@ typedef struct orbit_client_config {
 
 typedef struct orbit_http_request {
   orbit_embedded_slice_t origin, path, body;
+  /* Orbit-Client header value: at most 128 printable ASCII bytes. Send it
+   * on every request; an empty value sends no header. */
+  orbit_embedded_slice_t client;
   uint8_t post; /* 0 GET, 1 POST; JSON request/response, no redirects */
 } orbit_http_request_t;
 typedef int32_t (*orbit_receive_fn)(void *context, const uint8_t *bytes,
@@ -104,6 +115,9 @@ typedef struct orbit_access_snapshot {
   int64_t expires_at, refresh_after, credential_expires_at;
   uint32_t policy_version;
   uint8_t allowed, offline, has_credential_expiry, activation_required, pending;
+  /* Newer firmware version from the last online check; length 0 when none. */
+  uint8_t update_available_length;
+  uint8_t update_available[32];
 } orbit_access_snapshot_t;
 
 /* No heap, threads or implicit timers. Init loads/creates stable installation

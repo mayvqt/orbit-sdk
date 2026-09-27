@@ -14,6 +14,12 @@ void orbit_write_string(orbit_writer_t *w, orbit_embedded_slice_t value);
 #define ORBIT_LITERAL(w, s) orbit_write((w), (s), (uint32_t)(sizeof(s) - 1u))
 
 int orbit_client_opaque(orbit_embedded_slice_t value, uint32_t minimum, uint32_t maximum);
+int orbit_app_version_valid(orbit_embedded_slice_t value);
+int orbit_client_header_valid(orbit_embedded_slice_t language, orbit_embedded_slice_t version,
+                              orbit_embedded_slice_t platform);
+orbit_embedded_slice_t orbit_client_header(void);
+int orbit_error_code_is(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
+                        const char *code, uint32_t code_length);
 int32_t orbit_record_encode(const orbit_record_t *r, uint8_t *bytes, uint32_t *length);
 int32_t orbit_record_decode(const uint8_t *bytes, uint32_t length, orbit_record_t *r);
 
@@ -21,6 +27,8 @@ typedef struct orbit_reply {
     orbit_json_span_t grant, activation, installation, credential, binding, provider;
     int64_t server_time, credential_expiry, licence_expiry;
     uint8_t has_credential, has_credential_expiry, has_licence_expiry, has_provider, replay_expired;
+    orbit_json_span_t update;
+    uint8_t has_update;
 #ifdef ORBIT_ENABLE_SERVICES
     orbit_json_span_t licence;
     uint8_t session_required;
@@ -32,6 +40,9 @@ int orbit_timestamp(const uint8_t *, orbit_json_span_t, int64_t *);
 #endif
 int32_t orbit_reply_parse(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
                           orbit_reply_t *reply);
+/* Decodes and validates the optional update hint; length 0 when absent. */
+int32_t orbit_reply_update(const uint8_t *bytes, const orbit_reply_t *reply,
+                           uint8_t version[32], uint32_t *length);
 #ifdef ORBIT_ENABLE_SERVICES
 #include "orbit_extensions.h"
 int32_t orbit_extension_load(void *,uint8_t *,uint32_t,uint32_t *);

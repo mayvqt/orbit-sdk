@@ -36,6 +36,23 @@ It does not prompt after an outage, a denied request or a missing feature.
 Always call `require_access()` or `ensure_access()` before protected work;
 `snapshot()` is for display.
 
+## Application version
+
+Pass `Client.open(app_key, app_version="2.4.1")` so your licence policy can
+require a minimum application version and offer updates. Use one to four
+dot-separated numbers without leading zeros, optionally followed by a
+`-pre-release` and `+build` part, in at most 32 bytes (for example
+`3.0.0-beta.2+build.5`).
+`open` rejects an invalid value with a `configuration` error and sends a valid
+one with activation and validation.
+
+When the policy blocks this version, access checks raise
+`AppVersionUnsupportedError`, and cached or offline access is not used. Ask the
+user to update the application; the activation is kept, so the updated version
+continues without a new licence key. `Snapshot.update_available` contains a
+newer version when the policy offers one. Every request also identifies the SDK
+with an `Orbit-Client` header containing its language, version and platform.
+
 ## Floating sessions
 
 When the licence policy enables concurrent sessions, activation automatically
