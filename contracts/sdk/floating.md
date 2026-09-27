@@ -1,8 +1,7 @@
 # Floating seats and concurrent sessions
 
-Implementation contract for the candidate feature; this document is not evidence
-that the server or SDKs implement it. Floating seats count active application
-sessions. The existing device limit continues to count registered installations.
+Floating seats count active application sessions. The existing device limit
+continues to count registered installations.
 Neither limit silently changes the other.
 
 ## Policy and authorization
@@ -22,10 +21,15 @@ applications. A first-use licence still starts its term on activation; acquiring
 or renewing a seat does not restart that term.
 
 For a floating licence, activation and ordinary activation validation return
-their usual metadata and credential fields, plus `session_required=true` and
-`grant=null`. They issue no ordinary access grant. SDKs recognize this explicit
-response profile, durably save the activation credential, and then acquire a
-seat. An older SDK that cannot handle the profile cannot obtain local access.
+their usual metadata and credential fields, plus the authenticated `licence_id`,
+`session_required=true` and `grant=null`. The licence ID is required before the
+first session request so the SDK can persist the credential's licence identity.
+It must match the selected account licence or stored credential when either is
+available. The session grant's subject must match that ID; response metadata
+alone never authorizes access. These responses issue no ordinary access grant.
+SDKs recognize this explicit response profile, durably save the activation
+credential, and then acquire a seat. An older SDK that cannot handle the profile
+cannot obtain local access.
 Ordinary responses omit `session_required` and retain the existing grant shape.
 A device registration can succeed while seat acquisition is denied: the SDK
 keeps the credential and reports `concurrent_session_limit_reached`, so a later
