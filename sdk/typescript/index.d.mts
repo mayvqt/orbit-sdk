@@ -32,6 +32,38 @@ export interface OrbitBackendOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface DownloadTicketVerifierConfig {
+  appKey: string | AppKey;
+  /** Exact protected HTTPS endpoint, without credentials, query or fragment. */
+  endpoint: string;
+  /** Raw connected-purpose public JWKS JSON; duplicate keys are rejected. */
+  trustedKeys: string | Uint8Array;
+}
+
+export interface DownloadTicket {
+  readonly licenceId: string;
+  readonly ticketId: string;
+  readonly applicationId: string;
+  readonly environmentId: string;
+  readonly releaseId: string;
+  readonly artifactId: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  /** RFC3339 UTC timestamps. */
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+}
+
+export class OrbitDownloadTicketError extends Error {
+  readonly code: "invalid_download_ticket";
+}
+
+export class DownloadTicketVerifier {
+  constructor(config: DownloadTicketVerifierConfig);
+  /** No network request. Match returned metadata against your artifact registry. */
+  verify(ticket: string): DownloadTicket;
+}
+
 export interface CurrentCustomerSession {
   readonly customer_id: string;
   readonly application_id: string;

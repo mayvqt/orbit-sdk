@@ -9,8 +9,9 @@ From your backend project, install the package from this SDK checkout:
 npm install /path/to/orbit-sdk/sdk/typescript
 ```
 
-It makes online API requests; it does not validate signed grants or provide the
-offline/device behavior in Orbit's Rust, Go, C#, C++, and Python SDKs.
+It makes online API requests and can verify seller download tickets locally.
+For installed desktop/device access and offline licence files, use an installed
+SDK such as [Rust](../rust/README.md) or [Node/Electron](../typescript-installed/README.md).
 
 ## Quickstart
 
@@ -53,6 +54,46 @@ Call `AppKey.parse(key)` directly if you want to validate or inspect a key
 (`api_origin`, `issuer`, `application_id`, `environment_id`, `environment`)
 before constructing a client; `new OrbitBackendClient({ appKey, ... })` also
 accepts an already-parsed `AppKey`.
+
+## Verify seller download tickets
+
+On your download backend, configure the exact protected HTTPS endpoint and raw
+connected-purpose public JWKS JSON supplied through your trusted configuration.
+The verifier makes no network request and requires no management credential:
+
+```js
+import { readFileSync } from "node:fs";
+import { DownloadTicketVerifier } from "@orbit/trusted-backend-sdk";
+
+const downloads = new DownloadTicketVerifier({
+  appKey: process.env.ORBIT_APP_KEY,
+  endpoint: "https://downloads.example.com/artifacts",
+  trustedKeys: readFileSync("connected-jwks.json"),
+});
+
+function authorizeArtifact(bearer, registry) {
+  const ticket = downloads.verify(bearer); // Throws OrbitDownloadTicketError.
+  const artifact = registry.get(ticket.artifactId);
+  if (!artifact || artifact.releaseId !== ticket.releaseId ||
+      artifact.byteLength !== ticket.byteLength || artifact.sha256 !== ticket.sha256) {
+    throw new Error("Artifact unavailable");
+  }
+  return artifact; // Serve this registry entry or issue a short-lived storage URL.
+}
+```
+
+Use the bearer from the request's `Authorization` header. Do not take signing keys,
+an audience URL, or a filesystem path from that request. The immutable verified
+metadata contains licence, ticket, scope, release and artifact IDs, byte length,
+SHA-256 and RFC3339 issuance/expiry times; it never contains the bearer itself.
+Match it against a registry dedicated to the configured application/environment.
+Tickets can be replayed until expiry (at most 120 seconds); they are not single-use
+links. Never log the bearer or forward it to a storage redirect.
+
+This verifier does not host files or fetch seller URLs. Release metadata and ticket
+issuance require the matching unreleased Orbit server feature. A complete
+[seller storage example](../../examples/python/seller-downloads/README.md) shows
+the storage boundary; sellers retain their own hosting and credentials.
 
 ## Authenticate your own user first
 

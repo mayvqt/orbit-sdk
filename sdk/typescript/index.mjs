@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { downloadVerifier } from "./download-tickets.mjs";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -112,6 +113,37 @@ export class OrbitAccessDeniedError extends Error {
     super(`Orbit denied access (${reason})`);
     this.name = "OrbitAccessDeniedError";
     this.reason = reason;
+  }
+}
+
+/** A download bearer failed verification. Contains no token or claim values. */
+export class OrbitDownloadTicketError extends Error {
+  constructor() {
+    super("Invalid Orbit download ticket");
+    this.name = "OrbitDownloadTicketError";
+    this.code = "invalid_download_ticket";
+  }
+}
+
+/** Verify seller download bearers locally against explicitly trusted public keys. */
+export class DownloadTicketVerifier {
+  #verify;
+
+  constructor({ appKey, endpoint, trustedKeys }) {
+    try {
+      const scope = readAppKey(typeof appKey === "string" ? AppKey.parse(appKey) : appKey);
+      this.#verify = downloadVerifier(scope, endpoint, trustedKeys);
+    } catch {
+      throw new TypeError("Invalid Orbit download verifier configuration");
+    }
+  }
+
+  verify(ticket) {
+    try {
+      return this.#verify(ticket);
+    } catch {
+      throw new OrbitDownloadTicketError();
+    }
   }
 }
 
