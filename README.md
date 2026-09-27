@@ -39,7 +39,7 @@ activation credentials, and management tokens out of source and logs. A
 management token belongs only on your backend. Check access before protected
 work.
 
-Use the same client for the licensing features your application needs:
+The language guides also cover optional licensing features:
 
 - **Floating sessions:** limit concurrent use and release a seat when work ends.
 - **Offline files:** import a signed licence for installations that spend long
@@ -50,6 +50,6 @@ Use the same client for the licensing features your application needs:
   files. Host the files yourself; the [seller download example](examples/python/seller-downloads/README.md)
   shows how to protect them with expiring Orbit tickets.
 
-Each language guide covers setup, lifecycle and retry behavior for these features.
+Check your language guide for setup, lifecycle and retry behavior.
 
 The SDKs and examples are [MIT licensed](LICENSE).

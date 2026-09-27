@@ -107,7 +107,7 @@ internal static partial class InstalledTests
                     _ = client.Snapshot();
                 }
                 var versionReads = InstalledStorageDiagnostics.VersionReads;
-                Require(versionReads >= verificationCalls * 2 &&
+                Require(versionReads == verificationCalls * 2 &&
                     InstalledStorageDiagnostics.Writes == 0 && fixture.Server.RequestCount == requests);
 
 #if DEBUG

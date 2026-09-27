@@ -387,8 +387,6 @@ public sealed partial class OrbitClient : IDisposable
             OrbitException.CheckCancellation(cancellationToken);
             if (offlineFileMode)
             {
-                snapshot = SnapshotLocked();
-                OrbitException.CheckCancellation(cancellationToken);
                 if (snapshot.Access == Access.Expired)
                     throw new OrbitException(OrbitError.Denied, "offline_file_expired");
                 if (!snapshot.HasFeature(feature))
@@ -399,19 +397,9 @@ public sealed partial class OrbitClient : IDisposable
                 throw new OrbitException(OrbitError.Denied, "session_explicitly_ended");
             if (snapshot.Access == Access.Online)
             {
-                snapshot = SnapshotLocked();
-                OrbitException.CheckCancellation(cancellationToken);
-                if (snapshot.Access != Access.Online)
-                {
-                    // The session can expire between two clock samples. Continue
-                    // through the refresh/error path with the newer snapshot.
-                }
-                else
-                {
-                    if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
-                        throw new OrbitException(OrbitError.FeatureUnavailable, "feature_unavailable");
-                    return snapshot;
-                }
+                if (!snapshot.Entitlements.TryGetValue(feature, out var enabled) || !enabled)
+                    throw new OrbitException(OrbitError.FeatureUnavailable, "feature_unavailable");
+                return snapshot;
             }
             retryDue = RetryDueLocked();
         }

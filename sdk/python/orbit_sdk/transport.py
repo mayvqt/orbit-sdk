@@ -217,6 +217,13 @@ class _BoundedHTTPSConnection(http.client.HTTPSConnection):
         self._deadline = deadline
         self._cancel = cancel
 
+    def _close_failed_address(self) -> None:
+        # HTTPConnection.close() resets the request state. Address fallback runs
+        # while that request is being sent, so close only the failed socket.
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+
     def _connect_nonblocking(self, sock: socket.socket, address: Any) -> None:
         _check_io(self._deadline, self._cancel, "connection")
         result = sock.connect_ex(address)
@@ -274,10 +281,10 @@ class _BoundedHTTPSConnection(http.client.HTTPSConnection):
                 tls.do_handshake()
                 return
             except _AttemptError:
-                self.close()
+                self._close_failed_address()
                 raise
             except OSError as exc:
-                self.close()
+                self._close_failed_address()
                 if _cancelled(self._cancel):
                     raise _AttemptError(error(CANCELLED, "operation_cancelled")) from exc
                 if time.monotonic() >= self._deadline:
