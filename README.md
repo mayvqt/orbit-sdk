@@ -40,6 +40,10 @@ Each guide also covers the optional licensing features:
   files. You host the files; the [seller download example](examples/python/seller-downloads/README.md)
   protects them with expiring Orbit tickets.
 
+To issue and manage licences or publish releases from a terminal or build
+pipeline, use the [`orbit` command-line tool](cli/README.md) with a management
+token.
+
 The app key is public and can ship with your application; Test and Live have
 separate keys and data. Keep licence keys, passwords, sessions and management
 tokens out of source and logs.
