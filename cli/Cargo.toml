@@ -1,7 +1,7 @@
 [package]
 name = "orbit-cli"
 version = "0.1.0"
-description = "Seller command-line tool for Orbit licences and releases"
+description = "Orbit command-line tool for licences and releases"
 repository = "https://github.com/mayvqt/orbit-sdk"
 edition = "2024"
 rust-version = "1.98.1"

@@ -1,4 +1,4 @@
-//! `orbit`: seller command-line tool for the Orbit management API.
+//! `orbit`: command-line tool for the Orbit management API.
 
 mod api;
 mod app;
