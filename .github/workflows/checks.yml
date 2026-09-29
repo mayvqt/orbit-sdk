@@ -1,0 +1,165 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt && rustup default stable
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Package the crates without uploading
+        run: |
+          cargo package -p orbit-sdk-native --locked
+          cargo package -p orbit-sdk --locked \
+            --config 'patch.crates-io.orbit-sdk-native.path="sdk/rust/native"'
+
+  embedded:
+    name: Embedded
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev libssl-dev
+      - run: rustup toolchain install stable --profile minimal -c rustfmt && rustup default stable
+      - name: Rust wrapper
+        run: |
+          cargo fmt --manifest-path sdk/embedded/Cargo.toml -- --check
+          for features in "" services offline offline-full; do
+            cargo test --manifest-path sdk/embedded/Cargo.toml --locked ${features:+--features $features}
+          done
+      - name: C builds, one per configuration
+        run: |
+          set -e
+          check() { dir=$1; shift; cmake -S sdk/embedded -B "build/$dir" "$@"; cmake --build "build/$dir" -j4; ctest --test-dir "build/$dir" --output-on-failure; }
+          check embedded -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-Os -DORBIT_BUILD_POSIX=ON
+          check embedded-services -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_SERVICES=ON
+          check embedded-offline -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_OFFLINE=ON \
+            -DORBIT_OFFLINE_PROFILE_FILE_BYTES=4096 -DORBIT_CLIENT_ARENA_BYTES=8192
+          check embedded-offline-full -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_OFFLINE=ON \
+            -DORBIT_OFFLINE_PROFILE_FILE_BYTES=16384 -DORBIT_CLIENT_ARENA_BYTES=16384
+
+  cpp:
+    name: C++
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev libssl-dev libjsoncpp-dev
+      - run: |
+          cmake -S sdk/cpp -B build/cpp-tests -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=ON
+          cmake --build build/cpp-tests -j4
+          ctest --test-dir build/cpp-tests --output-on-failure
+          cmake -S examples/cpp -B build/cpp-example -DBUILD_TESTING=OFF
+          cmake --build build/cpp-example -j4
+
+  csharp:
+    name: C#
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      TESTS: sdk/csharp/tests/Orbit.Sdk.Tests.csproj
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - run: dotnet restore "$TESTS" --locked-mode
+      - run: |
+          dotnet run --project "$TESTS" --no-restore -- contracts/sdk/grants.json
+          dotnet run --project "$TESTS" --no-restore -- --offline-vectors contracts/sdk/offline-files.json
+          dotnet run --project "$TESTS" --no-restore -- --download-vectors contracts/sdk/download-tickets.json
+          dotnet run --project "$TESTS" --no-restore -- --session-vectors contracts/sdk/session-grants.json
+          dotnet run --project "$TESTS" --no-restore -p:OrbitLocalDevelopment=true -- --download-stream
+          dotnet run --project "$TESTS" --no-restore -p:OrbitLocalDevelopment=true -- --security
+          dotnet run --project "$TESTS" --no-restore -p:OrbitLocalDevelopment=true -- --installed
+      - run: |
+          dotnet restore examples/csharp/licensed-export/Orbit.LicensedExport.csproj
+          dotnet build examples/csharp/licensed-export/Orbit.LicensedExport.csproj --no-restore
+
+  go:
+    name: Go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sdk/go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - name: Vet the Windows and macOS builds
+        # The Windows ACL walk turns OS-owned addresses (ACEs inside a
+        # LocalAlloc'd security descriptor) into pointers, which unsafeptr
+        # always flags; Go's collector never moves that memory.
+        run: GOOS=windows go vet -unsafeptr=false ./... && GOOS=darwin CGO_ENABLED=0 go vet ./...
+      - run: go test -race ./...
+
+  python:
+    name: Python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet -e .
+      - run: python -m unittest discover -q -s tests
+
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Backend SDK
+        working-directory: sdk/typescript
+        run: npm test
+      - name: Installed SDK
+        working-directory: sdk/typescript-installed
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run typecheck
