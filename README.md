@@ -1,5 +1,15 @@
 # Orbit SDKs
 
+[![Checks](https://github.com/mayvqt/orbit-sdk/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/mayvqt/orbit-sdk/actions/workflows/checks.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-SDK-orange?logo=rust)
+![Go](https://img.shields.io/badge/Go-SDK-00ADD8?logo=go&logoColor=white)
+![C#](https://img.shields.io/badge/C%23-SDK-512BD4?logo=dotnet&logoColor=white)
+![C++](https://img.shields.io/badge/C%2B%2B-SDK-00599C?logo=cplusplus&logoColor=white)
+![Python](https://img.shields.io/badge/Python-SDK-3776AB?logo=python&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-SDK-3178C6?logo=typescript&logoColor=white)
+![Embedded](https://img.shields.io/badge/Embedded-C%20%2F%20Rust-555?logo=espressif&logoColor=white)
+
 Add licence activation and feature checks to your application with one public
 app key. The installed SDKs remember activation, refresh access automatically
 and ask for a licence key only when the installation has no activation.

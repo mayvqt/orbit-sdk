@@ -382,7 +382,9 @@ func TestInstalledOfflineImportSamplesAfterDurableWriteAndHonorsCancellation(t *
 			}{snapshot, err}
 		}()
 		<-blocked.entered
-		if delay := time.Until(time.Unix(expires, 0)) + 100*time.Millisecond; delay > 0 {
+		// The anchored clock counts whole seconds from a truncated start, so it can
+		// trail the wall clock by up to two seconds.
+		if delay := time.Until(time.Unix(expires, 0)) + 2*time.Second; delay > 0 {
 			time.Sleep(delay)
 		}
 		release()
