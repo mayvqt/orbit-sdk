@@ -66,6 +66,40 @@ HTTPS origin, reject redirects, time out after five seconds and cap JSON
 responses at 1 MiB. Every request identifies the SDK with an `Orbit-Client`
 header containing its language, version and platform.
 
+## Sell into a signed-in account
+
+To deliver a purchase into the buyer's Orbit account (and upgrade their
+sign-up licence instead of issuing a second one), put the verified customer ID
+in the checkout your backend creates. Take it from the session, never from the
+request body:
+
+```js
+import Stripe from "stripe";
+import { OrbitBackendClient } from "@orbit/trusted-backend-sdk";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const orbit = new OrbitBackendClient({
+  appKey: process.env.ORBIT_APP_KEY,
+  managementToken: process.env.ORBIT_MANAGEMENT_TOKEN,
+});
+
+export async function createCheckout(customerSession, priceId, returnUrl) {
+  const { customer_id } = await orbit.verifyCurrentCustomerSession(customerSession);
+  const checkout = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    line_items: [{ price: priceId, quantity: 1 }],
+    subscription_data: { metadata: { orbit_customer_id: customer_id } },
+    success_url: returnUrl,
+  });
+  return checkout.url;
+}
+```
+
+For a one-time Stripe payment, enable invoice creation and set the same key in
+`invoice_creation.invoice_data.metadata`. Paddle Billing reads it from
+`custom_data`, Lemon Squeezy from `checkout_data.custom` and Polar from checkout
+`metadata`. The purchase then appears in the account with no key to deliver.
+
 ## Management methods
 
 * `searchLicences({ query, after, status })` sends search text in a POST body.
