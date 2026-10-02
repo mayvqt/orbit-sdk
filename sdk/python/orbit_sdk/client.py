@@ -2183,13 +2183,17 @@ class Client:
                 raise
             self._check_response_generation(generation, cancel)
 
-    def register(self, licence_key: str, username: str, email: str, password: str, *, cancellation: Cancellation | None = None) -> RegistrationResult:
+    def register(self, licence_key: str | None, username: str, email: str, password: str, *, cancellation: Cancellation | None = None) -> RegistrationResult:
+        """Start registration. Pass ``None`` as the key for customer sign-up without one, when the application allows it."""
         with self._operation(cancellation) as cancel:
-            _validate_texts(licence_key, username, email, password)
-            if not licence_key or len(licence_key.encode()) > 256 or len(username.encode()) > 128 or len(email.encode()) > 254 or len(password.encode()) > 256 or len(password) < 8:
+            _validate_texts("" if licence_key is None else licence_key, username, email, password)
+            if (licence_key is not None and (not licence_key or len(licence_key.encode()) > 256)) or len(username.encode()) > 128 or len(email.encode()) > 254 or len(password.encode()) > 256 or len(password) < 8:
                 raise error(CONFIGURATION, "invalid_request")
             generation = self._generation_now()
-            body = self._scope_body({"licence_key": licence_key, "username": username, "email": email, "password": password})
+            request = {"username": username, "email": email, "password": password}
+            if licence_key is not None:
+                request["licence_key"] = licence_key
+            body = self._scope_body(request)
             try:
                 data = self.transport.post(CLIENT_PREFIX + "registrations", body, False, cancel)
                 value = unique_json(data if data is not None else b"")

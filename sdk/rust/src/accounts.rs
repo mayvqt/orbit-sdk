@@ -111,8 +111,11 @@ pub struct OwnedLicences {
 }
 
 /// Borrowed input is sent once and is never retained by the SDK.
+///
+/// Leave `licence_key` as `None` for customer sign-up without a key, when the
+/// application allows it.
 pub struct Registration<'a> {
-    pub licence_key: &'a str,
+    pub licence_key: Option<&'a str>,
     pub username: &'a str,
     pub email: &'a str,
     pub password: &'a str,
@@ -496,8 +499,9 @@ impl Client {
         input: Registration<'_>,
         cancel: &Cancellation,
     ) -> Result<PendingRegistration> {
-        if input.licence_key.is_empty()
-            || input.licence_key.len() > 256
+        if input
+            .licence_key
+            .is_some_and(|key| key.is_empty() || key.len() > 256)
             || input.username.len() > 128
             || input.email.len() > 254
             || input.password.len() > 256
@@ -510,10 +514,7 @@ impl Client {
                 .transport
                 .post_with_cancel(
                     "/api/client/v1/registrations",
-                    &self.account_body(
-                        json!({"licence_key": input.licence_key, "username": input.username,
-                "email": input.email, "password": input.password}),
-                    ),
+                    &self.account_body(registration_body(&input)),
                     false,
                     cancel,
                 )
@@ -664,6 +665,15 @@ fn accepted(value: Accepted) -> Result<Accepted> {
     Ok(value)
 }
 
+fn registration_body(input: &Registration<'_>) -> Value {
+    let mut body = json!({"username": input.username, "email": input.email,
+        "password": input.password});
+    if let Some(key) = input.licence_key {
+        body["licence_key"] = json!(key);
+    }
+    body
+}
+
 fn bearer(value: &str) -> bool {
     value.len() == 43 && access::opaque(value)
 }
@@ -769,6 +779,21 @@ mod tests {
 
     fn system_time(value: &str) -> SystemTime {
         from_unix_seconds(access::timestamp(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn registration_omits_absent_licence_key() {
+        let mut input = Registration {
+            licence_key: None,
+            username: "alice",
+            email: "alice@example.test",
+            password: "password",
+        };
+        let body = registration_body(&input);
+        assert!(body.get("licence_key").is_none());
+        assert_eq!(body["username"], "alice");
+        input.licence_key = Some("key");
+        assert_eq!(registration_body(&input)["licence_key"], "key");
     }
 
     #[test]
@@ -1164,7 +1189,7 @@ mod tests {
                     "registrations" => client
                         .register_with_cancel(
                             Registration {
-                                licence_key: "key",
+                                licence_key: Some("key"),
                                 username: "alice",
                                 email: "alice@example.test",
                                 password: "password",

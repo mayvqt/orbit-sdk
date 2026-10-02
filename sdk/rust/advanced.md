@@ -71,7 +71,7 @@ email, sign in and select one of their licences on the same client:
 
 ```rust,ignore
 let pending = orbit.register(Registration {
-    licence_key: &key, username: &username, email: &email, password: &password,
+    licence_key: Some(&key), username: &username, email: &email, password: &password,
 }).await?;
 orbit.resend_registration(&pending).await?;
 orbit.login(&username, &password).await?;
@@ -80,12 +80,14 @@ orbit.activate_account(&page.items[0].id).await?;
 orbit.require_access("export").await?;
 ```
 
-Registration confirmation does not sign the customer in. Passwords require at
-least eight characters; preserve whitespace. `PendingRegistration` keeps its
-resend proof private and in memory. Pass `page.next_cursor.as_deref()` to fetch
-the next licence page. `claim_licence(key)` adds an eligible key to the
-signed-in account without activating it. Recovery and email-change requests
-return generic acceptance.
+Set `licence_key` to `None` for customer sign-up without a key when the
+application allows it; any sign-up licence the application grants appears in
+`owned_licences` after sign-in. Registration confirmation does not sign the
+customer in. Passwords require at least eight characters; preserve whitespace.
+`PendingRegistration` keeps its resend proof private and in memory. Pass
+`page.next_cursor.as_deref()` to fetch the next licence page.
+`claim_licence(key)` adds an eligible key to the signed-in account without
+activating it. Recovery and email-change requests return generic acceptance.
 
 `OwnedLicence::offline_file_duration` is zero when long-term offline files are
 disabled, and between one and 366 days when they are enabled.

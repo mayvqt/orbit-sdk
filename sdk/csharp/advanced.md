@@ -108,7 +108,9 @@ management credential there.
 
 `RegisterAsync(new Registration(key, username, email, password))` starts
 registration; confirmation happens through the email link and does not sign the
-customer in. Passwords need at least eight characters. Keep the returned
+customer in. When the application allows customer sign-up, omit the key with
+`new Registration(username, email, password)`; any sign-up licence the
+application grants appears in `OwnedLicencesAsync` after sign-in. Passwords need at least eight characters. Keep the returned
 `RegistrationResult` in memory for `ResendRegistrationAsync`.
 `RequestPasswordRecoveryAsync` and `RequestEmailChangeAsync` return generic
 acceptance. `ClaimLicenceAsync` adds an eligible key to the signed-in account

@@ -89,12 +89,12 @@ try
                         }
                     case "register":
                         {
-                            var key = Prompt("Licence key (paste locally): ");
+                            var key = Prompt("Licence key (paste locally, or leave empty to sign up without one): ");
                             var username = Prompt("New customer username: ");
                             var email = Prompt("Email address: ");
                             Console.WriteLine("Customer passwords require at least 8 characters; spaces are preserved.");
                             var password = PasswordPrompt();
-                            pending = await client.RegisterAsync(new Registration(key, username, email, password), lifetime.Token);
+                            pending = await client.RegisterAsync(new Registration(key.Length == 0 ? null : key, username, email, password), lifetime.Token);
                             Console.WriteLine("Request accepted. If eligible, confirm the email link, then return here and login. Use resend if needed.");
                             break;
                         }

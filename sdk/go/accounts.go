@@ -160,6 +160,8 @@ type OwnedLicences struct {
 }
 
 // Registration is sent once and never retained by the client. Avoid logging it.
+// Leave LicenceKey empty for customer sign-up without a key when the
+// application allows it.
 type Registration struct {
 	LicenceKey string
 	Username   string
@@ -410,10 +412,14 @@ func (c *Client) RequestEmailChange(ctx context.Context, password, email string)
 	return c.accountPost(ctx, clientPrefix+"email-changes", map[string]any{"password": password, "email": email}, false, checkAccepted)
 }
 func (c *Client) Register(ctx context.Context, input Registration) (*PendingRegistration, error) {
-	if input.LicenceKey == "" || len(input.LicenceKey) > 256 || len(input.Username) > 128 || len(input.Email) > 254 || len(input.Password) > 256 || !utf8.ValidString(input.Password) || utf8.RuneCountInString(input.Password) < 8 {
+	if len(input.LicenceKey) > 256 || len(input.Username) > 128 || len(input.Email) > 254 || len(input.Password) > 256 || !utf8.ValidString(input.Password) || utf8.RuneCountInString(input.Password) < 8 {
 		return nil, ErrConfiguration
 	}
-	data, err := c.publicPost(ctx, clientPrefix+"registrations", map[string]any{"licence_key": input.LicenceKey, "username": input.Username, "email": input.Email, "password": input.Password})
+	body := map[string]any{"username": input.Username, "email": input.Email, "password": input.Password}
+	if input.LicenceKey != "" {
+		body["licence_key"] = input.LicenceKey
+	}
+	data, err := c.publicPost(ctx, clientPrefix+"registrations", body)
 	if err != nil {
 		return nil, err
 	}

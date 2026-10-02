@@ -44,7 +44,10 @@ device slot on the server.
 `register(licence_key, username, email, password)` returns a frozen
 `RegistrationResult(accepted, expires_at, pending)`. The opaque `pending`
 handle keeps the resend proof in memory; pass it to `resend_registration()` and
-close it when finished. Confirmation does not sign the customer in.
+close it when finished. Confirmation does not sign the customer in. When the
+application allows customer sign-up, pass `None` as the licence key; any
+sign-up licence the application grants appears in `owned_licences()` after
+sign-in.
 `request_password_recovery(email)` and `request_email_change(password,
 new_email)` return once Orbit accepts the request.
 

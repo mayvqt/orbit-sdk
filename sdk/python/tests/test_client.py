@@ -59,6 +59,13 @@ class ClientFlowTests(unittest.TestCase):
         self.assertNotIn("r" * 43, repr(registration.pending))
         self.client.resend_registration(registration.pending)
         registration.pending.close()
+        self.assertEqual(self.transport.requests[-2][2]["licence_key"], "synthetic-key")
+        signup = self.client.register(None, "alice3", "a3@example.test", "synthetic-password")
+        self.assertTrue(signup.accepted)
+        self.assertNotIn("licence_key", self.transport.requests[-1][2])
+        signup.pending.close()
+        with self.assertRaises(OrbitError):
+            self.client.register("", "alice4", "a4@example.test", "synthetic-password")
         with self.assertRaises(RuntimeError):
             self.client.resend_registration(registration.pending)
 

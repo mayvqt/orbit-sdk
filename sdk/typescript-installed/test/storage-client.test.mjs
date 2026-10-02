@@ -536,9 +536,11 @@ test("pending registration handles are bound to the complete origin scope and cl
   });
   const sameIdsDifferentOrigin = AppKey.parse(`orbit_app_test_${Buffer.from("https://other.example.test").toString("base64url")}.${key.application_id}.${key.environment_id}`);
   let resendCalls = 0;
+  const registrationBodies = [];
   const registrationTransport = {
-    async post(route) {
+    async post(route, body) {
       if (!route.endsWith("/registrations")) throw new Error("unexpected request");
+      registrationBodies.push(body);
       return Buffer.from(JSON.stringify({ accepted: true, expires_at: new Date(Math.floor((Date.now() + 60_000) / 1000) * 1000).toISOString(), resend_credential: "r".repeat(43) }));
     },
   };
@@ -546,6 +548,11 @@ test("pending registration handles are bound to the complete origin scope and cl
   first = await openClientForTesting(key, { statePath: path.join(base, "one"), machineBinding: false, transport: registrationTransport });
   second = await openClientForTesting(sameIdsDifferentOrigin, { statePath: path.join(base, "two"), machineBinding: false, transport: otherTransport });
   const result = await first.register(keyText, "registered_user", "user@example.test", "correct horse battery staple");
+  const signup = await first.register(null, "signup_user", "signup@example.test", "correct horse battery staple");
+  assert.equal(signup.accepted, true);
+  assert.equal(registrationBodies[0].licence_key, keyText);
+  assert.equal(Object.hasOwn(registrationBodies[1], "licence_key"), false);
+  await assert.rejects(first.register("", "empty_key", "empty@example.test", "correct horse battery staple"), (error) => error.code === "invalid_request");
   await assert.rejects(second.resendRegistration(result.pending), TypeError);
   assert.equal(resendCalls, 0);
   await first.close();
