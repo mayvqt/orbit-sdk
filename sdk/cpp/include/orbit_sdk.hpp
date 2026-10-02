@@ -431,6 +431,10 @@ public:
     RegistrationResult register_customer(std::string_view licence_key, std::string_view username,
                                          std::string_view email, std::string_view password,
                                          const Cancellation *cancellation = nullptr) const;
+    // Customer sign-up without a licence key, when the application allows it.
+    RegistrationResult register_customer(std::string_view username, std::string_view email,
+                                         std::string_view password,
+                                         const Cancellation *cancellation = nullptr) const;
     void resend_registration(const PendingRegistration& pending,
                              const Cancellation* cancellation = nullptr) const;
     Account login(std::string_view username, std::string_view password,
@@ -471,6 +475,10 @@ private:
     friend Client detail::make_test_client(detail::Config, detail::Transport,
         std::shared_ptr<detail::CredentialStorage>);
 #endif
+    RegistrationResult start_registration(std::optional<std::string_view> licence_key,
+                                          std::string_view username, std::string_view email,
+                                          std::string_view password,
+                                          const Cancellation *cancellation) const;
 
     std::shared_ptr<detail::ClientState> state_;
 };

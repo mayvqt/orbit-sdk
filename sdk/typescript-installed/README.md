@@ -76,7 +76,11 @@ The client also provides `login`, `account`, `ownedLicences`, `claimLicence`,
 `activateAccount`, registration and resend, email-change and password-recovery
 requests, and `logoutAccount`. Customer sessions and pending registration
 credentials stay in memory and are cleared when their handles or the client
-close. `OwnedLicence.concurrentSessionLimit` is separate from its device limit.
+close. When the application allows customer sign-up, call
+`register(null, username, email, password)` to register without a licence key;
+any sign-up licence the application grants appears in `ownedLicences` after
+sign-in. `OwnedLicence.concurrentSessionLimit` is separate from its device
+limit.
 
 For a policy reset that requires proof of the prior credential, pass
 `previousCredential` to `activate` or `activateAccount`. The SDK stores only its

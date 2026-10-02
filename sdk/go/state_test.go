@@ -677,3 +677,21 @@ func TestConcurrentStorageInvalidationPreventsGrantWrite(t *testing.T) {
 	}
 	assertLocalContext(t, client, "")
 }
+
+func TestRegisterOmitsAbsentLicenceKey(t *testing.T) {
+	for _, key := range []string{"", "synthetic-key"} {
+		transport := testTransport(t, func(r *http.Request) (*http.Response, error) {
+			var input map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			if value, ok := input["licence_key"]; ok != (key != "") || (ok && value != key) || input["username"] != "alice" {
+				t.Fatalf("registration body = %v", input)
+			}
+			return testResponse(r, 202, `{"accepted":true,"resend_credential":"`+strings.Repeat("s", 43)+`","expires_at":"2099-01-01T00:00:00Z"}`), nil
+		})
+		client := testClient(t, &MemoryStorage{}, transport)
+		pending, err := client.Register(context.Background(), Registration{LicenceKey: key, Username: "alice", Email: "alice@example.test", Password: "synthetic password"})
+		if err != nil || !pending.Accepted {
+			t.Fatalf("Register(%q) = %v, %v", key, pending, err)
+		}
+	}
+}

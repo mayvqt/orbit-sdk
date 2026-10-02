@@ -1192,13 +1192,13 @@ export class Client extends EventEmitter {
   }
 
   async register(licenceKey, username, email, password, { signal } = {}) {
-    if (!validInput(licenceKey, 256, false) || !validInput(username, 128, false) ||
+    if ((licenceKey !== null && !validInput(licenceKey, 256, false)) || !validInput(username, 128, false) ||
         !validInput(email, 254, false) || !validInput(password, 256, false) || password.length < 8 ||
         !/^[a-z0-9_]{3,32}$/.test(username)) throw fail(ErrorKind.CONFIGURATION, "invalid_request");
     return this.#run(signal, async (combined) => {
       const generation = this.#generation;
       try {
-        const bytes = await this.#transport.post(`${CLIENT_PREFIX}registrations`, this.#scopeBody({ licence_key: licenceKey, username, email, password }), false, combined);
+        const bytes = await this.#transport.post(`${CLIENT_PREFIX}registrations`, this.#scopeBody({ ...(licenceKey === null ? {} : { licence_key: licenceKey }), username, email, password }), false, combined);
         const reply = checkFields(uniqueJson(bytes ?? Buffer.alloc(0)), {
           accepted: (v) => typeof v === "boolean", expires_at: isString, resend_credential: isString,
         });

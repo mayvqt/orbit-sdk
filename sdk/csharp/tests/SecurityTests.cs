@@ -62,6 +62,7 @@ internal static class SecurityTests
             ("cancellation stops transient retries", CancelRetryAsync),
             ("denied unknown and malformed errors never retry", NonRetryableErrorsAsync),
             ("non-idempotent account operations never retry", NonIdempotentOperationsAsync),
+            ("keyless registration omits the licence key", KeylessRegistrationAsync),
             ("only specified transient errors allow offline access", OfflineErrorClassificationAsync),
             ("malformed JSON fails closed", MalformedJsonAsync),
             ("malformed JOSE fails closed", MalformedJoseAsync),
@@ -1217,6 +1218,35 @@ internal static class SecurityTests
                 new Dictionary<string, object?> { ["idempotency_key"] = "operation_123456" }, true, cancellationToken));
             Require(server.RequestCount == 1);
         }
+    }
+
+    private static async Task KeylessRegistrationAsync(CancellationToken cancellationToken)
+    {
+        foreach (var key in new[] { null, "synthetic-key" })
+        {
+            string? sent = null;
+            var hasKey = false;
+            await using var server = new LoopbackServer((request, _) =>
+            {
+                using var body = JsonDocument.Parse(request.Body);
+                hasKey = body.RootElement.TryGetProperty("licence_key", out var value);
+                if (hasKey) sent = value.GetString();
+                return Task.FromResult(new FixtureReply(202, JsonSerializer.Serialize(new
+                {
+                    accepted = true, expires_at = "2030-01-01T00:00:00Z", resend_credential = SessionToken
+                })));
+            });
+            using var transport = Transport.LocalLoopback(server.Origin);
+            var client = Client(transport);
+            var registration = key == null
+                ? new Registration("alice", "alice@example.test", "synthetic password")
+                : new Registration(key, "alice", "alice@example.test", "synthetic password");
+            _ = await client.RegisterAsync(registration, cancellationToken);
+            Require(hasKey == (key != null) && sent == key);
+        }
+        using var unused = Transport.LocalLoopback("http://127.0.0.1:9");
+        await ExpectAsync(OrbitError.Configuration, () => Client(unused).RegisterAsync(
+            new Registration("", "alice", "alice@example.test", "synthetic password"), cancellationToken));
     }
 
     private static async Task NonIdempotentOperationsAsync(CancellationToken cancellationToken)

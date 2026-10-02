@@ -1954,16 +1954,17 @@ void ClientState::accepted(const Json::Value& value) {
 }
 
 std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> ClientState::register_customer(
-    std::string_view licence_key, std::string_view username, std::string_view email,
+    std::optional<std::string_view> licence_key, std::string_view username, std::string_view email,
     std::string_view password, const std::atomic_bool& cancelled) {
     ClientOperation call(*this);
-    if (licence_key.empty() || licence_key.size() > 256 || username.size() > 128 ||
-        email.size() > 254 || password.size() > 256 || !valid_utf8(licence_key) ||
+    if ((licence_key && (licence_key->empty() || licence_key->size() > 256 ||
+                         !valid_utf8(*licence_key))) ||
+        username.size() > 128 || email.size() > 254 || password.size() > 256 ||
         !valid_utf8(username) || !valid_utf8(email) || utf8_characters(password) < 8) {
         raise(ErrorKind::configuration, "configuration");
     }
     Json::Value input(Json::objectValue);
-    input["licence_key"] = std::string(licence_key);
+    if (licence_key) input["licence_key"] = std::string(*licence_key);
     input["username"] = std::string(username);
     input["email"] = std::string(email);
     input["password"] = std::string(password);
@@ -2768,9 +2769,9 @@ void Client::logout() const { require_state(state_).local_logout(); }
 
 void Client::close() const { require_state(state_).close(); }
 
-RegistrationResult Client::register_customer(
-    std::string_view licence_key, std::string_view username, std::string_view email,
-    std::string_view password, const Cancellation* cancellation) const {
+RegistrationResult Client::start_registration(
+    std::optional<std::string_view> licence_key, std::string_view username,
+    std::string_view email, std::string_view password, const Cancellation* cancellation) const {
     std::atomic_bool inactive{false};
     auto result = require_state(state_).register_customer(licence_key, username, email, password,
                                                           detail::cancellation_flag(cancellation, inactive));
@@ -2780,6 +2781,18 @@ RegistrationResult Client::register_customer(
         detail::text(detail::required(result.first, "expires_at"))));
     output.pending = PendingRegistration(state_, std::move(result.second));
     return output;
+}
+
+RegistrationResult Client::register_customer(
+    std::string_view licence_key, std::string_view username, std::string_view email,
+    std::string_view password, const Cancellation* cancellation) const {
+    return start_registration(licence_key, username, email, password, cancellation);
+}
+
+RegistrationResult Client::register_customer(
+    std::string_view username, std::string_view email, std::string_view password,
+    const Cancellation* cancellation) const {
+    return start_registration(std::nullopt, username, email, password, cancellation);
 }
 
 void Client::resend_registration(const PendingRegistration& pending,

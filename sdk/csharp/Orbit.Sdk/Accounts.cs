@@ -39,9 +39,15 @@ public sealed class CustomerSessionProof
 }
 
 /// <summary>Request input only. The client never retains passwords or raw licence keys.</summary>
-public sealed class Registration(string licenceKey, string username, string email, string password)
+/// <remarks>A null licence key requests customer sign-up without a key, when the application allows it.</remarks>
+public sealed class Registration(string? licenceKey, string username, string email, string password)
 {
-    internal string LicenceKey { get; } = licenceKey;
+    /// <summary>Customer sign-up without a licence key.</summary>
+    public Registration(string username, string email, string password) : this(null, username, email, password)
+    {
+    }
+
+    internal string? LicenceKey { get; } = licenceKey;
     internal string Username { get; } = username;
     internal string Email { get; } = email;
     internal string Password { get; } = password;
@@ -223,11 +229,11 @@ public sealed partial class OrbitClient
     public async Task<RegistrationResult> RegisterAsync(Registration registration, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(registration);
-        if (registration.LicenceKey is not { Length: >= 1 and <= 256 } || registration.Username is not { Length: <= 128 } ||
+        if (registration.LicenceKey is { Length: < 1 or > 256 } || registration.Username is not { Length: <= 128 } ||
             registration.Email is not { Length: <= 254 } || registration.Password is not { Length: <= 256 } ||
             registration.Password.EnumerateRunes().Count() < 8) throw new OrbitException(OrbitError.Configuration);
         var body = ScopeBody();
-        body["licence_key"] = registration.LicenceKey;
+        if (registration.LicenceKey != null) body["licence_key"] = registration.LicenceKey;
         body["username"] = registration.Username;
         body["email"] = registration.Email;
         body["password"] = registration.Password;

@@ -143,7 +143,7 @@ public:
     void deactivate(std::string_view idempotency_key, const std::atomic_bool& cancelled);
     void local_logout();
     std::pair<Json::Value, std::shared_ptr<PendingRegistrationState>> register_customer(
-        std::string_view licence_key, std::string_view username, std::string_view email,
+        std::optional<std::string_view> licence_key, std::string_view username, std::string_view email,
         std::string_view password, const std::atomic_bool& cancelled);
     void resend_registration(const PendingRegistrationState& pending,
                              const std::atomic_bool& cancelled);

@@ -194,7 +194,8 @@ export declare class Client {
   claimLicence(licenceKey: string, options?: ActivationOptions): Promise<OwnedLicence>;
   requestEmailChange(password: string, email: string, options?: OperationOptions): Promise<void>;
   requestPasswordRecovery(email: string, options?: OperationOptions): Promise<void>;
-  register(licenceKey: string, username: string, email: string, password: string, options?: OperationOptions): Promise<RegistrationResult>;
+  /** Pass `null` as the licence key for customer sign-up without one, when the application allows it. */
+  register(licenceKey: string | null, username: string, email: string, password: string, options?: OperationOptions): Promise<RegistrationResult>;
   resendRegistration(pending: PendingRegistration, options?: OperationOptions): Promise<void>;
   logoutAccount(options?: OperationOptions): Promise<void>;
   close(): Promise<void>;

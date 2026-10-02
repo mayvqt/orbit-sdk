@@ -169,7 +169,7 @@ func (c *console) command(ctx context.Context, command string) error {
 		}
 		fmt.Printf("Claimed licence %s. Use select to activate it.\n", licence.ID)
 	case "register":
-		key, err := c.prompt("Licence key (paste locally): ", false)
+		key, err := c.prompt("Licence key (paste locally, or leave empty to sign up without one): ", false)
 		if err != nil {
 			return err
 		}

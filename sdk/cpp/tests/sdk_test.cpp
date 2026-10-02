@@ -583,6 +583,7 @@ struct ApiFixture {
     std::atomic_bool app_version_denied{false};
     Json::Value update_available;
     std::vector<std::string> app_versions;
+    std::vector<std::string> registration_bodies;
 
     explicit ApiFixture(Json::Value vectors) : corpus(std::move(vectors)) {}
 
@@ -776,6 +777,10 @@ struct ApiFixture {
             }
             if (route == "/api/client/v1/registrations") {
                 if (registration_gate) registration_gate->block();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    registration_bodies.emplace_back(body);
+                }
                 Json::Value value(Json::objectValue);
                 value["accepted"] = true;
                 value["resend_credential"] = std::string(43, 'r');
@@ -1939,6 +1944,18 @@ void test_activation_accounts_and_proofs(const Corpus& corpus) {
     require(registration.accepted && registration.expires_at.time_since_epoch().count() > 0 && registration.pending,
             "registration metadata/proof missing");
     client.resend_registration(registration.pending);
+    auto signup = client.register_customer("signup", "signup@example.test", "correct horse battery");
+    require(signup.accepted && signup.pending, "keyless registration proof missing");
+    {
+        std::lock_guard<std::mutex> lock(fixture.mutex);
+        require(fixture.registration_bodies.size() >= 2 &&
+                    parse_json(fixture.registration_bodies[fixture.registration_bodies.size() - 2])
+                            ["licence_key"].asString() == "license-key" &&
+                    !parse_json(fixture.registration_bodies.back()).isMember("licence_key"),
+                "registration must send the licence key only when one is given");
+    }
+    expect_error([&] { (void)client.register_customer("", "bob", "bob@example.test", "correct horse battery"); },
+                 ErrorKind::configuration);
     auto other_client = client_for(fixture);
     expect_error([&] { other_client.resend_registration(registration.pending); }, ErrorKind::configuration);
 

@@ -78,6 +78,10 @@ environment from the key IDs when you omit it, and report invalid key sets as
 Enable Account or Both authentication for the application. `register_customer`
 returns a `RegistrationResult` whose `pending` handle is used with
 `resend_registration`; the customer confirms the email link before `login`.
+When the application allows customer sign-up, call
+`register_customer(username, email, password)` without a licence key; any
+sign-up licence the application grants appears in `owned_licences` after
+sign-in.
 `owned_licences(cursor)` returns one bounded page; pass its `next_cursor` to
 fetch the next. `claim_licence` adds a key to the signed-in account without
 activating it. Recovery and email-change requests return generic acceptance.

@@ -69,8 +69,10 @@ revoking either on the server.
 ## Customer accounts
 
 Use `Register` and the optional `ResendRegistration`, then complete the email
-link before `Login`. Passwords need at least eight characters and whitespace is
-preserved. `ClaimLicence` adds a key to the signed-in account without
+link before `Login`. Leave `Registration.LicenceKey` empty for customer sign-up
+without a key when the application allows it; any sign-up licence the
+application grants appears in `OwnedLicences` after sign-in. Passwords need at
+least eight characters and whitespace is preserved. `ClaimLicence` adds a key to the signed-in account without
 activating it. `OwnedLicences` returns one bounded page; pass its `NextCursor`
 to the next call. `RequestPasswordRecovery` and `RequestEmailChange` return
 generic acceptance. `LogoutAccount` also requests remote session revocation.
