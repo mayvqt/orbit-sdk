@@ -8,6 +8,7 @@ mod credentials;
 mod files;
 mod licences;
 mod output;
+mod policies;
 mod releases;
 #[cfg(test)]
 mod tests;

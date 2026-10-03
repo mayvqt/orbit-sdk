@@ -44,7 +44,7 @@ pub enum Command {
     /// Store, inspect or remove the management token
     #[command(subcommand)]
     Credentials(Credentials),
-    /// Inspect licence policies
+    /// List and create licence policy versions
     #[command(subcommand)]
     Policies(Policies),
     /// Manage licences
@@ -69,6 +69,56 @@ pub enum Credentials {
 pub enum Policies {
     /// List the latest policy versions
     List,
+    /// Create a policy, or a new version of one with the same name
+    Create(Box<PolicyTerms>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Expiry {
+    Perpetual,
+    Fixed,
+    FirstActivation,
+}
+
+#[derive(Args)]
+pub struct PolicyTerms {
+    /// Start from this policy version's terms; other flags change them
+    #[arg(long, value_name = "POLICY_ID")]
+    pub from: Option<String>,
+    /// Policy name; an existing name creates that policy's next version
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long, value_enum)]
+    pub expiry: Option<Expiry>,
+    /// Licence lifetime from first activation, such as 30d
+    #[arg(long, value_name = "DURATION")]
+    pub duration: Option<String>,
+    /// Fixed expiry time (RFC 3339)
+    #[arg(long, value_name = "TIME")]
+    pub expires_at: Option<String>,
+    /// Devices each licence may activate
+    #[arg(long, value_name = "N")]
+    pub device_limit: Option<i32>,
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+    pub hwid_locked: Option<bool>,
+    /// Allow offline use between check-ins
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+    pub offline: Option<bool>,
+    /// How long a device may stay offline, such as 12h
+    #[arg(long, value_name = "DURATION")]
+    pub offline_allowance: Option<String>,
+    /// Longest offline file validity, such as 180d, or 0 for no offline files
+    #[arg(long, value_name = "DURATION")]
+    pub offline_file_allowance: Option<String>,
+    /// Concurrent floating sessions per licence, or 0 for no limit
+    #[arg(long, value_name = "N")]
+    pub concurrent_sessions: Option<i32>,
+    /// Entitlement to include, as NAME or NAME=false to include it turned off
+    #[arg(long, value_name = "NAME[=BOOL]")]
+    pub entitlement: Vec<String>,
+    /// Entitlement to leave out of the copied terms
+    #[arg(long, value_name = "NAME")]
+    pub remove_entitlement: Vec<String>,
 }
 
 #[derive(Args)]
@@ -108,6 +158,19 @@ pub enum Licences {
     },
     /// Show one licence
     Show { licence: String },
+    /// Move licences to another policy version after a preview
+    ChangePolicy {
+        /// Target policy version ID
+        #[arg(long, value_name = "POLICY_ID")]
+        policy: String,
+        #[command(flatten)]
+        reason: Reason,
+        /// Apply without the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        #[arg(required = true, value_name = "LICENCE_ID")]
+        licences: Vec<String>,
+    },
     /// Issue licences from a policy and print their keys once
     Issue {
         /// Policy version ID

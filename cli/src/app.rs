@@ -3,7 +3,7 @@
 use crate::{
     api::{self, Api, Response},
     args::{Cli, Command, Global},
-    config, credentials, licences, releases,
+    config, credentials, licences, policies, releases,
 };
 use clap::Parser;
 use serde_json::Value;
@@ -220,7 +220,7 @@ where
     };
     let result = match command {
         Command::Credentials(command) => credentials::run(&mut ctx, command),
-        Command::Policies(command) => licences::policies(&mut ctx, command),
+        Command::Policies(command) => policies::run(&mut ctx, command),
         Command::Licences(command) => licences::run(&mut ctx, command),
         Command::Releases(command) => releases::run(&mut ctx, command),
     };

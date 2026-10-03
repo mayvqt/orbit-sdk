@@ -1,10 +1,11 @@
-//! `orbit licences` and `orbit policies`.
+//! `orbit licences`.
 
 use crate::{
     app::{Ctx, Failure, Result},
-    args::{Licences, Policies, SearchStatus, SessionState},
+    args::{Licences, SearchStatus, SessionState},
     files,
     output::{fields, next_page, table},
+    policies,
 };
 use serde_json::{Map, Value, json};
 use std::io::Write;
@@ -33,22 +34,6 @@ const LICENCE_FIELDS: &[&str] = &[
     "created_at",
     "transfer_retry_at",
 ];
-
-pub fn policies(ctx: &mut Ctx, command: Policies) -> Result<()> {
-    match command {
-        Policies::List => {
-            let response = ctx.api()?.get(&["policies"], &[])?;
-            ctx.emit(&response, |out, value| {
-                let rows = value.as_array().cloned().unwrap_or_default();
-                table(
-                    out,
-                    &["id", "name", "version", "expiry_mode", "device_limit"],
-                    &rows,
-                )
-            })
-        }
-    }
-}
 
 fn licence(out: &mut dyn Write, value: &Value) -> std::io::Result<()> {
     fields(out, value, LICENCE_FIELDS)
@@ -111,6 +96,12 @@ pub fn run(ctx: &mut Ctx, command: Licences) -> Result<()> {
                 next_page(out, page)
             })
         }
+        Licences::ChangePolicy {
+            policy,
+            reason,
+            yes,
+            licences,
+        } => policies::change(ctx, &policy, &reason.reason, yes, licences),
         Licences::Show { licence: id } => {
             let response = ctx.api()?.get(&["licences", &id], &[])?;
             ctx.emit(&response, licence)
