@@ -135,6 +135,10 @@ struct Outcome {
 }
 
 fn invoke(env: &TestEnv, args: &[&str], stdin: &str) -> Outcome {
+    invoke_with(env, args, stdin, false)
+}
+
+fn invoke_with(env: &TestEnv, args: &[&str], stdin: &str, stdin_terminal: bool) -> Outcome {
     let mut input = stdin.as_bytes();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let status = run(
@@ -142,7 +146,7 @@ fn invoke(env: &TestEnv, args: &[&str], stdin: &str) -> Outcome {
         env,
         &mut Io {
             stdin: &mut input,
-            stdin_terminal: false,
+            stdin_terminal,
             out: &mut out,
             err: &mut err,
         },
@@ -797,6 +801,270 @@ fn api_errors_report_code_and_retry_key() {
         outcome.err
     );
     assert!(!outcome.err.contains(TOKEN));
+}
+
+const POLICY: &str = r#"{"id":"pol_1","name":"Playtest","version":1,"expiry_mode":"first_activation","duration_seconds":604800,"fixed_expires_at":null,"device_limit":2,"hwid_locked":true,"offline_allowed":true,"offline_seconds":3600,"offline_file_seconds":86400,"concurrent_session_limit":0,"usage_limits":{"exports":{"limit":10,"period":"day"}},"resource_limits":{},"entitlements":{"beta":true,"export":false},"created_at":"2026-01-01T00:00:00Z"}"#;
+
+#[test]
+fn policy_create_copies_a_version_and_applies_flags() {
+    let listing: &'static str = format!(r#"[{{"id":"pol_0"}},{POLICY}]"#).leak();
+    let created = r#"{"id":"pol_2","name":"Playtest","version":2,"concurrent_session_limit":1,"entitlements":{"export":true}}"#;
+    let server = Server::start(vec![(200, listing), (200, created)]);
+    let (env, dir) = TestEnv::api(&server);
+    let outcome = invoke(
+        &env,
+        &[
+            "policies",
+            "create",
+            "--from",
+            "pol_1",
+            "--concurrent-sessions",
+            "1",
+            "--offline",
+            "false",
+            "--offline-file-allowance",
+            "0",
+            "--entitlement",
+            "export",
+            "--entitlement",
+            "sync=false",
+            "--remove-entitlement",
+            "beta",
+        ],
+        "",
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let requests = server.finish();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_scoped(&requests[0], "GET", "/api/management/v1/policies");
+    assert_scoped(&requests[1], "POST", "/api/management/v1/policies");
+    assert_eq!(
+        requests[1].body,
+        json!({
+            "name": "Playtest",
+            "expiry_mode": "first_activation",
+            "duration_seconds": 604800,
+            "fixed_expires_at": null,
+            "device_limit": 2,
+            "hwid_locked": true,
+            "offline_allowed": false,
+            "offline_seconds": 0,
+            "offline_file_seconds": 0,
+            "concurrent_session_limit": 1,
+            "usage_limits": {"exports": {"limit": 10, "period": "day"}},
+            "resource_limits": {},
+            "entitlements": {"export": true, "sync": false},
+        })
+    );
+    assert!(
+        outcome.out.contains("version                   2"),
+        "{}",
+        outcome.out
+    );
+
+    // Changing the expiry mode drops the copied lifetime.
+    let listing: &'static str = format!("[{POLICY}]").leak();
+    let server = Server::start(vec![(200, listing), (200, created)]);
+    let (env, dir) = TestEnv::api(&server);
+    let args = [
+        "policies",
+        "create",
+        "--from",
+        "pol_1",
+        "--expiry",
+        "perpetual",
+    ];
+    assert_eq!(invoke(&env, &args, "").status, 0);
+    let requests = server.finish();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(requests[1].body["expiry_mode"], "perpetual");
+    assert_eq!(requests[1].body["duration_seconds"], Value::Null);
+    assert_eq!(requests[1].body["offline_allowed"], true);
+
+    // A source outside the listing fails before anything is created.
+    let (outcome, request) = exchange(&["policies", "create", "--from", "pol_9"], 200, "[]");
+    assert_eq!(outcome.status, 1);
+    assert!(outcome.err.contains("`pol_9`"), "{}", outcome.err);
+    assert_eq!(request.method, "GET");
+}
+
+#[test]
+fn policy_create_without_a_source_needs_the_required_terms() {
+    let dir = temp_dir();
+    let outcome = invoke(
+        &TestEnv::new(&dir),
+        &["policies", "create", "--name", "Pro"],
+        "",
+    );
+    assert_eq!(outcome.status, 2);
+    assert!(
+        outcome
+            .err
+            .contains("--expiry, --device-limit, --hwid-locked"),
+        "{}",
+        outcome.err
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let (outcome, request) = exchange(
+        &[
+            "policies",
+            "create",
+            "--name",
+            "Pro",
+            "--expiry",
+            "fixed",
+            "--expires-at",
+            "2027-01-01T00:00:00Z",
+            "--device-limit",
+            "3",
+            "--hwid-locked",
+            "false",
+            "--offline",
+            "true",
+            "--offline-allowance",
+            "12h",
+            "--entitlement",
+            "export",
+        ],
+        200,
+        POLICY,
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert_scoped(&request, "POST", "/api/management/v1/policies");
+    assert_eq!(
+        request.body,
+        json!({
+            "name": "Pro",
+            "expiry_mode": "fixed",
+            "duration_seconds": null,
+            "fixed_expires_at": "2027-01-01T00:00:00Z",
+            "device_limit": 3,
+            "hwid_locked": false,
+            "offline_allowed": true,
+            "offline_seconds": 43200,
+            "offline_file_seconds": 0,
+            "concurrent_session_limit": 0,
+            "usage_limits": {},
+            "resource_limits": {},
+            "entitlements": {"export": true},
+        })
+    );
+}
+
+const CHANGE: &str = r#"{"policy_id":"pol_2","policy_name":"Playtest","policy_version":2,"items":[{"licence_id":"lic_1","revision":"rev_1","changed":true,"previous_policy_id":"pol_1","previous_policy_name":"Playtest","previous_policy_version":1,"previous_expires_at":null,"expires_at":null,"previous_duration_seconds":604800,"duration_seconds":604800,"previous_device_limit":2,"device_limit":2,"previous_hwid_locked":true,"hwid_locked":true,"previous_entitlements":{"beta":true},"entitlements":{},"previous_concurrent_session_limit":0,"concurrent_session_limit":1,"previous_offline_allowed":true,"offline_allowed":false},{"licence_id":"lic_2","revision":"rev_2","changed":false,"previous_policy_id":"pol_2","previous_policy_name":"Playtest","previous_policy_version":2}]}"#;
+
+#[test]
+fn change_policy_previews_then_applies_previewed_revisions() {
+    let server = Server::start(vec![(200, CHANGE), (200, CHANGE)]);
+    let (env, dir) = TestEnv::api(&server);
+    let args = [
+        "licences",
+        "change-policy",
+        "--policy",
+        "pol_2",
+        "--reason",
+        "Limit sessions",
+        "--yes",
+        "lic_1",
+        "lic_2",
+        "lic_1",
+    ];
+    let outcome = invoke(&env, &args, "");
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let requests = server.finish();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_scoped(
+        &requests[0],
+        "POST",
+        "/api/management/v1/licences/policy-changes/preview",
+    );
+    assert_eq!(
+        requests[0].body,
+        json!({"licence_ids": ["lic_1", "lic_2"], "policy_id": "pol_2"})
+    );
+    assert_scoped(
+        &requests[1],
+        "POST",
+        "/api/management/v1/licences/policy-changes",
+    );
+    assert_eq!(
+        requests[1].body,
+        json!({
+            "licences": [{"id": "lic_1", "revision": "rev_1"}],
+            "policy_id": "pol_2",
+            "reason": "Limit sessions",
+        })
+    );
+    for expected in [
+        "lic_1: Playtest version 1 -> Playtest version 2",
+        "concurrent_session_limit  0 -> 1",
+        "entitlements              beta -> none",
+        "device_limit              2\n",
+        "lic_2: already on Playtest version 2",
+        "Moved 1 licence(s) to Playtest version 2.",
+    ] {
+        assert!(
+            outcome.out.contains(expected),
+            "{expected}\n{}",
+            outcome.out
+        );
+    }
+}
+
+#[test]
+fn change_policy_confirms_on_a_terminal_and_refuses_otherwise() {
+    let args = [
+        "licences",
+        "change-policy",
+        "--policy",
+        "pol_2",
+        "--reason",
+        "Limit sessions",
+        "lic_1",
+    ];
+    // Without a terminal the preview runs but nothing is applied.
+    let (outcome, request) = exchange(&args, 200, CHANGE);
+    assert_eq!(outcome.status, 2);
+    assert!(outcome.err.contains("--yes"), "{}", outcome.err);
+    assert!(request.path.ends_with("/preview"));
+
+    for (answer, status, requests) in [("n\n", 1, 1), ("y\n", 0, 2)] {
+        let server = Server::start(vec![(200, CHANGE); requests]);
+        let (env, dir) = TestEnv::api(&server);
+        let outcome = invoke_with(&env, &args, answer, true);
+        assert_eq!(outcome.status, status, "{}", outcome.err);
+        assert!(
+            outcome
+                .err
+                .contains("Move 1 licence(s) to Playtest version 2? [y/N]")
+        );
+        assert_eq!(server.finish().len(), requests);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn change_policy_sends_batches_of_one_hundred() {
+    let ids: Vec<String> = (0..101).map(|n| format!("lic_{n}")).collect();
+    let empty = r#"{"policy_id":"pol_2","policy_name":"Playtest","policy_version":2,"items":[]}"#;
+    let server = Server::start(vec![(200, empty), (200, empty)]);
+    let (env, dir) = TestEnv::api(&server);
+    let mut args = vec!["--json", "licences", "change-policy", "--policy", "pol_2"];
+    args.extend(["--reason", "Limit sessions", "--yes"]);
+    args.extend(ids.iter().map(String::as_str));
+    let outcome = invoke(&env, &args, "");
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let requests = server.finish();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body["licence_ids"].as_array().unwrap().len(),
+        100
+    );
+    assert_eq!(requests[1].body["licence_ids"], json!(["lic_100"]));
+    let output: Value = serde_json::from_str(&outcome.out).unwrap();
+    assert_eq!(output["policy_version"], 2);
 }
 
 #[test]

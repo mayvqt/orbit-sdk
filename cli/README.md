@@ -108,6 +108,50 @@ orbit licences offline-file 'LICENCE_ID' --request request.json \
 Device resets use the licence's transfer allowance. `offline-file` signs the
 request file your application exported and writes the result to a new file.
 
+## Policies
+
+`policies create` adds a policy. Using an existing policy's name adds that
+policy's next version; new sign-ups get the latest version, and licences
+already issued keep theirs until you move them.
+
+```sh
+orbit policies create --name 'Pro' --expiry first-activation --duration 365d \
+  --device-limit 3 --hwid-locked true --entitlement export
+orbit policies create --from 'POLICY_ID' --concurrent-sessions 1
+```
+
+Without `--from`, pass `--name`, `--expiry` (`perpetual`, `fixed` or
+`first-activation`), `--device-limit` and `--hwid-locked`. `first-activation`
+takes `--duration`; `fixed` takes `--expires-at` as an RFC 3339 time.
+
+`--from` copies a version's terms, including its usage and resource limits,
+and applies only the flags you pass. It looks the version up among the
+environment's 100 most recent policy versions. Other flags:
+
+- `--offline true|false`, `--offline-allowance 12h` and
+  `--offline-file-allowance 180d` (or `0` for no offline files);
+- `--concurrent-sessions N` limits floating sessions per licence (`0` for no
+  limit). A policy with a session limit cannot allow offline use, so add
+  `--offline false --offline-file-allowance 0` when you start from an offline
+  policy;
+- `--entitlement NAME` adds an entitlement turned on (`NAME=false` adds it
+  turned off), and `--remove-entitlement NAME` leaves a copied one out.
+
+Move licences to another policy version with `licences change-policy`:
+
+```sh
+orbit licences change-policy --policy 'POLICY_ID' \
+  --reason 'Limit to one session' 'LICENCE_ID' 'LICENCE_ID'
+```
+
+`change-policy` first shows each licence's current and new terms: policy
+version, expiry, device limit, binding, entitlements, concurrent sessions and
+offline use. It then asks for confirmation; pass `--yes` to skip the prompt.
+Without a terminal it only shows the preview unless you pass `--yes`. Licences
+already on the target version are left unchanged. If a licence changes between
+the preview and the confirmation, Orbit rejects the move with
+`policy_change_preview_stale`; run the command again to see the current terms.
+
 ## Releases
 
 Upload each file to your own host first, then register it against a draft.
