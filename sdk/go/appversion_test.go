@@ -158,3 +158,27 @@ func TestAppVersionIsSentAndUnsupportedVersionDeniesWithoutFallback(t *testing.T
 		t.Fatalf("reopened access: %v", err)
 	}
 }
+
+func TestCredentialRetentionVectors(t *testing.T) {
+	data, err := os.ReadFile("../../contracts/sdk/credential-retention.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Denials []struct {
+			Code              string `json:"code"`
+			DiscardCredential bool   `json:"discard_credential"`
+		} `json:"denials"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range vectors.Denials {
+		if discardsCredential(&Error{Kind: Denied, Code: item.Code}) != item.DiscardCredential {
+			t.Errorf("%q: discard=%v", item.Code, !item.DiscardCredential)
+		}
+	}
+	if discardsCredential(ErrTransient) {
+		t.Error("transient failure discarded the credential")
+	}
+}

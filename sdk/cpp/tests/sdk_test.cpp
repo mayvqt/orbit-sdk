@@ -1301,6 +1301,45 @@ std::string offline_file(const AppKey &app_key, std::string_view installation,
     return sign_test_token(claims, "orbit-offline+jwt", "offline-test-fixture");
 }
 
+std::size_t test_credential_retention(const Corpus &corpus) {
+    std::ifstream input(ORBIT_CREDENTIAL_RETENTION_VECTORS_PATH, std::ios::binary);
+    require(input.good(), "could not open shared credential-retention corpus");
+    const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto vectors = parse_json(bytes, 64 * 1024);
+    std::size_t count = 0;
+    for (const auto &item : vectors["denials"]) {
+        require(discards_credential(ErrorKind::denied, text(item, "code")) ==
+                    item["discard_credential"].asBool(),
+                "credential-retention vector mismatch: " + text(item, "code"));
+        ++count;
+    }
+    require(!discards_credential(ErrorKind::transient, "licence_revoked"),
+            "transient failure discarded the credential");
+
+    ApiFixture fixture(corpus.value);
+    auto base = fixture.handler();
+    std::string denial;
+    auto handler = [&](std::string_view method, std::string_view url, std::string_view bearer,
+                       std::string_view body, const CancellationView &cancelled) -> HttpResponse {
+        if (!denial.empty() && url.find("/validate") != std::string_view::npos)
+            return {403, R"({"error":{"code":")" + denial +
+                             R"(","message":"Denied","request_id":"denial_1"}})", {}};
+        return base(method, url, bearer, body, cancelled);
+    };
+    auto client =
+        make_test_client(config(), Transport("https://example.test", handler), fixture.storage);
+    (void)client.activate("synthetic-key");
+    denial = "licence_suspended";
+    expect_error([&] { (void)client.refresh(); }, ErrorKind::denied);
+    require(fixture.storage->load().second.has_value() &&
+                client.snapshot().access != Access::online,
+            "suspension must keep the credential and drop cached access");
+    denial = "licence_revoked";
+    expect_error([&] { (void)client.refresh(); }, ErrorKind::denied);
+    require(!fixture.storage->load().second, "revocation must discard the credential");
+    return count;
+}
+
 void test_online_meters_and_updates(const Corpus &corpus) {
     ApiFixture fixture(corpus.value);
     auto base = fixture.handler();
@@ -3481,6 +3520,7 @@ int main(int argc, char** argv) {
         test_installed_offline_file_lifecycle(corpus);
         test_installed_floating_session_lifecycle(corpus);
         test_online_meters_and_updates(corpus);
+        (void)test_credential_retention(corpus);
         test_floating_session_failures_and_generation_fences(corpus);
         test_offline_transition_floors(corpus);
         test_offline_identity_change_clears_file(corpus);

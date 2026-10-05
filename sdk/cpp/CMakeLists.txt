@@ -123,6 +123,7 @@ if(BUILD_TESTING AND CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_compile_definitions(orbit_sdk_tests PRIVATE
         ORBIT_APP_KEY_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-keys.json"
         ORBIT_APP_VERSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-versions.json"
+        ORBIT_CREDENTIAL_RETENTION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/credential-retention.json"
         ORBIT_GRANT_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/grants.json"
         ORBIT_OFFLINE_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/offline-files.json"
         ORBIT_SESSION_VECTORS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/session-grants.json"

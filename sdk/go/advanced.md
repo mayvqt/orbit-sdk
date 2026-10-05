@@ -29,7 +29,10 @@ protected DACL.
 
 Corrupt or missing established state is never silently replaced; preserve the
 directory after a storage error. A malformed reply or TLS failure keeps the
-saved activation for a later retry, while an authoritative denial clears it.
+saved activation for a later retry. A denial that only withholds access, such
+as a suspended or expired licence, also keeps it, so access resumes after the
+licence is restored; a revoked licence, invalid credential or device mismatch
+clears it.
 Elapsed time uses a clock that counts sleep (`mach_continuous_time` on macOS),
 and a clock rollback or inconsistent saved clock evidence requires online
 validation. Local storage cannot detect a restored disk or VM snapshot, and a

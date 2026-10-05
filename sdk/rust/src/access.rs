@@ -1819,14 +1819,24 @@ impl Client {
                     state.transient = false;
                     state.retry_deadline = Some(Instant::now() + transient_retry_delay());
                     state.last_failure = Some(error.clone());
-                    if definitive {
+                    let discard = error.discards_credential();
+                    if discard {
                         state.credential = None;
                         state.account = None;
                     }
-                    state.storage_version = storage.clear_cached(definitive, definitive)?;
+                    state.storage_version = storage.clear_cached(definitive, discard)?;
                 } else {
+                    let kept = state.credential.take().filter(|_| {
+                        matches!(error, Error::Denied { .. }) && !error.discards_credential()
+                    });
                     clear(&mut state);
                     state.storage_version = self.0.storage.invalidate()?;
+                    if let Some(credential) = kept {
+                        self.0
+                            .storage
+                            .save(state.storage_version, credential.clone())?;
+                        state.credential = Some(credential);
+                    }
                 }
                 Err(error)
             }
@@ -2897,10 +2907,15 @@ mod tests {
                 code: "licence_revoked".into(),
                 request_id: None,
             },
+            Error::Denied {
+                code: "licence_suspended".into(),
+                request_id: None,
+            },
             Error::InvalidResponse,
             Error::TransportSecurity,
         ] {
             let client = client(true);
+            let discard = !matches!(error, Error::Denied { .. }) || error.discards_credential();
             assert!(
                 client
                     .accept(
@@ -2913,7 +2928,10 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(client.snapshot().unwrap().access, Access::Denied);
+            let snapshot = client.snapshot().unwrap();
+            assert!(!snapshot.has_feature("export"));
+            assert_eq!(snapshot.access == Access::Denied, discard);
+            assert_eq!(client.0.storage.load().unwrap().1.is_none(), discard);
             assert!(matches!(
                 client
                     .accept(

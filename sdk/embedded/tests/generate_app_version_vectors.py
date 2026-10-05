@@ -1,15 +1,20 @@
-"""Generate allocation-free C fixtures from the shared app-version corpus."""
+"""Generate allocation-free C fixtures from the shared app-version and
+credential-retention corpora."""
 import argparse
 import json
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--source", type=Path, required=True)
+parser.add_argument("--retention", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
 corpus = json.loads(args.source.read_text(encoding="utf-8"))
 if corpus.get("format_version") != 1:
     raise SystemExit("unsupported app-version vector format")
+retention = json.loads(args.retention.read_text(encoding="utf-8"))
+if retention.get("format_version") != 1:
+    raise SystemExit("unsupported credential-retention vector format")
 
 
 def c_bytes(value):
@@ -22,7 +27,7 @@ def c_bytes(value):
 
 
 lines = [
-    "/* Generated from contracts/sdk/app-versions.json; do not edit. */",
+    "/* Generated from contracts/sdk/app-versions.json and credential-retention.json; do not edit. */",
     "#ifndef ORBIT_GENERATED_APP_VERSION_VECTORS_H",
     "#define ORBIT_GENERATED_APP_VERSION_VECTORS_H",
     "#include <stdint.h>",
@@ -64,6 +69,14 @@ for case in corpus["update_available"]:
     lines.append(
         f"  {{{json.dumps(case['name'])}, {value}, {version}, {1 if case['valid'] else 0}u}},"
     )
+lines.append("};")
+lines.append("typedef struct generated_retention_vector {")
+lines.append("  const char *code;")
+lines.append("  uint8_t discard;")
+lines.append("} generated_retention_vector_t;")
+lines.append("static const generated_retention_vector_t generated_retention_vectors[] = {")
+for case in retention["denials"]:
+    lines.append(f"  {{{json.dumps(case['code'])}, {1 if case['discard_credential'] else 0}u}},")
 lines.extend([
     "};",
     "#define GENERATED_COUNT(a) (sizeof(a) / sizeof((a)[0]))",

@@ -64,6 +64,11 @@ evidence and releases the local lock; it preserves the server activation.
 local access without revoking a customer session, while `logout_account()`
 also requests server-side session revocation.
 
+A denial that only withholds access, such as a suspended or expired licence,
+keeps the saved activation, so access resumes at the next validation after the
+licence is restored. A revoked licence, invalid credential or device mismatch
+clears it, and the device must activate again.
+
 ## Customer accounts
 
 Account sessions remain in memory. A customer can register, confirm their

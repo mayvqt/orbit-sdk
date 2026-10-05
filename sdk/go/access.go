@@ -199,6 +199,21 @@ func (c *Client) invalidateLocked() error {
 	c.wakeInstalled()
 	return nil
 }
+func (c *Client) invalidateKeepingCredentialLocked(credential *StoredCredential) error {
+	var version uint64
+	var err error
+	if c.installed != nil {
+		version, err = c.installed.invalidateKeepingCredential()
+	} else if version, err = c.storage.Invalidate(); err == nil && credential != nil {
+		err = c.storage.Save(version, *credential)
+	}
+	if err != nil {
+		return ErrStorage
+	}
+	c.state.storageVersion = version
+	c.wakeInstalled()
+	return nil
+}
 func (c *Client) invalidateLockedPreservingPending() error {
 	if c.installed == nil {
 		return c.invalidateLocked()
@@ -987,6 +1002,17 @@ func (c *Client) accept(ctx, budget context.Context, response json.RawMessage, r
 		}
 		c.state.failure = err
 		c.state.retryAt = time.Now().Add(time.Duration(retryDelaySeconds()) * time.Second)
+		return Snapshot{}, err
+	}
+	if errors.Is(err, ErrDenied) && !discardsCredential(err) {
+		// A suspension, expiry or similar denial only withholds access; keep the
+		// credential so the device resumes when access returns.
+		credential, account := c.state.credential, c.state.account
+		clearState(&c.state)
+		if storageErr := c.invalidateKeepingCredentialLocked(credential); storageErr != nil {
+			return Snapshot{}, storageErr
+		}
+		c.state.credential, c.state.account = credential, account
 		return Snapshot{}, err
 	}
 	clearState(&c.state)

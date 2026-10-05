@@ -70,6 +70,11 @@ with a caller-managed SHA-256 hex fingerprint and a `custom:` provider. The
 server still enforces hardware-locked licence policy, and identity
 unavailability never substitutes a random fingerprint.
 
+A denial that only withholds access, such as a suspended or expired licence,
+keeps the saved activation, so access resumes at the next validation after the
+licence is restored. A revoked licence, invalid credential or device mismatch
+clears it, and the device must activate again.
+
 ## Accounts
 
 The client also provides `login`, `account`, `ownedLicences`, `claimLicence`,

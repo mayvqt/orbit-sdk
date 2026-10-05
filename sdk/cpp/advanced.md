@@ -73,6 +73,11 @@ or caller input. Metering failures are `orbit::OperationError`, which adds
 environment from the key IDs when you omit it, and report invalid key sets as
 `ErrorKind::configuration`.
 
+A denial that only withholds access, such as a suspended or expired licence,
+keeps the saved activation, so access resumes at the next validation after the
+licence is restored. A revoked licence, invalid credential or device mismatch
+clears it, and the device must activate again.
+
 ## Customer accounts
 
 Enable Account or Both authentication for the application. `register_customer`

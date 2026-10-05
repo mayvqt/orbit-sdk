@@ -713,6 +713,25 @@ public sealed partial class OrbitClient : IDisposable
                     catch (OverflowException) { nextRetryElapsedTicks = long.MaxValue; }
                     installed?.DropCache();
                 }
+                else if (error.Error == OrbitError.Denied && !error.DiscardsCredential && credential is { } kept)
+                {
+                    // A suspension, expiry or similar denial only withholds access; keep
+                    // the credential so the device resumes when access returns.
+                    Clear(keepAccount: true);
+                    try
+                    {
+                        if (installed != null)
+                            storageVersion = installed.Invalidate(clearPending: true, clearCredential: false);
+                        else
+                        {
+                            storageVersion = storage.Invalidate();
+                            storage.Save(storageVersion, kept);
+                        }
+                        lifetime?.Signal();
+                    }
+                    catch (Exception) { Clear(); throw new OrbitException(OrbitError.Storage); }
+                    credential = kept;
+                }
                 else if (error.Error != OrbitError.Cancelled)
                 {
                     Clear();

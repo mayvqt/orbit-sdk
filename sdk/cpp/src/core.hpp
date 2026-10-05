@@ -268,7 +268,7 @@ private:
     void advance_generation_locked();
     void clear_access_locked();
     void clear_all_locked();
-    void invalidate_locked(bool clear_pending = true);
+    void invalidate_locked(bool clear_pending = true, const std::optional<Credential>& keep = std::nullopt);
     std::uint64_t request_generation_locked();
     Credential stored_credential(const Json::Value& value) const;
     Json::Value credential_json(const Credential& value) const;

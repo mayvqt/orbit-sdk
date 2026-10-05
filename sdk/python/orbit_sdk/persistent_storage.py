@@ -704,14 +704,15 @@ class InstallationStorage:
             self._commit(replace(self._state, generation=next_generation, credential=credential, access=None, pending_activation=pending, offline=_without_offline_file(self._state.offline)))
             return next_generation
 
-    def invalidate(self, *, preserve_pending: bool = False) -> int:
+    def invalidate(self, *, preserve_pending: bool = False, keep_credential: bool = False) -> int:
         with self._lock:
             self._check()
             if self._state.generation == MAX_GENERATION:
                 raise error(STORAGE, "storage_failed")
             generation = self._state.generation + 1
             pending = self._state.pending_activation if preserve_pending else None
-            self._commit(replace(self._state, generation=generation, credential=None, access=None, pending_activation=pending, offline=_without_offline_file(self._state.offline)))
+            credential = self._state.credential if keep_credential else None
+            self._commit(replace(self._state, generation=generation, credential=credential, access=None, pending_activation=pending, offline=_without_offline_file(self._state.offline)))
             return generation
 
     def save_offline(self, version: int, offline: OfflineState) -> int:

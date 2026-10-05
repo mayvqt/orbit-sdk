@@ -14,8 +14,10 @@ and any pending operation ID/input digest. It never contains a raw licence key,
 password or restored access grant. The pending identity is committed before the
 activation/deactivation request. Verified returned authority is committed before
 access is granted. A malformed or lost mutation response preserves its retry
-identity. Only a verified denial or an invalid signed reply clears the saved
-credential; a failed connection denies access and retries later. A failed
+identity. Only a verified revocation, invalid credential or device mismatch, or
+an invalid signed reply, clears the saved credential. A suspended or expired
+licence and a failed connection deny access but keep it, so access resumes
+when the licence is restored or the connection recovers. A failed
 durable write leaves access unavailable until the storage problem is resolved.
 
 Normal boot validates an existing credential online. The client never restores a

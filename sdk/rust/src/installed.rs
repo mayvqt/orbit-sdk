@@ -3096,6 +3096,21 @@ mod tests {
         let task = tokio::spawn(async move { refreshing.refresh().await });
         fixture.next().await.respond(
             403,
+            r#"{"error":{"code":"licence_suspended","message":"Denied","request_id":"fixture"}}"#,
+        );
+        assert!(matches!(task.await.unwrap(), Err(Error::Denied { .. })));
+        {
+            let store = client.0.installed.as_ref().unwrap().0.lock().unwrap();
+            assert!(store.record.access.is_none());
+            assert_eq!(
+                store.record.credential.as_ref().unwrap().bearer,
+                "a".repeat(43)
+            );
+        }
+        let refreshing = client.clone();
+        let task = tokio::spawn(async move { refreshing.refresh().await });
+        fixture.next().await.respond(
+            403,
             r#"{"error":{"code":"licence_revoked","message":"Denied","request_id":"fixture"}}"#,
         );
         assert!(matches!(task.await.unwrap(), Err(Error::Denied { .. })));

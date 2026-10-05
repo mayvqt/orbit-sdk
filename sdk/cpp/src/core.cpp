@@ -423,10 +423,10 @@ void ClientState::clear_all_locked() {
     customer.reset();
 }
 
-void ClientState::invalidate_locked(bool clear_pending) {
+void ClientState::invalidate_locked(bool clear_pending, const std::optional<Credential>& keep) {
     if (persistent) {
         persistent_record["generation"] = static_cast<Json::UInt64>(current_generation);
-        persistent_record["credential"] = null_value();
+        persistent_record["credential"] = keep ? credential_json(*keep) : null_value();
         if (clear_pending) persistent_record["pending_activation"] = null_value();
         persistent_record["access"] = null_value();
         if (persistent_record.isMember("offline") && persistent_record["offline"].isObject())
@@ -435,6 +435,7 @@ void ClientState::invalidate_locked(bool clear_pending) {
         return;
     }
     storage_version = storage->invalidate();
+    if (keep) storage->save(storage_version, credential_json(*keep));
 }
 
 void ClientState::sync_storage_locked() {
@@ -1222,6 +1223,17 @@ ClientState::verify_reply(const Json::Value &reply, const std::optional<Credenti
         const auto delay = RAND_bytes(&entropy, sizeof(entropy)) == 1
             ? std::chrono::seconds(15 + (entropy % 30)) : std::chrono::seconds(15);
         retry_deadline = std::chrono::steady_clock::now() + delay;
+        wake_worker();
+        throw *failure;
+    }
+
+    if (!mutation && previous && failure->kind() == ErrorKind::denied &&
+        !discards_credential(failure->kind(), failure->code())) {
+        // A suspension, expiry or similar denial only withholds access; keep the
+        // credential so the device resumes when access returns.
+        clear_access_locked();
+        invalidate_locked(true, previous);
+        credential = previous;
         wake_worker();
         throw *failure;
     }

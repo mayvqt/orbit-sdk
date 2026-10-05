@@ -61,6 +61,7 @@ if (root["format_version"] is not JsonValue version || !version.TryGetValue<int>
 }
 AppKeyTests.Run();
 AppVersionTests.Run();
+CredentialRetentionTests.Run();
 await NativeGrantTests.RunAsync(root);
 var passed = 0;
 var failed = 0;

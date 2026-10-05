@@ -2,7 +2,10 @@
 // Call RequireAccess before every protected operation.
 package orbit
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // ErrorKind identifies an error without exposing server text or credentials.
 type ErrorKind string
@@ -84,6 +87,23 @@ func (e *Error) Error() string {
 
 // Format never echoes caller-supplied fields, including with detailed fmt verbs.
 func (e Error) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(e.Error())) }
+
+// discardsCredential reports whether a validation denial proves the saved
+// device credential is dead. Other denials, such as a suspension or expiry,
+// only withhold access.
+func discardsCredential(err error) bool {
+	var e *Error
+	if !errors.As(err, &e) || e.Kind != Denied {
+		return false
+	}
+	switch e.Code {
+	case "invalid_credentials", "authentication_required", "reauthentication_required",
+		"credential_expired", "credential_revoked", "licence_revoked", "licence_claimed",
+		"device_mismatch":
+		return true
+	}
+	return false
+}
 
 func errorGuidance(code string) string {
 	switch code {

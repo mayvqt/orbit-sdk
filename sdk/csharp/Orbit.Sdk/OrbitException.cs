@@ -36,6 +36,15 @@ public sealed class OrbitException : Exception
     internal static bool ValidCode(string? value) => value is { Length: >= 1 and <= 128 } &&
         value.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_');
 
+    /// <summary>
+    /// Whether a validation denial proves the saved device credential is dead.
+    /// Other denials, such as a suspension or expiry, only withhold access.
+    /// </summary>
+    internal bool DiscardsCredential => Error == OrbitError.Denied && Code is
+        "invalid_credentials" or "authentication_required" or "reauthentication_required" or
+        "credential_expired" or "credential_revoked" or "licence_revoked" or "licence_claimed" or
+        "device_mismatch";
+
     private static string Guidance(OrbitError error, string? code)
     {
         if (error is OrbitError.Denied or OrbitError.Transient)
