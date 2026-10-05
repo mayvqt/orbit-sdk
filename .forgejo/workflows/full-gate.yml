@@ -1,0 +1,70 @@
+name: Full gate
+
+on:
+  # Ready PRs, weekly on main (for changes from outside the repository, such
+  # as dependencies or the runner image), and by hand. Not again on the merge
+  # to main: branch protection blocks merging an outdated PR, so the PR run
+  # already tested the merged tree.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "45 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the same PR or branch cancels the older run.
+  group: full-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # On PRs only the slow half: Checks runs the quick half beside it. Always
+    # reports, so it can be a required check; docs-only PRs skip the build.
+    name: Full gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Skip the build when only docs changed
+        id: changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          TOKEN: ${{ github.token }}
+        # A failed fetch builds anyway; the token stays out of .git/config.
+        run: |
+          if git -c http.extraHeader="Authorization: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" fetch --quiet --depth=1 origin "$BASE" && ! git diff --name-only "$BASE" HEAD | grep -qvE '^docs/|\.md$'; then
+            echo "Only docs changed; nothing to build."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+      # The C and C++ SDKs need headers the runner image doesn't ship.
+      - name: Install C libraries
+        if: steps.changes.outputs.code != 'false'
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends libcurl4-openssl-dev libjsoncpp-dev
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.changes.outputs.code != 'false'
+        with:
+          go-version-file: sdk/go/go.mod
+          cache-dependency-path: sdk/go/go.sum
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.changes.outputs.code != 'false'
+        with:
+          global-json-file: global.json
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        if: steps.changes.outputs.code != 'false'
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+            sdk/embedded/target
+          key: cargo-${{ hashFiles('Cargo.lock', 'sdk/embedded/Cargo.lock') }}
+          restore-keys: cargo-
+      - name: Build and test
+        if: steps.changes.outputs.code != 'false'
+        run: scripts/check ${{ github.event_name == 'pull_request' && 'slow' || 'full' }}

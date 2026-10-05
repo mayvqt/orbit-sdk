@@ -1,6 +1,5 @@
 # Orbit SDKs
 
-[![Checks](https://github.com/mayvqt/orbit-sdk/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/mayvqt/orbit-sdk/actions/workflows/checks.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-SDK-orange?logo=rust)
 ![Go](https://img.shields.io/badge/Go-SDK-00ADD8?logo=go&logoColor=white)

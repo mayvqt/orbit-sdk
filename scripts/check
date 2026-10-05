@@ -1,0 +1,123 @@
+#!/bin/bash
+# Run the repository's checks: scripts/check [quick|slow|full]. quick (the
+# default) checks formatting and whitespace and builds nothing; slow builds
+# and tests every SDK; full is both. Local runs, anvil land and CI all call
+# this, so the list lives here only. Prints failures, not progress.
+# CHECK_BASE (default origin/main) bounds the whitespace check. slow needs
+# Rust, CMake, a C/C++ compiler, Go, the .NET SDK in global.json, Python 3
+# with venv, Node 22, and the libcurl, OpenSSL and jsoncpp headers.
+set -euo pipefail
+mode=${1:-quick}
+case "$mode" in
+    quick|slow|full) ;;
+    -h|--help) sed -n '2,8p' "$0" | cut -c3-; exit 0 ;;
+    *) echo "usage: scripts/check [quick|slow|full]" >&2; exit 2 ;;
+esac
+cd "$(dirname "$0")/.."
+root=$PWD
+
+# run <command...>: quiet unless it fails, then its output and the command.
+run() {
+    local log; log=$(mktemp)
+    if ! "$@" >"$log" 2>&1; then
+        cat "$log"; rm -f "$log"
+        echo "check: failed: $*" >&2; exit 1
+    fi
+    rm -f "$log"
+}
+
+if [ "$mode" != slow ]; then
+    # Whitespace in every commit of the branch, not just the net diff. Needs
+    # the full history, or the check would quietly shrink to HEAD.
+    base=${CHECK_BASE:-origin/main}
+    if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+        echo "check: shallow clone; fetch the full history first" >&2; exit 1
+    elif git rev-parse -q --verify "$base^{commit}" >/dev/null; then
+        for commit in $(git rev-list --no-merges "$base..HEAD"); do
+            git show --format= --check "$commit" || { echo "check: whitespace errors in $commit" >&2; exit 1; }
+        done
+    elif [ -n "${CHECK_BASE:-}" ]; then
+        echo "check: CHECK_BASE $CHECK_BASE is not in this clone; fetch it first" >&2; exit 1
+    else
+        echo "check: no origin/main; the whitespace check covers HEAD only" >&2
+        git show --format= --check HEAD
+    fi
+    run cargo fmt --all -- --check
+    run cargo fmt --manifest-path sdk/embedded/Cargo.toml -- --check
+    unformatted=$(cd sdk/go && gofmt -l .)
+    [ -z "$unformatted" ] || { echo "check: gofmt: $unformatted" >&2; exit 1; }
+fi
+
+if [ "$mode" != quick ]; then
+    # Rust SDK and CLI, and packaging without uploading.
+    run cargo clippy --workspace --all-targets --locked -- -D warnings
+    run cargo test --workspace --locked
+    run cargo package -p orbit-sdk-native --locked
+    run cargo package -p orbit-sdk --locked \
+        --config 'patch.crates-io.orbit-sdk-native.path="sdk/rust/native"'
+
+    # Embedded: the Rust wrapper per feature set, then one C build per
+    # configuration.
+    for features in "" services offline offline-full; do
+        run cargo test --manifest-path sdk/embedded/Cargo.toml --locked ${features:+--features $features}
+    done
+    cbuild() {
+        local src=$1 dir=$2; shift 2
+        run cmake -S "$src" -B "build/$dir" "$@"
+        run cmake --build "build/$dir" -j4
+        if [ -f "build/$dir/CTestTestfile.cmake" ]; then
+            run ctest --test-dir "build/$dir" --output-on-failure
+        fi
+    }
+    cbuild sdk/embedded embedded -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-Os -DORBIT_BUILD_POSIX=ON
+    cbuild sdk/embedded embedded-services -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_SERVICES=ON
+    cbuild sdk/embedded embedded-offline -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_OFFLINE=ON \
+        -DORBIT_OFFLINE_PROFILE_FILE_BYTES=4096 -DORBIT_CLIENT_ARENA_BYTES=8192
+    cbuild sdk/embedded embedded-offline-full -DORBIT_BUILD_POSIX=ON -DORBIT_ENABLE_OFFLINE=ON \
+        -DORBIT_OFFLINE_PROFILE_FILE_BYTES=16384 -DORBIT_CLIENT_ARENA_BYTES=16384
+
+    # C++ SDK and its example.
+    cbuild sdk/cpp cpp-tests -DBUILD_TESTING=ON -DORBIT_ENABLE_TLS_TESTS=ON
+    cbuild examples/cpp cpp-example -DBUILD_TESTING=OFF
+
+    # C#: contract vectors, local-development suites, then the example.
+    export DOTNET_CLI_TELEMETRY_OPTOUT=1
+    tests=sdk/csharp/tests/Orbit.Sdk.Tests.csproj
+    run dotnet restore "$tests" --locked-mode
+    for args in "contracts/sdk/grants.json" \
+                "--offline-vectors contracts/sdk/offline-files.json" \
+                "--download-vectors contracts/sdk/download-tickets.json" \
+                "--session-vectors contracts/sdk/session-grants.json"; do
+        # shellcheck disable=SC2086 # args holds a flag and its value
+        run dotnet run --project "$tests" --no-restore -- $args
+    done
+    for suite in --download-stream --security --installed; do
+        run dotnet run --project "$tests" --no-restore -p:OrbitLocalDevelopment=true -- "$suite"
+    done
+    run dotnet restore examples/csharp/licensed-export/Orbit.LicensedExport.csproj
+    run dotnet build examples/csharp/licensed-export/Orbit.LicensedExport.csproj --no-restore
+
+    # Go, vetting the Windows and macOS builds too. The Windows ACL walk turns
+    # OS-owned addresses inside a LocalAlloc'd security descriptor into
+    # pointers, which unsafeptr always flags; Go's collector never moves that
+    # memory.
+    cd "$root/sdk/go"
+    run go vet ./...
+    run env GOOS=windows go vet -unsafeptr=false ./...
+    run env GOOS=darwin CGO_ENABLED=0 go vet ./...
+    run go test -race ./...
+
+    # Python, in a throwaway virtual environment.
+    cd "$root/sdk/python"
+    run python3 -m venv "$root/build/python-venv"
+    run "$root/build/python-venv/bin/python" -m pip install --quiet -e .
+    run "$root/build/python-venv/bin/python" -m unittest discover -q -s tests
+
+    # TypeScript: the backend SDK, then the installed SDK and its types.
+    cd "$root/sdk/typescript"
+    run npm test
+    cd "$root/sdk/typescript-installed"
+    run npm ci --no-audit --no-fund
+    run npm test
+    run npm run typecheck
+fi

@@ -1,0 +1,38 @@
+name: Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the PR cancels the older run.
+  group: checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # The required PR check: scripts/check quick (formatting and whitespace,
+    # no builds). Not on main: anvil land brings the PR up to date with main
+    # first, so this run already covered the merged tree.
+    name: Checks
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CHECK_BASE: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history, so the whitespace check sees every commit of the PR
+          # and finds its base locally.
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdk/go/go.mod
+          cache: false
+      - name: Quick checks
+        run: scripts/check quick
