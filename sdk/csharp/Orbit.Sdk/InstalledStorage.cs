@@ -180,7 +180,7 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             throw new OrbitException(OrbitError.StaleResponse);
     }
     public long Invalidate() => Invalidate(clearPending: true);
-    internal long Invalidate(bool clearPending)
+    internal long Invalidate(bool clearPending, bool clearCredential = true)
     {
         lock (gate)
         {
@@ -189,7 +189,7 @@ internal sealed class InstalledStorage : ICredentialStorage, IDisposable
             Write(Record with
             {
                 Generation = Record.Generation + 1,
-                Credential = null,
+                Credential = clearCredential ? null : Record.Credential,
                 Access = null,
                 PendingActivation = clearPending ? null : Record.PendingActivation,
                 Offline = Record.Offline is { } offline ? offline with { Jws = null } : null

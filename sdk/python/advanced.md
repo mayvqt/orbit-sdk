@@ -187,6 +187,11 @@ subclass it. `LimitReachedError` adds the validated `counter` and
 `idempotency_key` needed to recover a write. Keep the error from the failed
 operation when correlating support requests.
 
+A denial that only withholds access, such as a suspended or expired licence,
+keeps the saved activation, so access resumes at the next validation after the
+licence is restored. A revoked licence, invalid credential or device mismatch
+clears it, and the device must activate again.
+
 ## Access-check performance
 
 Reuse one open client per installation. A warm `require_access()` checks the

@@ -129,6 +129,23 @@ impl Error {
             _ => return None,
         })
     }
+
+    /// Whether a validation denial proves the saved device credential is dead.
+    /// Other denials, such as a suspension or expiry, only withhold access.
+    pub(crate) fn discards_credential(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+            && matches!(
+                self.code(),
+                "invalid_credentials"
+                    | "authentication_required"
+                    | "reauthentication_required"
+                    | "credential_expired"
+                    | "credential_revoked"
+                    | "licence_revoked"
+                    | "licence_claimed"
+                    | "device_mismatch"
+            )
+    }
 }
 
 #[cfg(test)]
@@ -300,5 +317,32 @@ mod tests {
                 format!("{guidance} (code: {code}, request ID: reference)")
             );
         }
+    }
+
+    #[test]
+    fn credential_retention_matches_shared_vectors() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/sdk/credential-retention.json");
+        let vectors: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for case in vectors["denials"].as_array().unwrap() {
+            let code = case["code"].as_str().unwrap();
+            let denied = Error::Denied {
+                code: code.into(),
+                request_id: None,
+            };
+            assert_eq!(
+                denied.discards_credential(),
+                case["discard_credential"].as_bool().unwrap(),
+                "{code:?}"
+            );
+        }
+        assert!(
+            !Error::Transient {
+                code: None,
+                request_id: None
+            }
+            .discards_credential()
+        );
     }
 }

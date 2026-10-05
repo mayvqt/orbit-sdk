@@ -127,6 +127,22 @@ int orbit_client_header_valid(orbit_embedded_slice_t language, orbit_embedded_sl
            orbit_app_version_valid(version) &&
            language.length + version.length + platform.length + 4u <= 128u;
 }
+/* Whether a validation denial proves the saved device credential is dead.
+ * Other denials, such as a suspension or expiry, only withhold access. */
+int orbit_error_discards_credential(const uint8_t *bytes, uint32_t length, uint8_t *scratch) {
+    static const char *const dead[] = {"invalid_credentials", "authentication_required",
+                                       "reauthentication_required", "credential_expired",
+                                       "credential_revoked", "licence_revoked",
+                                       "licence_claimed", "device_mismatch"};
+    uint32_t i, n;
+    for (i = 0u; i < sizeof(dead) / sizeof(dead[0]); ++i) {
+        for (n = 0u; dead[i][n]; ++n) {
+        }
+        if (orbit_error_code_is(bytes, length, scratch, dead[i], n))
+            return 1;
+    }
+    return 0;
+}
 int orbit_error_code_is(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
                         const char *code, uint32_t code_length) {
     orbit_json_parser_t p;

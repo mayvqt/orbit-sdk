@@ -6,9 +6,10 @@ import path from "node:path";
 import test from "node:test";
 import { AppKey } from "../src/app-key.mjs";
 import { Client, openClientForTesting, setClockForTesting } from "../src/client.mjs";
-import { ErrorKind } from "../src/errors.mjs";
+import { ErrorKind, discardsCredential, fail } from "../src/errors.mjs";
 import { PrivateFileStore, setStorageFaultForTesting } from "../src/storage/private-files.mjs";
 import { posixFilesystem, setPosixFilesystemForTesting } from "../src/platform/native.mjs";
+const retentionVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/credential-retention.json", import.meta.url), "utf8"));
 const grantVectors = JSON.parse(await readFile(new URL("../../../contracts/sdk/grants.json", import.meta.url), "utf8"));
 
 const key = AppKey.parse("orbit_app_test_aHR0cHM6Ly9sb2NhbGhvc3Q.Q2lK7xY3bR9mT0pW4vN8sA.Zx8_c-1dKpL5qR2tU6wY0g");
@@ -322,6 +323,54 @@ test("cancelled refresh encoding does not persist or grant a late response", asy
   releaseAccess();
   await assert.rejects(refresh, (error) => error.kind === ErrorKind.CANCELLED);
   assert.equal(client.snapshot().has("export"), true, "the previous verified grant remains usable");
+});
+
+test("credential retention matches the shared vectors", () => {
+  for (const item of retentionVectors.denials) {
+    assert.equal(discardsCredential(fail(ErrorKind.DENIED, item.code)), item.discard_credential, item.code);
+  }
+  assert.equal(discardsCredential(fail(ErrorKind.TRANSIENT, "licence_revoked")), false);
+});
+
+test("a suspension keeps the credential and a revocation discards it", async (context) => {
+  if (process.platform !== "linux" && process.platform !== "darwin") return context.skip("POSIX private-file storage runtime only");
+  const base = await mkdtemp(path.join(os.tmpdir(), "orbit-js-suspension-"));
+  const clients = [];
+  context.after(async () => {
+    for (const client of clients) await client.close();
+    await rm(base, { recursive: true, force: true });
+  });
+  let denial = null;
+  const transport = {
+    async post(route, body) {
+      if (route.endsWith("/activations")) return activationReply(body, "activation-1", "licence-1");
+      if (route.endsWith("/validate")) {
+        if (denial) throw fail(ErrorKind.DENIED, denial, "fixture", 403);
+        return activationReply(body, "activation-1", "licence-1", { credential: null });
+      }
+      throw new Error("unexpected request");
+    },
+    async get() { return Buffer.from(JSON.stringify(grantVectors.jwks)); },
+  };
+  const open = async () => {
+    const client = await openClientForTesting(key, { statePath: path.join(base, "state"), machineBinding: false, transport, lifecycle: false });
+    clients.push(client);
+    return client;
+  };
+  const client = await open();
+  await client.activate(keyText);
+  denial = "licence_suspended";
+  await assert.rejects(client.refresh(), (error) => error.code === "licence_suspended");
+  assert.equal(client.snapshot().has("export"), false);
+  await client.close();
+  const resumed = await open();
+  assert.notEqual(resumed.snapshot().access, "denied", "suspension must keep the credential");
+  denial = null;
+  assert.equal((await resumed.refresh()).has("export"), true, "access resumes without activating again");
+  denial = "licence_revoked";
+  await assert.rejects(resumed.refresh(), (error) => error.code === "licence_revoked");
+  await resumed.close();
+  assert.equal((await open()).snapshot().access, "denied", "revocation must discard the credential");
 });
 
 test("checkpoint queued before logout cannot restore the old signed access", async (context) => {

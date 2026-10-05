@@ -66,6 +66,11 @@ was unreachable; `Denied` is an authoritative refusal whose `Code` says why.
 Exception messages are fixed guidance and never contain server text or
 credentials.
 
+A denial that only withholds access, such as a suspended or expired licence,
+keeps the saved activation, so access resumes at the next validation after the
+licence is restored. A revoked licence, invalid credential or device mismatch
+clears it, and the device must activate again.
+
 ## Long-term offline files
 
 `OfflineKeys.Parse` validates the whole trusted key set before installed state

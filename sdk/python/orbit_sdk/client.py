@@ -33,6 +33,7 @@ from .errors import (
     FeatureUnavailableError,
     NotActivatedError,
     OrbitError,
+    discards_credential,
     error,
 )
 from .grants import Expected, Keys, valid_entitlements, verify
@@ -1427,7 +1428,7 @@ class Client:
                         if self._pending_session_id == session_id:
                             self._pending_session_id = None
                         self._queue_session_release(session_id, credential)
-                        if exc.code == "licence_revoked":
+                        if discards_credential(exc):
                             self._invalidate(clear_account=False)
                         elif exc.kind not in (CANCELLED, STALE_RESPONSE):
                             self._session_disabled = True
@@ -1502,7 +1503,7 @@ class Client:
             with self._state_lock:
                 if self._generation != generation or self._credential != credential or self._floating is not current:
                     raise error(STALE_RESPONSE, "stale_response") from exc
-                if exc.code == "licence_revoked":
+                if discards_credential(exc):
                     revoke_credential = True
                 else:
                     revoke_credential = False
@@ -1752,18 +1753,27 @@ class Client:
             and self._persistent_storage.pending_activation is not None
             and failure.kind not in (DENIED, REAUTHENTICATION_REQUIRED)
         )
+        # A suspension, expiry or similar denial only withholds access; keep the
+        # credential so the device resumes when access returns.
+        keep_credential = failure.kind == DENIED and not discards_credential(failure)
         with self._state_lock:
             if self._generation != generation:
                 raise error(STALE_RESPONSE, "stale_response")
+            credential, account = self._credential, self._account
             self._clear_all_locked()
             try:
-                self._storage_version = (
-                    self._persistent_storage.invalidate(preserve_pending=preserve_pending)
-                    if self._persistent_storage is not None
-                    else self._storage.invalidate()
-                )
+                if self._persistent_storage is not None:
+                    self._storage_version = self._persistent_storage.invalidate(
+                        preserve_pending=preserve_pending, keep_credential=keep_credential
+                    )
+                else:
+                    self._storage_version = self._storage.invalidate()
+                    if keep_credential and credential is not None:
+                        self._storage.save(self._storage_version, credential)
             except BaseException as exc:
                 raise error(STORAGE, "storage_failed") from exc
+            if keep_credential:
+                self._credential, self._account = credential, account
         raise failure
 
     def _verify_reply(self, data: bytes, previous: StoredCredential | None, expected_licence: str | None, started: Start, cancel: threading.Event | None) -> tuple[StoredCredential, dict[str, Any] | None, Anchor | None, AccessState | None, bool, int | None, str]:

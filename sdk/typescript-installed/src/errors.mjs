@@ -65,3 +65,16 @@ export const ErrorKind = Object.freeze({
   TRANSPORT_SECURITY: "transport_security",
   INTERNAL: "internal",
 });
+
+const DEAD_CREDENTIAL_CODES = new Set([
+  "invalid_credentials", "authentication_required", "reauthentication_required", "credential_expired",
+  "credential_revoked", "licence_revoked", "licence_claimed", "device_mismatch",
+]);
+
+/**
+ * Whether a validation denial proves the saved device credential is dead. Other
+ * denials, such as a suspension or expiry, only withhold access.
+ */
+export function discardsCredential(error) {
+  return error?.kind === ErrorKind.DENIED && DEAD_CREDENTIAL_CODES.has(error.code);
+}

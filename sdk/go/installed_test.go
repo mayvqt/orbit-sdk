@@ -210,6 +210,8 @@ func (f *installedFixture) respond(request *http.Request) (*http.Response, error
 		return testResponse(request, 403, `{"error":{"code":"licence_revoked","message":"Denied","request_id":"fixture"}}`), nil
 	case 3:
 		return testResponse(request, 200, `{"malformed":true}`), nil
+	case 7:
+		return testResponse(request, 403, `{"error":{"code":"licence_suspended","message":"Denied","request_id":"fixture"}}`), nil
 	case 6:
 		return testResponse(request, 403, `{"error":{"code":"app_version_unsupported","message":"Update required","request_id":"fixture"}}`), nil
 	}
@@ -680,6 +682,32 @@ func TestInstalledAuthoritativeDenialClearsCache(t *testing.T) {
 	c = mustInstalledOpen(t, f, path)
 	if c.state.credential != nil || c.installed.record.Access != nil {
 		t.Fatal("denied cached authority survived restart")
+	}
+}
+func TestInstalledSuspensionKeepsCredentialUntilRevoked(t *testing.T) {
+	f := newInstalledFixture(t, true)
+	path := filepath.Join(installedTestTempDir(t), "state")
+	c := mustInstalledOpen(t, f, path)
+	mustInstalledActivate(t, c)
+	_ = c.Close()
+	f.mode.Store(7)
+	if c, err := f.open(path); c != nil || !errors.Is(err, ErrDenied) {
+		t.Fatal("suspension restored access", err)
+	}
+	f.mode.Store(1)
+	c = mustInstalledOpen(t, f, path)
+	if c.state.credential == nil || c.installed.record.Credential == nil || c.installed.record.Access != nil {
+		t.Fatal("suspension discarded the credential or kept cached authority")
+	}
+	_ = c.Close()
+	f.mode.Store(2)
+	if c, err := f.open(path); c != nil || !errors.Is(err, ErrDenied) {
+		t.Fatal("revocation restored access", err)
+	}
+	f.mode.Store(1)
+	c = mustInstalledOpen(t, f, path)
+	if c.state.credential != nil || c.installed.record.Credential != nil {
+		t.Fatal("revocation kept the credential")
 	}
 }
 func TestInstalledCloseSettlesInflightAndReleasesLease(t *testing.T) {

@@ -391,6 +391,8 @@ internal static partial class InstalledTests
             }
             if (Mode == 1)
                 return new(503, "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"Unavailable\",\"request_id\":\"fixture\"}}", RetryAfter: "30");
+            if (Mode == 8)
+                return new(403, "{\"error\":{\"code\":\"licence_suspended\",\"message\":\"Denied\",\"request_id\":\"fixture\"}}");
             if (Mode == 2)
                 return new(403, "{\"error\":{\"code\":\"licence_revoked\",\"message\":\"Denied\",\"request_id\":\"fixture\"}}");
             if (Mode == 3)
@@ -1274,6 +1276,9 @@ internal static partial class InstalledTests
         await using var f = new Fixture();
         await using (var c = await f.Open())
             await f.Activate(c);
+        f.Mode = 8;
+        await Expect(OrbitError.Denied, async () => { await using var c = await f.Open(); });
+        Require(f.Record().Access == null && f.Record().Credential != null, "suspension discarded the credential");
         f.Mode = 2;
         await Expect(OrbitError.Denied, async () => { await using var c = await f.Open(); });
         Require(f.Record().Access == null && f.Record().Credential == null);

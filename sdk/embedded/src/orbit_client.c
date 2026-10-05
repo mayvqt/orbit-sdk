@@ -822,6 +822,23 @@ static int32_t perform(orbit_client_state_t *c, uint8_t operation,
         started > UINT64_MAX - 60000u ? UINT64_MAX : started + 60000u;
     return result;
   }
+  if (result == ORBIT_CLIENT_DENIED && operation == 0u &&
+      !orbit_error_discards_credential(c->arena, sink.length, c->scratch)) {
+    /* A suspension, expiry or similar denial only withholds access; keep the
+     * credential so the device resumes when access returns. */
+#ifdef ORBIT_ENABLE_SERVICES
+    if (c->extension) {
+      c->extension->session.active = 0;
+      c->extension->policy_known = 0;
+    }
+#endif
+    clear_access(c);
+    if (advance(c) != 0)
+      return ORBIT_CLIENT_STORAGE;
+    c->retry_ticks =
+        started > UINT64_MAX - 30000u ? UINT64_MAX : started + 30000u;
+    return result;
+  }
   if (result != 0 && result != ORBIT_CLIENT_PENDING &&
       result != ORBIT_CLIENT_CLOCK && result != ORBIT_CLIENT_STALE &&
       result != ORBIT_CLIENT_STORAGE) {

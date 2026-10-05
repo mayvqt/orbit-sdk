@@ -22,6 +22,7 @@ int orbit_client_header_valid(orbit_embedded_slice_t language, orbit_embedded_sl
 orbit_embedded_slice_t orbit_client_header(void);
 int orbit_error_code_is(const uint8_t *bytes, uint32_t length, uint8_t *scratch,
                         const char *code, uint32_t code_length);
+int orbit_error_discards_credential(const uint8_t *bytes, uint32_t length, uint8_t *scratch);
 int32_t orbit_record_encode(const orbit_record_t *r, uint8_t *bytes, uint32_t *length);
 int32_t orbit_record_decode(const uint8_t *bytes, uint32_t length, orbit_record_t *r);
 

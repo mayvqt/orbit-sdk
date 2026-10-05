@@ -1306,7 +1306,9 @@ internal static class SecurityTests
             else
             {
                 await ExpectAsync(OrbitError.Denied, () => client.RefreshAsync(cancellationToken));
-                Require(client.Snapshot().Access == Access.Denied && storage.Load().Credential == null);
+                var revoked = code == "licence_revoked";
+                Require(client.Snapshot().Access is not (Access.Online or Access.Offline));
+                Require((client.Snapshot().Access == Access.Denied) == revoked && (storage.Load().Credential == null) == revoked);
             }
             Require(server.RequestCount == 3);
         }

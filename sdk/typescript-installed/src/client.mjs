@@ -2,7 +2,7 @@ import { randomBytes, createHash, randomInt } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { validateAppKey, canonicalScope, isOpaqueId, validProvider } from "./app-key.mjs";
 import { configuredAppVersion, updateHint } from "./app-version.mjs";
-import { fail, ErrorKind, AppVersionUnsupportedError, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
+import { fail, ErrorKind, discardsCredential, AppVersionUnsupportedError, NotActivatedError, FeatureUnavailableError, MutationUncertainError } from "./errors.mjs";
 import * as online from "./online.mjs";
 import { downloadFile } from "./download-file.mjs";
 import { validEntitlements, parseJwks, verifyGrant } from "./grants.mjs";
@@ -637,8 +637,11 @@ export class Client extends EventEmitter {
         if (snapshot.access === "offline" || snapshot.access === "online" && this.#sessionRequired) return snapshot;
         throw error;
       }
+      // A suspension, expiry or similar denial only withholds access; keep the
+      // credential so the device resumes when access returns.
       await this.#invalidate({ preservePending: Boolean(this.#store.state.pending_activation) &&
-        error?.kind !== ErrorKind.DENIED && error?.kind !== ErrorKind.REAUTHENTICATION_REQUIRED });
+        error?.kind !== ErrorKind.DENIED && error?.kind !== ErrorKind.REAUTHENTICATION_REQUIRED,
+      keepCredential: error?.kind === ErrorKind.DENIED && !discardsCredential(error) });
       throw error;
     }
     this.#transient = false;
@@ -706,7 +709,7 @@ export class Client extends EventEmitter {
         } else {
           if (this.#pendingSessionId === sessionId) this.#pendingSessionId = null;
           this.#scheduleSessionRelease(sessionId, credential);
-          if (error?.code === "licence_revoked") {
+          if (discardsCredential(error)) {
             await this.#invalidate();
           } else if (![ErrorKind.CANCELLED, ErrorKind.STALE_RESPONSE].includes(error?.kind)) {
             this.#sessionDisabled = true;
@@ -773,7 +776,7 @@ export class Client extends EventEmitter {
         if (error?.kind === ErrorKind.CANCELLED) throw error;
         throw fail(ErrorKind.STALE_RESPONSE, "stale_response");
       }
-      if (error?.code === "licence_revoked") {
+      if (discardsCredential(error)) {
         await this.#invalidate();
         throw error;
       }
@@ -1303,7 +1306,7 @@ export class Client extends EventEmitter {
     await this.#invalidate({ preservePending: true, clearAccount: true });
   }
 
-  async #invalidate({ preservePending = false, clearAccount = false } = {}) {
+  async #invalidate({ preservePending = false, clearAccount = false, keepCredential = false } = {}) {
     this.#advanceIntent();
     const checkpointContext = { claims: this.#claims, anchor: this.#anchor, offlineAnchor: this.#offlineAnchor };
     const generation = this.#fence();
@@ -1320,7 +1323,7 @@ export class Client extends EventEmitter {
     this.#state = await this.#store.updateState((state) => ({
       ...state,
       generation: nextGeneration(state.generation),
-      credential: null,
+      credential: keepCredential ? state.credential : null,
       access: null,
       pending_activation: preservePending ? state.pending_activation : null,
       offline: state.offline.jws === null ? state.offline : { ...state.offline, jws: null },

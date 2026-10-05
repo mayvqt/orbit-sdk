@@ -658,6 +658,20 @@ class PersistentClientTests(unittest.TestCase):
         finally:
             storage.close()
 
+    def test_suspension_keeps_credential_but_drops_cached_access(self) -> None:
+        self._activate_offline()
+        with self.assertRaises(OrbitError) as denied:
+            self.open(PersistentTransport(validation_error=error(DENIED, "licence_suspended")))
+        self.assertEqual(denied.exception.code, "licence_suspended")
+        storage = InstallationStorage.open(self.directory.name, APP_SCOPE)
+        try:
+            _, credential = storage.load()
+            self.assertIsNotNone(credential)
+            self.assertIsNone(storage.access)
+            self.assertIsNone(storage.pending_activation)
+        finally:
+            storage.close()
+
     def test_close_cancels_foreground_refresh_and_prevents_commit(self) -> None:
         client = self.open(PersistentTransport(offline=True))
         client.activate("foreground-close-key")

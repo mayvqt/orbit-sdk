@@ -43,6 +43,21 @@ def error(kind: str, code: str, request_id: str | None = None) -> OrbitError:
     return OrbitError(kind, code, request_id)
 
 
+_DEAD_CREDENTIAL_CODES = frozenset({
+    "invalid_credentials", "authentication_required", "reauthentication_required",
+    "credential_expired", "credential_revoked", "licence_revoked", "licence_claimed",
+    "device_mismatch",
+})
+
+
+def discards_credential(failure: OrbitError) -> bool:
+    """Whether a validation denial proves the saved device credential is dead.
+
+    Other denials, such as a suspension or expiry, only withhold access.
+    """
+    return failure.kind == DENIED and failure.code in _DEAD_CREDENTIAL_CODES
+
+
 class NotActivatedError(OrbitError):
     """No usable access: the installation has not been activated (or its
     activation no longer provides access). Distinguishable from

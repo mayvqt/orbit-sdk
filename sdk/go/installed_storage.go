@@ -92,9 +92,14 @@ func installedCredentialFrom(c *StoredCredential) *installedCredential {
 	}
 	return r
 }
-func (s *installedStorage) Invalidate() (uint64, error)                  { return s.invalidate(true) }
-func (s *installedStorage) invalidatePreservingPending() (uint64, error) { return s.invalidate(false) }
-func (s *installedStorage) invalidate(clearPending bool) (uint64, error) {
+func (s *installedStorage) Invalidate() (uint64, error) { return s.invalidate(true, true) }
+func (s *installedStorage) invalidatePreservingPending() (uint64, error) {
+	return s.invalidate(false, true)
+}
+func (s *installedStorage) invalidateKeepingCredential() (uint64, error) {
+	return s.invalidate(true, false)
+}
+func (s *installedStorage) invalidate(clearPending, clearCredential bool) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.record
@@ -102,7 +107,10 @@ func (s *installedStorage) invalidate(clearPending bool) (uint64, error) {
 		return 0, ErrStorage
 	}
 	r.Generation++
-	r.Credential, r.Access = nil, nil
+	r.Access = nil
+	if clearCredential {
+		r.Credential = nil
+	}
 	clearOfflineAuthority(&r)
 	if clearPending {
 		r.Pending = nil

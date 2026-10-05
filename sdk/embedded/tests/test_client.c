@@ -29,7 +29,8 @@ typedef struct mock {
   uint64_t ticks;
   uint8_t record[1024];
   uint32_t record_length, commits, posts, gets, large_response_length;
-  int post_transient, key_transient, post_link, key_link, denial, bad_signature, storage_failure,
+  const char *denial;
+  int post_transient, key_transient, post_link, key_link, bad_signature, storage_failure,
       oversized, oversized_response, offline, reenter, reenter_clock,
       reenter_commit, grant_hwid_claims, sent_fingerprint, sent_provider,
       version_denied;
@@ -215,8 +216,13 @@ static int32_t exchange(void *context, const orbit_http_request_t *request,
   if (m->post_link)
     return ORBIT_CLIENT_UNTRUSTED;
   if (m->denial) {
+    char denied[128];
+    int length = snprintf(denied, sizeof(denied),
+                          "{\"error\":{\"code\":\"%s\",\"message\":\"Denied\","
+                          "\"request_id\":\"req_1\"}}",
+                          m->denial);
     *http = 403u;
-    return 0;
+    return receive(sink, (const uint8_t *)denied, (uint32_t)length);
   }
   if (m->version_denied) {
     static const char denied[] =
@@ -538,7 +544,15 @@ static int lifecycle(void) {
   CHECK(orbit_client_clock_lost(&client) == 0);
   CHECK(orbit_client_require_access(&client, S("export")) == 0);
   elapse(&m, 901);
-  m.denial = 1;
+  m.denial = "licence_suspended";
+  CHECK(orbit_client_require_access(&client, S("export")) ==
+        ORBIT_CLIENT_DENIED);
+  CHECK(orbit_client_snapshot(&client, &snapshot) == 0 && !snapshot.allowed);
+  m.denial = NULL;
+  elapse(&m, 31);
+  CHECK(orbit_client_require_access(&client, S("export")) == 0);
+  elapse(&m, 901);
+  m.denial = "licence_revoked";
   CHECK(orbit_client_require_access(&client, S("export")) ==
         ORBIT_CLIENT_DENIED);
   CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_ACTIVATION_REQUIRED);
@@ -602,6 +616,19 @@ static int link_failures_keep_credential(void) {
   CHECK(!has_credential(&m));
   CHECK(orbit_client_tick(&client) == ORBIT_CLIENT_ACTIVATION_REQUIRED);
   orbit_client_destroy(&client);
+  return 0;
+}
+static int retention_vectors(void) {
+  char body[128];
+  uint32_t i;
+  int length;
+  for (i = 0; i < GENERATED_COUNT(generated_retention_vectors); ++i) {
+    length = snprintf(body, sizeof(body), "{\"error\":{\"code\":\"%s\"}}",
+                      generated_retention_vectors[i].code);
+    CHECK(orbit_error_discards_credential((const uint8_t *)body, (uint32_t)length,
+                                          scratch) ==
+          generated_retention_vectors[i].discard);
+  }
   return 0;
 }
 static int app_version_vectors(void) {
@@ -936,6 +963,7 @@ int main(void) {
   CHECK(optional_machine_binding() == 0);
   CHECK(lifecycle() == 0);
   CHECK(app_version_vectors() == 0);
+  CHECK(retention_vectors() == 0);
   CHECK(app_version_policy() == 0);
   CHECK(retry_and_storage() == 0);
   CHECK(link_failures_keep_credential() == 0);

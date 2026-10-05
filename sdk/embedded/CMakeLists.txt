@@ -105,14 +105,17 @@ if(BUILD_TESTING)
     set(ORBIT_TEST_PRIVATE_KEY ${CMAKE_CURRENT_SOURCE_DIR}/../rust/tests/fixtures/es256-test-private.pem CACHE FILEPATH "Public synthetic signing fixture")
     set(ORBIT_GENERATED_APP_VERSION_VECTORS ${CMAKE_CURRENT_BINARY_DIR}/orbit_generated_app_version_vectors.h)
     set(ORBIT_APP_VERSION_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/app-versions.json CACHE FILEPATH "Shared app-version vectors")
+    set(ORBIT_RETENTION_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/../../contracts/sdk/credential-retention.json CACHE FILEPATH "Shared credential-retention vectors")
     add_custom_command(
         OUTPUT ${ORBIT_GENERATED_APP_VERSION_VECTORS}
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_version_vectors.py
             --source ${ORBIT_APP_VERSION_VECTORS}
+            --retention ${ORBIT_RETENTION_VECTORS}
             --output ${ORBIT_GENERATED_APP_VERSION_VECTORS}
         DEPENDS
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_app_version_vectors.py
             ${ORBIT_APP_VERSION_VECTORS}
+            ${ORBIT_RETENTION_VECTORS}
         VERBATIM
     )
     add_custom_target(orbit_embedded_generate_app_version_vectors DEPENDS ${ORBIT_GENERATED_APP_VERSION_VECTORS})
