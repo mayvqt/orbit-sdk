@@ -20,3 +20,6 @@ npm-debug.log*
 
 # Local maintainer notes for agents; never published.
 INTERNAL.md
+
+# Local working notes, never committed.
+/.local/
